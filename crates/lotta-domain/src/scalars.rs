@@ -88,6 +88,19 @@ impl Timestamp {
         clock.parse_timestamp(value)
     }
 
+    /// Adds a signed duration without reading the current time.
+    ///
+    /// # Errors
+    /// Returns [`DomainError::InvalidTimestamp`] when the result is outside the supported range.
+    pub fn checked_add(self, duration: chrono::Duration) -> Result<Self, DomainError> {
+        self.0
+            .checked_add_signed(duration)
+            .map(Self)
+            .ok_or_else(|| DomainError::InvalidTimestamp {
+                value: "checked timestamp arithmetic overflow".into(),
+            })
+    }
+
     /// Returns the UTC date-time value.
     #[must_use]
     pub fn as_utc(&self) -> &DateTime<Utc> {

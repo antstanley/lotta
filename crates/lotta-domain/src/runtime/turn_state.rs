@@ -158,18 +158,14 @@ impl fmt::Debug for TurnLifecycle {
     }
 }
 
-impl Default for TurnLifecycle {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl TurnLifecycle {
-    /// Creates an idle lifecycle owner with a unique identity.
+    /// Creates an idle lifecycle with a caller-injected unique owner identity.
+    ///
+    /// The caller must provide an identity not shared by another live lifecycle owner.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new(owner_id: Uuid) -> Self {
         Self {
-            owner_id: Uuid::new_v4(),
+            owner_id,
             generation: 0,
             state: TurnState::Idle,
             last_stop_reason: None,

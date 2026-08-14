@@ -1,5 +1,6 @@
 use super::PortFuture;
 use lotta_domain::{AgentId, ConversationId, MessageId, RunId};
+use uuid::Uuid;
 
 /// Generates every random or monotonic identifier needed by runtime workflows.
 ///
@@ -40,4 +41,9 @@ pub trait IdGenerator: Send + Sync {
     /// The returned future yields one owned ID. Dropping it cancels the request; consumed entropy
     /// or sequence values need not be reused.
     fn run_id(&self) -> PortFuture<'_, RunId>;
+
+    /// Generates the unique owner UUID injected into a new turn lifecycle.
+    ///
+    /// The caller must not reuse the returned UUID for another live lifecycle owner.
+    fn turn_lifecycle_owner_id(&self) -> PortFuture<'_, Uuid>;
 }

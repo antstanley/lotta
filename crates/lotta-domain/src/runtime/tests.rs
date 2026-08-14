@@ -15,7 +15,7 @@ fn stop_reason(value: &str) -> StopReason {
 }
 
 fn owner_in(kind: TurnStateKind) -> (TurnLifecycle, Option<TurnLease>) {
-    let mut owner = TurnLifecycle::new();
+    let mut owner = TurnLifecycle::new(uuid::Uuid::from_u128(1));
     let lease = match kind {
         TurnStateKind::Idle => None,
         TurnStateKind::Command => Some(owner.start_command().expect("command starts")),
@@ -87,14 +87,14 @@ pub(super) fn assert_turn_state_exhaustive_transition_matrix() {
 }
 
 pub(super) fn assert_turn_state_idle_command_idle() {
-    let mut owner = TurnLifecycle::new();
+    let mut owner = TurnLifecycle::new(uuid::Uuid::from_u128(1));
     let lease = owner.start_command().expect("legal transition");
     owner.finish_command(&lease).expect("current lease");
     assert_eq!(owner.state().kind(), TurnStateKind::Idle);
 }
 
 pub(super) fn assert_turn_state_idle_active_idle() {
-    let mut owner = TurnLifecycle::new();
+    let mut owner = TurnLifecycle::new(uuid::Uuid::from_u128(1));
     let lease = owner
         .start_turn("turn-1".into(), run_id())
         .expect("legal transition");
@@ -105,7 +105,7 @@ pub(super) fn assert_turn_state_idle_active_idle() {
 }
 
 pub(super) fn assert_turn_state_active_cancelling_idle() {
-    let mut owner = TurnLifecycle::new();
+    let mut owner = TurnLifecycle::new(uuid::Uuid::from_u128(1));
     let lease = owner
         .start_turn("turn-1".into(), run_id())
         .expect("legal transition");
@@ -117,15 +117,15 @@ pub(super) fn assert_turn_state_active_cancelling_idle() {
 }
 
 pub(super) fn assert_turn_state_idle_cancelling_fails() {
-    let mut owner = TurnLifecycle::new();
-    let mut other = TurnLifecycle::new();
+    let mut owner = TurnLifecycle::new(uuid::Uuid::from_u128(1));
+    let mut other = TurnLifecycle::new(uuid::Uuid::from_u128(1));
     let lease = other.start_command().expect("lease");
     assert!(owner.request_cancellation(&lease).is_err());
     assert_eq!(owner.state().kind(), TurnStateKind::Idle);
 }
 
 pub(super) fn assert_turn_state_command_active_fails() {
-    let mut owner = TurnLifecycle::new();
+    let mut owner = TurnLifecycle::new(uuid::Uuid::from_u128(1));
     owner.start_command().expect("command");
     assert!(owner.start_turn("turn-1".into(), run_id()).is_err());
     assert_eq!(owner.state().kind(), TurnStateKind::Command);
@@ -144,7 +144,7 @@ fn turn_state_kind_wire_names_and_projections() {
     {
         assert_eq!(serde_json::to_value(kind).expect("encode"), json!(spelling));
     }
-    let mut owner = TurnLifecycle::new();
+    let mut owner = TurnLifecycle::new(uuid::Uuid::from_u128(1));
     assert!(!owner.state().is_processing());
     owner.start_turn("turn-1".into(), run_id()).expect("turn");
     assert_eq!(owner.state().loop_status(), LoopStatus::SendingApiRequest);
@@ -153,7 +153,7 @@ fn turn_state_kind_wire_names_and_projections() {
 
 #[test]
 fn stale_and_cross_owner_leases_preserve_exact_state() {
-    let mut owner = TurnLifecycle::new();
+    let mut owner = TurnLifecycle::new(uuid::Uuid::from_u128(1));
     let stale = owner.start_command().expect("generation one");
     owner.finish_command(&stale).expect("settle command");
     let current = owner
@@ -169,7 +169,7 @@ fn stale_and_cross_owner_leases_preserve_exact_state() {
     assert_eq!(owner.state().active_run_ids(), before_runs);
     assert_eq!(owner.last_stop_reason(), None);
 
-    let mut other = TurnLifecycle::new();
+    let mut other = TurnLifecycle::new(uuid::Uuid::from_u128(1));
     let cross_owner_same_generation = other
         .start_turn("other".into(), run_id())
         .expect("generation one");
@@ -187,9 +187,9 @@ fn stale_and_cross_owner_leases_preserve_exact_state() {
 
 #[test]
 fn lease_checked_settlements_preserve_state_on_failure() {
-    let mut owner = TurnLifecycle::new();
+    let mut owner = TurnLifecycle::new(uuid::Uuid::from_u128(1));
     let current = owner.start_command().expect("command");
-    let mut other = TurnLifecycle::new();
+    let mut other = TurnLifecycle::new(uuid::Uuid::from_u128(2));
     let wrong = other.start_command().expect("cross-owner same generation");
     assert_eq!(
         owner.finish_command(&wrong),
@@ -217,7 +217,7 @@ fn lease_checked_settlements_preserve_state_on_failure() {
 
 #[test]
 fn lease_generation_exhaustion_is_typed_and_atomic() {
-    let mut owner = TurnLifecycle::new();
+    let mut owner = TurnLifecycle::new(uuid::Uuid::from_u128(1));
     owner.test_set_generation(u64::MAX - 1);
     let last = owner.start_command().expect("last generation is valid");
     assert_eq!(owner.test_generation(), u64::MAX);
@@ -255,7 +255,7 @@ fn lease_generation_exhaustion_is_typed_and_atomic() {
 
 #[test]
 fn empty_turn_id_is_typed_and_atomic() {
-    let mut owner = TurnLifecycle::new();
+    let mut owner = TurnLifecycle::new(uuid::Uuid::from_u128(1));
     let lease = owner.start_turn("valid".into(), run_id()).expect("active");
     owner
         .finish_turn(&lease, stop_reason("complete"))
@@ -276,7 +276,7 @@ fn empty_turn_id_is_typed_and_atomic() {
 
 #[test]
 fn last_stop_reason_is_terminal_and_lease_checked() {
-    let mut owner = TurnLifecycle::new();
+    let mut owner = TurnLifecycle::new(uuid::Uuid::from_u128(1));
     let first = owner.start_turn("first".into(), run_id()).expect("first");
     owner
         .finish_turn(&first, stop_reason("complete"))
@@ -306,7 +306,7 @@ fn last_stop_reason_is_terminal_and_lease_checked() {
 pub(super) fn assert_approval_keeps_active() {
     let approval = approval_sample(false);
     assert_eq!(approval.subtype, ApprovalSubtype::CanUseTool);
-    let mut owner = TurnLifecycle::new();
+    let mut owner = TurnLifecycle::new(uuid::Uuid::from_u128(1));
     owner
         .start_turn("turn-1".into(), run_id())
         .expect("active turn");

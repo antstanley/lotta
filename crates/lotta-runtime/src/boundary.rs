@@ -333,7 +333,7 @@ fn validate_components(
 }
 
 /// UTF-8 repository-relative path with no root, prefix, current, or parent components.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RepositoryPath(PathBuf);
 impl RepositoryPath {
     /// Validates a repository-relative path lexically without filesystem I/O.
