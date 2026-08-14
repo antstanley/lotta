@@ -1,6 +1,7 @@
 //! Bounded collection primitives for persistent entities.
 
-use super::{EntityError, JSON_DEPTH_MAX, JSON_ITEMS_MAX, JSON_PROPERTIES_MAX};
+use super::{JSON_DEPTH_MAX, JSON_ITEMS_MAX, JSON_PROPERTIES_MAX};
+use crate::DomainError;
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
     de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor},
@@ -16,10 +17,10 @@ impl<T, const MAX: usize> BoundedVec<T, MAX> {
     /// Creates a bounded vector.
     ///
     /// # Errors
-    /// Returns [`EntityError`] if the vector exceeds `MAX` elements.
-    pub fn new(values: Vec<T>) -> Result<Self, EntityError> {
+    /// Returns [`DomainError`] if the vector exceeds `MAX` elements.
+    pub fn new(values: Vec<T>) -> Result<Self, DomainError> {
         if values.len() > MAX {
-            return Err(EntityError::collection("list", values.len(), MAX));
+            return Err(DomainError::collection("list", values.len(), MAX));
         }
         Ok(Self(values))
     }
@@ -66,7 +67,7 @@ impl<'de, T: Deserialize<'de>, const MAX: usize> Visitor<'de> for VecVisitor<T, 
         let mut values = Vec::with_capacity(capacity);
         while let Some(value) = sequence.next_element()? {
             if values.len() == MAX {
-                return Err(de::Error::custom(EntityError::collection(
+                return Err(de::Error::custom(DomainError::collection(
                     "list",
                     MAX + 1,
                     MAX,
@@ -92,8 +93,8 @@ impl BoundedJsonValue {
     /// Validates and wraps an existing JSON value.
     ///
     /// # Errors
-    /// Returns [`EntityError`] when a nested JSON limit is exceeded.
-    pub fn new(value: Value) -> Result<Self, EntityError> {
+    /// Returns [`DomainError`] when a nested JSON limit is exceeded.
+    pub fn new(value: Value) -> Result<Self, DomainError> {
         validate_json(&value, 0)?;
         Ok(Self(value))
     }
@@ -124,7 +125,7 @@ impl JsonSeed {
     fn child<E: de::Error>(self) -> Result<Self, E> {
         let depth = self.depth + 1;
         if depth > JSON_DEPTH_MAX {
-            return Err(E::custom(EntityError::collection(
+            return Err(E::custom(DomainError::collection(
                 "JSON depth",
                 depth,
                 JSON_DEPTH_MAX,
@@ -198,7 +199,7 @@ impl<'de> Visitor<'de> for JsonVisitor {
         let seed = JsonSeed { depth: self.depth }.child()?;
         while let Some(value) = sequence.next_element_seed(seed)? {
             if values.len() == JSON_ITEMS_MAX {
-                return Err(de::Error::custom(EntityError::collection(
+                return Err(de::Error::custom(DomainError::collection(
                     "JSON array",
                     JSON_ITEMS_MAX + 1,
                     JSON_ITEMS_MAX,
@@ -215,7 +216,7 @@ impl<'de> Visitor<'de> for JsonVisitor {
         let seed = JsonSeed { depth: self.depth }.child()?;
         while let Some(key) = access.next_key::<String>()? {
             if values.len() == JSON_PROPERTIES_MAX {
-                return Err(de::Error::custom(EntityError::collection(
+                return Err(de::Error::custom(DomainError::collection(
                     "JSON object",
                     JSON_PROPERTIES_MAX + 1,
                     JSON_PROPERTIES_MAX,
@@ -241,10 +242,10 @@ impl<const MAX: usize> BoundedMap<MAX> {
     /// Creates a bounded map and validates all retained JSON recursively.
     ///
     /// # Errors
-    /// Returns [`EntityError`] if direct or nested JSON bounds are exceeded.
-    pub fn new(values: BTreeMap<String, Value>) -> Result<Self, EntityError> {
+    /// Returns [`DomainError`] if direct or nested JSON bounds are exceeded.
+    pub fn new(values: BTreeMap<String, Value>) -> Result<Self, DomainError> {
         if values.len() > MAX {
-            return Err(EntityError::collection("object", values.len(), MAX));
+            return Err(DomainError::collection("object", values.len(), MAX));
         }
         values
             .into_iter()
@@ -295,7 +296,7 @@ impl<'de, const MAX: usize> Visitor<'de> for MapVisitor<MAX> {
         let mut values = BTreeMap::new();
         while let Some(key) = access.next_key::<String>()? {
             if values.len() == MAX {
-                return Err(de::Error::custom(EntityError::collection(
+                return Err(de::Error::custom(DomainError::collection(
                     "object",
                     MAX + 1,
                     MAX,
@@ -314,9 +315,9 @@ impl<'de, const MAX: usize> Deserialize<'de> for BoundedMap<MAX> {
     }
 }
 
-fn validate_json(value: &Value, depth: usize) -> Result<(), EntityError> {
+fn validate_json(value: &Value, depth: usize) -> Result<(), DomainError> {
     if depth > JSON_DEPTH_MAX {
-        return Err(EntityError::collection("JSON depth", depth, JSON_DEPTH_MAX));
+        return Err(DomainError::collection("JSON depth", depth, JSON_DEPTH_MAX));
     }
     match value {
         Value::Array(values) => validate_array(values, depth),
@@ -325,9 +326,9 @@ fn validate_json(value: &Value, depth: usize) -> Result<(), EntityError> {
     }
 }
 
-fn validate_array(values: &[Value], depth: usize) -> Result<(), EntityError> {
+fn validate_array(values: &[Value], depth: usize) -> Result<(), DomainError> {
     if values.len() > JSON_ITEMS_MAX {
-        return Err(EntityError::collection(
+        return Err(DomainError::collection(
             "JSON array",
             values.len(),
             JSON_ITEMS_MAX,
@@ -338,9 +339,9 @@ fn validate_array(values: &[Value], depth: usize) -> Result<(), EntityError> {
         .try_for_each(|value| validate_json(value, depth + 1))
 }
 
-fn validate_object(values: &Map<String, Value>, depth: usize) -> Result<(), EntityError> {
+fn validate_object(values: &Map<String, Value>, depth: usize) -> Result<(), DomainError> {
     if values.len() > JSON_PROPERTIES_MAX {
-        return Err(EntityError::collection(
+        return Err(DomainError::collection(
             "JSON object",
             values.len(),
             JSON_PROPERTIES_MAX,

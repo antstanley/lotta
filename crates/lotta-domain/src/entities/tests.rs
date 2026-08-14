@@ -1,4 +1,5 @@
 use super::*;
+use crate::bounds::EXTRAS_FIELDS_MAX;
 use crate::{AgentId, ConversationId, MessageId, NonEmptyString, RunId, Timestamp};
 use jsonschema::Validator;
 use serde::Serialize;

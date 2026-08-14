@@ -1,7 +1,7 @@
+use crate::DomainError;
 use crate::RunId;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use thiserror::Error;
 use uuid::Uuid;
 
 /// Opaque owner-and-generation token minted by a lifecycle owner.
@@ -44,11 +44,11 @@ impl StopReason {
     /// Validates a non-empty stop reason.
     ///
     /// # Errors
-    /// Returns [`StopReasonError`] if `value` is empty.
-    pub fn new(value: impl Into<String>) -> Result<Self, StopReasonError> {
+    /// Returns [`DomainError`] if `value` is empty.
+    pub fn new(value: impl Into<String>) -> Result<Self, DomainError> {
         let value = value.into();
         if value.is_empty() {
-            Err(StopReasonError)
+            Err(DomainError::EmptyStopReason)
         } else {
             Ok(Self(value))
         }
@@ -60,11 +60,6 @@ impl StopReason {
         &self.0
     }
 }
-
-/// A stop reason was empty.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-#[error("stop reason must be non-empty")]
-pub struct StopReasonError;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TurnState {
@@ -196,8 +191,8 @@ impl TurnLifecycle {
     /// Starts a command from idle and returns its opaque lease.
     ///
     /// # Errors
-    /// Returns [`TurnTransitionError`] unless the lifecycle is idle.
-    pub fn start_command(&mut self) -> Result<TurnLease, TurnLifecycleError> {
+    /// Returns [`DomainError`] unless the lifecycle is idle.
+    pub fn start_command(&mut self) -> Result<TurnLease, DomainError> {
         self.require_state(TurnStateKind::Idle, TurnStateKind::Command)?;
         let lease = self.next_lease()?;
         self.state = TurnState::Command {
@@ -210,7 +205,7 @@ impl TurnLifecycle {
     ///
     /// # Errors
     /// Returns a typed error unless command state and the complete lease match.
-    pub fn finish_command(&mut self, lease: &TurnLease) -> Result<(), TurnLifecycleError> {
+    pub fn finish_command(&mut self, lease: &TurnLease) -> Result<(), DomainError> {
         self.require_lease(lease, TurnStateKind::Command, TurnStateKind::Idle)?;
         self.state = TurnState::Idle;
         Ok(())
@@ -220,14 +215,10 @@ impl TurnLifecycle {
     ///
     /// # Errors
     /// Returns a typed error unless the lifecycle is idle and `turn_id` is non-empty.
-    pub fn start_turn(
-        &mut self,
-        turn_id: String,
-        run_id: RunId,
-    ) -> Result<TurnLease, TurnLifecycleError> {
+    pub fn start_turn(&mut self, turn_id: String, run_id: RunId) -> Result<TurnLease, DomainError> {
         self.require_state(TurnStateKind::Idle, TurnStateKind::Active)?;
         if turn_id.is_empty() {
-            return Err(TurnIdError.into());
+            return Err(DomainError::EmptyTurnId);
         }
         let lease = self.next_lease()?;
         self.state = TurnState::Active {
@@ -243,7 +234,7 @@ impl TurnLifecycle {
     ///
     /// # Errors
     /// Returns a typed error unless active state and the complete lease match.
-    pub fn request_cancellation(&mut self, lease: &TurnLease) -> Result<(), TurnLifecycleError> {
+    pub fn request_cancellation(&mut self, lease: &TurnLease) -> Result<(), DomainError> {
         self.require_lease(lease, TurnStateKind::Active, TurnStateKind::Cancelling)?;
         let prior = std::mem::replace(&mut self.state, TurnState::Idle);
         if let TurnState::Active {
@@ -271,14 +262,13 @@ impl TurnLifecycle {
         &mut self,
         lease: &TurnLease,
         stop_reason: StopReason,
-    ) -> Result<(), TurnLifecycleError> {
+    ) -> Result<(), DomainError> {
         let from = self.state.kind();
         if !matches!(from, TurnStateKind::Active | TurnStateKind::Cancelling) {
-            return Err(TurnTransitionError {
+            return Err(DomainError::TurnTransition {
                 from,
                 to: TurnStateKind::Idle,
-            }
-            .into());
+            });
         }
         self.require_current_lease(lease)?;
         self.state = TurnState::Idle;
@@ -286,11 +276,11 @@ impl TurnLifecycle {
         Ok(())
     }
 
-    fn next_lease(&mut self) -> Result<TurnLease, TurnLeaseExhaustedError> {
+    fn next_lease(&mut self) -> Result<TurnLease, DomainError> {
         let generation = self
             .generation
             .checked_add(1)
-            .ok_or(TurnLeaseExhaustedError)?;
+            .ok_or(DomainError::TurnLeaseGenerationExhausted)?;
         self.generation = generation;
         Ok(TurnLease {
             owner_id: self.owner_id,
@@ -298,16 +288,12 @@ impl TurnLifecycle {
         })
     }
 
-    fn require_state(
-        &self,
-        required: TurnStateKind,
-        to: TurnStateKind,
-    ) -> Result<(), TurnTransitionError> {
+    fn require_state(&self, required: TurnStateKind, to: TurnStateKind) -> Result<(), DomainError> {
         let from = self.state.kind();
         if from == required {
             Ok(())
         } else {
-            Err(TurnTransitionError { from, to })
+            Err(DomainError::TurnTransition { from, to })
         }
     }
 
@@ -316,64 +302,21 @@ impl TurnLifecycle {
         lease: &TurnLease,
         required: TurnStateKind,
         to: TurnStateKind,
-    ) -> Result<(), TurnLifecycleError> {
+    ) -> Result<(), DomainError> {
         self.require_state(required, to)?;
         self.require_current_lease(lease)
     }
 
-    fn require_current_lease(&self, lease: &TurnLease) -> Result<(), TurnLifecycleError> {
+    fn require_current_lease(&self, lease: &TurnLease) -> Result<(), DomainError> {
         match self.state.lease() {
             Some(current) if current == lease => Ok(()),
-            Some(_) => Err(TurnLeaseError.into()),
-            None => Err(TurnTransitionError {
+            Some(_) => Err(DomainError::StaleTurnLease),
+            None => Err(DomainError::TurnTransition {
                 from: TurnStateKind::Idle,
                 to: TurnStateKind::Idle,
-            }
-            .into()),
+            }),
         }
     }
-}
-
-/// A requested turn-state transition is not a lifecycle-diagram edge.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-#[error("illegal turn transition from {from:?} to {to:?}")]
-pub struct TurnTransitionError {
-    /// Current state kind.
-    pub from: TurnStateKind,
-    /// Requested state kind.
-    pub to: TurnStateKind,
-}
-
-/// A lease did not match the current owner's complete token.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-#[error("turn lease is not current for this lifecycle owner")]
-pub struct TurnLeaseError;
-
-/// A lifecycle owner exhausted its lease generation space.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-#[error("turn lease generation exhausted")]
-pub struct TurnLeaseExhaustedError;
-
-/// A turn identifier was empty.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-#[error("turn identifier must be non-empty")]
-pub struct TurnIdError;
-
-/// A lifecycle operation failed without mutating owner state.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum TurnLifecycleError {
-    /// The requested lifecycle edge was illegal.
-    #[error(transparent)]
-    Transition(#[from] TurnTransitionError),
-    /// The supplied lease was stale or belonged to another owner.
-    #[error(transparent)]
-    Lease(#[from] TurnLeaseError),
-    /// The owner cannot mint another generation.
-    #[error(transparent)]
-    LeaseExhausted(#[from] TurnLeaseExhaustedError),
-    /// The requested turn identifier was empty.
-    #[error(transparent)]
-    InvalidTurnId(#[from] TurnIdError),
 }
 
 #[cfg(test)]

@@ -8,17 +8,17 @@ mod core;
 mod schedule;
 mod transcript;
 
+pub(crate) use crate::bounds::{
+    JSON_DEPTH_MAX, JSON_ITEMS_MAX, JSON_PROPERTIES_MAX, STRING_ITEMS_MAX,
+    UNBOUNDED_COLLECTION_ITEMS_MAX, UNBOUNDED_MAP_FIELDS_MAX,
+};
 pub use bounded::{BoundedJsonValue, BoundedMap, BoundedVec};
 pub use catalog::{ModelDescriptor, ProviderConnection};
 pub use channel::{
     ChannelAccount, ChannelChatType, ChannelRoute, DmPolicy, GroupPolicy, RuntimeChannelAccount,
     RuntimeChannelRoute,
 };
-pub use common::{
-    EXTRAS_FIELDS_MAX, EntityError, EntityExtras, JSON_DEPTH_MAX, JSON_ITEMS_MAX,
-    JSON_PROPERTIES_MAX, STRING_ITEMS_MAX, UNBOUNDED_COLLECTION_ITEMS_MAX,
-    UNBOUNDED_MAP_FIELDS_MAX,
-};
+pub use common::EntityExtras;
 pub use core::{
     Agent, Conversation, LocalMessage, LocalMessageRole, MemoryBlockInput, Run, RunStatus,
 };

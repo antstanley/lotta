@@ -1,8 +1,7 @@
 use crate::{BoundedMap, BoundedVec, NonEmptyString, UNBOUNDED_MAP_FIELDS_MAX};
 use serde::{Deserialize, Serialize};
 
-const PERMISSION_SUGGESTIONS_ITEMS_MAX: usize = 128;
-const DIFFS_ITEMS_MAX: usize = 1_024;
+use crate::bounds::{DIFFS_ITEMS_MAX, PERMISSION_SUGGESTIONS_ITEMS_MAX};
 
 /// Fixed approval request subtype.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

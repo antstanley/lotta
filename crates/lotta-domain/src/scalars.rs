@@ -1,22 +1,8 @@
 //! Validated shared scalar values and injected time.
+use crate::DomainError;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
-use thiserror::Error;
-
-/// A shared scalar value failed domain validation.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum ScalarError {
-    /// A required string was empty.
-    #[error("non-empty string must contain at least one byte")]
-    EmptyString,
-    /// A timestamp was not strict RFC3339 UTC.
-    #[error("timestamp must be canonical RFC3339 UTC: {value}")]
-    InvalidTimestamp {
-        /// The rejected timestamp text.
-        value: String,
-    },
-}
 
 /// A string containing at least one byte.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -27,11 +13,11 @@ impl NonEmptyString {
     /// Validates a string without trimming or otherwise rewriting it.
     ///
     /// # Errors
-    /// Returns [`ScalarError::EmptyString`] when the input has zero bytes.
-    pub fn new(value: impl Into<String>) -> Result<Self, ScalarError> {
+    /// Returns [`DomainError::EmptyString`] when the input has zero bytes.
+    pub fn new(value: impl Into<String>) -> Result<Self, DomainError> {
         let value = value.into();
         if value.is_empty() {
-            return Err(ScalarError::EmptyString);
+            return Err(DomainError::EmptyString);
         }
         Ok(Self(value))
     }
@@ -88,8 +74,8 @@ impl Timestamp {
     /// Accepted inputs serialize in canonical UTC `Z` form.
     ///
     /// # Errors
-    /// Returns [`ScalarError::InvalidTimestamp`] unless `value` is valid zero-offset RFC3339.
-    pub fn parse(clock: &impl Clock, value: &str) -> Result<Self, ScalarError> {
+    /// Returns [`DomainError::InvalidTimestamp`] unless `value` is valid zero-offset RFC3339.
+    pub fn parse(clock: &impl Clock, value: &str) -> Result<Self, DomainError> {
         clock.parse_timestamp(value)
     }
 
@@ -133,11 +119,11 @@ pub trait Clock {
     /// Parses persisted timestamp input under this clock boundary.
     ///
     /// # Errors
-    /// Returns [`ScalarError::InvalidTimestamp`] for invalid input.
-    fn parse_timestamp(&self, value: &str) -> Result<Timestamp, ScalarError>;
+    /// Returns [`DomainError::InvalidTimestamp`] for invalid input.
+    fn parse_timestamp(&self, value: &str) -> Result<Timestamp, DomainError>;
 }
 
-fn parse_rfc3339_utc(value: &str) -> Result<Timestamp, ScalarError> {
+fn parse_rfc3339_utc(value: &str) -> Result<Timestamp, DomainError> {
     let parsed = DateTime::parse_from_rfc3339(value).map_err(|_| invalid_timestamp(value))?;
     if parsed.offset().local_minus_utc() != 0 {
         return Err(invalid_timestamp(value));
@@ -145,8 +131,8 @@ fn parse_rfc3339_utc(value: &str) -> Result<Timestamp, ScalarError> {
     Ok(Timestamp(parsed.with_timezone(&Utc)))
 }
 
-fn invalid_timestamp(value: &str) -> ScalarError {
-    ScalarError::InvalidTimestamp {
+fn invalid_timestamp(value: &str) -> DomainError {
+    DomainError::InvalidTimestamp {
         value: value.into(),
     }
 }
@@ -163,7 +149,7 @@ mod tests {
             self.0
         }
 
-        fn parse_timestamp(&self, value: &str) -> Result<Timestamp, ScalarError> {
+        fn parse_timestamp(&self, value: &str) -> Result<Timestamp, DomainError> {
             parse_rfc3339_utc(value)
         }
     }
@@ -178,7 +164,7 @@ mod tests {
 
     #[test]
     fn rejects_only_empty_strings() {
-        assert_eq!(NonEmptyString::new(""), Err(ScalarError::EmptyString));
+        assert_eq!(NonEmptyString::new(""), Err(DomainError::EmptyString));
         assert_eq!(
             NonEmptyString::new(" ").map(NonEmptyString::into_string),
             Ok(" ".into())

@@ -1,8 +1,8 @@
 //! Opaque identifiers and deterministic generation forms.
+use crate::DomainError;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use thiserror::Error;
 use uuid::{Uuid, Version};
 
 const AGENT_PREFIX: &str = "agent-local-";
@@ -12,37 +12,6 @@ const LOCAL_MESSAGE_PREFIX: &str = "ui-msg-";
 const RUN_PREFIX: &str = "local-run-";
 const RESPONSE_PREFIX: &str = "resp_letta_";
 const SEQUENCE_MIN: u64 = 1;
-
-/// A domain identifier could not be accepted or generated.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum IdError {
-    /// An accepted opaque identifier was empty.
-    #[error("{kind} identifier must not be empty")]
-    Empty {
-        /// The entity whose identifier was invalid.
-        kind: IdKind,
-    },
-    /// A generated identifier had no suffix after its canonical prefix.
-    #[error("generated {kind} identifier must have a suffix after {prefix}")]
-    MissingGeneratedSuffix {
-        /// The entity whose identifier was invalid.
-        kind: IdKind,
-        /// The required canonical prefix.
-        prefix: &'static str,
-    },
-    /// A generated identifier required a UUID v4 suffix.
-    #[error("generated {kind} identifier requires a UUID v4 suffix")]
-    UuidVersion {
-        /// The entity whose UUID version was invalid.
-        kind: IdKind,
-    },
-    /// A sequence-backed identifier used the reserved zero value.
-    #[error("generated {kind} sequence must be at least {SEQUENCE_MIN}")]
-    SequenceOutOfRange {
-        /// The entity whose sequence was invalid.
-        kind: IdKind,
-    },
-}
 
 /// Entity categories used by typed identifier errors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,8 +52,8 @@ macro_rules! opaque_id {
             /// Accepts an opaque non-empty identifier without rewriting it.
             ///
             /// # Errors
-            /// Returns [`IdError::Empty`] when the input is empty.
-            pub fn accept(value: impl Into<String>) -> Result<Self, IdError> {
+            /// Returns [`DomainError::EmptyId`] when the input is empty.
+            pub fn accept(value: impl Into<String>) -> Result<Self, DomainError> {
                 let value = value.into();
                 validate_accepted(&value, $kind)?;
                 Ok(Self(value))
@@ -114,10 +83,10 @@ impl AgentId {
     /// Generates the canonical local-agent form from an injected UUID v4 value.
     ///
     /// # Errors
-    /// Returns [`IdError::UuidVersion`] unless `uuid` is version 4.
-    pub fn generate(uuid: Uuid) -> Result<Self, IdError> {
+    /// Returns [`DomainError::IdUuidVersion`] unless `uuid` is version 4.
+    pub fn generate(uuid: Uuid) -> Result<Self, DomainError> {
         if uuid.get_version() != Some(Version::Random) {
-            return Err(IdError::UuidVersion {
+            return Err(DomainError::IdUuidVersion {
                 kind: IdKind::Agent,
             });
         }
@@ -130,7 +99,7 @@ impl ConversationId {
     ///
     /// # Errors
     /// Returns an error when `sequence` is zero.
-    pub fn generate(sequence: u64) -> Result<Self, IdError> {
+    pub fn generate(sequence: u64) -> Result<Self, DomainError> {
         generate_sequence(CONVERSATION_PREFIX, sequence, IdKind::Conversation).map(Self)
     }
 
@@ -152,7 +121,7 @@ impl MessageId {
     ///
     /// # Errors
     /// Returns an error when `sequence` is zero.
-    pub fn generate_projection(sequence: u64) -> Result<Self, IdError> {
+    pub fn generate_projection(sequence: u64) -> Result<Self, DomainError> {
         generate_sequence(PROJECTED_MESSAGE_PREFIX, sequence, IdKind::Message).map(Self)
     }
 
@@ -160,7 +129,7 @@ impl MessageId {
     ///
     /// # Errors
     /// Returns an error when `sequence` is zero.
-    pub fn generate_local(sequence: u64) -> Result<Self, IdError> {
+    pub fn generate_local(sequence: u64) -> Result<Self, DomainError> {
         generate_sequence(LOCAL_MESSAGE_PREFIX, sequence, IdKind::Message).map(Self)
     }
 }
@@ -172,7 +141,7 @@ impl RunId {
     ///
     /// # Errors
     /// Returns an error if the canonical generated form has no suffix.
-    pub fn generate_uuid(uuid: Uuid) -> Result<Self, IdError> {
+    pub fn generate_uuid(uuid: Uuid) -> Result<Self, DomainError> {
         generate_with_suffix(RUN_PREFIX, &uuid.to_string(), IdKind::Run).map(Self)
     }
 
@@ -180,7 +149,7 @@ impl RunId {
     ///
     /// # Errors
     /// Returns an error when `sequence` is zero.
-    pub fn generate_sequence(sequence: u64) -> Result<Self, IdError> {
+    pub fn generate_sequence(sequence: u64) -> Result<Self, DomainError> {
         generate_sequence(RUN_PREFIX, sequence, IdKind::Run).map(Self)
     }
 }
@@ -195,7 +164,7 @@ impl ResponseId {
     ///
     /// # Errors
     /// Returns an error when `cursor` is empty.
-    pub fn generate(cursor: impl Into<String>) -> Result<Self, IdError> {
+    pub fn generate(cursor: impl Into<String>) -> Result<Self, DomainError> {
         let cursor = cursor.into();
         generate_with_suffix(RESPONSE_PREFIX, &cursor, IdKind::Response).map(Self)
     }
@@ -207,16 +176,20 @@ impl ResponseId {
     }
 }
 
-fn validate_accepted(value: &str, kind: IdKind) -> Result<(), IdError> {
+fn validate_accepted(value: &str, kind: IdKind) -> Result<(), DomainError> {
     if value.is_empty() {
-        return Err(IdError::Empty { kind });
+        return Err(DomainError::EmptyId { kind });
     }
     Ok(())
 }
 
-fn generate_sequence(prefix: &'static str, sequence: u64, kind: IdKind) -> Result<String, IdError> {
+fn generate_sequence(
+    prefix: &'static str,
+    sequence: u64,
+    kind: IdKind,
+) -> Result<String, DomainError> {
     if sequence < SEQUENCE_MIN {
-        return Err(IdError::SequenceOutOfRange { kind });
+        return Err(DomainError::IdSequenceOutOfRange { kind });
     }
     generate_with_suffix(prefix, &sequence.to_string(), kind)
 }
@@ -225,9 +198,9 @@ fn generate_with_suffix(
     prefix: &'static str,
     suffix: &str,
     kind: IdKind,
-) -> Result<String, IdError> {
+) -> Result<String, DomainError> {
     if suffix.is_empty() {
-        return Err(IdError::MissingGeneratedSuffix { kind, prefix });
+        return Err(DomainError::MissingGeneratedIdSuffix { kind, prefix });
     }
     let generated = format!("{prefix}{suffix}");
     assert!(
@@ -279,7 +252,7 @@ mod tests {
     fn agent_generation_requires_uuid_v4() {
         assert_eq!(
             AgentId::generate(Uuid::nil()),
-            Err(IdError::UuidVersion {
+            Err(DomainError::IdUuidVersion {
                 kind: IdKind::Agent
             })
         );
@@ -300,7 +273,7 @@ mod tests {
     fn rejects_empty_id() {
         assert_eq!(
             ConversationId::accept(""),
-            Err(IdError::Empty {
+            Err(DomainError::EmptyId {
                 kind: IdKind::Conversation
             })
         );

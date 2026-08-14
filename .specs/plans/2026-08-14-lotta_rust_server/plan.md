@@ -151,6 +151,8 @@ graph TD
   02 --> 04
   03 --> 04
   02 --> 05
+  03 --> 05
+  04 --> 05
   04 --> 06
   05 --> 06
   06 --> 07
@@ -430,7 +432,7 @@ If the two ever disagree, the table wins — fix the graph to match.
 | 02 · domain IDs + scalars | 01 | build | typed, opaque ID newtypes and validated scalars that accept every baseline ID form and never rewrite a client-supplied ID |
 | 03 · domain persistent entities | 02 | build | every persisted entity as a Rust type that round-trips through the exact canonical-types schema shape, including the 25-field Schedule and the snake_case channel records |
 | 04 · domain runtime entities + state machines | 02, 03 | build | the four-state turn machine, lease tokens, and runtime projections that make contradictory activity states unrepresentable |
-| 05 · domain errors + bounds | 02 | build | one typed error enum per crate boundary plus every `01-domain-model.md` resource bound as a units-last named constant that is observable when reached |
+| 05 · domain errors + bounds | 02, 03, 04 | build | one typed error enum per crate boundary plus every `01-domain-model.md` resource bound as a units-last named constant that is observable when reached |
 | 06 · core port traits | 04, 05 | build | the port traits every adapter implements, defined in `lotta-runtime` so the runtime never links a concrete adapter crate |
 | 07 · provider port contract | 06 | build | the `ProviderRequest`/`ProviderEvent`/`ProviderError` contract exactly as `06-model-providers.md` specifies it, so no vendor type can reach the runtime |
 | 08 · tool port contract | 06 | build | the `ToolPort` trait and the tool definition/outcome records every executor, MCP server, controller tool, mod, and channel gateway implements |

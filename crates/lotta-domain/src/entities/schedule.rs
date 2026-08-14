@@ -15,10 +15,10 @@ impl IanaTimezone {
     ///
     /// # Errors
     /// Returns a typed error when the identifier is not present in the database.
-    pub fn new(value: &str) -> Result<Self, super::EntityError> {
+    pub fn new(value: &str) -> Result<Self, crate::DomainError> {
         Tz::from_str(value)
             .map(Self)
-            .map_err(|_| super::EntityError::InvalidTimezone {
+            .map_err(|_| crate::DomainError::InvalidTimezone {
                 value: value.into(),
             })
     }

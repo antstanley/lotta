@@ -1,59 +1,8 @@
+use crate::DomainError;
+use crate::bounds::EXTRAS_FIELDS_MAX;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
-use thiserror::Error;
-
-/// Maximum unknown fields retained for a compatible entity.
-pub const EXTRAS_FIELDS_MAX: usize = 128;
-/// Maximum elements accepted in string collections, in items.
-pub const STRING_ITEMS_MAX: usize = 1_024;
-/// Safety maximum for schema-unbounded collections, in items.
-pub const UNBOUNDED_COLLECTION_ITEMS_MAX: usize = 4_096;
-/// Safety maximum for schema-unbounded maps, in fields.
-pub const UNBOUNDED_MAP_FIELDS_MAX: usize = 1_024;
-/// Maximum nested JSON depth retained at this boundary, in levels.
-pub const JSON_DEPTH_MAX: usize = 64;
-/// Maximum elements in any retained nested JSON array, in items.
-pub const JSON_ITEMS_MAX: usize = 4_096;
-/// Maximum properties in any retained nested JSON object, in fields.
-pub const JSON_PROPERTIES_MAX: usize = 1_024;
-
-/// Persistent entity validation failed.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum EntityError {
-    /// A collection exceeded its explicit domain bound.
-    #[error("{field} contains {actual} items; maximum is {maximum}")]
-    CollectionTooLarge {
-        /// Field whose collection was rejected.
-        field: &'static str,
-        /// Observed item count.
-        actual: usize,
-        /// Accepted item count.
-        maximum: usize,
-    },
-    /// An unknown field collided with a canonical field.
-    #[error("unknown field collides with canonical field: {field}")]
-    ExtraFieldCollision {
-        /// Colliding field name.
-        field: String,
-    },
-    /// An IANA timezone identifier was invalid.
-    #[error("invalid IANA timezone identifier: {value}")]
-    InvalidTimezone {
-        /// Rejected timezone text.
-        value: String,
-    },
-}
-
-impl EntityError {
-    pub(crate) const fn collection(field: &'static str, actual: usize, maximum: usize) -> Self {
-        Self::CollectionTooLarge {
-            field,
-            actual,
-            maximum,
-        }
-    }
-}
 
 /// Deterministically ordered, bounded compatible fields.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -63,14 +12,14 @@ impl EntityExtras {
     /// Builds extras while rejecting excessive cardinality and known-field collisions.
     ///
     /// # Errors
-    /// Returns [`EntityError`] when a bound or collision is violated.
+    /// Returns [`DomainError`] when a bound or collision is violated.
     pub fn new(
         values: BTreeMap<String, Value>,
         known_fields: &[&str],
-    ) -> Result<Self, EntityError> {
+    ) -> Result<Self, DomainError> {
         for key in values.keys() {
             if known_fields.contains(&key.as_str()) {
-                return Err(EntityError::ExtraFieldCollision { field: key.clone() });
+                return Err(DomainError::ExtraFieldCollision { field: key.clone() });
             }
         }
         super::BoundedMap::new(values).map(Self)
@@ -86,10 +35,10 @@ impl EntityExtras {
         &self,
         map: &mut Map<String, Value>,
         known_fields: &[&str],
-    ) -> Result<(), EntityError> {
+    ) -> Result<(), DomainError> {
         for (key, value) in self.0.iter() {
             if known_fields.contains(&key.as_str()) {
-                return Err(EntityError::ExtraFieldCollision { field: key.clone() });
+                return Err(DomainError::ExtraFieldCollision { field: key.clone() });
             }
             map.insert(key.clone(), value.clone());
         }

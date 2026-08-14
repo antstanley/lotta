@@ -1,4 +1,5 @@
 use super::*;
+use crate::DomainError;
 use crate::{AgentId, BoundedJsonValue, ConversationId, Timestamp};
 use jsonschema::Validator;
 use serde::{Serialize, de::DeserializeOwned};
@@ -162,7 +163,7 @@ fn stale_and_cross_owner_leases_preserve_exact_state() {
     let before_runs = owner.state().active_run_ids().to_vec();
     assert_eq!(
         owner.request_cancellation(&stale),
-        Err(TurnLeaseError.into())
+        Err(DomainError::StaleTurnLease)
     );
     assert_eq!(owner.state().kind(), before_kind);
     assert_eq!(owner.state().active_run_ids(), before_runs);
@@ -174,7 +175,7 @@ fn stale_and_cross_owner_leases_preserve_exact_state() {
         .expect("generation one");
     assert_eq!(
         owner.finish_turn(&cross_owner_same_generation, stop_reason("wrong")),
-        Err(TurnLeaseError.into())
+        Err(DomainError::StaleTurnLease)
     );
     assert_eq!(owner.state().kind(), before_kind);
     assert_eq!(owner.state().active_run_ids(), before_runs);
@@ -190,14 +191,17 @@ fn lease_checked_settlements_preserve_state_on_failure() {
     let current = owner.start_command().expect("command");
     let mut other = TurnLifecycle::new();
     let wrong = other.start_command().expect("cross-owner same generation");
-    assert_eq!(owner.finish_command(&wrong), Err(TurnLeaseError.into()));
+    assert_eq!(
+        owner.finish_command(&wrong),
+        Err(DomainError::StaleTurnLease)
+    );
     assert_eq!(owner.state().kind(), TurnStateKind::Command);
     owner.finish_command(&current).expect("current command");
 
     let current = owner.start_turn("turn".into(), run_id()).expect("active");
     assert_eq!(
         owner.request_cancellation(&wrong),
-        Err(TurnLeaseError.into())
+        Err(DomainError::StaleTurnLease)
     );
     assert_eq!(owner.state().kind(), TurnStateKind::Active);
     owner
@@ -205,7 +209,7 @@ fn lease_checked_settlements_preserve_state_on_failure() {
         .expect("current cancel");
     assert_eq!(
         owner.finish_turn(&wrong, stop_reason("wrong")),
-        Err(TurnLeaseError.into())
+        Err(DomainError::StaleTurnLease)
     );
     assert_eq!(owner.state().kind(), TurnStateKind::Cancelling);
     assert_eq!(owner.last_stop_reason(), None);
@@ -226,7 +230,10 @@ fn lease_generation_exhaustion_is_typed_and_atomic() {
     let before_status = owner.state().loop_status();
     let before_runs = owner.state().active_run_ids().to_vec();
     let before_reason = owner.last_stop_reason().cloned();
-    assert_eq!(owner.start_command(), Err(TurnLeaseExhaustedError.into()));
+    assert_eq!(
+        owner.start_command(),
+        Err(DomainError::TurnLeaseGenerationExhausted)
+    );
     assert_eq!(owner.test_generation(), before_generation);
     assert_eq!(owner.state().kind(), before_kind);
     assert_eq!(owner.state().is_processing(), before_processing);
@@ -236,7 +243,7 @@ fn lease_generation_exhaustion_is_typed_and_atomic() {
 
     assert_eq!(
         owner.start_turn("unallocated".into(), run_id()),
-        Err(TurnLeaseExhaustedError.into())
+        Err(DomainError::TurnLeaseGenerationExhausted)
     );
     assert_eq!(owner.test_generation(), before_generation);
     assert_eq!(owner.state().kind(), before_kind);
@@ -257,7 +264,7 @@ fn empty_turn_id_is_typed_and_atomic() {
 
     assert_eq!(
         owner.start_turn(String::new(), run_id()),
-        Err(TurnIdError.into())
+        Err(DomainError::EmptyTurnId)
     );
     assert_eq!(owner.test_generation(), generation);
     assert_eq!(owner.state().kind(), TurnStateKind::Idle);
@@ -282,7 +289,7 @@ fn last_stop_reason_is_terminal_and_lease_checked() {
     assert_eq!(owner.last_stop_reason(), None);
     assert_eq!(
         owner.finish_turn(&first, stop_reason("stale")),
-        Err(TurnLeaseError.into())
+        Err(DomainError::StaleTurnLease)
     );
     assert_eq!(owner.state().kind(), TurnStateKind::Active);
     assert_eq!(owner.last_stop_reason(), None);
@@ -453,7 +460,7 @@ fn schema_runtime_enum_spellings_and_bounds() {
         assert!(runtime.is_valid(&sample));
     }
     let mut queue = Vec::new();
-    for _ in 0..=QUEUE_ITEMS_MAX {
+    for _ in 0..=QUEUE_ITEMS_HARD_MAX.value {
         queue.push(queue_json());
     }
     let over = json!({"runtime":scope_json(),"turn_state":"idle","queue":queue,

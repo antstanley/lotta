@@ -16,14 +16,12 @@ pub use queue_item::{
     QueueDropReason, QueueItem, QueueItemKind, QueueItemSource, QueueRemovalDisposition,
 };
 pub use turn_state_contract::{
-    LoopStatus, StopReason, StopReasonError, TurnIdError, TurnLease, TurnLeaseError,
-    TurnLeaseExhaustedError, TurnLifecycle, TurnLifecycleError, TurnStateKind, TurnStateView,
-    TurnTransitionError,
+    LoopStatus, StopReason, TurnLease, TurnLifecycle, TurnStateKind, TurnStateView,
 };
 
-const RUNTIME_SUBSCRIPTIONS_ITEMS_MAX: usize = 256;
-const QUEUE_ITEMS_MAX: usize = 300;
-const ADMISSION_HISTORY_ITEMS_MAX: usize = 300;
+use crate::bounds::{
+    ADMISSION_HISTORY_ITEMS_MAX, QUEUE_ITEMS_HARD_MAX, RUNTIME_SUBSCRIPTIONS_PER_CONNECTION_MAX,
+};
 
 /// Result of submitting one client input.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -91,7 +89,7 @@ pub struct RuntimeConnection {
     /// Whether protocol initialization completed.
     pub initialized: bool,
     /// Runtime subscriptions.
-    pub subscriptions: BoundedVec<RuntimeScope, RUNTIME_SUBSCRIPTIONS_ITEMS_MAX>,
+    pub subscriptions: BoundedVec<RuntimeScope, { RUNTIME_SUBSCRIPTIONS_PER_CONNECTION_MAX.value }>,
     /// Next connection event sequence.
     pub event_seq: u64,
 }
@@ -121,7 +119,7 @@ pub struct ConversationRuntimeSnapshot {
     /// Turn-state kind derived from the owner state.
     pub turn_state: TurnStateKind,
     /// Pending input snapshot.
-    pub queue: BoundedVec<QueueItem, QUEUE_ITEMS_MAX>,
+    pub queue: BoundedVec<QueueItem, { QUEUE_ITEMS_HARD_MAX.value }>,
     /// Current permission mode.
     pub permission_mode: PermissionMode,
     /// Optional working directory.
