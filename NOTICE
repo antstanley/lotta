@@ -1,0 +1,19 @@
+Lotta
+
+This independent project specifies and implements compatibility with software
+from Letta, Inc. Its protocol, persistence, runtime, extension, channel, and
+deployment compatibility work is based on study of these source repositories:
+
+  Letta Code
+  https://github.com/letta-ai/letta-code
+  Version 0.30.20, commit 300f923f16cc8eee50656d7da732902c1dea2b65
+  Copyright 2025, Letta authors
+  Licensed under the Apache License, Version 2.0
+
+  Letta App Server Deployment
+  https://github.com/letta-ai/letta-app-server-deployment
+  Commit a37ac8e45f2e071f6e6c2cbb48b8e52a011e8cc4
+
+Lotta is not affiliated with or endorsed by Letta, Inc. The Letta name, Letta
+Code name, logos, wordmarks, images, and other brand assets are not licensed
+for use by this project except as required for reasonable attribution.
