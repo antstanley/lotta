@@ -1,0 +1,338 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lotta.local/schemas/canonical-types.schema.json",
+  "title": "Lotta canonical types",
+  "description": "Canonical local entity, persistence, and wire-adjacent shapes. additionalProperties mirrors pinned baseline input tolerance where these definitions are read from external state or protocol objects.",
+  "$defs": {
+    "NonEmptyString": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "Timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "AgentId": {
+      "type": "string",
+      "pattern": "^agent-local-[A-Za-z0-9_-]+$"
+    },
+    "ConversationId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "MessageId": {
+      "type": "string",
+      "pattern": "^(letta-msg-|ui-msg-)[A-Za-z0-9_-]+$"
+    },
+    "RunId": {
+      "type": "string",
+      "pattern": "^local-run-[A-Za-z0-9_-]+$"
+    },
+    "RuntimeScope": {
+      "type": "object",
+      "required": ["agent_id", "conversation_id"],
+      "additionalProperties": true,
+      "properties": {
+        "agent_id": { "$ref": "#/$defs/AgentId" },
+        "conversation_id": { "$ref": "#/$defs/ConversationId" },
+        "acting_user_id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "MemoryBlockInput": {
+      "type": "object",
+      "required": ["label", "value"],
+      "additionalProperties": true,
+      "properties": {
+        "label": { "$ref": "#/$defs/NonEmptyString" },
+        "value": { "type": "string" },
+        "description": { "type": ["string", "null"] }
+      }
+    },
+    "Agent": {
+      "type": "object",
+      "required": ["id", "name", "system", "tags", "model", "model_settings"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "$ref": "#/$defs/AgentId" },
+        "name": { "$ref": "#/$defs/NonEmptyString" },
+        "description": { "type": ["string", "null"] },
+        "system": { "type": "string" },
+        "tags": { "type": "array", "items": { "type": "string" }, "maxItems": 1024 },
+        "model": { "$ref": "#/$defs/NonEmptyString" },
+        "model_settings": { "type": "object", "additionalProperties": true },
+        "hidden": { "type": ["boolean", "null"] },
+        "compaction_settings": { "type": ["object", "null"], "additionalProperties": true }
+      }
+    },
+    "Conversation": {
+      "type": "object",
+      "required": ["id", "agent_id", "archived", "created_at", "updated_at", "in_context_message_ids"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "$ref": "#/$defs/ConversationId" },
+        "agent_id": { "$ref": "#/$defs/AgentId" },
+        "archived": { "type": "boolean" },
+        "archived_at": { "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+        "created_at": { "$ref": "#/$defs/Timestamp" },
+        "updated_at": { "$ref": "#/$defs/Timestamp" },
+        "last_message_at": { "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+        "summary": { "type": ["string", "null"] },
+        "in_context_message_ids": { "type": "array", "items": { "$ref": "#/$defs/MessageId" } },
+        "model": { "type": ["string", "null"] },
+        "model_settings": { "type": "object", "additionalProperties": true },
+        "context_window_limit": { "type": "integer", "minimum": 1 },
+        "hidden": { "type": "boolean" },
+        "tags": { "type": "array", "items": { "type": "string" }, "maxItems": 1024 }
+      }
+    },
+    "LocalMessage": {
+      "type": "object",
+      "required": ["id", "role", "timestamp"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "$ref": "#/$defs/MessageId" },
+        "role": { "enum": ["user", "assistant", "toolResult"] },
+        "content": {},
+        "timestamp": { "type": "number", "minimum": 0 },
+        "metadata": { "type": "object", "additionalProperties": true }
+      }
+    },
+    "TranscriptManifest": {
+      "type": "object",
+      "required": ["schema_version", "message_format", "provider_stack", "created_at"],
+      "additionalProperties": true,
+      "properties": {
+        "schema_version": { "enum": [1, 2] },
+        "message_format": { "enum": ["pi-ai-message-jsonl", "pi-session-entry-jsonl"] },
+        "provider_stack": { "const": "pi-ai" },
+        "created_at": { "$ref": "#/$defs/Timestamp" },
+        "migrated_from": { "type": "string" },
+        "migrated_at": { "$ref": "#/$defs/Timestamp" },
+        "backup_path": { "type": "string" }
+      }
+    },
+    "SessionEntry": {
+      "type": "object",
+      "required": ["type", "version", "id", "timestamp", "cwd"],
+      "additionalProperties": true,
+      "properties": {
+        "type": { "const": "session" },
+        "version": { "const": 3 },
+        "id": { "$ref": "#/$defs/NonEmptyString" },
+        "timestamp": { "$ref": "#/$defs/Timestamp" },
+        "cwd": { "type": "string" }
+      }
+    },
+    "MessageEntry": {
+      "type": "object",
+      "required": ["type", "id", "parentId", "timestamp", "message"],
+      "additionalProperties": true,
+      "properties": {
+        "type": { "const": "message" },
+        "id": { "$ref": "#/$defs/NonEmptyString" },
+        "parentId": { "type": ["string", "null"] },
+        "timestamp": { "$ref": "#/$defs/Timestamp" },
+        "message": { "$ref": "#/$defs/LocalMessage" }
+      }
+    },
+    "CompactionEntry": {
+      "type": "object",
+      "required": ["type", "id", "parentId", "timestamp", "summary", "firstKeptEntryId", "tokensBefore", "message"],
+      "additionalProperties": true,
+      "properties": {
+        "type": { "const": "compaction" },
+        "id": { "$ref": "#/$defs/NonEmptyString" },
+        "parentId": { "type": ["string", "null"] },
+        "timestamp": { "$ref": "#/$defs/Timestamp" },
+        "summary": { "type": "string" },
+        "firstKeptEntryId": { "type": ["string", "null"] },
+        "tokensBefore": { "type": "integer", "minimum": 0 },
+        "message": { "$ref": "#/$defs/LocalMessage" },
+        "details": { "type": "object", "additionalProperties": true }
+      }
+    },
+    "TranscriptEntry": {
+      "oneOf": [
+        { "$ref": "#/$defs/SessionEntry" },
+        { "$ref": "#/$defs/MessageEntry" },
+        { "$ref": "#/$defs/CompactionEntry" }
+      ]
+    },
+    "ApprovalRequest": {
+      "type": "object",
+      "required": ["request_id", "subtype", "tool_name", "input", "tool_call_id", "permission_suggestions", "blocked_path"],
+      "additionalProperties": false,
+      "properties": {
+        "request_id": { "$ref": "#/$defs/NonEmptyString" },
+        "subtype": { "const": "can_use_tool" },
+        "tool_name": { "$ref": "#/$defs/NonEmptyString" },
+        "input": { "type": "object", "additionalProperties": true },
+        "tool_call_id": { "$ref": "#/$defs/NonEmptyString" },
+        "permission_suggestions": { "type": "array", "items": { "type": "object", "additionalProperties": true }, "maxItems": 128 },
+        "blocked_path": { "type": ["string", "null"] },
+        "diffs": { "type": "array", "items": { "type": "object", "additionalProperties": true }, "maxItems": 1024 }
+      }
+    },
+    "ProviderConnection": {
+      "type": "object",
+      "required": ["provider_id", "auth_method", "connected"],
+      "additionalProperties": true,
+      "properties": {
+        "provider_id": { "$ref": "#/$defs/NonEmptyString" },
+        "auth_method": { "$ref": "#/$defs/NonEmptyString" },
+        "connected": { "type": "boolean" },
+        "metadata": { "type": "object", "additionalProperties": true }
+      }
+    },
+    "ModelDescriptor": {
+      "type": "object",
+      "required": ["handle", "provider_id", "available"],
+      "additionalProperties": true,
+      "properties": {
+        "handle": { "$ref": "#/$defs/NonEmptyString" },
+        "provider_id": { "$ref": "#/$defs/NonEmptyString" },
+        "available": { "type": "boolean" },
+        "context_window": { "type": "integer", "minimum": 1 },
+        "model_settings": { "type": "object", "additionalProperties": true }
+      }
+    },
+    "Run": {
+      "type": "object",
+      "required": ["id", "agent_id", "conversation_id", "status", "created_at"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "$ref": "#/$defs/RunId" },
+        "agent_id": { "$ref": "#/$defs/AgentId" },
+        "conversation_id": { "$ref": "#/$defs/ConversationId" },
+        "status": { "enum": ["running", "completed", "failed", "cancelled"] },
+        "stop_reason": { "type": ["string", "null"] },
+        "created_at": { "$ref": "#/$defs/Timestamp" },
+        "completed_at": { "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+        "background": { "type": ["boolean", "null"] },
+        "metadata": { "type": "object", "additionalProperties": true },
+        "usage": { "type": "object", "additionalProperties": true }
+      }
+    },
+    "RuntimeConnection": {
+      "type": "object",
+      "required": ["id", "ordinal", "initialized", "subscriptions", "event_seq"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/NonEmptyString" },
+        "ordinal": { "type": "integer", "minimum": 0 },
+        "initialized": { "type": "boolean" },
+        "subscriptions": { "type": "array", "items": { "$ref": "#/$defs/RuntimeScope" }, "maxItems": 256 },
+        "event_seq": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "ConversationRuntimeSnapshot": {
+      "type": "object",
+      "required": ["runtime", "turn_state", "queue", "permission_mode"],
+      "additionalProperties": true,
+      "properties": {
+        "runtime": { "$ref": "#/$defs/RuntimeScope" },
+        "turn_state": { "enum": ["idle", "command", "active", "cancelling"] },
+        "queue": { "type": "array", "items": { "$ref": "#/$defs/QueueItem" }, "maxItems": 300 },
+        "permission_mode": { "enum": ["standard", "acceptEdits", "unrestricted", "strict"] },
+        "working_directory": { "type": ["string", "null"] },
+        "active_run_ids": { "type": "array", "items": { "$ref": "#/$defs/RunId" } }
+      }
+    },
+    "QueueItem": {
+      "type": "object",
+      "required": ["id", "client_message_id", "kind", "source", "content", "enqueued_at"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "$ref": "#/$defs/NonEmptyString" },
+        "client_message_id": { "$ref": "#/$defs/NonEmptyString" },
+        "kind": { "enum": ["message", "task_notification", "cron_prompt", "approval_result", "overlay_action", "mod_continue"] },
+        "source": { "enum": ["user", "task_notification", "cron", "subagent", "system", "channel"] },
+        "content": {},
+        "enqueued_at": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "ExternalToolRegistration": {
+      "type": "object",
+      "required": ["name", "description", "parameters"],
+      "additionalProperties": true,
+      "properties": {
+        "name": { "$ref": "#/$defs/NonEmptyString" },
+        "label": { "type": "string" },
+        "description": { "$ref": "#/$defs/NonEmptyString" },
+        "parameters": { "type": "object", "additionalProperties": true }
+      }
+    },
+    "Schedule": {
+      "type": "object",
+      "required": ["id", "agent_id", "conversation_id", "name", "description", "cron", "timezone", "recurring", "prompt", "status", "created_at", "expires_at", "last_fired_at", "fire_count", "cancel_reason", "jitter_offset_ms", "scheduled_for", "fired_at", "missed_at"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "$ref": "#/$defs/NonEmptyString" },
+        "agent_id": { "$ref": "#/$defs/AgentId" },
+        "conversation_id": { "$ref": "#/$defs/ConversationId" },
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "cron": { "$ref": "#/$defs/NonEmptyString" },
+        "timezone": { "$ref": "#/$defs/NonEmptyString" },
+        "recurring": { "type": "boolean" },
+        "prompt": { "$ref": "#/$defs/NonEmptyString" },
+        "status": { "enum": ["active", "fired", "missed", "cancelled"] },
+        "created_at": { "$ref": "#/$defs/Timestamp" },
+        "expires_at": { "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+        "last_fired_at": { "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+        "fire_count": { "type": "integer", "minimum": 0 },
+        "cancel_reason": { "enum": ["conversation_not_found", "expired", null] },
+        "jitter_offset_ms": { "type": "integer" },
+        "last_run_at": { "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+        "last_run_outcome": { "enum": ["queued", "missed", "failed", "skipped", null] },
+        "last_run_reason": { "type": ["string", "null"] },
+        "last_run_error": { "type": ["string", "null"] },
+        "missed_count": { "type": "integer", "minimum": 0 },
+        "failed_count": { "type": "integer", "minimum": 0 },
+        "scheduled_for": { "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+        "fired_at": { "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+        "missed_at": { "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] }
+      }
+    },
+    "ChannelAccount": {
+      "type": "object",
+      "required": ["channel_id", "account_id", "enabled", "configured", "running", "dm_policy", "allowed_users", "config", "created_at", "updated_at"],
+      "additionalProperties": true,
+      "properties": {
+        "channel_id": { "$ref": "#/$defs/NonEmptyString" },
+        "account_id": { "$ref": "#/$defs/NonEmptyString" },
+        "display_name": { "type": "string" },
+        "enabled": { "type": "boolean" },
+        "configured": { "type": "boolean" },
+        "running": { "type": "boolean" },
+        "dm_policy": { "enum": ["pairing", "allowlist", "open"] },
+        "group_policy": { "enum": ["open", "allowlist"] },
+        "allowed_users": { "type": "array", "items": { "type": "string" } },
+        "admin_users": { "type": "array", "items": { "type": "string" } },
+        "user_allowed_commands": { "type": "array", "items": { "type": "string" } },
+        "config": { "type": "object", "additionalProperties": true },
+        "created_at": { "$ref": "#/$defs/Timestamp" },
+        "updated_at": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "ChannelRoute": {
+      "type": "object",
+      "required": ["channel_id", "account_id", "chat_id", "agent_id", "conversation_id", "enabled", "created_at", "updated_at"],
+      "additionalProperties": true,
+      "properties": {
+        "channel_id": { "$ref": "#/$defs/NonEmptyString" },
+        "account_id": { "$ref": "#/$defs/NonEmptyString" },
+        "chat_id": { "$ref": "#/$defs/NonEmptyString" },
+        "chat_type": { "enum": ["direct", "channel"] },
+        "thread_id": { "type": ["string", "null"] },
+        "agent_id": { "$ref": "#/$defs/AgentId" },
+        "conversation_id": { "$ref": "#/$defs/ConversationId" },
+        "enabled": { "type": "boolean" },
+        "outbound_enabled": { "type": "boolean" },
+        "created_at": { "$ref": "#/$defs/Timestamp" },
+        "updated_at": { "$ref": "#/$defs/Timestamp" }
+      }
+    }
+  }
+}
