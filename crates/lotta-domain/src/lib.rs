@@ -8,10 +8,12 @@
 
 pub mod entities;
 mod ids;
+pub mod runtime;
 mod scalars;
 mod scope;
 
 pub use entities::*;
 pub use ids::{AgentId, ConversationId, IdError, IdKind, MessageId, ResponseId, RunId};
+pub use runtime::*;
 pub use scalars::{Clock, NonEmptyString, ScalarError, Timestamp};
 pub use scope::RuntimeScope;

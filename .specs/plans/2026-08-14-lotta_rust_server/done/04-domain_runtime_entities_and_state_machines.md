@@ -9,18 +9,18 @@
 
 ## Steps
 
-- [ ] Define `TurnState` with exactly `Idle`, `Command { lease }`, `Active { lease, turn_id, run_id }`, and `Cancelling { lease, turn_id, run_id }`, matching `03-runtime-and-turns.md` §Lifecycle owner and `$defs.ConversationRuntimeSnapshot.turn_state`
-- [ ] Define `TurnLease` as an unforgeable generation token with no public constructor outside the lifecycle owner
-- [ ] Derive `is_processing`, `loop_status`, active run IDs, and last stop reason from `TurnState` so no parallel boolean can contradict it
-- [ ] Define `InputDisposition` covering prior-disposition replay for a duplicate `client_message_id`, `started`, `queued`, and `rejected`
-- [ ] Define `QueueItem` with wire removal dispositions `dequeued`/`cancelled` and internal drop reasons `buffer_limit`/`stale_generation`
-- [ ] Define `ApprovalRequest`, `ExternalToolRegistration`, `RuntimeConnection`, and `ConversationRuntimeSnapshot` to their `$defs` shapes, and add transition tests for the turn, disposition, and archival machines
+- [x] Define `TurnState` with exactly `Idle`, `Command { lease }`, `Active { lease, turn_id, run_id }`, and `Cancelling { lease, turn_id, run_id }`, matching `03-runtime-and-turns.md` §Lifecycle owner and `$defs.ConversationRuntimeSnapshot.turn_state`
+- [x] Define `TurnLease` as an unforgeable generation token with no public constructor outside the lifecycle owner
+- [x] Derive `is_processing`, `loop_status`, and active run IDs from `TurnState`; model last stop reason as related lifecycle-owner state, with no parallel activity boolean that can contradict the turn state
+- [x] Define `InputDisposition` with `started`, `queued`, and `rejected`, plus bounded admission-history behavior that replays the exact prior disposition for a duplicate `client_message_id`
+- [x] Define `QueueItem` with wire removal dispositions `dequeued`/`cancelled` and internal drop reasons `buffer_limit`/`stale_generation`
+- [x] Define `ApprovalRequest`, `ExternalToolRegistration`, `RuntimeConnection`, and `ConversationRuntimeSnapshot` to their `$defs` shapes, and add transition tests for the turn, disposition, and archival machines
 
 ## Definition of done
 
-- [ ] `TurnState` has exactly the four variants `Idle`, `Command`, `Active`, `Cancelling`, and every legal and illegal transition of the `01-domain-model.md` §Turn lifecycle diagram is covered by a test
-- [ ] A pending approval leaves the state `Active` rather than introducing a terminal or parallel state, and UI projections derive from `TurnState` alone
-- [ ] `InputDisposition` returns the prior disposition for a repeated `client_message_id` instead of executing twice
-- [ ] `QueueItem` models both wire removal dispositions and both internal drop reasons with the baseline spellings
-- [ ] Meets the repo definition of done (tests, lint/format, named-constant limits — see plan.md baseline)
-- [ ] Reviewable: a reviewer runs `cargo nextest run -p lotta-domain -E 'test(runtime::)'` and sees the four-state machine, approval-stays-active, duplicate-disposition, and queue wire-name cases pass
+- [x] `TurnState` has exactly the four variants `Idle`, `Command`, `Active`, `Cancelling`, and every legal and illegal transition of the `01-domain-model.md` §Turn lifecycle diagram is covered by a test
+- [x] A pending approval leaves the state `Active` rather than introducing a terminal or parallel state, and UI projections derive from `TurnState` alone
+- [x] `InputDisposition` returns the prior disposition for a repeated `client_message_id` instead of executing twice
+- [x] `QueueItem` models both wire removal dispositions and both internal drop reasons with the baseline spellings
+- [x] Meets the repo definition of done (tests, lint/format, named-constant limits — see plan.md baseline)
+- [x] Reviewable: a reviewer runs `cargo nextest run -p lotta-domain -E 'test(runtime::)'` and sees the four-state machine, approval-stays-active, duplicate-disposition, and queue wire-name cases pass
