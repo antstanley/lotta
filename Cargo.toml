@@ -29,6 +29,12 @@ edition = "2024"
 license = "Apache-2.0"
 publish = false
 
+[workspace.dependencies]
+chrono = { version = "0.4.41", default-features = false, features = ["serde", "std"] }
+serde = { version = "1.0.219", features = ["derive"] }
+thiserror = "2.0.12"
+uuid = { version = "1.16.0", features = ["serde", "v4"] }
+
 [workspace.lints.rust]
 missing_docs = "deny"
 unsafe_code = "forbid"
