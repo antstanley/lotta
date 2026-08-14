@@ -69,9 +69,18 @@ impl Timestamp {
         timestamp
     }
 
-    /// Parses zero-offset RFC3339 text through an injected clock boundary.
+    /// Deterministically parses persisted zero-offset RFC3339 text.
     ///
-    /// Accepted inputs serialize in canonical UTC `Z` form.
+    /// Both `Z` and `+00:00` are accepted and serialize in canonical UTC `Z` form. This helper
+    /// never reads the current time; runtime time acquisition remains exclusive to [`Clock`].
+    ///
+    /// # Errors
+    /// Returns [`DomainError::InvalidTimestamp`] unless `value` is valid zero-offset RFC3339.
+    pub fn parse_persisted_rfc3339(value: &str) -> Result<Self, DomainError> {
+        parse_rfc3339_utc(value)
+    }
+
+    /// Parses zero-offset RFC3339 text through an injected clock boundary.
     ///
     /// # Errors
     /// Returns [`DomainError::InvalidTimestamp`] unless `value` is valid zero-offset RFC3339.
@@ -107,7 +116,7 @@ impl<'de> Deserialize<'de> for Timestamp {
         D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        parse_rfc3339_utc(&value).map_err(de::Error::custom)
+        Self::parse_persisted_rfc3339(&value).map_err(de::Error::custom)
     }
 }
 
@@ -150,12 +159,12 @@ mod tests {
         }
 
         fn parse_timestamp(&self, value: &str) -> Result<Timestamp, DomainError> {
-            parse_rfc3339_utc(value)
+            Timestamp::parse_persisted_rfc3339(value)
         }
     }
 
     fn clock() -> FixedClock {
-        let timestamp = parse_rfc3339_utc("2026-08-14T12:34:56Z");
+        let timestamp = Timestamp::parse_persisted_rfc3339("2026-08-14T12:34:56Z");
         match timestamp {
             Ok(value) => FixedClock(value),
             Err(error) => panic!("fixed test timestamp must be valid: {error}"),
