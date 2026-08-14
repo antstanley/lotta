@@ -1,0 +1,38 @@
+[package]
+name = "lotta"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/lotta-domain",
+    "crates/lotta-protocol",
+    "crates/lotta-runtime",
+    "crates/lotta-store",
+    "crates/lotta-memfs",
+    "crates/lotta-providers",
+    "crates/lotta-tools",
+    "crates/lotta-extensions",
+    "crates/lotta-channels",
+    "crates/lotta-app-server",
+    "crates/lotta-config",
+    "crates/lotta-telemetry",
+    "crates/lotta-testkit",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace.lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }

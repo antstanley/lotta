@@ -1,6 +1,6 @@
 # Plan: Lotta Rust Server
 
-**Status:** Accepted · **Layout:** kanban · **Date:** 2026-08-14 · **Owner:** Ant Stanley · **Source spec:** `.specs/` canonical set (`00-overview.md` through `07-channels-and-operations.md`, `architecture-principles.md`, `development-guidelines.md`, `canonical-types.schema.json`)
+**Status:** In progress · **Layout:** kanban · **Date:** 2026-08-14 · **Owner:** Ant Stanley · **Source spec:** `.specs/` canonical set (`00-overview.md` through `07-channels-and-operations.md`, `architecture-principles.md`, `development-guidelines.md`, `canonical-types.schema.json`)
 
 Lotta is a Rust implementation of the local Letta App Server. This plan decomposes the canonical
 spec into 95 reviewable task packages across nine milestones. The reviewability spine is a thin
@@ -426,7 +426,7 @@ If the two ever disagree, the table wins — fix the graph to match.
 
 | Task | Depends on | Edge kind | Produces (reviewable artifact) |
 |---|---|---|---|
-| 01 · workspace bootstrap + CI | — | — | a 13-crate Rust workspace with a root composition-root binary that builds clean and runs every toolchain gate in GitHub Actions |
+| 01 · workspace bootstrap + CI | — | — | a Rust workspace with the 13 named library crates plus the root `lotta` composition binary that builds clean and runs every toolchain gate in GitHub Actions |
 | 02 · domain IDs + scalars | 01 | build | typed, opaque ID newtypes and validated scalars that accept every baseline ID form and never rewrite a client-supplied ID |
 | 03 · domain persistent entities | 02 | build | every persisted entity as a Rust type that round-trips through the exact canonical-types schema shape, including the 25-field Schedule and the snake_case channel records |
 | 04 · domain runtime entities + state machines | 02, 03 | build | the four-state turn machine, lease tokens, and runtime projections that make contradictory activity states unrepresentable |

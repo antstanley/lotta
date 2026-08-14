@@ -1,0 +1,2 @@
+# Pedantic-adjacent policy is enabled centrally in Cargo.toml.
+# No lint opt-outs are needed for the bootstrap workspace.

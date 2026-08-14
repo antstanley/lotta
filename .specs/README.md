@@ -41,7 +41,7 @@ Implementation plans live in `.specs/plans/`. Each plan is a self-contained kanb
 
 | Plan | Status | Scope |
 |---|---|---|
-| [2026-08-14-lotta_rust_server](plans/2026-08-14-lotta_rust_server/plan.md) | Accepted | Full Rust server implementation: 95 tasks across 9 milestones, from workspace bootstrap through conformance and release readiness |
+| [2026-08-14-lotta_rust_server](plans/2026-08-14-lotta_rust_server/plan.md) | In progress | Full Rust server implementation: 95 tasks across 9 milestones, from workspace bootstrap through conformance and release readiness |
 
 ## Change specs
 
