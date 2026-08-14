@@ -10,8 +10,7 @@ lotta-domain = { path = "../lotta-domain" }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-
-[dev-dependencies]
+serde.workspace = true
 serde_json.workspace = true
 
 [lints]

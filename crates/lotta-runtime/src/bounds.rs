@@ -128,6 +128,59 @@ bound!(
     "confined_path_component_limit",
     "confined_path_component_limit_total"
 );
+bound!(
+    PROVIDER_REQUEST_BYTES_MAX,
+    32 * 1024 * 1024,
+    "provider_request_byte_limit",
+    "provider_request_byte_limit_total"
+);
+bound!(
+    PROVIDER_RESPONSE_EVENT_BYTES_MAX,
+    8 * 1024 * 1024,
+    "provider_response_event_byte_limit",
+    "provider_response_event_byte_limit_total"
+);
+bound!(
+    TOOL_ARGUMENT_BYTES_MAX,
+    4 * 1024 * 1024,
+    "tool_argument_byte_limit",
+    "tool_argument_byte_limit_total"
+);
+bound!(
+    PROVIDER_STREAM_EVENTS_MAX,
+    256,
+    "provider_stream_event_count_limit",
+    "provider_stream_event_count_limit_total"
+);
+bound!(
+    PROVIDER_MESSAGES_MAX,
+    100_000,
+    "provider_message_count_limit",
+    "provider_message_count_limit_total"
+);
+bound!(
+    PROVIDER_CONTENT_PARTS_MAX,
+    100_000,
+    "provider_content_part_count_limit",
+    "provider_content_part_count_limit_total"
+);
+bound!(
+    PROVIDER_TOOLS_MAX,
+    10_000,
+    "provider_tool_count_limit",
+    "provider_tool_count_limit_total"
+);
+
+/// Task 07 provider bounds in stable declaration order.
+pub const PROVIDER_RESOURCE_BOUNDS: [ResourceBound; 7] = [
+    PROVIDER_REQUEST_BYTES_MAX,
+    PROVIDER_RESPONSE_EVENT_BYTES_MAX,
+    TOOL_ARGUMENT_BYTES_MAX,
+    PROVIDER_STREAM_EVENTS_MAX,
+    PROVIDER_MESSAGES_MAX,
+    PROVIDER_CONTENT_PARTS_MAX,
+    PROVIDER_TOOLS_MAX,
+];
 
 /// All Task 06 runtime bounds in stable declaration order.
 pub const RUNTIME_RESOURCE_BOUNDS: [ResourceBound; 19] = [
@@ -155,6 +208,93 @@ pub const RUNTIME_RESOURCE_BOUNDS: [ResourceBound; 19] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_seven_provider_rows_do_not_drift() {
+        let expected = [
+            (
+                "PROVIDER_REQUEST_BYTES_MAX",
+                32 * 1024 * 1024,
+                "provider_request_byte_limit",
+                "provider_request_byte_limit_total",
+            ),
+            (
+                "PROVIDER_RESPONSE_EVENT_BYTES_MAX",
+                8 * 1024 * 1024,
+                "provider_response_event_byte_limit",
+                "provider_response_event_byte_limit_total",
+            ),
+            (
+                "TOOL_ARGUMENT_BYTES_MAX",
+                4 * 1024 * 1024,
+                "tool_argument_byte_limit",
+                "tool_argument_byte_limit_total",
+            ),
+            (
+                "PROVIDER_STREAM_EVENTS_MAX",
+                256,
+                "provider_stream_event_count_limit",
+                "provider_stream_event_count_limit_total",
+            ),
+            (
+                "PROVIDER_MESSAGES_MAX",
+                100_000,
+                "provider_message_count_limit",
+                "provider_message_count_limit_total",
+            ),
+            (
+                "PROVIDER_CONTENT_PARTS_MAX",
+                100_000,
+                "provider_content_part_count_limit",
+                "provider_content_part_count_limit_total",
+            ),
+            (
+                "PROVIDER_TOOLS_MAX",
+                10_000,
+                "provider_tool_count_limit",
+                "provider_tool_count_limit_total",
+            ),
+        ];
+        assert_eq!(PROVIDER_RESOURCE_BOUNDS.len(), expected.len());
+        for (bound, (name, value, event, counter)) in PROVIDER_RESOURCE_BOUNDS.iter().zip(expected)
+        {
+            assert_eq!(
+                (bound.name, bound.value, bound.event, bound.counter),
+                (name, value, event, counter)
+            );
+            assert_eq!(bound.reached, BoundReached::Reject);
+            assert!(name.ends_with("_MAX"));
+            assert!(value > 0);
+            assert!(bound.observe(value - 1).is_none());
+            let at_limit = bound.observe(value).expect("limit must be observable");
+            assert_eq!(
+                (
+                    at_limit.name,
+                    at_limit.event,
+                    at_limit.counter,
+                    at_limit.reached
+                ),
+                (bound.name, bound.event, bound.counter, bound.reached)
+            );
+            assert_eq!(at_limit.actual, value);
+            assert!(!at_limit.exceeded);
+            let over_limit = bound
+                .observe(value + 1)
+                .expect("overage must be observable");
+            assert_eq!(
+                (
+                    over_limit.name,
+                    over_limit.event,
+                    over_limit.counter,
+                    over_limit.reached,
+                ),
+                (bound.name, bound.event, bound.counter, bound.reached)
+            );
+            assert_eq!(over_limit.actual, value + 1);
+            assert!(over_limit.exceeded);
+        }
+    }
+
     #[test]
     #[allow(
         clippy::too_many_lines,

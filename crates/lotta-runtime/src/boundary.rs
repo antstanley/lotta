@@ -7,7 +7,8 @@ use crate::bounds::{
     PROCESS_ARGUMENT_BYTES_MAX, PROCESS_ARGUMENTS_ITEMS_MAX, PROCESS_ENVIRONMENT_ITEMS_MAX,
     PROCESS_ENVIRONMENT_NAME_BYTES_MAX, PROCESS_ENVIRONMENT_VALUE_BYTES_MAX,
     PROCESS_OUTPUT_CHUNK_BYTES_MAX, PROCESS_PROGRAM_BYTES_MAX, PROCESS_STDIN_BYTES_MAX,
-    REPOSITORY_PATH_BYTES_MAX, REPOSITORY_PATH_COMPONENTS_MAX, REVISION_ID_BYTES_MAX,
+    PROVIDER_REQUEST_BYTES_MAX, PROVIDER_RESPONSE_EVENT_BYTES_MAX, REPOSITORY_PATH_BYTES_MAX,
+    REPOSITORY_PATH_COMPONENTS_MAX, REVISION_ID_BYTES_MAX, TOOL_ARGUMENT_BYTES_MAX,
     WORKTREE_ID_BYTES_MAX,
 };
 use lotta_domain::{BoundedVec, MemoryBlockInput, bounds::ResourceBound};
@@ -30,7 +31,7 @@ fn check_len(actual: usize, bound: ResourceBound) -> Result<(), RuntimeError> {
 macro_rules! text_value {
     ($name:ident, $bound:ident, $allow_empty:literal, $docs:literal) => {
         #[doc = $docs]
-        #[derive(Clone, Eq, Hash, PartialEq)]
+        #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
         pub struct $name(String);
         impl $name {
             /// Validates and stores a UTF-8 value under its declared empty-value policy.
@@ -132,6 +133,27 @@ debug_text!(RevisionId);
 debug_text!(WorktreeId);
 debug_text!(MemoryLabel);
 debug_text!(MemoryDescription);
+text_value!(
+    ProviderText,
+    PROVIDER_REQUEST_BYTES_MAX,
+    true,
+    "Bounded provider request text; empty values are preserved."
+);
+text_value!(
+    ProviderName,
+    PROVIDER_REQUEST_BYTES_MAX,
+    false,
+    "Bounded non-empty provider-facing name or stable identifier."
+);
+text_value!(
+    ProviderEventText,
+    PROVIDER_RESPONSE_EVENT_BYTES_MAX,
+    true,
+    "Bounded provider response event text; empty deltas are preserved."
+);
+debug_text!(ProviderText);
+debug_text!(ProviderName);
+debug_text!(ProviderEventText);
 impl std::fmt::Debug for EnvironmentValue {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("EnvironmentValue([REDACTED])")
@@ -183,6 +205,16 @@ bytes_value!(
     DiffChunk,
     MEMFS_DIFF_CHUNK_BYTES_MAX,
     "One bounded `MemFS` diff chunk."
+);
+bytes_value!(
+    ProviderImageBytes,
+    PROVIDER_REQUEST_BYTES_MAX,
+    "Bounded image bytes owned by a provider request."
+);
+bytes_value!(
+    ToolArgumentChunk,
+    TOOL_ARGUMENT_BYTES_MAX,
+    "One bounded unparsed tool-argument byte fragment."
 );
 
 /// Validated total process-output ceiling.

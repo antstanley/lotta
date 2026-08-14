@@ -3,6 +3,9 @@
 mod ids;
 mod memfs;
 mod process;
+#[path = "provider.rs"]
+mod provider_contract;
+mod provider_event;
 mod store;
 mod transcript;
 
@@ -10,6 +13,15 @@ pub use ids::IdGenerator;
 pub use lotta_domain::Clock;
 pub use memfs::{MemFsHistoryEntry, MemFsPort, MemFsStatus, MemFsTreeEntry};
 pub use process::{ChildProcessPort, ProcessEvent, ProcessOutcome, ProcessRequest, SandboxPort};
+pub use provider_contract::{
+    ImagePolicy, ProviderContent, ProviderContentPart, ProviderDeadline, ProviderError,
+    ProviderErrorContext, ProviderEventReceiver, ProviderEventSink, ProviderMessage,
+    ProviderMessageRole, ProviderMessages, ProviderMetadata, ProviderMetadataInput, ProviderPort,
+    ProviderRequest, ProviderToolChoice, ProviderToolDefinition, ProviderTools, ReasoningControls,
+    StopReason, TokenLimit, ToolArgumentBuffer, ToolCallAccumulator, ToolCallId,
+    provider_event_channel,
+};
+pub use provider_event::{ProviderEvent, ProviderUsage};
 pub use store::{AgentStore, ConversationStore};
 pub use transcript::{TranscriptItem, TranscriptStore};
 
@@ -18,6 +30,135 @@ use std::{future::Future, pin::Pin};
 /// Object-safe future returned by port methods.
 pub type PortFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, crate::RuntimeError>> + Send + 'a>>;
+
+#[cfg(test)]
+mod provider_event_variants {
+    #[test]
+    fn exact_ten_variants() {
+        super::provider_contract::contract::provider_event_variants();
+    }
+}
+#[cfg(test)]
+mod model_descriptor_is_domain_type {
+    #[test]
+    fn provider_contract() {
+        super::provider_contract::contract::model_descriptor_is_domain_type();
+    }
+}
+#[cfg(test)]
+mod streaming_invariants {
+    #[test]
+    fn text_reasoning_arrival_order_preserved_provider() {
+        super::provider_contract::contract::streaming_invariants::
+            text_reasoning_arrival_order_preserved();
+    }
+    #[test]
+    fn stable_tool_call_id_across_start_deltas_end_provider() {
+        super::provider_contract::contract::streaming_invariants::
+            stable_tool_call_id_across_start_deltas_end();
+    }
+    #[test]
+    fn partial_json_bounded_incrementally_and_parsed_only_at_end_provider() {
+        super::provider_contract::contract::streaming_invariants::
+            partial_json_bounded_incrementally_and_parsed_only_at_end();
+    }
+    #[test]
+    fn usage_monotonic_and_final_snapshot_retained_provider() {
+        super::provider_contract::contract::streaming_invariants::
+            usage_monotonic_and_final_snapshot_retained();
+    }
+    #[test]
+    fn exactly_one_stop_provider() {
+        super::provider_contract::contract::streaming_invariants::exactly_one_stop();
+    }
+    #[test]
+    fn cancellation_closes_and_suppresses_late_adapter_sends_provider() {
+        super::provider_contract::contract::streaming_invariants::
+            cancellation_closes_and_suppresses_late_adapter_sends();
+    }
+    #[test]
+    fn strict_drop_image_policy_behavior_provider() {
+        super::provider_contract::contract::streaming_invariants::strict_drop_image_policy_behavior(
+        );
+    }
+    #[test]
+    fn metadata_rejects_secrets_retaining_continuation_provider() {
+        super::provider_contract::contract::streaming_invariants::
+            persisted_provider_metadata_rejects_secrets_retaining_continuation();
+    }
+}
+
+#[cfg(test)]
+mod provider {
+    use super::provider_contract::contract;
+
+    #[test]
+    fn event_exact_ten() {
+        contract::provider_event_variants();
+    }
+    #[test]
+    fn error_exact_twelve() {
+        contract::provider_error_variants();
+    }
+    #[test]
+    fn model_is_domain_descriptor() {
+        contract::model_descriptor_is_domain_type();
+    }
+    #[test]
+    fn request_has_exact_fields() {
+        contract::provider_request_fields_have_exact_types();
+    }
+    #[test]
+    fn request_wire_is_bounded() {
+        contract::provider_request_aggregate_bytes_are_bounded();
+    }
+    #[test]
+    fn async_channel_backpressure_and_cancellation() {
+        contract::async_channel_backpressure_and_cancellation();
+    }
+    #[test]
+    fn text_reasoning_arrival_order_preserved() {
+        contract::streaming_invariants::text_reasoning_arrival_order_preserved();
+    }
+    #[test]
+    fn stable_tool_call_id_across_start_deltas_end() {
+        contract::streaming_invariants::stable_tool_call_id_across_start_deltas_end();
+    }
+    #[test]
+    fn partial_json_bounded_incrementally_and_parsed_only_at_end() {
+        contract::streaming_invariants::partial_json_bounded_incrementally_and_parsed_only_at_end();
+    }
+    #[test]
+    fn usage_monotonic_and_final_snapshot_retained() {
+        contract::streaming_invariants::usage_monotonic_and_final_snapshot_retained();
+    }
+    #[test]
+    fn exactly_one_stop() {
+        contract::streaming_invariants::exactly_one_stop();
+    }
+    #[test]
+    fn cancellation_closes_and_suppresses_late_adapter_sends() {
+        contract::streaming_invariants::cancellation_closes_and_suppresses_late_adapter_sends();
+    }
+    #[test]
+    fn strict_drop_image_policy_behavior() {
+        contract::streaming_invariants::strict_drop_image_policy_behavior();
+    }
+    #[test]
+    fn metadata_rejects_secrets_retaining_continuation() {
+        contract::streaming_invariants::
+            persisted_provider_metadata_rejects_secrets_retaining_continuation();
+    }
+
+    #[test]
+    fn port_is_object_safe_and_channel_is_opaque() {
+        fn object_safe(_: std::sync::Arc<dyn super::ProviderPort>) {}
+        let _ = object_safe;
+        let request = contract::request_for_structural_test();
+        let (_sink, _receiver): (super::ProviderEventSink, super::ProviderEventReceiver) =
+            super::provider_event_channel(1, &request.cancellation).unwrap();
+    }
+}
 
 #[cfg(test)]
 mod dependency_direction {
@@ -97,7 +238,17 @@ mod tests {
         fn memfs(_: Arc<dyn MemFsPort>) {}
         fn sandbox(_: Arc<dyn SandboxPort>) {}
         fn child(_: Arc<dyn ChildProcessPort>) {}
-        let _ = (id, agent, conversation, transcript, memfs, sandbox, child);
+        fn provider(_: Arc<dyn ProviderPort>) {}
+        let _ = (
+            id,
+            agent,
+            conversation,
+            transcript,
+            memfs,
+            sandbox,
+            child,
+            provider,
+        );
     }
 
     #[test]
