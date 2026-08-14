@@ -35,6 +35,14 @@ The parity source of truth is the adjacent checkout at `../letta-code/`. Importa
 - `src/channels/`
 - `../letta-app-server-deployment/`
 
+## Plans
+
+Implementation plans live in `.specs/plans/`. Each plan is a self-contained kanban with task files, done certificates, and a dependency DAG.
+
+| Plan | Status | Scope |
+|---|---|---|
+| [2026-08-14-lotta_rust_server](plans/2026-08-14-lotta_rust_server/plan.md) | Accepted | Full Rust server implementation: 95 tasks across 9 milestones, from workspace bootstrap through conformance and release readiness |
+
 ## Change specs
 
 No change specs exist. Changes to the parity baseline or intentional compatibility breaks belong in `.specs/changes/` before they alter these canonical pages.
