@@ -7,14 +7,15 @@ publish.workspace = true
 
 [dependencies]
 chrono.workspace = true
+chrono-tz.workspace = true
 serde.workspace = true
+serde_json = "1.0.140"
 thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 jsonschema = { version = "0.32.1", default-features = false }
 proptest = "1.7.0"
-serde_json = "1.0.140"
 
 [lints]
 workspace = true
