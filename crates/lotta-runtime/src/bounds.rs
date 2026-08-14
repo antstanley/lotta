@@ -182,6 +182,60 @@ pub const PROVIDER_RESOURCE_BOUNDS: [ResourceBound; 7] = [
     PROVIDER_TOOLS_MAX,
 ];
 
+bound!(
+    TOOL_INPUT_BYTES_MAX,
+    4 * 1024 * 1024,
+    "tool_input_byte_limit",
+    "tool_input_byte_limit_total"
+);
+bound!(
+    TOOL_RESULT_BYTES_MAX,
+    1024 * 1024,
+    "tool_result_byte_limit",
+    "tool_result_byte_limit_total"
+);
+bound!(
+    TOOL_RESULT_MODEL_CHARS_MAX,
+    32_000,
+    "tool_result_model_char_limit",
+    "tool_result_model_char_limit_total"
+);
+bound!(
+    EXTERNAL_TOOL_CALL_TIMEOUT_MS,
+    300_000,
+    "external_tool_call_timeout_limit",
+    "external_tool_call_timeout_limit_total"
+);
+bound!(
+    TOOL_NAME_BYTES_MAX,
+    256,
+    "tool_name_byte_limit",
+    "tool_name_byte_limit_total"
+);
+bound!(
+    TOOL_DESCRIPTION_BYTES_MAX,
+    64 * 1024,
+    "tool_description_byte_limit",
+    "tool_description_byte_limit_total"
+);
+bound!(
+    TOOL_SECRET_FIELDS_ITEMS_MAX,
+    128,
+    "tool_secret_field_count_limit",
+    "tool_secret_field_count_limit_total"
+);
+
+/// Task 08 tool-contract bounds in stable specification order.
+pub const TOOL_RESOURCE_BOUNDS: [ResourceBound; 7] = [
+    TOOL_INPUT_BYTES_MAX,
+    TOOL_RESULT_BYTES_MAX,
+    TOOL_RESULT_MODEL_CHARS_MAX,
+    EXTERNAL_TOOL_CALL_TIMEOUT_MS,
+    TOOL_NAME_BYTES_MAX,
+    TOOL_DESCRIPTION_BYTES_MAX,
+    TOOL_SECRET_FIELDS_ITEMS_MAX,
+];
+
 /// All Task 06 runtime bounds in stable declaration order.
 pub const RUNTIME_RESOURCE_BOUNDS: [ResourceBound; 19] = [
     MEMORY_FILES_MAX,
@@ -208,6 +262,103 @@ pub const RUNTIME_RESOURCE_BOUNDS: [ResourceBound; 19] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_seven_tool_rows_do_not_drift() {
+        let expected = [
+            (
+                "TOOL_INPUT_BYTES_MAX",
+                4 * 1024 * 1024,
+                "tool_input_byte_limit",
+                "tool_input_byte_limit_total",
+                "bytes",
+            ),
+            (
+                "TOOL_RESULT_BYTES_MAX",
+                1024 * 1024,
+                "tool_result_byte_limit",
+                "tool_result_byte_limit_total",
+                "bytes",
+            ),
+            (
+                "TOOL_RESULT_MODEL_CHARS_MAX",
+                32_000,
+                "tool_result_model_char_limit",
+                "tool_result_model_char_limit_total",
+                "chars",
+            ),
+            (
+                "EXTERNAL_TOOL_CALL_TIMEOUT_MS",
+                300_000,
+                "external_tool_call_timeout_limit",
+                "external_tool_call_timeout_limit_total",
+                "ms",
+            ),
+            (
+                "TOOL_NAME_BYTES_MAX",
+                256,
+                "tool_name_byte_limit",
+                "tool_name_byte_limit_total",
+                "bytes",
+            ),
+            (
+                "TOOL_DESCRIPTION_BYTES_MAX",
+                64 * 1024,
+                "tool_description_byte_limit",
+                "tool_description_byte_limit_total",
+                "bytes",
+            ),
+            (
+                "TOOL_SECRET_FIELDS_ITEMS_MAX",
+                128,
+                "tool_secret_field_count_limit",
+                "tool_secret_field_count_limit_total",
+                "items",
+            ),
+        ];
+        assert_eq!(TOOL_RESOURCE_BOUNDS.len(), expected.len());
+        for (bound, (name, value, event, counter, units)) in
+            TOOL_RESOURCE_BOUNDS.iter().zip(expected)
+        {
+            assert_eq!(
+                (
+                    bound.name,
+                    bound.value,
+                    bound.event,
+                    bound.counter,
+                    bound.reached
+                ),
+                (name, value, event, counter, BoundReached::Reject)
+            );
+            assert!(name.ends_with("_MAX") || name.ends_with("_MS"));
+            assert!(matches!(units, "bytes" | "chars" | "ms" | "items"));
+            assert!(bound.observe(value - 1).is_none());
+            let at = bound.observe(value).unwrap();
+            assert_eq!(
+                (
+                    at.name,
+                    at.actual,
+                    at.exceeded,
+                    at.event,
+                    at.counter,
+                    at.reached
+                ),
+                (name, value, false, event, counter, BoundReached::Reject)
+            );
+            let over = bound.observe(value + 1).unwrap();
+            assert_eq!(
+                (
+                    over.name,
+                    over.actual,
+                    over.exceeded,
+                    over.event,
+                    over.counter,
+                    over.reached
+                ),
+                (name, value + 1, true, event, counter, BoundReached::Reject)
+            );
+        }
+    }
 
     #[test]
     fn exact_seven_provider_rows_do_not_drift() {

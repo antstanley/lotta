@@ -7,6 +7,7 @@ mod process;
 mod provider_contract;
 mod provider_event;
 mod store;
+mod tool;
 mod transcript;
 
 pub use ids::IdGenerator;
@@ -23,6 +24,13 @@ pub use provider_contract::{
 };
 pub use provider_event::{ProviderEvent, ProviderUsage};
 pub use store::{AgentStore, ConversationStore};
+pub use tool::{
+    InternalToolName, ModelFacingToolName, ParallelCertificationId, ParallelSafety,
+    PermissionAction, SecretFieldPath, SecretRedactionPolicy, SecretRedactionSpec,
+    ToolApprovalPolicy, ToolDefinition, ToolDescriptionAsset, ToolExecutionOwner,
+    ToolExecutionRequest, ToolInputSchema, ToolOutcome, ToolOutcomeCode, ToolOutcomeMessage,
+    ToolOutputLimit, ToolPort, ToolResultText, ToolTimeout, ValidatedToolInput,
+};
 pub use transcript::{TranscriptItem, TranscriptStore};
 
 use std::{future::Future, pin::Pin};
@@ -157,6 +165,84 @@ mod provider {
         let request = contract::request_for_structural_test();
         let (_sink, _receiver): (super::ProviderEventSink, super::ProviderEventReceiver) =
             super::provider_event_channel(1, &request.cancellation).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tool_definition_fields {
+    #[test]
+    fn structural_eleven_field_case() {
+        super::tool::tests::tool_definition_fields();
+    }
+}
+#[cfg(test)]
+mod parallel_safety_defaults_sequential {
+    #[test]
+    fn normal_constructor_is_sequential() {
+        super::tool::tests::parallel_safety_defaults_sequential();
+    }
+}
+#[cfg(test)]
+mod execution_owner {
+    #[test]
+    fn exact_five_variants() {
+        super::tool::tests::execution_owner();
+    }
+}
+#[cfg(test)]
+mod tool_outcome_round_trip {
+    use super::tool::tests;
+    #[test]
+    fn success() {
+        tests::outcome_success();
+    }
+    #[test]
+    fn user_denied() {
+        tests::outcome_user_denied();
+    }
+    #[test]
+    fn interrupted() {
+        tests::outcome_interrupted();
+    }
+    #[test]
+    fn timeout() {
+        tests::outcome_timeout();
+    }
+    #[test]
+    fn validation_failure() {
+        tests::outcome_validation_failure();
+    }
+    #[test]
+    fn sandbox_denied() {
+        tests::outcome_sandbox_denied();
+    }
+    #[test]
+    fn spawn_failure() {
+        tests::outcome_spawn_failure();
+    }
+    #[test]
+    fn tool_defined_error() {
+        tests::outcome_tool_defined_error();
+    }
+}
+#[cfg(test)]
+mod tool_contract {
+    use super::tool::tests;
+    #[test]
+    fn contract() {
+        tests::broad_contract();
+    }
+    #[test]
+    fn object_safe_external_implementation() {
+        tests::object_safe_external_implementation();
+    }
+    #[test]
+    fn input_output_deadline_boundaries() {
+        tests::input_output_deadline_boundaries();
+    }
+    #[test]
+    fn schema_shape_and_malicious_serde() {
+        tests::schema_shape_and_malicious_serde();
     }
 }
 
