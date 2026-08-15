@@ -10,6 +10,10 @@ pub enum StoreErrorKind {
     Permission,
     /// Stored JSON could not be parsed or validated.
     Parse,
+    /// An unversioned non-empty transcript requires explicit migration.
+    TranscriptMigrationRequired,
+    /// A versioned transcript contains legacy UI-message rows requiring repair.
+    TranscriptRepairRequired,
     /// Persisted bytes failed an integrity check.
     Checksum,
     /// The source changed after its revision was sampled.
@@ -34,6 +38,8 @@ impl StoreErrorKind {
             Self::DiskFull => "disk_full",
             Self::Permission => "permission",
             Self::Parse => "parse",
+            Self::TranscriptMigrationRequired => "transcript_migration_required",
+            Self::TranscriptRepairRequired => "transcript_repair_required",
             Self::Checksum => "checksum",
             Self::StorageConflict => "storage_conflict",
             Self::LottaLock => "lotta_lock",
@@ -104,9 +110,11 @@ impl From<StoreError> for lotta_runtime::RuntimeError {
             StoreErrorKind::NotFound => Self::NotFound { context },
             StoreErrorKind::StorageConflict => Self::Conflict { context },
             StoreErrorKind::Permission => Self::PermissionDenied { context },
-            StoreErrorKind::InvalidPath | StoreErrorKind::Parse | StoreErrorKind::Checksum => {
-                Self::InvalidData { context }
-            }
+            StoreErrorKind::InvalidPath
+            | StoreErrorKind::Parse
+            | StoreErrorKind::TranscriptMigrationRequired
+            | StoreErrorKind::TranscriptRepairRequired
+            | StoreErrorKind::Checksum => Self::InvalidData { context },
             StoreErrorKind::Limit => Self::LimitExceeded { context },
             kind => Self::AdapterFailure {
                 code: kind.code(),

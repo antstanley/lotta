@@ -37,6 +37,14 @@ pub fn read_rows(
     path: &Path,
     mut callback: impl FnMut(usize, &[u8]) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
+    read_rows_terminated(root, path, |number, row, _terminated| callback(number, row))
+}
+
+pub(crate) fn read_rows_terminated(
+    root: &Path,
+    path: &Path,
+    mut callback: impl FnMut(usize, &[u8], bool) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
     validate_regular_file(root, path)?;
     let metadata =
         std::fs::symlink_metadata(path).map_err(|error| StoreError::from_io(path, &error))?;
@@ -55,7 +63,7 @@ fn stream_rows(
     reader: &mut impl BufRead,
     path: &Path,
     row: &mut Vec<u8>,
-    callback: &mut impl FnMut(usize, &[u8]) -> Result<(), StoreError>,
+    callback: &mut impl FnMut(usize, &[u8], bool) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
     let mut number = 0_usize;
     loop {
@@ -80,7 +88,7 @@ fn stream_rows(
         number = number
             .checked_add(1)
             .ok_or_else(|| StoreError::new(StoreErrorKind::Limit, path))?;
-        callback(number, payload)?;
+        callback(number, payload, terminated)?;
     }
 }
 

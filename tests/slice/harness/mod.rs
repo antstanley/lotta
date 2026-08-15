@@ -522,6 +522,7 @@ fn admitted_message(value: &Value) -> Result<TranscriptEntry, ()> {
             content: Some(BoundedJsonValue::new(json!(text)).map_err(|_| ())?),
             timestamp: 946_684_810_000.0,
             metadata: None,
+            extras: lotta_domain::EntityExtras::default(),
         },
     }))
 }

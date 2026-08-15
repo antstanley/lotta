@@ -87,6 +87,7 @@ fn local_message() -> LocalMessage {
         ),
         timestamp: 1.0,
         metadata: None,
+        extras: EntityExtras::default(),
     }
 }
 

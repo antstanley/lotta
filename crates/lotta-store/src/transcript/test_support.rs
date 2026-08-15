@@ -56,6 +56,7 @@ fn local_message(id: &str, text: &str) -> LocalMessage {
         ),
         timestamp: 1_776_214_923_456.25,
         metadata: None,
+        extras: lotta_domain::EntityExtras::default(),
     }
 }
 

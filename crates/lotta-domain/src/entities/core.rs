@@ -254,6 +254,9 @@ pub struct LocalMessage {
     /// Optional metadata object.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<BoundedMap<UNBOUNDED_MAP_FIELDS_MAX>>,
+    /// Compatible role-specific fields such as tool correlation and stop reason.
+    #[serde(flatten)]
+    pub extras: EntityExtras,
 }
 
 /// Run lifecycle state.

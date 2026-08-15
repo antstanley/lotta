@@ -243,6 +243,16 @@ impl FileRevision {
         self.exists
     }
 
+    pub(crate) const fn length(&self) -> u64 {
+        self.length
+    }
+
+    pub(crate) fn same_contents(&self, other: &Self) -> bool {
+        self.exists == other.exists
+            && self.length == other.length
+            && self.checksum == other.checksum
+    }
+
     pub(crate) fn sample_path(path: &Path) -> Result<Self, StoreError> {
         Self::sample_path_bounded(path, ATOMIC_WRITE_BYTES_MAX as u64)
     }
