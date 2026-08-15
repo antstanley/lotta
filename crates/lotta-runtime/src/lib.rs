@@ -28,6 +28,8 @@ pub mod queue_snapshot;
 pub mod registry;
 /// Explicit task-local per-turn context.
 pub mod scope_context;
+/// Lease-guarded provider and local-tool turn loop.
+pub mod turn;
 /// Worktree watcher lifetime state.
 pub mod worktree_watcher;
 
@@ -40,6 +42,10 @@ pub use registry::{ListenerRuntime, ResidencyUpdate, RuntimeHandle, RuntimeKey, 
 pub use scope_context::{
     ScopeContextInput, ScopeContextSnapshot, WorkspaceSandbox, scope_operation, spawn_scoped,
     try_current,
+};
+pub use turn::{
+    ProjectionKind, ToolResultRecord, TurnEffectPort, TurnEvent, TurnPorts, TurnProjection,
+    TurnRunOutcome, TurnToolCatalog, run_turn,
 };
 pub use worktree_watcher::{WORKTREE_WATCHER_IDLE_STOP_MS, WorktreeWatcher};
 

@@ -170,6 +170,21 @@ bound!(
     "provider_tool_count_limit",
     "provider_tool_count_limit_total"
 );
+bound!(
+    TURN_TOOL_CALLS_MAX,
+    256,
+    "turn_tool_call_count_limit",
+    "turn_tool_call_count_limit_total"
+);
+bound!(
+    TURN_STEPS_MAX,
+    256,
+    "turn_step_count_limit",
+    "turn_step_count_limit_total"
+);
+
+/// Audited whole-turn resource bounds in stable declaration order.
+pub const TURN_RESOURCE_BOUNDS: [ResourceBound; 2] = [TURN_TOOL_CALLS_MAX, TURN_STEPS_MAX];
 
 /// Task 07 provider bounds in stable declaration order.
 pub const PROVIDER_RESOURCE_BOUNDS: [ResourceBound; 7] = [

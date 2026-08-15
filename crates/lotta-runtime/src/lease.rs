@@ -93,6 +93,38 @@ impl LeaseGuard {
         }
     }
 
+    /// Checks once, applies a terminal effect, then releases the exact owner synchronously.
+    ///
+    /// The exclusive registry borrow makes cancellation during `effect` an in-flight
+    /// invalidation: it cannot install N+1, and the already-linearized N operation completes.
+    /// If the effect fails ownership is retained for recovery.
+    ///
+    /// # Errors
+    /// Returns the effect failure or a typed lifecycle invariant failure.
+    pub fn finish_turn_with_effect_after_await<T>(
+        &self,
+        registry: &mut ListenerRuntime,
+        stop_reason: StopReason,
+        effect: impl FnOnce() -> Result<T, crate::RuntimeError>,
+    ) -> Result<LeaseEffect<T>, crate::RuntimeError> {
+        if let Err(reason) = self.check(registry) {
+            return Ok(LeaseEffect::Suppressed(reason));
+        }
+        let value = effect()?;
+        let owner =
+            registry
+                .lifecycle_mut(&self.handle)
+                .map_err(|_| crate::RuntimeError::NotFound {
+                    context: "checked turn runtime".into(),
+                })?;
+        owner
+            .finish_turn(&self.lease, stop_reason)
+            .map_err(|_| crate::RuntimeError::Conflict {
+                context: "checked turn lease".into(),
+            })?;
+        Ok(LeaseEffect::Applied(value))
+    }
+
     fn check(&self, registry: &ListenerRuntime) -> Result<(), SuppressionReason> {
         if !registry.is_active() {
             return Err(SuppressionReason::ListenerInactive);
