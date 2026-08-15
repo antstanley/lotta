@@ -104,7 +104,38 @@ pub(crate) fn atomic_write_expected_locked(
     expected: &FileRevision,
     lock: &LottaStorageLock,
 ) -> Result<(), StoreError> {
-    logged_once(|| atomic_write_held(path, bytes, mode, expected, lock, &NoopObserver))
+    atomic_write_expected_locked_observed(path, bytes, mode, expected, lock, &NoopObserver)
+}
+
+pub(crate) fn atomic_write_expected_locked_observed(
+    path: &Path,
+    bytes: &[u8],
+    mode: WriteMode,
+    expected: &FileRevision,
+    lock: &LottaStorageLock,
+    observer: &dyn AtomicObserver,
+) -> Result<(), StoreError> {
+    logged_once(|| atomic_write_held(path, bytes, mode, expected, lock, observer))
+}
+
+pub(crate) fn atomic_delete_expected_locked_observed(
+    path: &Path,
+    expected: &FileRevision,
+    lock: &LottaStorageLock,
+    observer: &dyn AtomicObserver,
+) -> Result<(), StoreError> {
+    validate_target(path, &[])?;
+    let root = backend_root(path)?;
+    if !lock.guards_root(root) {
+        return Err(StoreError::new(StoreErrorKind::LottaLock, path));
+    }
+    validate_regular_file(root, path)?;
+    observer.before_remove(path)?;
+    ensure_revision(root, path, expected, observer)?;
+    validate_regular_file(root, path)?;
+    std::fs::remove_file(path).map_err(|error| StoreError::from_io(path, &error))?;
+    let parent = path.parent().ok_or_else(|| invalid_path(path))?;
+    flush_parent(parent, observer)
 }
 
 pub(crate) fn atomic_write_locked(
@@ -245,6 +276,15 @@ impl FileRevision {
 
     pub(crate) const fn length(&self) -> u64 {
         self.length
+    }
+
+    pub(crate) const fn from_contents(length: u64, checksum: [u8; 32]) -> Self {
+        Self {
+            exists: true,
+            modified: None,
+            length,
+            checksum,
+        }
     }
 
     pub(crate) fn same_contents(&self, other: &Self) -> bool {

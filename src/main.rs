@@ -11,6 +11,8 @@ use std::{io::Write, sync::Arc};
 use lotta_app_server::{config::parse_cli, listener::start_listener};
 use lotta_domain::{Clock, DomainError, Timestamp};
 
+mod cli;
+
 struct SystemClock;
 
 impl Clock for SystemClock {
@@ -31,8 +33,19 @@ async fn main() {
     }
 }
 
-async fn run() -> Result<(), lotta_app_server::error::AppServerError> {
-    let args = parse_cli(std::env::args().skip(1))?;
+async fn run() -> Result<(), cli::CliError> {
+    match cli::parse(std::env::args().skip(1))? {
+        cli::Command::Server(arguments) => run_server(arguments).await,
+        cli::Command::Migrate {
+            storage_dir,
+            dry_run,
+        } => cli::migrate(storage_dir, dry_run),
+        cli::Command::Verify { storage_dir } => cli::verify(storage_dir),
+    }
+}
+
+async fn run_server(arguments: Vec<String>) -> Result<(), cli::CliError> {
+    let args = parse_cli(arguments)?;
     let prepared = args.prepare()?;
     let mut handle = start_listener(prepared, Arc::new(SystemClock)).await?;
     println!("Base URL: {}", handle.base_url());
@@ -47,5 +60,6 @@ async fn run() -> Result<(), lotta_app_server::error::AppServerError> {
         .await
         .map_err(|_| lotta_app_server::error::AppServerError::Listener)?;
     handle.shutdown();
-    handle.wait().await
+    handle.wait().await?;
+    Ok(())
 }

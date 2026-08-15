@@ -746,10 +746,12 @@ dependencies = [
  "lotta-app-server",
  "lotta-domain",
  "lotta-runtime",
+ "lotta-store",
  "lotta-testkit",
  "serde",
  "serde_json",
  "sha2",
+ "thiserror",
  "tokio",
  "tokio-util",
  "uuid",
@@ -853,6 +855,7 @@ name = "lotta-store"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "chrono",
  "lotta-domain",
  "lotta-runtime",
  "lotta-testkit",

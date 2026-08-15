@@ -15,6 +15,15 @@ use std::sync::atomic::AtomicU64;
 
 pub(crate) const MIGRATION_BACKUPS_PER_FILE_MAX: usize = 3;
 const BACKUP_CREATE_RETRIES_MAX: usize = 64;
+
+pub(crate) trait BackupObserver: Send + Sync {
+    fn file_flushed(&self, _path: &Path) {}
+    fn parent_flushed(&self, _path: &Path) {}
+}
+
+pub(crate) struct NoopBackupObserver;
+impl BackupObserver for NoopBackupObserver {}
+
 const COPY_BUFFER_BYTES: usize = 64 * 1_024;
 static BACKUP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -179,17 +188,28 @@ fn legacy_upgrade_entries(
     Ok(entries)
 }
 
-fn copy_backup_durable(
+pub(crate) fn copy_backup_durable(
     paths: &TranscriptPaths,
     expected: &FileRevision,
 ) -> Result<PathBuf, StoreError> {
-    enforce_backup_limit(paths)?;
+    copy_backup_durable_observed(paths, expected, &NoopBackupObserver)
+}
+
+pub(crate) fn copy_backup_durable_observed(
+    paths: &TranscriptPaths,
+    expected: &FileRevision,
+    observer: &dyn BackupObserver,
+) -> Result<PathBuf, StoreError> {
     for _ in 0..BACKUP_CREATE_RETRIES_MAX {
         let backup = backup_candidate(paths)?;
-        match create_backup(paths, &backup, expected) {
+        match create_backup(paths, &backup, expected, observer) {
             Err(error)
                 if error.kind() == StoreErrorKind::StorageConflict && error.path() == backup => {}
-            result => return result.map(|()| backup),
+            Err(error) => return Err(error),
+            Ok(()) => {
+                enforce_backup_limit(paths)?;
+                return Ok(backup);
+            }
         }
     }
     Err(StoreError::new(StoreErrorKind::Limit, &paths.messages))
@@ -204,18 +224,23 @@ fn backup_candidate(paths: &TranscriptPaths) -> Result<PathBuf, StoreError> {
 }
 
 fn persisted_timestamp_component(paths: &TranscriptPaths) -> Result<String, StoreError> {
-    let manifest = manifest::read(&paths.manifest)?;
-    Ok(manifest
-        .created_at
-        .as_utc()
-        .format("%Y%m%d-%H%M%S")
-        .to_string())
+    let created_at = match std::fs::symlink_metadata(&paths.manifest) {
+        Ok(_) => manifest::read(&paths.manifest)?.created_at,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let conversation: lotta_domain::Conversation =
+                crate::adapter::read_record(&paths.conversation)?;
+            conversation.created_at
+        }
+        Err(error) => return Err(StoreError::from_io(&paths.manifest, &error)),
+    };
+    Ok(created_at.as_utc().format("%Y%m%d-%H%M%S").to_string())
 }
 
 fn create_backup(
     paths: &TranscriptPaths,
     backup: &Path,
     expected: &FileRevision,
+    observer: &dyn BackupObserver,
 ) -> Result<(), StoreError> {
     validate_existing(&paths.root, &paths.directory)?;
     validate_regular_file(&paths.root, &paths.messages)?;
@@ -235,7 +260,7 @@ fn create_backup(
         }
         Err(error) => return Err(StoreError::from_io(backup, &error)),
     };
-    let result = copy_and_verify(paths, backup, &mut source, &mut target, expected);
+    let result = copy_and_verify(paths, backup, &mut source, &mut target, expected, observer);
     drop(target);
     if result.is_err() {
         cleanup_backup(backup);
@@ -249,6 +274,7 @@ fn copy_and_verify(
     source: &mut File,
     target: &mut File,
     expected: &FileRevision,
+    observer: &dyn BackupObserver,
 ) -> Result<(), StoreError> {
     let copied = copy_bounded(source, target, backup)?;
     if copied != expected.length() {
@@ -260,6 +286,7 @@ fn copy_and_verify(
     target
         .sync_all()
         .map_err(|error| StoreError::from_io(backup, &error))?;
+    observer.file_flushed(backup);
     let after = FileRevision::sample_path_bounded(&paths.messages, super::TRANSCRIPT_BYTES_MAX)?;
     let proof = FileRevision::sample_path_bounded(backup, super::TRANSCRIPT_BYTES_MAX)?;
     if &after != expected || !proof.same_contents(expected) {
@@ -270,7 +297,9 @@ fn copy_and_verify(
     }
     File::open(&paths.directory)
         .and_then(|directory| directory.sync_all())
-        .map_err(|error| StoreError::from_io(&paths.directory, &error))
+        .map_err(|error| StoreError::from_io(&paths.directory, &error))?;
+    observer.parent_flushed(&paths.directory);
+    Ok(())
 }
 
 fn copy_bounded(source: &mut File, target: &mut File, path: &Path) -> Result<u64, StoreError> {
@@ -303,8 +332,8 @@ fn copy_bounded(source: &mut File, target: &mut File, path: &Path) -> Result<u64
 
 fn enforce_backup_limit(paths: &TranscriptPaths) -> Result<(), StoreError> {
     let mut backups = completed_backups(paths)?;
-    backups.sort();
-    while backups.len() >= MIGRATION_BACKUPS_PER_FILE_MAX {
+    backups.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    while backups.len() > MIGRATION_BACKUPS_PER_FILE_MAX {
         let (_, oldest) = backups.remove(0);
         validate_regular_file(&paths.root, &oldest)?;
         std::fs::remove_file(&oldest).map_err(|error| StoreError::from_io(&oldest, &error))?;
@@ -397,10 +426,15 @@ mod tests {
             backups.push(path);
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
+        let extra = paths
+            .directory
+            .join("messages.jsonl.lotta-upgrade-20000101-000000-4.bak");
+        std::fs::write(&extra, "backup-4").expect("extra backup");
         enforce_backup_limit(&paths).expect("rotation");
         assert!(!backups[0].exists());
         assert!(backups[1].exists());
         assert!(backups[2].exists());
-        assert_eq!(completed_backups(&paths).expect("completed").len(), 2);
+        assert!(extra.exists());
+        assert_eq!(completed_backups(&paths).expect("completed").len(), 3);
     }
 }

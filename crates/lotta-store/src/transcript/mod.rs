@@ -10,12 +10,12 @@ pub mod load;
 pub mod manifest;
 mod projection;
 mod repair;
-mod session_header;
+pub(crate) mod session_header;
 #[cfg(test)]
-mod task25_test_support;
+pub(crate) mod task25_test_support;
 #[cfg(test)]
 pub(crate) mod test_support;
-mod upgrade;
+pub(crate) mod upgrade;
 
 use crate::adapter::run_blocking;
 use crate::atomic::{ATOMIC_WRITE_RETRIES_MAX, FileRevision, atomic_write_locked, next_sequence};

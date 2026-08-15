@@ -15,11 +15,15 @@ mod confinement;
 mod conversation;
 mod error;
 mod lock;
+/// Explicit bounded transcript migration.
+pub mod migration;
 /// Baseline-compatible local-backend paths and encoded keys.
 pub mod paths;
 mod refresh;
 /// Bounded append-only transcript persistence.
 pub mod transcript;
+/// Non-mutating strict transcript diagnostics.
+pub mod verify;
 
 pub use adapter::{LOCAL_STORE_BLOCKING_MAX, LocalStore};
 pub use agent::AGENTS_MAX;

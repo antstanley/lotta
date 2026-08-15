@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 base64.workspace = true
+chrono.workspace = true
 lotta-domain = { version = "0.1.0", path = "../lotta-domain" }
 lotta-runtime = { version = "0.1.0", path = "../lotta-runtime" }
 serde.workspace = true
