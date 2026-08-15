@@ -7,8 +7,8 @@ publish.workspace = true
 
 [dependencies]
 chrono.workspace = true
-lotta-domain = { path = "../lotta-domain" }
-lotta-runtime = { path = "../lotta-runtime" }
+lotta-domain = { version = "0.1.0", path = "../lotta-domain" }
+lotta-runtime = { version = "0.1.0", path = "../lotta-runtime" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

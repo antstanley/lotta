@@ -42,6 +42,11 @@ pub trait IdGenerator: Send + Sync {
     /// or sequence values need not be reused.
     fn run_id(&self) -> PortFuture<'_, RunId>;
 
+    /// Generates a new diagnostic incident UUID.
+    ///
+    /// Callers must retain this identifier only in protected diagnostics, never client envelopes.
+    fn incident_id(&self) -> PortFuture<'_, Uuid>;
+
     /// Generates the unique owner UUID injected into a new turn lifecycle.
     ///
     /// The caller must not reuse the returned UUID for another live lifecycle owner.

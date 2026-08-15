@@ -50,7 +50,7 @@ where
     let second = id_trace(&factory().await).await;
     assert_eq!(first, second);
     assert_eq!(first, expected_id_trace());
-    assert_eq!(first.len(), 10);
+    assert_eq!(first.len(), 12);
     let mut unique = first.clone();
     unique.sort();
     unique.dedup();
@@ -59,24 +59,27 @@ where
 }
 
 async fn id_trace(ids: &impl IdGenerator) -> Vec<String> {
-    let mut values = Vec::with_capacity(10);
+    let mut values = Vec::with_capacity(12);
     for _ in 0..2 {
         let agent = ids.agent_id().await.expect("agent ID");
         let conversation = ids.conversation_id().await.expect("conversation ID");
         let message = ids.message_id().await.expect("message ID");
         let run = ids.run_id().await.expect("run ID");
+        let incident = ids.incident_id().await.expect("incident ID");
         let owner = ids.turn_lifecycle_owner_id().await.expect("owner ID");
         assert_uuid_suffix(agent.as_str(), "agent-local-");
         assert!(AgentId::accept(agent.as_str()).is_ok());
         assert!(ConversationId::accept(conversation.as_str()).is_ok());
         assert!(lotta_domain::MessageId::accept(message.as_str()).is_ok());
         assert!(lotta_domain::RunId::accept(run.as_str()).is_ok());
+        assert_uuid_v4(incident);
         assert_uuid_v4(owner);
         values.extend([
             agent.into_string(),
             conversation.into_string(),
             message.into_string(),
             run.into_string(),
+            incident.to_string(),
             owner.to_string(),
         ]);
     }
@@ -101,11 +104,13 @@ fn expected_id_trace() -> Vec<String> {
         "ui-msg-3",
         "local-run-00000000-0000-4000-8000-000000000004",
         "00000000-0000-4000-8000-000000000005",
-        "agent-local-00000000-0000-4000-8000-000000000006",
-        "local-conv-7",
-        "ui-msg-8",
-        "local-run-00000000-0000-4000-8000-000000000009",
-        "00000000-0000-4000-8000-00000000000a",
+        "00000000-0000-4000-8000-000000000006",
+        "agent-local-00000000-0000-4000-8000-000000000007",
+        "local-conv-8",
+        "ui-msg-9",
+        "local-run-00000000-0000-4000-8000-00000000000a",
+        "00000000-0000-4000-8000-00000000000b",
+        "00000000-0000-4000-8000-00000000000c",
     ]
     .into_iter()
     .map(String::from)

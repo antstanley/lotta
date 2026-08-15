@@ -48,13 +48,17 @@ thiserror = "2.0.12"
 chrono-tz = { version = "0.10.4", features = ["serde"] }
 tokio-util = { version = "0.7.16", default-features = false }
 tracing = "0.1.41"
+tungstenite = "0.29.0"
+tokio-tungstenite = "0.29.0"
+futures-util = "=0.3.31"
+tower = "0.5.3"
 url = "2.5.4"
 uuid = { version = "1.16.0", features = ["serde"] }
 
 [workspace.dependencies.tokio]
 version = "1.47.1"
 default-features = false
-features = ["macros", "net", "rt-multi-thread", "signal", "sync"]
+features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "test-util", "time"]
 
 [workspace.lints.rust]
 missing_docs = "deny"

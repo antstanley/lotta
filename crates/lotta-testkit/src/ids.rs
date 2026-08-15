@@ -93,6 +93,10 @@ impl IdGenerator for DeterministicIdGenerator {
         Box::pin(async move { RunId::generate_uuid(uuid_v4(self.reserve()?)).map_err(domain) })
     }
 
+    fn incident_id(&self) -> lotta_runtime::ports::PortFuture<'_, Uuid> {
+        Box::pin(async move { Ok(uuid_v4(self.reserve()?)) })
+    }
+
     fn turn_lifecycle_owner_id(&self) -> lotta_runtime::ports::PortFuture<'_, Uuid> {
         Box::pin(async move { Ok(uuid_v4(self.reserve()?)) })
     }
@@ -115,5 +119,15 @@ mod tests {
         assert!(exhausted.agent_id().await.is_ok());
         assert!(exhausted.agent_id().await.is_err());
         assert!(exhausted.agent_id().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn incident_ids_are_unique_deterministic_uuid_v4() {
+        let ids = DeterministicIdGenerator::new();
+        let first = ids.incident_id().await.expect("first incident");
+        let second = ids.incident_id().await.expect("second incident");
+        assert_ne!(first, second);
+        assert_eq!(first.get_version(), Some(uuid::Version::Random));
+        assert_eq!(second.get_version(), Some(uuid::Version::Random));
     }
 }

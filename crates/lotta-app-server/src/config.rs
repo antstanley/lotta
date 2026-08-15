@@ -4,8 +4,8 @@ use url::Url;
 
 use crate::{auth::AuthPolicy, error::AppServerError};
 
-/// Largest accepted signed-token clock skew.
-pub const AUTH_CLOCK_SKEW_SECONDS_MAX: u32 = 300;
+/// Compatibility re-export of the canonical signed-token skew ceiling.
+pub use crate::bounds::AUTH_CLOCK_SKEW_SECONDS_MAX;
 /// Baseline signed-token clock skew.
 pub const AUTH_CLOCK_SKEW_SECONDS_DEFAULT: u32 = 30;
 
