@@ -2,11 +2,16 @@ use futures_util::{SinkExt, StreamExt};
 use lotta_domain::Timestamp;
 use lotta_testkit::clock::FakeClock;
 use serde_json::Value;
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use super::start_listener_for_test;
 use crate::config::ServerArgs;
+use crate::ws::{EventIdGenerator, RuntimeEvent};
 
 const FRAME_CAP: usize = 1024;
 const LONG_PING_MS: u64 = 3_600_000;
@@ -108,11 +113,115 @@ async fn nested_request_id_257_returns_correlated_error_and_remains_usable() {
     handle.wait().await.unwrap();
 }
 
+#[tokio::test]
+async fn outbound_registry_fans_out_actual_broadcast_to_both_peers() {
+    let clock = clock();
+    let ids: Arc<dyn EventIdGenerator> = Arc::new(crate::ws::RandomEventIdGenerator);
+    let mut router = crate::ws::RuntimeRouter::new(clock, ids);
+    let first = router.connections.open().unwrap();
+    router.connections.initialize(first).unwrap();
+    let second = router.connections.open().unwrap();
+    router.connections.initialize(second).unwrap();
+    let scope = lotta_domain::RuntimeScope::new(
+        lotta_domain::AgentId::accept("agent-1").unwrap(),
+        lotta_domain::ConversationId::accept("conversation-1").unwrap(),
+        None,
+    );
+    router.connections.subscribe(first, scope.clone()).unwrap();
+    router.connections.subscribe(second, scope.clone()).unwrap();
+    let deliveries = router
+        .broadcast(
+            &scope,
+            &RuntimeEvent::UpdateQueue {
+                queue: lotta_domain::BoundedJsonValue::new(serde_json::json!(["queued"])).unwrap(),
+                removed: lotta_domain::BoundedJsonValue::new(serde_json::json!([])).unwrap(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        deliveries
+            .as_slice()
+            .iter()
+            .map(|d| d.connection_id)
+            .collect::<Vec<_>>(),
+        vec![first, second]
+    );
+    let (tx1, mut rx1) = mpsc::channel(1);
+    let (tx2, mut rx2) = mpsc::channel(1);
+    let outbound = Mutex::new(HashMap::from([(first, tx1), (second, tx2)]));
+    super::dispatch_deliveries(&outbound, &deliveries).unwrap();
+    let one: Value = serde_json::from_str(&rx1.recv().await.unwrap()).unwrap();
+    let two: Value = serde_json::from_str(&rx2.recv().await.unwrap()).unwrap();
+    for value in [&one, &two] {
+        assert_eq!(value["type"], "update_queue");
+        assert_eq!(value["queue"], serde_json::json!(["queued"]));
+        assert_eq!(value["event_seq"], 1);
+    }
+    assert_ne!(one["idempotency_key"], two["idempotency_key"]);
+}
+
+#[tokio::test]
+async fn typed_runtime_failures_are_unstamped_and_sent_to_origin() {
+    let args = ServerArgs {
+        listen_enabled: true,
+        ..ServerArgs::default()
+    };
+    let prepared = args.prepare().unwrap();
+    let mut runtime_router =
+        crate::ws::RuntimeRouter::new(clock(), Arc::new(crate::ws::RandomEventIdGenerator));
+    let origin = runtime_router.connections.open().unwrap();
+    runtime_router.connections.initialize(origin).unwrap();
+    let router = Arc::new(Mutex::new(runtime_router));
+    let (sender, mut receiver) = mpsc::channel(4);
+    let state = super::ListenerState {
+        auth: prepared.auth,
+        clock: clock(),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        limits: super::SocketLimits::default(),
+        runtime_router: router,
+        runtime_service: Arc::new(crate::ws::UnsupportedRuntimeCommandService),
+        outbound: Arc::new(Mutex::new(HashMap::from([(origin, sender)]))),
+    };
+    for (wire, expected, false_field) in [
+        (
+            serde_json::json!({"type":"runtime_start","request_id":"r"}),
+            "runtime_start_response",
+            "success",
+        ),
+        (
+            serde_json::json!({"type":"input","request_id":"r","runtime":{"agent_id":"a","conversation_id":"c"},"payload":{}}),
+            "input_accepted",
+            "accepted",
+        ),
+        (
+            serde_json::json!({"type":"sync","request_id":"r","runtime":{"agent_id":"a","conversation_id":"c"}}),
+            "sync_response",
+            "success",
+        ),
+        (
+            serde_json::json!({"type":"abort_message","request_id":"r","runtime":{"agent_id":"a","conversation_id":"c"}}),
+            "abort_message_response",
+            "success",
+        ),
+    ] {
+        let frame = crate::framing::decode_text(&wire.to_string()).unwrap();
+        super::dispatch_typed_failure(&state, origin, &frame).unwrap();
+        let value: Value = serde_json::from_str(&receiver.recv().await.unwrap()).unwrap();
+        assert_eq!(value["type"], expected);
+        assert_eq!(value[false_field], false);
+        assert_eq!(value["error"], "runtime service unavailable");
+        for field in ["event_seq", "emitted_at", "idempotency_key"] {
+            assert!(value.get(field).is_none(), "{field}");
+        }
+    }
+}
+
 #[test]
 fn websocket_error_classifier_maps_concrete_classes() {
     use axum::extract::ws::close_code;
     use tungstenite::{Error, error::ProtocolError};
-    let classify = |error| super::websocket_error_close(axum::Error::new(error)).0;
+    let classify =
+        |error| super::websocket_error_close(axum::Error::new(error)).map(|value| value.0);
     assert_eq!(
         classify(Error::Protocol(ProtocolError::ResetWithoutClosingHandshake)),
         Some(close_code::PROTOCOL)

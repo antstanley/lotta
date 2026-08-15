@@ -1,0 +1,40 @@
+//! Typed, bounded Runtime WebSocket commands, events, and routing.
+
+/// Runtime command wire models and decoding.
+pub mod command;
+/// Connection subscriptions and per-connection sequencing.
+pub mod connection;
+/// Runtime event lifecycle envelopes.
+pub mod envelope;
+/// Exact runtime broadcast event models.
+pub mod event;
+/// Synchronous owner-local routing and deferred input application.
+pub mod router;
+/// Injectable Runtime command service seam.
+pub mod service;
+
+pub use command::RuntimeCommand;
+pub use connection::{ConnectionId, EventDelivery, RuntimeConnections};
+pub use envelope::{EventIdGenerator, RandomEventIdGenerator, StampedRuntimeEvent};
+pub use event::RuntimeEvent;
+pub use router::{
+    ConnectionResponse, DeferredInput, EventDeliveryBatch, RouteAdmission, RouteOutput,
+    RouterEventSink, RuntimeRouter, lock_router, route_command,
+};
+pub use service::{
+    RuntimeCommandService, RuntimeEventSink, UnsupportedRuntimeCommandService,
+    WS_RUNTIME_ROUTE_EVENTS_MAX,
+};
+
+#[cfg(test)]
+#[path = "ws/ordering_tests.rs"]
+mod ordering_invariants;
+#[cfg(test)]
+#[path = "ws/runtime_group_tests.rs"]
+mod runtime_group;
+#[cfg(test)]
+#[path = "ws/subscriptions_tests.rs"]
+mod subscriptions;
+#[cfg(test)]
+#[path = "ws/test_support.rs"]
+mod test_support;

@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use axum::{
     Router,
@@ -12,7 +12,7 @@ use axum::{
     routing::get,
 };
 use lotta_domain::Clock;
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -21,6 +21,10 @@ use crate::{
     config::{PreparedServer, is_loopback_host},
     error::AppServerError,
     heartbeat::Heartbeat,
+    ws::{
+        EventDeliveryBatch, RandomEventIdGenerator, RouterEventSink, RuntimeCommandService,
+        RuntimeRouter, UnsupportedRuntimeCommandService, lock_router, route_command,
+    },
 };
 
 #[cfg(test)]
@@ -58,6 +62,9 @@ struct ListenerState {
     clock: Arc<dyn Clock + Send + Sync>,
     shutdown: CancellationToken,
     limits: SocketLimits,
+    runtime_router: Arc<std::sync::Mutex<RuntimeRouter>>,
+    runtime_service: Arc<dyn RuntimeCommandService>,
+    outbound: Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
 }
 
 /// Owned running listener with resolved URLs and graceful shutdown.
@@ -113,7 +120,20 @@ pub async fn start_listener(
     prepared: PreparedServer,
     clock: Arc<dyn Clock + Send + Sync>,
 ) -> Result<ListenerHandle, AppServerError> {
-    start_listener_with_limits(prepared, clock, SocketLimits::default()).await
+    start_listener_with_runtime_service(prepared, clock, Arc::new(UnsupportedRuntimeCommandService))
+        .await
+}
+
+/// Binds a listener with an injectable Runtime command application service.
+///
+/// # Errors
+/// Returns a stable listener error when startup fails.
+pub async fn start_listener_with_runtime_service(
+    prepared: PreparedServer,
+    clock: Arc<dyn Clock + Send + Sync>,
+    runtime_service: Arc<dyn RuntimeCommandService>,
+) -> Result<ListenerHandle, AppServerError> {
+    start_listener_with_limits(prepared, clock, SocketLimits::default(), runtime_service).await
 }
 
 #[cfg(test)]
@@ -127,13 +147,20 @@ async fn start_listener_for_test(
         frame_bytes,
         ping_interval_ms,
     };
-    start_listener_with_limits(prepared, clock, limits).await
+    start_listener_with_limits(
+        prepared,
+        clock,
+        limits,
+        Arc::new(UnsupportedRuntimeCommandService),
+    )
+    .await
 }
 
 async fn start_listener_with_limits(
     prepared: PreparedServer,
     clock: Arc<dyn Clock + Send + Sync>,
     limits: SocketLimits,
+    runtime_service: Arc<dyn RuntimeCommandService>,
 ) -> Result<ListenerHandle, AppServerError> {
     if !is_loopback_host(&prepared.host) && prepared.auth.is_none() {
         return Err(AppServerError::Config(
@@ -149,11 +176,15 @@ async fn start_listener_with_limits(
     let (base_url, websocket_url, openai_url) = resolved_urls(&prepared, address);
     tracing::info!(base_url, websocket_url, "app server listener started");
     let shutdown = CancellationToken::new();
+    let runtime_router = RuntimeRouter::new(clock.clone(), Arc::new(RandomEventIdGenerator));
     let state = Arc::new(ListenerState {
         auth: prepared.auth,
         clock,
         shutdown: shutdown.clone(),
         limits,
+        runtime_router: Arc::new(std::sync::Mutex::new(runtime_router)),
+        runtime_service,
+        outbound: Arc::new(std::sync::Mutex::new(HashMap::new())),
     });
     let router = build_router(&prepared.websocket_path, state);
     let server_shutdown = shutdown.clone();
@@ -225,16 +256,29 @@ async fn upgrade(
         .into_response()
 }
 
+/// Maximum queued outbound frames for one live connection.
+pub const WS_OUTBOUND_FRAMES_PER_CONNECTION_MAX: usize = 256;
+
 async fn serve_socket(mut socket: WebSocket, state: Arc<ListenerState>) {
+    let (sender, mut receiver) = mpsc::channel(WS_OUTBOUND_FRAMES_PER_CONNECTION_MAX);
+    let Ok(connection_id) = open_connection(&state, sender) else {
+        return;
+    };
     let mut heartbeat = Heartbeat::new(state.clock.as_ref());
-    let interval_ms = state.limits.ping_interval_ms;
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(
+        state.limits.ping_interval_ms,
+    ));
     interval.tick().await;
     loop {
         tokio::select! {
             () = state.shutdown.cancelled() => {
                 send_close(&mut socket, close_code::AWAY, "server shutdown").await;
                 break;
+            }
+            Some(body) = receiver.recv() => {
+                if socket.send(Message::Text(body.into())).await.is_err() {
+                    break;
+                }
             }
             _ = interval.tick() => {
                 if heartbeat.is_expired(state.clock.as_ref()) {
@@ -247,41 +291,84 @@ async fn serve_socket(mut socket: WebSocket, state: Arc<ListenerState>) {
             }
             incoming = socket.recv() => {
                 let keep_open = handle_incoming(
-                    &mut socket,
                     incoming,
+                    &mut socket,
                     &mut heartbeat,
-                    state.clock.as_ref(),
-                )
-                .await;
+                    &state,
+                    connection_id,
+                ).await;
                 if !keep_open {
                     break;
                 }
             }
         }
     }
+    close_connection(&state, connection_id);
+}
+
+fn open_connection(
+    state: &ListenerState,
+    sender: mpsc::Sender<String>,
+) -> Result<crate::ws::ConnectionId, AppServerError> {
+    let id = {
+        let mut router = lock_router(&state.runtime_router)?;
+        let id = router.connections.open()?;
+        router.connections.initialize(id)?;
+        id
+    };
+    let inserted = prepare_outbound(state, id, sender);
+    if inserted.is_err() {
+        lock_router(&state.runtime_router)?.connections.close(id);
+    }
+    inserted.map(|()| id)
+}
+
+fn prepare_outbound(
+    state: &ListenerState,
+    id: crate::ws::ConnectionId,
+    sender: mpsc::Sender<String>,
+) -> Result<(), AppServerError> {
+    let mut outbound = state
+        .outbound
+        .lock()
+        .map_err(|_| AppServerError::Internal)?;
+    outbound
+        .try_reserve(1)
+        .map_err(|_| AppServerError::Unavailable)?;
+    outbound.insert(id, sender);
+    Ok(())
+}
+
+fn close_connection(state: &ListenerState, id: crate::ws::ConnectionId) {
+    if let Ok(mut outbound) = state.outbound.lock() {
+        outbound.remove(&id);
+    }
+    if let Ok(mut router) = state.runtime_router.lock() {
+        router.connections.close(id);
+    }
 }
 
 async fn handle_incoming(
-    socket: &mut WebSocket,
     incoming: Option<Result<Message, axum::Error>>,
+    socket: &mut WebSocket,
     heartbeat: &mut Heartbeat,
-    clock: &(dyn Clock + Send + Sync),
+    state: &Arc<ListenerState>,
+    connection_id: crate::ws::ConnectionId,
 ) -> bool {
     match incoming {
         Some(Ok(Message::Pong(_))) => {
-            heartbeat.record_pong(clock);
+            heartbeat.record_pong(state.clock.as_ref());
             true
         }
         Some(Ok(Message::Ping(payload))) => socket.send(Message::Pong(payload)).await.is_ok(),
-        Some(Ok(Message::Text(text))) => handle_text(socket, &text).await,
+        Some(Ok(Message::Text(text))) => handle_text(&text, state, connection_id).await,
         Some(Ok(Message::Binary(_))) => {
             send_close(socket, close_code::UNSUPPORTED, "binary unsupported").await;
             false
         }
         Some(Ok(Message::Close(_))) | None => false,
         Some(Err(error)) => {
-            let (code, reason) = websocket_error_close(error);
-            if let Some((code, reason)) = code.zip(reason) {
+            if let Some((code, reason)) = websocket_error_close(error) {
                 send_close(socket, code, reason).await;
             }
             false
@@ -289,32 +376,175 @@ async fn handle_incoming(
     }
 }
 
-fn websocket_error_close(error: axum::Error) -> (Option<u16>, Option<&'static str>) {
+fn websocket_error_close(error: axum::Error) -> Option<(u16, &'static str)> {
     let inner = error.into_inner();
     let Some(error) = inner.downcast_ref::<tungstenite::Error>() else {
-        return (Some(close_code::ERROR), Some("internal websocket error"));
+        return Some((close_code::ERROR, "internal websocket error"));
     };
     match error {
-        tungstenite::Error::Capacity(_) => (Some(close_code::SIZE), Some("message too large")),
-        tungstenite::Error::Protocol(_) => {
-            (Some(close_code::PROTOCOL), Some("websocket protocol error"))
-        }
-        tungstenite::Error::Utf8(_) => (Some(close_code::INVALID), Some("invalid UTF-8")),
+        tungstenite::Error::Capacity(_) => Some((close_code::SIZE, "message too large")),
+        tungstenite::Error::Protocol(_) => Some((close_code::PROTOCOL, "websocket protocol error")),
+        tungstenite::Error::Utf8(_) => Some((close_code::INVALID, "invalid UTF-8")),
         tungstenite::Error::Io(_)
         | tungstenite::Error::Tls(_)
-        | tungstenite::Error::WriteBufferFull(_) => (None, None),
-        _ => (Some(close_code::ERROR), Some("internal websocket error")),
+        | tungstenite::Error::WriteBufferFull(_) => None,
+        _ => Some((close_code::ERROR, "internal websocket error")),
     }
 }
 
-async fn handle_text(socket: &mut WebSocket, text: &str) -> bool {
-    match crate::framing::decode_text(text) {
-        Ok(_) => true,
-        Err(error) => match serde_json::to_string(&error) {
-            Ok(body) => socket.send(Message::Text(body.into())).await.is_ok(),
-            Err(_) => false,
-        },
+async fn handle_text(
+    text: &str,
+    state: &Arc<ListenerState>,
+    connection_id: crate::ws::ConnectionId,
+) -> bool {
+    let frame = match crate::framing::decode_text(text) {
+        Ok(frame) => frame,
+        Err(error) => return dispatch_value(state, connection_id, &error).is_ok(),
+    };
+    let command = match crate::ws::command::decode(&frame) {
+        Ok(Some(command)) => command,
+        Ok(None) => return true,
+        Err(error) => return dispatch_value(state, connection_id, &error).is_ok(),
+    };
+    let routed = route_command(
+        state.runtime_router.clone(),
+        state.runtime_service.clone(),
+        connection_id,
+        command,
+    )
+    .await;
+    let Ok((output, deferred)) = routed else {
+        return dispatch_typed_failure(state, connection_id, &frame).is_ok();
+    };
+    if dispatch_output(state, connection_id, &output).is_err() {
+        return false;
     }
+    if let Some(deferred) = deferred {
+        let sink = event_sink(state);
+        if state
+            .runtime_service
+            .continue_input(deferred.scope, deferred.continuation, sink)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn event_sink(state: &Arc<ListenerState>) -> Arc<dyn crate::ws::RuntimeEventSink> {
+    let outbound = state.outbound.clone();
+    Arc::new(RouterEventSink::new(
+        state.runtime_router.clone(),
+        Arc::new(move |deliveries| dispatch_deliveries(&outbound, &deliveries)),
+    ))
+}
+
+fn dispatch_output(
+    state: &ListenerState,
+    connection_id: crate::ws::ConnectionId,
+    output: &crate::ws::RouteOutput,
+) -> Result<(), AppServerError> {
+    for response in output.responses.as_slice() {
+        dispatch_value(state, connection_id, response)?;
+    }
+    dispatch_deliveries(&state.outbound, &output.deliveries)
+}
+
+fn dispatch_value(
+    state: &ListenerState,
+    connection_id: crate::ws::ConnectionId,
+    value: &impl serde::Serialize,
+) -> Result<(), AppServerError> {
+    let sender = state
+        .outbound
+        .lock()
+        .map_err(|_| AppServerError::Internal)?
+        .get(&connection_id)
+        .cloned()
+        .ok_or(AppServerError::Unavailable)?;
+    let body = serde_json::to_string(value).map_err(|_| AppServerError::Internal)?;
+    sender
+        .try_send(body)
+        .map_err(|_| AppServerError::Unavailable)
+}
+
+fn dispatch_deliveries(
+    outbound: &std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>,
+    deliveries: &EventDeliveryBatch,
+) -> Result<(), AppServerError> {
+    let senders = {
+        let outbound = outbound.lock().map_err(|_| AppServerError::Internal)?;
+        deliveries
+            .as_slice()
+            .iter()
+            .map(|delivery| {
+                outbound
+                    .get(&delivery.connection_id)
+                    .cloned()
+                    .ok_or(AppServerError::Unavailable)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (delivery, sender) in deliveries.as_slice().iter().zip(senders) {
+        let body = serde_json::to_string(&delivery.frame).map_err(|_| AppServerError::Internal)?;
+        sender
+            .try_send(body)
+            .map_err(|_| AppServerError::Unavailable)?;
+    }
+    Ok(())
+}
+
+fn dispatch_typed_failure(
+    state: &ListenerState,
+    connection_id: crate::ws::ConnectionId,
+    frame: &crate::framing::DecodedFrame,
+) -> Result<(), AppServerError> {
+    let Some(request_id) = frame.request_id.clone() else {
+        return Ok(());
+    };
+    let runtime = frame
+        .value
+        .get("runtime")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
+    let response = match frame.value.get("type").and_then(serde_json::Value::as_str) {
+        Some("runtime_start") => crate::ws::ConnectionResponse::RuntimeStart {
+            request_id,
+            success: false,
+            runtime: None,
+            agent: None,
+            conversation: None,
+            created: crate::ws::router::CreatedFlags {
+                agent: false,
+                conversation: false,
+            },
+            error: Some("runtime service unavailable".into()),
+        },
+        Some("sync") => crate::ws::ConnectionResponse::SyncResponse {
+            request_id,
+            runtime: runtime.ok_or(AppServerError::Malformed)?,
+            success: false,
+            error: Some("runtime service unavailable".into()),
+        },
+        Some("abort_message") => crate::ws::ConnectionResponse::AbortMessage {
+            request_id,
+            runtime: runtime.ok_or(AppServerError::Malformed)?,
+            aborted: false,
+            success: false,
+            error: Some("runtime service unavailable".into()),
+        },
+        Some("input") => crate::ws::ConnectionResponse::InputAccepted {
+            request_id,
+            runtime: runtime.ok_or(AppServerError::Malformed)?,
+            accepted: false,
+            disposition: None,
+            error: Some("runtime service unavailable".into()),
+        },
+        _ => return Ok(()),
+    };
+    dispatch_value(state, connection_id, &response)
 }
 
 async fn send_close(socket: &mut WebSocket, code: u16, reason: &'static str) {

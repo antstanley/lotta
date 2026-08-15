@@ -36,6 +36,12 @@ fn router() -> axum::Router {
         clock: Arc::new(TestClock),
         shutdown: tokio_util::sync::CancellationToken::new(),
         limits: SocketLimits::default(),
+        runtime_router: Arc::new(std::sync::Mutex::new(crate::ws::RuntimeRouter::new(
+            Arc::new(TestClock),
+            Arc::new(crate::ws::RandomEventIdGenerator),
+        ))),
+        runtime_service: Arc::new(crate::ws::UnsupportedRuntimeCommandService),
+        outbound: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
     build_router("/ws", state)
 }
@@ -134,7 +140,7 @@ fn receive_error_classification_never_labels_non_capacity_as_1009() {
         tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
     );
     let wrapped = axum::Error::new(protocol);
-    let (code, _) = super::websocket_error_close(wrapped);
+    let code = super::websocket_error_close(wrapped).map(|value| value.0);
     assert_ne!(code, Some(axum::extract::ws::close_code::SIZE));
 }
 
