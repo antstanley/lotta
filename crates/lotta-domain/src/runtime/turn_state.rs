@@ -11,6 +11,14 @@ pub struct TurnLease {
     generation: u64,
 }
 
+impl TurnLease {
+    /// Returns this opaque lease's monotonic owner-local generation.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
 /// Stable projection of the current turn state.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -176,6 +184,12 @@ impl TurnLifecycle {
     #[must_use]
     pub const fn state(&self) -> TurnStateView<'_> {
         TurnStateView { state: &self.state }
+    }
+
+    /// Returns whether `lease` is the complete current owner token.
+    #[must_use]
+    pub fn is_current(&self, lease: &TurnLease) -> bool {
+        self.state.lease().is_some_and(|current| current == lease)
     }
 
     /// Returns the last successfully settled turn stop reason.

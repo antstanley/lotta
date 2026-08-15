@@ -1,6 +1,6 @@
 use super::*;
 use crate::{ListenerRuntime, RuntimeResidency};
-use lotta_domain::{AgentId, ConversationId, DomainError, RuntimeScope, TurnStateKind};
+use lotta_domain::{AgentId, ConversationId, DomainError, RuntimeScope};
 
 struct FakeClock(Mutex<Timestamp>);
 
@@ -105,9 +105,9 @@ async fn independent_from_runtime_registry() {
         None,
     );
     let handle = registry
-        .get_or_create(&scope)
+        .get_or_create(&scope, uuid::Uuid::from_u128(1))
         .unwrap_or_else(|error| panic!("runtime: {error}"));
-    let residency = RuntimeResidency::new(TurnStateKind::Idle, 1, 0, false, 0);
+    let residency = RuntimeResidency::new(1, 0, false, 0);
     let _update = registry.set_residency(&handle, residency);
     advance(&clock, WORKTREE_WATCHER_IDLE_STOP_MS).await;
     assert!(!watcher.is_active());

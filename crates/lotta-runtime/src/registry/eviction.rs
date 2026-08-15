@@ -1,4 +1,5 @@
 use super::*;
+use lotta_domain::{RunId, TurnStateKind};
 
 fn scope() -> RuntimeScope {
     RuntimeScope::new(
@@ -9,12 +10,13 @@ fn scope() -> RuntimeScope {
 }
 
 fn quiescent() -> RuntimeResidency {
-    RuntimeResidency::new(TurnStateKind::Idle, 0, 0, false, 0)
+    RuntimeResidency::new(0, 0, false, 0)
 }
 
 fn create(registry: &mut ListenerRuntime) -> RuntimeHandle {
+    let owner_id = uuid::Uuid::from_u128(u128::from(registry.next_generation));
     registry
-        .get_or_create(&scope())
+        .get_or_create(&scope(), owner_id)
         .unwrap_or_else(|error| panic!("create runtime: {error}"))
 }
 
@@ -31,27 +33,32 @@ fn evicts_immediately_when_quiescent() {
 
 #[test]
 fn stays_resident_while_lifecycle() {
-    assert_one_hot(RuntimeResidency::new(TurnStateKind::Active, 0, 0, false, 0));
+    let mut registry = ListenerRuntime::new();
+    let handle = create(&mut registry);
+    let run = RunId::generate_sequence(1).unwrap_or_else(|error| panic!("run: {error}"));
+    registry
+        .lifecycle_mut(&handle)
+        .unwrap_or_else(|error| panic!("owner: {error}"))
+        .begin_turn("turn".into(), run)
+        .unwrap_or_else(|error| panic!("turn: {error}"));
+    assert_one_hot(registry, &handle, quiescent());
 }
 
 #[test]
 fn stays_resident_while_queue() {
-    assert_one_hot(RuntimeResidency::new(TurnStateKind::Idle, 1, 0, false, 0));
+    assert_auxiliary(RuntimeResidency::new(1, 0, false, 0));
 }
-
 #[test]
 fn stays_resident_while_approval() {
-    assert_one_hot(RuntimeResidency::new(TurnStateKind::Idle, 0, 1, false, 0));
+    assert_auxiliary(RuntimeResidency::new(0, 1, false, 0));
 }
-
 #[test]
 fn stays_resident_while_interrupted_result() {
-    assert_one_hot(RuntimeResidency::new(TurnStateKind::Idle, 0, 0, true, 0));
+    assert_auxiliary(RuntimeResidency::new(0, 0, true, 0));
 }
-
 #[test]
 fn stays_resident_while_sandbox_subscription() {
-    assert_one_hot(RuntimeResidency::new(TurnStateKind::Idle, 0, 0, false, 1));
+    assert_auxiliary(RuntimeResidency::new(0, 0, false, 1));
 }
 
 #[test]
@@ -72,12 +79,20 @@ fn no_runtime_idle_timer() {
     assert!(!source.contains("Duration"));
 }
 
-fn assert_one_hot(snapshot: RuntimeResidency) {
+fn assert_auxiliary(snapshot: RuntimeResidency) {
     let mut registry = ListenerRuntime::new();
     let handle = create(&mut registry);
-    assert!(snapshot.requires_residency());
+    assert!(snapshot.requires_residency(TurnStateKind::Idle));
+    assert_one_hot(registry, &handle, snapshot);
+}
+
+fn assert_one_hot(
+    mut registry: ListenerRuntime,
+    handle: &RuntimeHandle,
+    snapshot: RuntimeResidency,
+) {
     assert_eq!(
-        registry.set_residency(&handle, snapshot),
+        registry.set_residency(handle, snapshot),
         Ok(ResidencyUpdate::Retained)
     );
     assert_eq!(registry.len(), 1);

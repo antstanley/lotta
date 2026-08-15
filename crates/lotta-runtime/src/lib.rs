@@ -12,6 +12,10 @@
 pub mod boundary;
 /// Immutable Task 06 runtime resource bounds exported for inward-dependent adapters.
 pub mod bounds;
+/// Lease-guarded post-await effects.
+pub mod lease;
+/// Runtime lifecycle ownership and projections.
+pub mod lifecycle;
 /// Effect interfaces implemented by adapters outside this crate.
 pub mod ports;
 /// Bounded listener-owned runtime registry.
@@ -21,6 +25,8 @@ pub mod scope_context;
 /// Worktree watcher lifetime state.
 pub mod worktree_watcher;
 
+pub use lease::{CancellationPolicy, LeaseEffect, LeaseGuard, SuppressionReason};
+pub use lifecycle::{LifecycleOwner, LifecycleProjection};
 pub use registry::{ListenerRuntime, ResidencyUpdate, RuntimeHandle, RuntimeKey, RuntimeResidency};
 pub use scope_context::{
     ScopeContextInput, ScopeContextSnapshot, WorkspaceSandbox, scope_operation, spawn_scoped,

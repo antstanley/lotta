@@ -1,9 +1,10 @@
-//! Bounded listener-owned conversation runtime registry.
+//! Bounded listener-owned runtime registry.
 
-use crate::RuntimeError;
+use crate::{LifecycleOwner, RuntimeError};
 use lotta_domain::bounds::RUNTIMES_MAX;
 use lotta_domain::{AgentId, ConversationId, RuntimeScope, TurnStateKind};
 use std::collections::HashMap;
+use uuid::Uuid;
 
 /// Immutable identity of one conversation runtime.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -18,7 +19,6 @@ impl RuntimeKey {
     pub const fn agent_id(&self) -> &AgentId {
         &self.agent_id
     }
-
     /// Returns the conversation identifier.
     #[must_use]
     pub const fn conversation_id(&self) -> &ConversationId {
@@ -42,10 +42,9 @@ pub struct RuntimeHandle {
     generation: u64,
 }
 
-/// Complete immutable snapshot controlling runtime residency.
+/// Complete auxiliary snapshot controlling runtime residency.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeResidency {
-    lifecycle: TurnStateKind,
     queue_item_count: usize,
     pending_approval_count: usize,
     interrupted_result_present: bool,
@@ -53,17 +52,15 @@ pub struct RuntimeResidency {
 }
 
 impl RuntimeResidency {
-    /// Creates a complete residency snapshot with five independent terms.
+    /// Creates the complete four-term auxiliary residency snapshot.
     #[must_use]
     pub const fn new(
-        lifecycle: TurnStateKind,
         queue_item_count: usize,
         pending_approval_count: usize,
         interrupted_result_present: bool,
         sandbox_subscription_count: usize,
     ) -> Self {
         Self {
-            lifecycle,
             queue_item_count,
             pending_approval_count,
             interrupted_result_present,
@@ -71,10 +68,10 @@ impl RuntimeResidency {
         }
     }
 
-    /// Returns whether any of the exact five terms requires residency.
+    /// ORs live lifecycle state with the exact four auxiliary terms.
     #[must_use]
-    pub fn requires_residency(self) -> bool {
-        self.lifecycle != TurnStateKind::Idle
+    pub fn requires_residency(self, lifecycle: TurnStateKind) -> bool {
+        lifecycle != TurnStateKind::Idle
             || self.queue_item_count > 0
             || self.pending_approval_count > 0
             || self.interrupted_result_present
@@ -84,6 +81,7 @@ impl RuntimeResidency {
 
 struct RuntimeEntry {
     generation: u64,
+    owner: LifecycleOwner,
     residency: RuntimeResidency,
 }
 
@@ -100,6 +98,7 @@ pub enum ResidencyUpdate {
 pub struct ListenerRuntime {
     entries: HashMap<RuntimeKey, RuntimeEntry>,
     next_generation: u64,
+    active: bool,
 }
 
 impl Default for ListenerRuntime {
@@ -109,13 +108,25 @@ impl Default for ListenerRuntime {
 }
 
 impl ListenerRuntime {
-    /// Creates an empty listener runtime registry.
+    /// Creates an active empty listener runtime registry.
     #[must_use]
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
             next_generation: 1,
+            active: true,
         }
+    }
+
+    /// Returns whether this listener accepts post-await effects.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// Permanently deactivates post-await effects.
+    pub fn deactivate(&mut self) {
+        self.active = false;
     }
 
     /// Returns the number of resident runtimes.
@@ -145,21 +156,47 @@ impl ListenerRuntime {
         })
     }
 
-    /// Returns the immutable residency snapshot for a current handle.
+    /// Returns auxiliary residency for a current handle.
     #[must_use]
     pub fn residency(&self, handle: &RuntimeHandle) -> Option<RuntimeResidency> {
         self.current_entry(handle).map(|entry| entry.residency)
     }
 
-    /// Gets or creates one runtime without duplicate allocation.
-    ///
-    /// A new runtime begins in command lifecycle residency so creation remains valid until its
-    /// caller publishes the actual complete state with [`Self::set_residency`].
+    /// Returns the exact handle's live lifecycle owner.
+    #[must_use]
+    pub fn lifecycle(&self, handle: &RuntimeHandle) -> Option<&LifecycleOwner> {
+        self.current_entry(handle).map(|entry| &entry.owner)
+    }
+
+    /// Returns the exact handle's mutable lifecycle owner.
     ///
     /// # Errors
-    /// Returns [`RuntimeError::LimitExceeded`] before generation or allocation at the runtime
-    /// bound, or [`RuntimeError::InvalidData`] if generation space is exhausted.
-    pub fn get_or_create(&mut self, scope: &RuntimeScope) -> Result<RuntimeHandle, RuntimeError> {
+    /// Returns [`RuntimeError::NotFound`] for a missing or stale generation.
+    pub fn lifecycle_mut(
+        &mut self,
+        handle: &RuntimeHandle,
+    ) -> Result<&mut LifecycleOwner, RuntimeError> {
+        let Some(entry) = self.entries.get_mut(&handle.key) else {
+            return Err(stale_handle());
+        };
+        if entry.generation != handle.generation {
+            return Err(stale_handle());
+        }
+        Ok(&mut entry.owner)
+    }
+
+    /// Gets or creates exactly one runtime owner per scope.
+    ///
+    /// `owner_id` must be injected from [`crate::ports::IdGenerator`] and unique among live
+    /// lifecycle owners. It is ignored when the scope already exists.
+    ///
+    /// # Errors
+    /// Returns a limit error at capacity or invalid data on generation exhaustion.
+    pub fn get_or_create(
+        &mut self,
+        scope: &RuntimeScope,
+        owner_id: Uuid,
+    ) -> Result<RuntimeHandle, RuntimeError> {
         let key = RuntimeKey::from(scope);
         if let Some(existing) = self.lookup(&key) {
             return Ok(existing);
@@ -171,33 +208,34 @@ impl ListenerRuntime {
         }
         let generation = self.next_generation;
         self.next_generation = generation.checked_add(1).ok_or_else(generation_exhausted)?;
-        self.entries.insert(
-            key.clone(),
-            RuntimeEntry {
-                generation,
-                residency: RuntimeResidency::new(TurnStateKind::Command, 0, 0, false, 0),
-            },
-        );
+        let entry = RuntimeEntry {
+            generation,
+            owner: LifecycleOwner::new(scope.clone(), owner_id),
+            residency: RuntimeResidency::new(0, 0, false, 0),
+        };
+        self.entries.insert(key.clone(), entry);
         Ok(RuntimeHandle { key, generation })
     }
 
-    /// Publishes state for a current handle and synchronously evicts quiescent state.
+    /// Publishes auxiliary state and consults live lifecycle before synchronous eviction.
     ///
     /// # Errors
-    /// Returns [`RuntimeError::NotFound`] when the key or generation is stale.
+    /// Returns [`RuntimeError::NotFound`] for a missing or stale generation.
     pub fn set_residency(
         &mut self,
         handle: &RuntimeHandle,
         snapshot: RuntimeResidency,
     ) -> Result<ResidencyUpdate, RuntimeError> {
-        let Some(entry) = self.entries.get_mut(&handle.key) else {
-            return Err(stale_handle());
-        };
-        if entry.generation != handle.generation {
-            return Err(stale_handle());
-        }
-        if snapshot.requires_residency() {
-            entry.residency = snapshot;
+        let lifecycle = self
+            .lifecycle(handle)
+            .ok_or_else(stale_handle)?
+            .projection()
+            .state();
+        if snapshot.requires_residency(lifecycle) {
+            self.lifecycle_mut(handle)?;
+            if let Some(entry) = self.entries.get_mut(&handle.key) {
+                entry.residency = snapshot;
+            }
             return Ok(ResidencyUpdate::Retained);
         }
         self.entries.remove(&handle.key);

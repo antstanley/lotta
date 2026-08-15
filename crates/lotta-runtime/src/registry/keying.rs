@@ -14,8 +14,9 @@ fn scope(agent_value: impl Into<String>, conversation_value: u64) -> RuntimeScop
 }
 
 fn create(registry: &mut ListenerRuntime, runtime_scope: &RuntimeScope) -> RuntimeHandle {
+    let owner_id = uuid::Uuid::from_u128(u128::from(registry.next_generation));
     registry
-        .get_or_create(runtime_scope)
+        .get_or_create(runtime_scope, owner_id)
         .unwrap_or_else(|error| panic!("create runtime: {error}"))
 }
 
@@ -43,7 +44,7 @@ fn default_conversation_is_agent_scoped() {
 #[test]
 fn rejects_at_runtimes_max() {
     let mut registry = full_registry();
-    let result = registry.get_or_create(&scope("overflow", 1));
+    let result = registry.get_or_create(&scope("overflow", 1), uuid::Uuid::from_u128(50_000));
     assert_eq!(registry.len(), RUNTIMES_MAX.value);
     assert!(
         matches!(result, Err(RuntimeError::LimitExceeded { context }) if
@@ -60,10 +61,11 @@ fn rejects_corrupted_over_capacity_without_harming_existing() {
         RuntimeKey::from(&scope("corrupt", 1)),
         RuntimeEntry {
             generation: 99_999,
-            residency: RuntimeResidency::new(TurnStateKind::Command, 0, 0, false, 0),
+            owner: LifecycleOwner::new(scope("corrupt", 1), uuid::Uuid::from_u128(99_999)),
+            residency: RuntimeResidency::new(0, 0, false, 0),
         },
     );
-    let result = registry.get_or_create(&scope("rejected", 1));
+    let result = registry.get_or_create(&scope("rejected", 1), uuid::Uuid::from_u128(50_001));
     assert!(matches!(result, Err(RuntimeError::LimitExceeded { .. })));
     assert_eq!(
         registry.lookup(&RuntimeKey::from(&preserved_scope)),
@@ -76,7 +78,7 @@ fn rejects_corrupted_over_capacity_without_harming_existing() {
 fn generation_exhaustion_does_not_insert() {
     let mut registry = ListenerRuntime::new();
     registry.next_generation = u64::MAX;
-    let result = registry.get_or_create(&scope("agent", 1));
+    let result = registry.get_or_create(&scope("agent", 1), uuid::Uuid::from_u128(1));
     assert!(matches!(result, Err(RuntimeError::InvalidData { .. })));
     assert!(registry.is_empty());
 }
@@ -86,7 +88,12 @@ fn existing_key_allowed_at_limit() {
     let mut registry = full_registry();
     let runtime_scope = scope("agent-0", 1);
     let existing = registry.lookup(&RuntimeKey::from(&runtime_scope));
-    assert_eq!(registry.get_or_create(&runtime_scope).ok(), existing);
+    assert_eq!(
+        registry
+            .get_or_create(&runtime_scope, uuid::Uuid::from_u128(50_002))
+            .ok(),
+        existing
+    );
 }
 
 #[test]
