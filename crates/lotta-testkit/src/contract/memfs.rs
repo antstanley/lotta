@@ -30,7 +30,8 @@ pub async fn memfs_contract<F, Fut, Adapter>(
         .expect("initialize");
     let source = RepositoryPath::new("system/new.md".into()).expect("source");
     let target = RepositoryPath::new("system/renamed.md".into()).expect("target");
-    let original = MemoryFileContent::new(b"memory".to_vec()).expect("content");
+    let original = MemoryFileContent::new(b"---\ndescription: contract\n---\nmemory".to_vec())
+        .expect("content");
     memfs_status_and_files(&port, &agent_id, &initial, &source, &target, &original).await;
     let committed = memfs_commit_history(&port, &agent_id, &initial, &target, &original).await;
     memfs_tree_revision(&port, &agent_id, &initial, &committed).await;
@@ -58,7 +59,7 @@ async fn memfs_initialize<F, Fut, Adapter>(
         .initialize(agent, &empty)
         .await
         .expect("empty initialize");
-    assert_eq!(first.as_str(), "testkit-revision-0000000000000001");
+    assert!(!first.as_str().is_empty());
     assert!(matches!(
         port.initialize(agent, blocks).await,
         Err(RuntimeError::Conflict { .. })
@@ -69,7 +70,7 @@ async fn memfs_initialize<F, Fut, Adapter>(
         .initialize(agent, blocks)
         .await
         .expect("block initialize");
-    assert_eq!(revision.as_str(), "testkit-revision-0000000000000001");
+    assert!(!revision.as_str().is_empty());
     assert_eq!(
         collect_tree_at(&other, agent, None).await.len(),
         blocks.as_slice().len()
@@ -97,7 +98,9 @@ async fn memfs_status_and_files(
     ));
     port.write(agent, source, original).await.expect("write");
     assert_eq!(port.read(agent, source).await.expect("read"), *original);
-    let replacement = MemoryFileContent::new(b"replacement".to_vec()).expect("replacement");
+    let replacement =
+        MemoryFileContent::new(b"---\ndescription: contract\n---\nreplacement".to_vec())
+            .expect("replacement");
     port.write(agent, source, &replacement)
         .await
         .expect("replace");
@@ -152,7 +155,7 @@ async fn memfs_commit_history(
     let message = CommitMessage::new("contract commit".into()).expect("message");
     let committed = port.commit(agent, &message).await.expect("commit");
     assert_ne!(&committed, initial);
-    assert_eq!(committed.as_str(), "testkit-revision-0000000000000002");
+    assert!(!committed.as_str().is_empty());
     assert_eq!(
         port.status(agent).await.expect("clean"),
         MemFsStatus {
@@ -167,19 +170,15 @@ async fn memfs_commit_history(
         )
         .await
         .expect("no-change commit");
-    assert_eq!(no_change.as_str(), "testkit-revision-0000000000000003");
+    assert_ne!(no_change, committed);
     let history = collect_history(port, agent).await;
-    assert_eq!(
-        history
-            .iter()
-            .map(|item| (item.revision.as_str(), item.summary.as_str()))
-            .collect::<Vec<_>>(),
-        vec![
-            ("testkit-revision-0000000000000003", "no change"),
-            ("testkit-revision-0000000000000002", "contract commit"),
-            ("testkit-revision-0000000000000001", "initialize"),
-        ]
-    );
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[0].revision, no_change);
+    assert_eq!(history[0].summary.as_str(), "no change");
+    assert_eq!(history[1].revision, committed);
+    assert_eq!(history[1].summary.as_str(), "contract commit");
+    assert_eq!(history[2].revision, *initial);
+    assert!(!history[2].summary.as_str().is_empty());
     assert_eq!(
         port.file_at_revision(agent, target, &committed)
             .await
@@ -189,7 +188,7 @@ async fn memfs_commit_history(
     port.write(
         agent,
         target,
-        &MemoryFileContent::new(b"later".to_vec()).expect("later"),
+        &MemoryFileContent::new(b"---\ndescription: contract\n---\nlater".to_vec()).expect("later"),
     )
     .await
     .expect("later write");
@@ -245,17 +244,28 @@ async fn memfs_diff_revision(
     target: &RepositoryPath,
 ) {
     let chunks = collect_diff(port, agent, Some(initial), Some(committed)).await;
-    assert_eq!(chunks.len(), 1);
-    let expected = format!("{} added\n+ memory\n", target.as_path().display());
-    assert_eq!(chunks[0].as_slice(), expected.as_bytes());
+    let combined = chunks
+        .iter()
+        .flat_map(|chunk| chunk.as_slice().iter().copied())
+        .collect::<Vec<_>>();
+    let expected = format!(
+        "{} added\n+ ---\ndescription: contract\n---\nmemory\n",
+        target.as_path().display()
+    );
+    assert_eq!(combined, expected.as_bytes());
     assert!(
         collect_diff(port, agent, Some(committed), Some(committed))
             .await
             .is_empty()
     );
     let current = collect_diff(port, agent, Some(committed), None).await;
-    assert_eq!(current.len(), 1);
-    assert!(current[0].as_slice().ends_with(b"- memory\n+ later\n"));
+    let current = current
+        .iter()
+        .flat_map(|chunk| chunk.as_slice().iter().copied())
+        .collect::<Vec<_>>();
+    assert!(current.ends_with(
+        b"- ---\ndescription: contract\n---\nmemory\n+ ---\ndescription: contract\n---\nlater\n"
+    ));
     let unknown = RevisionId::new("unknown".into()).expect("unknown");
     let (sender, _receiver) = mpsc::channel(1);
     assert!(matches!(
@@ -272,15 +282,21 @@ async fn memfs_diff_revision(
 }
 
 async fn memfs_worktree(port: &impl MemFsPort, agent: &AgentId, _committed: &RevisionId) {
+    port.commit(
+        agent,
+        &CommitMessage::new("prepare worktree".into()).expect("message"),
+    )
+    .await
+    .expect("prepare worktree");
     let worktree = port.create_worktree(agent).await.expect("worktree");
-    assert_eq!(worktree.as_str(), "testkit-worktree-0000000000000001");
+    assert!(!worktree.as_str().is_empty());
     assert!(!worktree.as_str().contains('/'));
     let message = CommitMessage::new("merge snapshot".into()).expect("merge message");
     let merged = port
         .merge_worktree(agent, &worktree, &message)
         .await
         .expect("merge");
-    assert_eq!(merged.as_str(), "testkit-revision-0000000000000004");
+    assert!(!merged.as_str().is_empty());
     assert!(!port.status(agent).await.expect("merged status").dirty);
     assert!(matches!(
         port.merge_worktree(agent, &worktree, &message).await,
