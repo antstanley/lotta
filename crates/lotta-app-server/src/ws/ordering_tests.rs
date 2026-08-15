@@ -85,7 +85,7 @@ fn recorder(
     let output = recorded.clone();
     let sink = RouterEventSink::new(
         router,
-        Arc::new(move |batch| {
+        Arc::new(move |_, _, batch| {
             output.lock().unwrap().push(batch);
             Ok(())
         }),
@@ -146,7 +146,7 @@ async fn input_accepted_before_caused_events() {
     let mut frames = vec![frame(0, 1, &output.responses.as_slice()[0])];
     let offset = frames.len();
     frames.extend(
-        output
+        output.event_batches.as_slice()[0]
             .deliveries
             .as_slice()
             .iter()

@@ -693,6 +693,53 @@
       }
     }
   ],
+  "derived_cases": [
+    {
+      "name": "slice_happy_turn",
+      "path": "slice_happy_turn.json",
+      "kind": "vertical_slice",
+      "derived_from": "vertical-slice.json",
+      "projection": "source frame indices 0..14 plus 30,31; frame_index renumbered, terminal subscriber projected to 1, and final emission-9 relabeled emission-5 only",
+      "projection_declaration": {
+        "source_frame_indices": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          30,
+          31
+        ],
+        "renumber_frame_indices": true,
+        "subscriber_projections": [
+          {
+            "source_frame_index": 30,
+            "subscriber_ordinals": [
+              1
+            ]
+          }
+        ],
+        "emission_relabels": [
+          {
+            "from": 9,
+            "to": 5
+          }
+        ]
+      },
+      "bytes": 10699,
+      "sha256": "e9f7a58d4f4c55737e987243b1750ca64fd719a2da2627c3566848c05529e63b"
+    }
+  ],
   "inventory": [
     {
       "path": "abort.json",

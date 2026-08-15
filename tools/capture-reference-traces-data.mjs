@@ -3,7 +3,7 @@ export const BOUNDARY =
   "pinned AppServerClient + pinned source-test scenario boundary";
 export const PLACEHOLDER = "<sanitized-trace>";
 export const LIMITS = Object.freeze({
-  files: 9,
+  files: 10,
   fileBytes: 131072,
   totalBytes: 524288,
   frames: 64,

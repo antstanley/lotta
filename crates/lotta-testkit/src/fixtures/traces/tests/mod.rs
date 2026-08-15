@@ -1,6 +1,8 @@
 use super::*;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::PathBuf;
 fn trace(name: &str) -> ReferenceTrace {
     load_trace(name).unwrap_or_else(|error| panic!("trace {name}: {error}"))
 }
@@ -539,11 +541,106 @@ fn source_provenance_is_pinned_and_honest() {
 fn tree_sha_and_all_traces_validate() {
     load_all().expect("integrity");
 }
+
+struct TraceCorpus(PathBuf);
+impl TraceCorpus {
+    fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let ordinal = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("lotta-traces-{}-{ordinal}", std::process::id()));
+        let destination = root.join("reference-traces");
+        fs::create_dir_all(&destination).expect("create trace corpus");
+        let loader = FixtureLoader::new();
+        for relative in loader.list_tree("reference-traces").expect("source tree") {
+            let bytes = loader
+                .load_bytes(format!("reference-traces/{relative}"))
+                .expect("source bytes");
+            fs::write(destination.join(relative), bytes).expect("copy trace corpus");
+        }
+        Self(root)
+    }
+    fn loader(&self) -> FixtureLoader {
+        FixtureLoader::from_root(&self.0).expect("custom trace loader")
+    }
+    fn index_path(&self) -> PathBuf {
+        self.0.join("reference-traces/index.json")
+    }
+}
+impl Drop for TraceCorpus {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).expect("remove trace corpus");
+    }
+}
+
+fn mutate_derived_index(edit: impl FnOnce(&mut Value)) -> TraceCorpus {
+    let corpus = TraceCorpus::new();
+    let path = corpus.index_path();
+    let mut index: Value =
+        serde_json::from_slice(&fs::read(&path).expect("read index")).expect("parse index");
+    edit(&mut index["derived_cases"][0]);
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&index).expect("serialize index"),
+    )
+    .expect("write index");
+    corpus
+}
+
 #[test]
-fn sanitization_covers_all_nine_files() {
+fn derived_metadata_tamper_bytes_hash_and_path_are_rejected() {
+    for corpus in [
+        mutate_derived_index(|case| case["bytes"] = json!(1)),
+        mutate_derived_index(|case| case["sha256"] = json!("00")),
+        mutate_derived_index(|case| case["path"] = json!("vertical-slice.json")),
+    ] {
+        let loader = corpus.loader();
+        let index: ReferenceTraceIndex = loader
+            .load("reference-traces/index.json")
+            .expect("mutated index parses");
+        assert!(validate_index(&loader, &index).is_err());
+    }
+}
+
+#[test]
+fn derived_projection_declaration_tamper_is_rejected() {
+    let mutations: [fn(&mut Value); 7] = [
+        |case| case["projection_declaration"]["source_frame_indices"][0] = json!(1),
+        |case| case["projection_declaration"]["source_frame_indices"][1] = json!(0),
+        |case| case["projection_declaration"]["renumber_frame_indices"] = json!(false),
+        |case| {
+            case["projection_declaration"]["subscriber_projections"][0]["source_frame_index"] =
+                json!(29);
+        },
+        |case| {
+            case["projection_declaration"]["subscriber_projections"][0]["subscriber_ordinals"] =
+                json!([2]);
+        },
+        |case| case["projection_declaration"]["emission_relabels"][0]["from"] = json!(8),
+        |case| case["projection_declaration"]["emission_relabels"][0]["to"] = json!(6),
+    ];
+    for mutation in mutations {
+        let corpus = mutate_derived_index(mutation);
+        let loader = corpus.loader();
+        let index: ReferenceTraceIndex = loader
+            .load("reference-traces/index.json")
+            .expect("mutated index parses");
+        assert!(validate_index(&loader, &index).is_err());
+    }
+}
+
+#[test]
+fn derived_trace_loads_authoritatively_by_public_name() {
+    let trace = load_trace(DERIVED_NAME).expect("derived trace");
+    assert_eq!(trace.name, DERIVED_NAME);
+    assert_eq!(trace.kind, DERIVED_KIND);
+    assert_ordering(&trace).expect("derived ordering authority");
+}
+#[test]
+fn sanitization_covers_all_ten_files() {
     let loader = FixtureLoader::new();
     let tree = loader.list_tree("reference-traces").expect("tree");
-    assert_eq!(tree.len(), 9);
+    assert_eq!(tree.len(), 10);
     validate_sanitization(&loader, &tree).expect("sanitized");
 }
 #[test]

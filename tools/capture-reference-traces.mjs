@@ -238,6 +238,56 @@ function verifySources(root) {
 
 async function buildCorpus(sourceRoot, regions) {
   const traces = await captureReferenceTraces(sourceRoot);
+  const vertical = traces.find((value) => value.name === "vertical-slice");
+  if (!vertical) fail("vertical-slice source trace missing");
+  const projectionDeclaration = {
+    source_frame_indices: [...Array(15).keys(), 30, 31],
+    renumber_frame_indices: true,
+    subscriber_projections: [{
+      source_frame_index: 30,
+      subscriber_ordinals: [1],
+    }],
+    emission_relabels: [{ from: 9, to: 5 }],
+  };
+  const subscriberProjections = new Map(
+    projectionDeclaration.subscriber_projections.map((value) => [
+      value.source_frame_index,
+      value.subscriber_ordinals,
+    ]),
+  );
+  const emissionRelabels = new Map(
+    projectionDeclaration.emission_relabels.map((value) => [
+      `emission-${value.from}`,
+      `emission-${value.to}`,
+    ]),
+  );
+  const sliceFrames = projectionDeclaration.source_frame_indices.map(
+    (sourceIndex, frameIndex) => {
+      const frame = structuredClone(vertical.frames[sourceIndex]);
+      if (projectionDeclaration.renumber_frame_indices)
+        frame.frame_index = frameIndex;
+      const subscribers = subscriberProjections.get(sourceIndex);
+      if (subscribers) frame.wire.subscriber_ordinals = subscribers;
+      frame.broadcast_emission =
+        emissionRelabels.get(frame.broadcast_emission) ?? frame.broadcast_emission;
+      if (frame.wire?.type === "broadcast_begin")
+        frame.wire.emission = emissionRelabels.get(frame.wire.emission) ?? frame.wire.emission;
+      return frame;
+    },
+  );
+  traces.push({
+    ...structuredClone(vertical),
+    name: "slice_happy_turn",
+    provenance: { ...vertical.provenance },
+    driver_proof: {
+      command_types: ["runtime_start", "input"],
+      message_types: [
+        "runtime_start_response", "update_device_status", "update_loop_status",
+        "update_queue", "input_accepted", "stream_delta", "turn_finished",
+      ],
+    },
+    frames: sliceFrames,
+  });
   const regionKeys = new Set(
     regions.map((x) => `${x.path}:${x.symbol}`),
   );
@@ -254,6 +304,7 @@ async function buildCorpus(sourceRoot, regions) {
   for (const value of traces)
     put(files, `${value.name}.json`, json(value));
   const inventory = [...files]
+    .filter(([path]) => path !== "slice_happy_turn.json")
     .map(([path, bytes]) => ({
       path,
       kind: "json",
@@ -265,7 +316,7 @@ async function buildCorpus(sourceRoot, regions) {
     path,
     sha256,
   }));
-  const cases = traces.map((value) => ({
+  const cases = traces.filter((value) => value.name !== "slice_happy_turn").map((value) => ({
     name: value.name,
     path: `${value.name}.json`,
     kind: value.kind,
@@ -273,6 +324,20 @@ async function buildCorpus(sourceRoot, regions) {
     supporting_provenance: value.supporting_provenance,
     driver_proof: value.driver_proof,
   }));
+  const sliceBytes = files.get("slice_happy_turn.json");
+  const derivedCases = [{
+    name: "slice_happy_turn",
+    path: "slice_happy_turn.json",
+    kind: "vertical_slice",
+    derived_from: "vertical-slice.json",
+    projection:
+      "source frame indices 0..14 plus 30,31; frame_index renumbered, " +
+      "terminal subscriber projected to 1, and final emission-9 relabeled " +
+      "emission-5 only",
+    projection_declaration: projectionDeclaration,
+    bytes: sliceBytes.length,
+    sha256: sha(sliceBytes),
+  }];
   const invariantRegions = INVARIANT_PROVENANCE_SPECS.map(
     ([invariant, path, symbol]) => ({
       invariant,
@@ -302,6 +367,7 @@ async function buildCorpus(sourceRoot, regions) {
     invariant_provenance: invariantRegions,
     semantic_rules: RULES,
     cases,
+    derived_cases: derivedCases,
     inventory,
   };
   return { files, index };

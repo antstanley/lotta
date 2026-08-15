@@ -11,6 +11,19 @@ lotta-domain = { version = "0.1.0", path = "crates/lotta-domain" }
 chrono.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+lotta-runtime = { version = "0.1.0", path = "crates/lotta-runtime" }
+lotta-testkit = { version = "0.1.0", path = "crates/lotta-testkit" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+
+[[test]]
+name = "slice"
+path = "tests/slice/main.rs"
+
 [workspace]
 resolver = "3"
 members = [

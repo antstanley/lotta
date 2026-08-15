@@ -9,7 +9,7 @@ use super::{envelope::StampedRuntimeEvent, event::RuntimeEvent};
 pub type ConnectionId = u64;
 
 /// One ordered, connection-specific delivery.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct EventDelivery {
     /// Target connection identifier.
     pub connection_id: ConnectionId,

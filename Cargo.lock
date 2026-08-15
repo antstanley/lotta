@@ -745,7 +745,14 @@ dependencies = [
  "chrono",
  "lotta-app-server",
  "lotta-domain",
+ "lotta-runtime",
+ "lotta-testkit",
+ "serde",
+ "serde_json",
+ "sha2",
  "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]

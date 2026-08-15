@@ -29,7 +29,7 @@ impl EventIdGenerator for RandomEventIdGenerator {
 }
 
 /// One independently stamped runtime event delivery.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct StampedRuntimeEvent {
     /// Exact runtime event payload.
     #[serde(flatten)]

@@ -107,7 +107,7 @@ async fn runtime_start_routes_response_subscribe_initial() {
         .await
         .unwrap_or_else(|e| panic!("route: {e}"));
     assert_eq!(response_json(&output)["type"], "runtime_start_response");
-    assert_eq!(output.deliveries.len(), 1);
+    assert_eq!(output.event_batches.as_slice()[0].deliveries.len(), 1);
     assert_eq!(
         lock_router(&router)
             .unwrap_or_else(|e| panic!("lock: {e}"))
@@ -181,7 +181,7 @@ async fn change_device_payload_routes_without_response() {
         .await
         .unwrap_or_else(|e| panic!("route: {e}"));
     assert!(output.responses.is_empty());
-    assert_eq!(output.deliveries.len(), 1);
+    assert_eq!(output.event_batches.as_slice()[0].deliveries.len(), 1);
 }
 async fn conflict(value: Value) {
     let (router, _, _, id) = router();
@@ -268,14 +268,14 @@ async fn input_ack_physically_precedes_after_ack_and_continue() {
                 .unwrap_or("?")
                 .into(),
         );
-        for d in output.deliveries.as_slice() {
+        for d in output.event_batches.as_slice()[0].deliveries.as_slice() {
             values.push(d.frame.event.discriminant().into());
         }
     }
     let output_frames = frames.clone();
     let sink = Arc::new(RouterEventSink::new(
         router,
-        Arc::new(move |d| {
+        Arc::new(move |_, _, d| {
             if let Ok(mut values) = output_frames.lock() {
                 for item in d.as_slice() {
                     values.push(item.frame.event.discriminant().into());

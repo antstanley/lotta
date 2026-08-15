@@ -1,4 +1,11 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use axum::{
     Router,
@@ -30,6 +37,9 @@ use crate::{
 #[cfg(test)]
 #[path = "listener/tests/heartbeat.rs"]
 mod heartbeat_integration;
+#[cfg(test)]
+#[path = "listener/tests/observer.rs"]
+mod observer_tests;
 #[cfg(test)]
 #[path = "listener/tests/transport.rs"]
 mod transport;
@@ -64,6 +74,8 @@ struct ListenerState {
     limits: SocketLimits,
     runtime_router: Arc<std::sync::Mutex<RuntimeRouter>>,
     runtime_service: Arc<dyn RuntimeCommandService>,
+    observer: Arc<dyn crate::observer::RuntimeBroadcastObserver>,
+    next_observation: AtomicU64,
     outbound: Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
 }
 
@@ -133,7 +145,33 @@ pub async fn start_listener_with_runtime_service(
     clock: Arc<dyn Clock + Send + Sync>,
     runtime_service: Arc<dyn RuntimeCommandService>,
 ) -> Result<ListenerHandle, AppServerError> {
-    start_listener_with_limits(prepared, clock, SocketLimits::default(), runtime_service).await
+    start_listener_with_runtime_service_and_observer(
+        prepared,
+        clock,
+        runtime_service,
+        Arc::new(crate::observer::InertRuntimeBroadcastObserver),
+    )
+    .await
+}
+
+/// Binds a listener with a Runtime service and read-only dispatch observer.
+///
+/// # Errors
+/// Returns a stable listener error when startup fails.
+pub async fn start_listener_with_runtime_service_and_observer(
+    prepared: PreparedServer,
+    clock: Arc<dyn Clock + Send + Sync>,
+    runtime_service: Arc<dyn RuntimeCommandService>,
+    observer: Arc<dyn crate::observer::RuntimeBroadcastObserver>,
+) -> Result<ListenerHandle, AppServerError> {
+    start_listener_with_limits(
+        prepared,
+        clock,
+        SocketLimits::default(),
+        runtime_service,
+        observer,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -152,6 +190,7 @@ async fn start_listener_for_test(
         clock,
         limits,
         Arc::new(UnsupportedRuntimeCommandService),
+        Arc::new(crate::observer::InertRuntimeBroadcastObserver),
     )
     .await
 }
@@ -161,6 +200,7 @@ async fn start_listener_with_limits(
     clock: Arc<dyn Clock + Send + Sync>,
     limits: SocketLimits,
     runtime_service: Arc<dyn RuntimeCommandService>,
+    observer: Arc<dyn crate::observer::RuntimeBroadcastObserver>,
 ) -> Result<ListenerHandle, AppServerError> {
     if !is_loopback_host(&prepared.host) && prepared.auth.is_none() {
         return Err(AppServerError::Config(
@@ -184,6 +224,8 @@ async fn start_listener_with_limits(
         limits,
         runtime_router: Arc::new(std::sync::Mutex::new(runtime_router)),
         runtime_service,
+        observer,
+        next_observation: AtomicU64::new(1),
         outbound: Arc::new(std::sync::Mutex::new(HashMap::new())),
     });
     let router = build_router(&prepared.websocket_path, state);
@@ -434,10 +476,12 @@ async fn handle_text(
 }
 
 fn event_sink(state: &Arc<ListenerState>) -> Arc<dyn crate::ws::RuntimeEventSink> {
-    let outbound = state.outbound.clone();
+    let observer_state = state.clone();
     Arc::new(RouterEventSink::new(
         state.runtime_router.clone(),
-        Arc::new(move |deliveries| dispatch_deliveries(&outbound, &deliveries)),
+        Arc::new(move |scope, event, deliveries| {
+            dispatch_event_batch(&observer_state, scope, event, &deliveries)
+        }),
     ))
 }
 
@@ -449,7 +493,15 @@ fn dispatch_output(
     for response in output.responses.as_slice() {
         dispatch_value(state, connection_id, response)?;
     }
-    dispatch_deliveries(&state.outbound, &output.deliveries)
+    for batch in output.event_batches.as_slice() {
+        dispatch_event_batch(
+            state,
+            batch.scope.clone(),
+            batch.event.clone(),
+            &batch.deliveries,
+        )?;
+    }
+    Ok(())
 }
 
 fn dispatch_value(
@@ -468,6 +520,31 @@ fn dispatch_value(
     sender
         .try_send(body)
         .map_err(|_| AppServerError::Unavailable)
+}
+
+fn dispatch_event_batch(
+    state: &ListenerState,
+    scope: lotta_domain::RuntimeScope,
+    event: crate::ws::RuntimeEvent,
+    deliveries: &EventDeliveryBatch,
+) -> Result<(), AppServerError> {
+    dispatch_deliveries(&state.outbound, deliveries)?;
+    // Observation is post-dispatch and cannot affect routing. Once the ordinal space is exhausted,
+    // retain the saturated counter and skip all later observations rather than wrapping it.
+    let ordinal = state
+        .next_observation
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+            value.checked_add(1)
+        })
+        .ok();
+    let Some(ordinal) = ordinal else {
+        return Ok(());
+    };
+    let value = crate::observer::observation(ordinal, scope, event, deliveries);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        state.observer.observe(value);
+    }));
+    Ok(())
 }
 
 fn dispatch_deliveries(

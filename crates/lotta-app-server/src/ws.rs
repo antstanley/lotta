@@ -19,7 +19,8 @@ pub use envelope::{EventIdGenerator, RandomEventIdGenerator, StampedRuntimeEvent
 pub use event::RuntimeEvent;
 pub use router::{
     ConnectionResponse, DeferredInput, EventDeliveryBatch, RouteAdmission, RouteOutput,
-    RouterEventSink, RuntimeRouter, lock_router, route_command,
+    RoutedEventBatch, RoutedEventBatches, RouterEventSink, RuntimeRouter, lock_router,
+    route_command,
 };
 pub use service::{
     RuntimeCommandService, RuntimeEventSink, UnsupportedRuntimeCommandService,

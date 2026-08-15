@@ -1,411 +1,16 @@
-//! Bounded loader, ordering assertions, and semantic comparator for reference traces.
-
-use crate::TestkitError;
-use crate::fixtures::FixtureLoader;
-use crate::fixtures::sha256::lowercase_hex;
-use chrono::DateTime;
-use lotta_domain::{BoundedJsonValue, BoundedVec};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::BTreeSet;
-use std::fmt as formatting;
-use uuid::Uuid;
-
-const RELIABILITY_COUNT: usize = 7;
-const INVARIANT_COUNT: usize = 6;
-const CASE_COUNT: usize = 8;
-const INVENTORY_COUNT: usize = 8;
-const SOURCE_FILES_COUNT: usize = 20;
-const SOURCE_REGIONS_COUNT: usize = 35;
-const SUPPORTING_MAX: usize = 12;
-const SEMANTIC_RULES_COUNT: usize = 5;
-/// Maximum frames retained in one reference trace.
-pub const TRACE_FRAMES_MAX: usize = 64;
-const TRACE_STRING_BYTES_MAX: usize = 512;
-const TRACE_AGGREGATE_BYTES_MAX: usize = 524_288;
-const SOURCE_COMMIT: &str = "300f923f16cc8eee50656d7da732902c1dea2b65";
-const BOUNDARY: &str = "pinned AppServerClient + pinned source-test scenario boundary";
-const PLACEHOLDER: &str = "<sanitized-trace>";
-const TRACE_NAMES: [&str; CASE_COUNT] = [
-    "queue",
-    "abort",
-    "disconnect",
-    "stale-lease",
-    "retry",
-    "idempotency",
-    "crash-recovery",
-    "vertical-slice",
-];
-const GENERATED_UUID_PATHS: [&str; 11] = [
-    "/wire/agent_id",
-    "/wire/conversation_id",
-    "/wire/runtime/agent_id",
-    "/wire/runtime/conversation_id",
-    "/wire/turn_id",
-    "/wire/run_id",
-    "/wire/delta/id",
-    "/wire/delta/tool_call_id",
-    "/wire/queue/*/id",
-    "/wire/loop_status/active_run_ids/*",
-    "/wire/loop_status/executing_tool_call_ids/*",
-];
-const TIMESTAMP_PATHS: [&str; 3] = [
-    "/wire/emitted_at",
-    "/wire/delta/date",
-    "/wire/queue/*/enqueued_at",
-];
-const INVARIANT_PROVENANCE: [(OrderingInvariant, &str, &str); INVARIANT_COUNT] = [
-    (
-        OrderingInvariant::IncreasingEventSeqPerConnection,
-        "src/websocket/listener/protocol-outbound.ts",
-        "emitProtocolV2Message",
-    ),
-    (
-        OrderingInvariant::InputAcceptedBeforeCausedEvents,
-        "src/websocket/listener/message-router.test.ts",
-        "test:preserves the acting user on a directly-owned input and deduplicates retries",
-    ),
-    (
-        OrderingInvariant::ToolStartBeforeMatchingToolEnd,
-        "src/websocket/listener/loop-state-executing-tools.test.ts",
-        "test:reuses the approval request message id for tool lifecycle rows",
-    ),
-    (
-        OrderingInvariant::TurnFinishedExactlyOnceAfterFinalStreamDelta,
-        "src/websocket/listener/turn-terminal-protocol.test.ts",
-        "test:finishListenerTurn emits exactly one correlated terminal event",
-    ),
-    (
-        OrderingInvariant::NoServerEventFromStaleLeaseAfterReplacement,
-        "src/websocket/listener/recovery-lease.test.ts",
-        "test:stale recovered tool execution emits nothing into a replacement run",
-    ),
-    (
-        OrderingInvariant::BroadcastDeliveryStableAscendingConnectionOrdinal,
-        "src/websocket/listener/protocol-outbound.test.ts",
-        "test:fans notifications out to subscribers and honors an explicit target",
-    ),
-];
-
-/// Exact compatibility reliability surfaces in specification order.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum ReliabilitySurface {
-    /// Queue transition behavior.
-    Queue,
-    /// Abort behavior.
-    Abort,
-    /// Disconnect cleanup and replay.
-    Disconnect,
-    /// Stale lease suppression.
-    StaleLease,
-    /// Retry lifecycle.
-    Retry,
-    /// Input admission idempotency.
-    Idempotency,
-    /// Crash recovery.
-    CrashRecovery,
-}
-impl ReliabilitySurface {
-    /// All seven surfaces independent of fixture metadata.
-    pub const ALL: [Self; RELIABILITY_COUNT] = [
-        Self::Queue,
-        Self::Abort,
-        Self::Disconnect,
-        Self::StaleLease,
-        Self::Retry,
-        Self::Idempotency,
-        Self::CrashRecovery,
-    ];
-}
-
-/// Six executable ordering requirements in specification order.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OrderingInvariant {
-    /// Event sequence increases per connection.
-    IncreasingEventSeqPerConnection,
-    /// Admission acknowledgement precedes caused events.
-    InputAcceptedBeforeCausedEvents,
-    /// Tool start precedes matching end.
-    ToolStartBeforeMatchingToolEnd,
-    /// One terminal follows the final delta.
-    TurnFinishedExactlyOnceAfterFinalStreamDelta,
-    /// A replaced lease emits no later event.
-    NoServerEventFromStaleLeaseAfterReplacement,
-    /// Broadcast delivery follows connection ordinal.
-    BroadcastDeliveryStableAscendingConnectionOrdinal,
-}
-impl OrderingInvariant {
-    /// Exact invariant list independent of index contents.
-    pub const ALL: [Self; INVARIANT_COUNT] = [
-        Self::IncreasingEventSeqPerConnection,
-        Self::InputAcceptedBeforeCausedEvents,
-        Self::ToolStartBeforeMatchingToolEnd,
-        Self::TurnFinishedExactlyOnceAfterFinalStreamDelta,
-        Self::NoServerEventFromStaleLeaseAfterReplacement,
-        Self::BroadcastDeliveryStableAscendingConnectionOrdinal,
-    ];
-}
-
-/// Direction of a trace observation.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FrameDirection {
-    /// Actual client command.
-    ClientToServer,
-    /// Actual server event or response.
-    ServerToClient,
-    /// Non-protocol lifecycle observation.
-    Lifecycle,
-}
-
-/// One bounded trace frame with protocol JSON isolated in `wire`.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct TraceFrame {
-    /// Exact zero-based index.
-    pub frame_index: usize,
-    /// Observation direction.
-    pub direction: FrameDirection,
-    /// Stable connection ordinal.
-    pub connection_ordinal: u32,
-    /// Sanitized client message causal identity.
-    pub caused_by: Option<String>,
-    /// Lease identity observation.
-    pub lease_id: Option<String>,
-    /// Whether the observed lease is current.
-    pub lease_current: Option<bool>,
-    /// Same-emission broadcast label.
-    pub broadcast_emission: Option<String>,
-    /// Actual protocol or lifecycle JSON.
-    pub wire: BoundedJsonValue,
-}
-
-/// One complete bounded reference trace.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct ReferenceTrace {
-    /// Trace schema version.
-    pub schema_version: u8,
-    /// Stable case name.
-    pub name: String,
-    /// Semantic case kind.
-    pub kind: String,
-    /// Source provenance.
-    pub provenance: Provenance,
-    /// Exact bounded supporting source provenance.
-    pub supporting_provenance: BoundedVec<Provenance, SUPPORTING_MAX>,
-    /// Actual command/message projection proving the client driver.
-    pub driver_proof: TraceDriverProof,
-    /// Ordered frames.
-    pub frames: BoundedVec<TraceFrame, TRACE_FRAMES_MAX>,
-}
-
-/// Indexed source-test provenance.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct Provenance {
-    /// Repository-relative source path.
-    pub path: String,
-    /// Test or operative symbol.
-    pub symbol: String,
-    /// Honest capture boundary.
-    pub capture_boundary: String,
-}
-
-/// One pinned source file.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct SourceFile {
-    /// Relative path.
-    pub path: String,
-    /// Whole-file SHA-256.
-    pub sha256: String,
-}
-/// One pinned operative source region.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct SourceRegion {
-    /// Relative path.
-    pub path: String,
-    /// Unique symbol.
-    pub symbol: String,
-    /// Balanced lexical region SHA-256.
-    pub sha256: String,
-}
-/// Source provenance for one invariant.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct InvariantProvenance {
-    /// Ordering invariant justified by this source.
-    pub invariant: OrderingInvariant,
-    /// Source file path.
-    pub path: String,
-    /// Exact operative symbol.
-    pub symbol: String,
-}
-/// One fixed semantic path rule.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct SemanticRule {
-    /// Rule identifier.
-    pub rule: String,
-    /// Exact paths covered by the rule.
-    pub paths: BoundedVec<String, 12>,
-}
-/// One indexed trace case.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct TraceCase {
-    /// Case name.
-    pub name: String,
-    /// Fixture path.
-    pub path: String,
-    /// Semantic kind.
-    pub kind: String,
-    /// Source provenance.
-    pub provenance: Provenance,
-    /// Exact bounded supporting provenance copied from the trace.
-    pub supporting_provenance: BoundedVec<Provenance, SUPPORTING_MAX>,
-    /// Exact projection copied from the trace.
-    pub driver_proof: TraceDriverProof,
-}
-/// One corpus inventory entry.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct InventoryEntry {
-    /// Relative path.
-    pub path: String,
-    /// Parser kind.
-    pub kind: String,
-    /// Exact bytes.
-    pub bytes: usize,
-    /// Exact SHA-256.
-    pub sha256: String,
-}
-/// Bounded proof projected from actual trace directions.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct TraceDriverProof {
-    /// Actual client-to-server wire discriminants in frame order.
-    pub command_types: BoundedVec<String, TRACE_FRAMES_MAX>,
-    /// Actual server-to-client wire discriminants in frame order.
-    pub message_types: BoundedVec<String, TRACE_FRAMES_MAX>,
-}
-/// Complete fixed-shape corpus index.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct ReferenceTraceIndex {
-    /// Schema version.
-    pub schema_version: u8,
-    /// Pinned source commit.
-    pub source_commit: String,
-    /// Generator path.
-    pub generator: String,
-    /// Capture boundary.
-    pub capture_boundary: String,
-    /// Explicit non-live boundary detail.
-    pub boundary_detail: String,
-    /// Exact pinned files.
-    pub source_files: [SourceFile; SOURCE_FILES_COUNT],
-    /// Exact operative regions.
-    pub source_regions: BoundedVec<SourceRegion, SOURCE_REGIONS_COUNT>,
-    /// Exact surfaces.
-    pub reliability_surfaces: [ReliabilitySurface; RELIABILITY_COUNT],
-    /// Exact invariants.
-    pub ordering_invariants: [OrderingInvariant; INVARIANT_COUNT],
-    /// Exact source provenance for each invariant.
-    pub invariant_provenance: [InvariantProvenance; INVARIANT_COUNT],
-    /// Exact semantic path table.
-    pub semantic_rules: [SemanticRule; SEMANTIC_RULES_COUNT],
-    /// Exact cases.
-    pub cases: [TraceCase; CASE_COUNT],
-    /// Exact trace inventory.
-    pub inventory: [InventoryEntry; INVENTORY_COUNT],
-}
-
-/// Bounded frame summary in a typed invariant report.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FrameSummary {
-    /// Zero-based frame index.
-    pub index: usize,
-    /// Wire discriminant.
-    pub frame_type: String,
-    /// Connection ordinal.
-    pub connection_ordinal: u32,
-}
-/// One typed ordering invariant failure.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TraceInvariantViolation {
-    /// Failed invariant.
-    pub invariant: OrderingInvariant,
-    /// First offending frame.
-    pub first_frame: FrameSummary,
-    /// Second offending frame, absent only when a counterpart is missing.
-    pub second_frame: Option<FrameSummary>,
-}
-impl formatting::Display for TraceInvariantViolation {
-    fn fmt(&self, formatter: &mut formatting::Formatter<'_>) -> formatting::Result {
-        std::write!(
-            formatter,
-            "trace invariant {:?} failed at {}:{}:{}",
-            self.invariant,
-            self.first_frame.index,
-            self.first_frame.frame_type,
-            self.first_frame.connection_ordinal
-        )?;
-        if let Some(second) = &self.second_frame {
-            std::write!(
-                formatter,
-                " and {}:{}:{}",
-                second.index,
-                second.frame_type,
-                second.connection_ordinal
-            )?;
-        }
-        Ok(())
-    }
-}
-impl std::error::Error for TraceInvariantViolation {}
-
-/// First semantic mismatch after both traces pass validation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SemanticDivergence {
-    /// Exact frame index.
-    pub frame_index: usize,
-    /// JSON pointer-like path.
-    pub path: String,
-    /// Bounded expected summary.
-    pub expected: String,
-    /// Bounded actual summary.
-    pub actual: String,
-}
-/// Comparator failure precedence: ordering before semantic divergence.
-#[derive(Debug)]
-pub enum TraceComparisonError {
-    /// Ordering or metadata validation failed.
-    Ordering(TraceInvariantViolation),
-    /// First semantic divergence.
-    Semantic(SemanticDivergence),
-}
-impl formatting::Display for TraceComparisonError {
-    fn fmt(&self, formatter: &mut formatting::Formatter<'_>) -> formatting::Result {
-        match self {
-            Self::Ordering(value) => value.fmt(formatter),
-            Self::Semantic(value) => std::write!(
-                formatter,
-                "semantic divergence at frame {} {}",
-                value.frame_index,
-                value.path
-            ),
-        }
-    }
-}
-impl std::error::Error for TraceComparisonError {}
-
-/// Corpus loading and validation error.
-#[derive(Debug, thiserror::Error)]
-pub enum ReferenceTraceError {
-    /// Generic fixture loader error.
-    #[error("reference trace fixture load failed")]
-    Fixture(#[from] TestkitError),
-    /// Corpus metadata, integrity, or sanitization failure.
-    #[error("reference trace corpus validation failed: {0}")]
-    Invalid(&'static str),
-    /// Ordering validation failure.
-    #[error(transparent)]
-    Ordering(#[from] TraceInvariantViolation),
-}
+#[cfg(test)]
+use super::INVENTORY_COUNT;
+use super::{
+    BOUNDARY, BTreeSet, BoundedJsonValue, BoundedVec, CASE_COUNT, DERIVED_COUNT, DERIVED_KIND,
+    DERIVED_NAME, DERIVED_PATH, DERIVED_PROJECTION, DERIVED_SOURCE, DERIVED_SOURCE_INDICES,
+    DateTime, DerivedTraceCase, FixtureLoader, FrameDirection, FrameSummary, GENERATED_UUID_PATHS,
+    INVARIANT_PROVENANCE, OrderingInvariant, PLACEHOLDER, ReferenceTrace, ReferenceTraceError,
+    ReferenceTraceIndex, ReliabilitySurface, SOURCE_COMMIT, SOURCE_FILES_COUNT,
+    SOURCE_REGIONS_COUNT, SemanticDivergence, SourceFile, SourceRegion, TIMESTAMP_PATHS,
+    TRACE_AGGREGATE_BYTES_MAX, TRACE_FRAMES_MAX, TRACE_NAMES, TRACE_STRING_BYTES_MAX, TraceCase,
+    TraceComparisonError, TraceDriverProof, TraceFrame, TraceInvariantViolation, Uuid, Value,
+    formatting, lowercase_hex,
+};
 
 fn reject_duplicate_json_keys(bytes: &[u8]) -> Result<(), ReferenceTraceError> {
     struct Seed;
@@ -503,16 +108,86 @@ pub fn load_all() -> Result<(ReferenceTraceIndex, [ReferenceTrace; 8]), Referenc
         .map(|traces| (index, traces))
 }
 
-/// Loads and validates one named trace.
+/// Loads and validates the corpus index and returns one derived declaration.
 ///
 /// # Errors
-/// Returns a bounded typed error when the name or trace is invalid.
+/// Returns a bounded typed error when the corpus or derived name is invalid.
+pub fn load_derived_case(name: &str) -> Result<DerivedTraceCase, ReferenceTraceError> {
+    let (index, _) = load_all()?;
+    index
+        .derived_cases
+        .iter()
+        .find(|case| case.name == name)
+        .cloned()
+        .ok_or(ReferenceTraceError::Invalid("unknown derived trace"))
+}
+
+/// Applies a validated declarative derived case to its canonical source trace.
+///
+/// # Errors
+/// Returns a bounded typed error if source identity or declared transforms do not resolve.
+pub fn project_derived_trace(
+    source: &ReferenceTrace,
+    case: &DerivedTraceCase,
+) -> Result<ReferenceTrace, ReferenceTraceError> {
+    validate_projection(case, source.frames.len())?;
+    let mut frames = Vec::new();
+    frames
+        .try_reserve_exact(case.projection_declaration.source_frame_indices.len())
+        .map_err(|_| ReferenceTraceError::Invalid("projection allocation"))?;
+    for source_index in case.projection_declaration.source_frame_indices.as_slice() {
+        let mut frame = source
+            .frames
+            .as_slice()
+            .get(*source_index)
+            .cloned()
+            .ok_or(ReferenceTraceError::Invalid("projection source index"))?;
+        apply_projection_frame(case, *source_index, &mut frame)?;
+        frames.push(frame);
+    }
+    if case.projection_declaration.renumber_frame_indices {
+        for (index, frame) in frames.iter_mut().enumerate() {
+            frame.frame_index = index;
+        }
+    }
+    let mut trace = source.clone();
+    trace.name.clone_from(&case.name);
+    trace.kind.clone_from(&case.kind);
+    trace.frames = BoundedVec::new(frames)
+        .map_err(|_| ReferenceTraceError::Invalid("projection frame bound"))?;
+    trace.driver_proof = driver_proof(&trace.frames)?;
+    assert_ordering(&trace)?;
+    Ok(trace)
+}
+
+/// Loads and validates one named authoritative or derived trace.
+///
+/// # Errors
+/// Returns a bounded typed error when the corpus, name, or trace is invalid.
 pub fn load_trace(name: &str) -> Result<ReferenceTrace, ReferenceTraceError> {
-    let (_, traces) = load_all()?;
-    traces
-        .into_iter()
-        .find(|trace| trace.name == name)
-        .ok_or(ReferenceTraceError::Invalid("unknown trace"))
+    let (index, traces) = load_all()?;
+    if let Some(trace) = traces.into_iter().find(|trace| trace.name == name) {
+        return Ok(trace);
+    }
+    let loader = FixtureLoader::new();
+    let record = index
+        .derived_cases
+        .iter()
+        .find(|case| case.name == name)
+        .ok_or(ReferenceTraceError::Invalid("unknown trace"))?;
+    load_validated_trace(&loader, &record.path)
+}
+
+fn load_validated_trace(
+    loader: &FixtureLoader,
+    path: &str,
+) -> Result<ReferenceTrace, ReferenceTraceError> {
+    let bytes = loader.load_bytes(format!("reference-traces/{path}"))?;
+    reject_duplicate_json_keys(&bytes)?;
+    let trace =
+        serde_json::from_slice(&bytes).map_err(|_| ReferenceTraceError::Invalid("trace JSON"))?;
+    validate_trace(&trace)?;
+    Ok(trace)
 }
 
 fn validate_index(
@@ -531,12 +206,14 @@ fn validate_index(
     let tree = loader.list_tree("reference-traces")?;
     let mut expected = std::iter::once("index.json".to_owned())
         .chain(index.inventory.iter().map(|entry| entry.path.clone()))
+        .chain(index.derived_cases.iter().map(|entry| entry.path.clone()))
         .collect::<Vec<_>>();
     expected.sort();
-    if tree != expected || tree.len() != CASE_COUNT + 1 {
+    if tree != expected || tree.len() != CASE_COUNT + DERIVED_COUNT + 1 {
         return Err(ReferenceTraceError::Invalid("exact tree"));
     }
     validate_inventory(loader, index)?;
+    validate_derived_cases(loader, index)?;
     validate_provenance(index)?;
     validate_rule_table(index)?;
     validate_sanitization(loader, &tree)
@@ -634,6 +311,145 @@ fn validate_inventory(
             return Err(ReferenceTraceError::Invalid("inventory integrity"));
         }
         previous = &entry.path;
+    }
+    Ok(())
+}
+
+fn apply_projection_frame(
+    case: &DerivedTraceCase,
+    source_index: usize,
+    frame: &mut TraceFrame,
+) -> Result<(), ReferenceTraceError> {
+    for projection in case
+        .projection_declaration
+        .subscriber_projections
+        .as_slice()
+    {
+        if projection.source_frame_index == source_index {
+            let mut wire = frame.wire.as_value().clone();
+            wire["subscriber_ordinals"] = serde_json::to_value(&projection.subscriber_ordinals)
+                .map_err(|_| ReferenceTraceError::Invalid("subscriber projection"))?;
+            frame.wire = BoundedJsonValue::new(wire)
+                .map_err(|_| ReferenceTraceError::Invalid("subscriber projection"))?;
+        }
+    }
+    for relabel in case.projection_declaration.emission_relabels.as_slice() {
+        let from = format!("emission-{}", relabel.from);
+        let to = format!("emission-{}", relabel.to);
+        if frame.broadcast_emission.as_deref() == Some(from.as_str()) {
+            frame.broadcast_emission = Some(to.clone());
+        }
+        if frame.wire.as_value()["type"] == "broadcast_begin"
+            && frame.wire.as_value()["emission"] == from
+        {
+            let mut wire = frame.wire.as_value().clone();
+            wire["emission"] = Value::String(to);
+            frame.wire = BoundedJsonValue::new(wire)
+                .map_err(|_| ReferenceTraceError::Invalid("emission projection"))?;
+        }
+    }
+    Ok(())
+}
+
+fn driver_proof(
+    frames: &BoundedVec<TraceFrame, TRACE_FRAMES_MAX>,
+) -> Result<TraceDriverProof, ReferenceTraceError> {
+    let types = |direction| {
+        frames
+            .as_slice()
+            .iter()
+            .filter_map(|frame| {
+                (frame.direction == direction)
+                    .then(|| frame.wire.as_value()["type"].as_str().map(str::to_owned))
+                    .flatten()
+            })
+            .collect()
+    };
+    Ok(TraceDriverProof {
+        command_types: BoundedVec::new(types(FrameDirection::ClientToServer))
+            .map_err(|_| ReferenceTraceError::Invalid("projection command proof"))?,
+        message_types: BoundedVec::new(types(FrameDirection::ServerToClient))
+            .map_err(|_| ReferenceTraceError::Invalid("projection message proof"))?,
+    })
+}
+
+fn validate_projection(
+    case: &DerivedTraceCase,
+    source_len: usize,
+) -> Result<(), ReferenceTraceError> {
+    let declaration = &case.projection_declaration;
+    if declaration.source_frame_indices.as_slice() != DERIVED_SOURCE_INDICES
+        || !declaration.renumber_frame_indices
+        || declaration.subscriber_projections.len() != 1
+        || declaration.emission_relabels.len() != 1
+    {
+        return Err(ReferenceTraceError::Invalid(
+            "derived projection declaration",
+        ));
+    }
+    let subscriber = &declaration.subscriber_projections.as_slice()[0];
+    let relabel = &declaration.emission_relabels.as_slice()[0];
+    if subscriber.source_frame_index != 30
+        || subscriber.subscriber_ordinals.as_slice() != [1]
+        || relabel.from != 9
+        || relabel.to != 5
+        || declaration
+            .source_frame_indices
+            .as_slice()
+            .iter()
+            .any(|index| *index >= source_len)
+    {
+        return Err(ReferenceTraceError::Invalid("derived projection mapping"));
+    }
+    Ok(())
+}
+
+fn validate_derived_cases(
+    loader: &FixtureLoader,
+    index: &ReferenceTraceIndex,
+) -> Result<(), ReferenceTraceError> {
+    let mut previous = "";
+    for case in &index.derived_cases {
+        let source = index
+            .cases
+            .iter()
+            .find(|source| source.path == case.derived_from);
+        if case.path.as_str() <= previous
+            || case.name != DERIVED_NAME
+            || case.path != DERIVED_PATH
+            || case.kind != DERIVED_KIND
+            || case.derived_from != DERIVED_SOURCE
+            || case.projection != DERIVED_PROJECTION
+            || case.projection.is_empty()
+            || source.is_none()
+        {
+            return Err(ReferenceTraceError::Invalid("derived metadata"));
+        }
+        let source_record = source.ok_or(ReferenceTraceError::Invalid("derived source"))?;
+        let source_trace = load_validated_trace(loader, &source_record.path)?;
+        validate_projection(case, source_trace.frames.len())?;
+        let bytes = loader.load_bytes(format!("reference-traces/{}", case.path))?;
+        if bytes.len() != case.bytes || lowercase_hex(&bytes) != case.sha256 {
+            return Err(ReferenceTraceError::Invalid("derived integrity"));
+        }
+        let trace = load_validated_trace(loader, &case.path)?;
+        let source = source_record;
+        if trace.name != case.name
+            || trace.kind != case.kind
+            || trace.provenance.path != source.provenance.path
+            || trace.provenance.capture_boundary != source.provenance.capture_boundary
+            || trace.supporting_provenance != source.supporting_provenance
+        {
+            return Err(ReferenceTraceError::Invalid(
+                "derived identity or authority",
+            ));
+        }
+        assert_ordering(&trace)?;
+        let projected = project_derived_trace(&source_trace, case)?;
+        if projected.frames != trace.frames || projected.driver_proof != trace.driver_proof {
+            return Err(ReferenceTraceError::Invalid("derived projection output"));
+        }
+        previous = &case.path;
     }
     Ok(())
 }
@@ -754,7 +570,7 @@ pub(crate) fn scan_sanitized_json(
 
 fn validate_trace(trace: &ReferenceTrace) -> Result<(), ReferenceTraceError> {
     if trace.schema_version != 1
-        || !TRACE_NAMES.contains(&trace.name.as_str())
+        || (!TRACE_NAMES.contains(&trace.name.as_str()) && trace.name != DERIVED_NAME)
         || trace.provenance.capture_boundary != BOUNDARY
         || trace.frames.is_empty()
     {
@@ -885,7 +701,7 @@ fn validate_idempotency_keys(trace: &ReferenceTrace) -> Result<(), ReferenceTrac
     Ok(())
 }
 
-#[path = "traces_ordering.rs"]
+#[path = "../traces_ordering.rs"]
 mod traces_ordering;
 pub use traces_ordering::{assert_invariant, assert_ordering, compare_semantic};
 use traces_ordering::{
@@ -897,7 +713,8 @@ use traces_ordering::{
 };
 
 #[cfg(test)]
+#[path = "tests/mod.rs"]
 mod tests;
 #[cfg(test)]
-#[path = "traces_authority_tests.rs"]
+#[path = "../traces_authority_tests.rs"]
 mod traces_authority_tests;

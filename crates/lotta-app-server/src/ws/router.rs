@@ -116,12 +116,27 @@ pub struct CreatedFlags {
     pub conversation: bool,
 }
 
+/// One bounded logical event route and its actual stamped deliveries.
+pub struct RoutedEventBatch {
+    /// Runtime scope supplied to routing, retained even with no subscribers.
+    pub scope: RuntimeScope,
+    /// Actual logical event before stamping.
+    pub event: RuntimeEvent,
+    /// Stamped deliveries in stable target order, possibly empty.
+    pub deliveries: EventDeliveryBatch,
+}
+
+/// Maximum logical event batches produced by one route.
+pub const WS_RUNTIME_ROUTED_EVENT_BATCHES_MAX: usize = super::service::WS_RUNTIME_ROUTE_EVENTS_MAX;
+/// Bounded logical event batches produced by one route.
+pub type RoutedEventBatches = BoundedVec<RoutedEventBatch, WS_RUNTIME_ROUTED_EVENT_BATCHES_MAX>;
+
 /// One bounded ordered routing result.
 pub struct RouteOutput {
     /// Targeted connection responses.
     pub responses: ConnectionResponseBatch,
-    /// Broadcast deliveries in stable target order.
-    pub deliveries: EventDeliveryBatch,
+    /// Logical events paired with their stamped deliveries.
+    pub event_batches: RoutedEventBatches,
 }
 
 /// Deferred phase-two input work returned after admission application.
@@ -302,29 +317,27 @@ impl RuntimeRouter {
         runtime: &RuntimeScope,
         events: &RuntimeEventBatch,
     ) -> Result<RouteOutput, crate::error::AppServerError> {
-        let mut deliveries = Vec::new();
+        let mut batches = Vec::new();
+        batches
+            .try_reserve_exact(events.len())
+            .map_err(|_| crate::error::AppServerError::Unavailable)?;
         for event in events.as_slice() {
-            let next = self.connections.broadcast(
+            let deliveries = self.connections.broadcast(
                 runtime,
                 event,
                 self.clock.as_ref(),
                 self.ids.as_ref(),
             )?;
-            let total = deliveries
-                .len()
-                .checked_add(next.len())
-                .ok_or(crate::error::AppServerError::PayloadTooLarge)?;
-            if total > WS_RUNTIME_ROUTE_DELIVERIES_MAX {
-                return Err(crate::error::AppServerError::PayloadTooLarge);
-            }
-            deliveries
-                .try_reserve(next.len())
-                .map_err(|_| crate::error::AppServerError::Unavailable)?;
-            deliveries.extend(next);
+            batches.push(RoutedEventBatch {
+                scope: runtime.clone(),
+                event: event.clone(),
+                deliveries: bounded_deliveries(deliveries)?,
+            });
         }
         Ok(RouteOutput {
             responses: bounded_responses(response)?,
-            deliveries: bounded_deliveries(deliveries)?,
+            event_batches: BoundedVec::new(batches)
+                .map_err(|_| crate::error::AppServerError::PayloadTooLarge)?,
         })
     }
 }
@@ -355,7 +368,8 @@ fn empty_output(
 ) -> Result<RouteOutput, crate::error::AppServerError> {
     Ok(RouteOutput {
         responses: bounded_responses(response)?,
-        deliveries: bounded_deliveries(Vec::new())?,
+        event_batches: BoundedVec::new(Vec::new())
+            .map_err(|_| crate::error::AppServerError::PayloadTooLarge)?,
     })
 }
 
@@ -419,8 +433,15 @@ pub fn lock_router(
 /// Mutex-backed sink that stamps events under only a brief synchronous lock.
 pub struct RouterEventSink {
     router: Arc<Mutex<RuntimeRouter>>,
-    dispatch:
-        Arc<dyn Fn(EventDeliveryBatch) -> Result<(), crate::error::AppServerError> + Send + Sync>,
+    dispatch: Arc<
+        dyn Fn(
+                RuntimeScope,
+                RuntimeEvent,
+                EventDeliveryBatch,
+            ) -> Result<(), crate::error::AppServerError>
+            + Send
+            + Sync,
+    >,
 }
 
 impl RouterEventSink {
@@ -429,7 +450,13 @@ impl RouterEventSink {
     pub fn new(
         router: Arc<Mutex<RuntimeRouter>>,
         dispatch: Arc<
-            dyn Fn(EventDeliveryBatch) -> Result<(), crate::error::AppServerError> + Send + Sync,
+            dyn Fn(
+                    RuntimeScope,
+                    RuntimeEvent,
+                    EventDeliveryBatch,
+                ) -> Result<(), crate::error::AppServerError>
+                + Send
+                + Sync,
         >,
     ) -> Self {
         Self { router, dispatch }
@@ -443,6 +470,6 @@ impl RuntimeEventSink for RouterEventSink {
         event: RuntimeEvent,
     ) -> Result<(), crate::error::AppServerError> {
         let deliveries = lock_router(&self.router)?.broadcast(scope, &event)?;
-        (self.dispatch)(deliveries)
+        (self.dispatch)(scope.clone(), event, deliveries)
     }
 }

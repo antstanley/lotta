@@ -1,0 +1,206 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, atomic::AtomicU64};
+
+use lotta_domain::{
+    AgentId, BoundedJsonValue, BoundedVec, Clock, ConversationId, DomainError, RuntimeScope,
+    Timestamp,
+};
+use serde_json::{Value, json};
+use tokio::sync::mpsc;
+
+use super::{ListenerState, SocketLimits, dispatch_output, event_sink};
+use crate::auth::AuthPolicy;
+use crate::observer::{RuntimeBroadcastObservation, RuntimeBroadcastObserver};
+use crate::ws::{
+    RandomEventIdGenerator, RouteOutput, RoutedEventBatch, RuntimeEvent, RuntimeRouter,
+    UnsupportedRuntimeCommandService,
+};
+
+const OBSERVATIONS_MAX: usize = 4;
+type Observations = BoundedVec<RuntimeBroadcastObservation, OBSERVATIONS_MAX>;
+
+struct RecordingObserver {
+    observations: Mutex<Observations>,
+}
+
+impl RecordingObserver {
+    fn new() -> Self {
+        Self {
+            observations: Mutex::new(BoundedVec::new(Vec::new()).unwrap()),
+        }
+    }
+
+    fn values(&self) -> Observations {
+        self.observations.lock().unwrap().clone()
+    }
+}
+
+impl RuntimeBroadcastObserver for RecordingObserver {
+    fn observe(&self, observation: RuntimeBroadcastObservation) {
+        let mut observations = self.observations.lock().unwrap();
+        let mut values = observations.as_slice().to_vec();
+        values.push(observation);
+        *observations = BoundedVec::new(values).unwrap();
+    }
+}
+
+struct TestClock;
+impl Clock for TestClock {
+    fn now(&self) -> Timestamp {
+        Timestamp::parse_persisted_rfc3339("2026-08-14T12:34:56Z").unwrap()
+    }
+
+    fn parse_timestamp(&self, value: &str) -> Result<Timestamp, DomainError> {
+        Timestamp::parse_persisted_rfc3339(value)
+    }
+}
+
+struct PanickingObserver;
+impl RuntimeBroadcastObserver for PanickingObserver {
+    fn observe(&self, _: RuntimeBroadcastObservation) {
+        panic!("observer panic");
+    }
+}
+
+fn scope(index: usize) -> RuntimeScope {
+    RuntimeScope::new(
+        AgentId::accept(format!("agent-{index}")).unwrap(),
+        ConversationId::accept(format!("conversation-{index}")).unwrap(),
+        None,
+    )
+}
+
+fn event(name: &str) -> RuntimeEvent {
+    RuntimeEvent::UpdateLoopStatus {
+        loop_status: BoundedJsonValue::new(json!({"status": name})).unwrap(),
+    }
+}
+
+fn state(
+    observer: Arc<dyn RuntimeBroadcastObserver>,
+    subscribed: bool,
+) -> (Arc<ListenerState>, u64, mpsc::Receiver<String>) {
+    let clock: Arc<dyn Clock + Send + Sync> = Arc::new(TestClock);
+    let mut router = RuntimeRouter::new(clock.clone(), Arc::new(RandomEventIdGenerator));
+    let id = router.connections.open().unwrap();
+    router.connections.initialize(id).unwrap();
+    if subscribed {
+        router.connections.subscribe(id, scope(1)).unwrap();
+    }
+    let (sender, receiver) = mpsc::channel(4);
+    let mut outbound = HashMap::new();
+    outbound.insert(id, sender);
+    let state = Arc::new(ListenerState {
+        auth: AuthPolicy::None,
+        clock,
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        limits: SocketLimits::default(),
+        runtime_router: Arc::new(Mutex::new(router)),
+        runtime_service: Arc::new(UnsupportedRuntimeCommandService),
+        observer,
+        next_observation: AtomicU64::new(1),
+        outbound: Arc::new(Mutex::new(outbound)),
+    });
+    (state, id, receiver)
+}
+
+fn output(state: &ListenerState, event: RuntimeEvent) -> RouteOutput {
+    let scope = scope(1);
+    let deliveries = state
+        .runtime_router
+        .lock()
+        .unwrap()
+        .broadcast(&scope, &event)
+        .unwrap();
+    RouteOutput {
+        responses: BoundedVec::new(Vec::new()).unwrap(),
+        event_batches: BoundedVec::new(vec![RoutedEventBatch {
+            scope,
+            event,
+            deliveries,
+        }])
+        .unwrap(),
+    }
+}
+
+fn wire(value: &str) -> Value {
+    serde_json::from_str(value).unwrap()
+}
+
+#[tokio::test]
+async fn initial_route_output_queues_exact_frame_and_observes_actual_batch() {
+    let observer = Arc::new(RecordingObserver::new());
+    let (state, id, mut receiver) = state(observer.clone(), true);
+    let logical = event("INITIAL");
+    dispatch_output(&state, id, &output(&state, logical.clone())).unwrap();
+    let queued = wire(&receiver.recv().await.unwrap());
+    let values = observer.values();
+    let record = &values.as_slice()[0];
+    assert_eq!(record.batch_ordinal, 1);
+    assert_eq!(record.scope, scope(1));
+    assert_eq!(
+        serde_json::to_value(&record.event).unwrap(),
+        serde_json::to_value(logical).unwrap()
+    );
+    assert_eq!(record.deliveries.len(), 1);
+    let delivery = &record.deliveries.as_slice()[0];
+    assert_eq!(delivery.connection_id, id);
+    assert_eq!(delivery.ordinal, 1);
+    assert_eq!(serde_json::to_value(&delivery.frame).unwrap(), queued);
+}
+
+#[tokio::test]
+async fn continuation_sink_records_next_batch_and_queues_exact_frame() {
+    let observer = Arc::new(RecordingObserver::new());
+    let (state, id, mut receiver) = state(observer.clone(), true);
+    dispatch_output(&state, id, &output(&state, event("INITIAL"))).unwrap();
+    let _ = receiver.recv().await.unwrap();
+    event_sink(&state)
+        .emit(&scope(1), event("CONTINUATION"))
+        .unwrap();
+    let queued = wire(&receiver.recv().await.unwrap());
+    let values = observer.values();
+    assert_eq!(values.len(), 2);
+    let record = &values.as_slice()[1];
+    assert_eq!(record.batch_ordinal, 2);
+    assert_eq!(record.deliveries.as_slice()[0].ordinal, 1);
+    assert_eq!(
+        serde_json::to_value(&record.deliveries.as_slice()[0].frame).unwrap(),
+        queued
+    );
+}
+
+#[test]
+fn zero_subscriber_dispatch_observes_actual_empty_batch() {
+    let observer = Arc::new(RecordingObserver::new());
+    let (state, id, _) = state(observer.clone(), false);
+    let logical = event("EMPTY");
+    dispatch_output(&state, id, &output(&state, logical.clone())).unwrap();
+    let values = observer.values();
+    let record = &values.as_slice()[0];
+    assert_eq!(record.scope, scope(1));
+    assert_eq!(
+        serde_json::to_value(&record.event).unwrap(),
+        serde_json::to_value(logical).unwrap()
+    );
+    assert!(record.deliveries.is_empty());
+}
+
+#[tokio::test]
+async fn panicking_observer_cannot_change_dispatch_or_delivery() {
+    let (state, id, mut receiver) = state(Arc::new(PanickingObserver), true);
+    assert!(dispatch_output(&state, id, &output(&state, event("PANIC"))).is_ok());
+    let queued = wire(&receiver.recv().await.unwrap());
+    assert_eq!(queued["type"], "update_loop_status");
+}
+
+#[test]
+fn exhausted_observation_ordinal_skips_observer_after_dispatch() {
+    let observer = Arc::new(RecordingObserver::new());
+    let (state, id, _) = state(observer.clone(), false);
+    state
+        .next_observation
+        .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+    assert!(dispatch_output(&state, id, &output(&state, event("SATURATED"))).is_ok());
+    assert!(observer.values().is_empty());
+}

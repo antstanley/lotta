@@ -26,7 +26,7 @@ pub enum TurnEvent {
 }
 
 /// Synchronous actor-local effects applied only after a live lease check.
-pub trait TurnEffectPort {
+pub trait TurnEffectPort: Send + Sync {
     /// Persists one bounded projection.
     ///
     /// # Errors

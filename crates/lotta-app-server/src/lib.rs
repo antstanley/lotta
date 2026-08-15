@@ -24,5 +24,7 @@ pub mod heartbeat;
 pub mod http_body;
 /// Axum listener lifecycle.
 pub mod listener;
+/// Read-only Runtime broadcast dispatch observation.
+pub mod observer;
 /// Typed bounded Runtime WebSocket routing.
 pub mod ws;
