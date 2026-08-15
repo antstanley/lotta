@@ -33,6 +33,10 @@ jobs:
           node tools/extract-persistence-fixtures.mjs --self-test
           node --check tools/capture-provider-streams.mjs
           node tools/capture-provider-streams.mjs --self-test
+          node --check tools/capture-reference-traces-data.mjs
+          node --check tools/capture-reference-traces-scenarios.mjs
+          node --check tools/capture-reference-traces.mjs
+          node tools/capture-reference-traces.mjs --self-test
       - name: Check fixtures twice without writing
         run: |
           node tools/extract-protocol-fixture.mjs --source letta-code --check
@@ -41,9 +45,12 @@ jobs:
           node tools/extract-persistence-fixtures.mjs --source letta-code --check
           node tools/capture-provider-streams.mjs --source letta-code --check
           node tools/capture-provider-streams.mjs --source letta-code --check
+          node tools/capture-reference-traces.mjs --source letta-code --check
+          node tools/capture-reference-traces.mjs --source letta-code --check
           git diff --exit-code -- fixtures/protocol/discriminants.json
           git diff --exit-code -- fixtures/persistence
           git diff --exit-code -- fixtures/providers
+          git diff --exit-code -- fixtures/reference-traces
 
   quality:
     name: ${{ matrix.gate }}

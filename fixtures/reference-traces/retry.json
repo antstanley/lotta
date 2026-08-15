@@ -1,0 +1,261 @@
+{
+  "schema_version": 1,
+  "name": "retry",
+  "kind": "retry",
+  "provenance": {
+    "path": "src/websocket/listener/cloud-retry-message.test.ts",
+    "symbol": "test:normalizes Cloud retry metadata into the listener protocol",
+    "capture_boundary": "pinned AppServerClient + pinned source-test scenario boundary"
+  },
+  "supporting_provenance": [
+    {
+      "path": "src/websocket/listener/turn-terminal-protocol.test.ts",
+      "symbol": "test:finishListenerTurn emits exactly one correlated terminal event",
+      "capture_boundary": "pinned AppServerClient + pinned source-test scenario boundary"
+    }
+  ],
+  "driver_proof": {
+    "command_types": [
+      "runtime_start",
+      "input"
+    ],
+    "message_types": [
+      "runtime_start_response",
+      "input_accepted",
+      "stream_delta",
+      "stream_delta",
+      "turn_finished"
+    ]
+  },
+  "frames": [
+    {
+      "frame_index": 0,
+      "direction": "lifecycle",
+      "connection_ordinal": 1,
+      "wire": {
+        "type": "open"
+      }
+    },
+    {
+      "frame_index": 1,
+      "direction": "client_to_server",
+      "connection_ordinal": 1,
+      "wire": {
+        "type": "runtime_start",
+        "request_id": "request-runtime-1",
+        "agent_id": "00000000-0000-4000-8000-000000000001",
+        "conversation_id": "00000000-0000-4000-8000-000000000002"
+      }
+    },
+    {
+      "frame_index": 2,
+      "direction": "server_to_client",
+      "connection_ordinal": 1,
+      "wire": {
+        "type": "runtime_start_response",
+        "request_id": "request-runtime-1",
+        "success": true,
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "agent": null,
+        "conversation": null,
+        "created": {
+          "agent": false,
+          "conversation": false
+        }
+      }
+    },
+    {
+      "frame_index": 3,
+      "direction": "client_to_server",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-retry",
+      "wire": {
+        "type": "input",
+        "request_id": "request-retry",
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "payload": {
+          "kind": "create_message",
+          "messages": [
+            {
+              "role": "user",
+              "content": "<sanitized-trace>",
+              "client_message_id": "client-message-retry"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "frame_index": 4,
+      "direction": "server_to_client",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-retry",
+      "wire": {
+        "type": "input_accepted",
+        "request_id": "request-retry",
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "accepted": true,
+        "disposition": "started"
+      }
+    },
+    {
+      "frame_index": 5,
+      "direction": "lifecycle",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-retry",
+      "lease_id": "lease-retry",
+      "wire": {
+        "type": "turn_started",
+        "caused_by": "client-message-retry",
+        "lease_id": "lease-retry"
+      }
+    },
+    {
+      "frame_index": 6,
+      "direction": "lifecycle",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-retry",
+      "lease_id": "lease-retry",
+      "wire": {
+        "type": "lease_acquired",
+        "lease_id": "lease-retry",
+        "caused_by": "client-message-retry"
+      }
+    },
+    {
+      "frame_index": 7,
+      "direction": "lifecycle",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-retry",
+      "lease_id": "lease-retry",
+      "wire": {
+        "type": "broadcast_begin",
+        "emission": "emission-1",
+        "message_type": "stream_delta",
+        "subscriber_ordinals": [
+          1
+        ],
+        "payload_sha256": "6496f5da784f68ac8027a43326a15550ec8bd8fde4afe1a35804d6727641b394"
+      }
+    },
+    {
+      "frame_index": 8,
+      "direction": "server_to_client",
+      "connection_ordinal": 1,
+      "broadcast_emission": "emission-1",
+      "caused_by": "client-message-retry",
+      "lease_id": "lease-retry",
+      "lease_current": true,
+      "wire": {
+        "type": "stream_delta",
+        "delta": {
+          "id": "00000000-0000-4000-8000-000000000017",
+          "date": "2000-01-01T00:00:07.000Z",
+          "message_type": "retry",
+          "message": "<sanitized-trace>",
+          "reason": "api_error",
+          "attempt": 1,
+          "max_attempts": 3,
+          "delay_ms": 250,
+          "retry_kind": "provider_retry"
+        },
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "event_seq": 1,
+        "emitted_at": "2000-01-01T00:00:01.000Z",
+        "idempotency_key": "stream_delta:1:00000000-0000-4000-8000-000000000102"
+      }
+    },
+    {
+      "frame_index": 9,
+      "direction": "lifecycle",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-retry",
+      "lease_id": "lease-retry",
+      "wire": {
+        "type": "broadcast_begin",
+        "emission": "emission-2",
+        "message_type": "stream_delta",
+        "subscriber_ordinals": [
+          1
+        ],
+        "payload_sha256": "3492a8551210757de0f829aec8f8c25ba87c3c58501217ee53737e2c07034efd"
+      }
+    },
+    {
+      "frame_index": 10,
+      "direction": "server_to_client",
+      "connection_ordinal": 1,
+      "broadcast_emission": "emission-2",
+      "caused_by": "client-message-retry",
+      "lease_id": "lease-retry",
+      "lease_current": true,
+      "wire": {
+        "type": "stream_delta",
+        "delta": {
+          "id": "00000000-0000-4000-8000-000000000018",
+          "date": "2000-01-01T00:00:08.000Z",
+          "message_type": "message",
+          "type": "message",
+          "delta": "<sanitized-trace>"
+        },
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "event_seq": 2,
+        "emitted_at": "2000-01-01T00:00:02.000Z",
+        "idempotency_key": "stream_delta:2:00000000-0000-4000-8000-000000000103"
+      }
+    },
+    {
+      "frame_index": 11,
+      "direction": "lifecycle",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-retry",
+      "lease_id": "lease-retry",
+      "wire": {
+        "type": "broadcast_begin",
+        "emission": "emission-3",
+        "message_type": "turn_finished",
+        "subscriber_ordinals": [
+          1
+        ],
+        "payload_sha256": "060707a56ffa108b5926fd060b9befa55902ab9645f343a0b0ad3fd0b5b980cc"
+      }
+    },
+    {
+      "frame_index": 12,
+      "direction": "server_to_client",
+      "connection_ordinal": 1,
+      "broadcast_emission": "emission-3",
+      "caused_by": "client-message-retry",
+      "lease_id": "lease-retry",
+      "lease_current": true,
+      "wire": {
+        "type": "turn_finished",
+        "turn_id": "00000000-0000-4000-8000-000000000090",
+        "run_id": "00000000-0000-4000-8000-000000000091",
+        "stop_reason": "end_turn",
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "event_seq": 3,
+        "emitted_at": "2000-01-01T00:00:03.000Z",
+        "idempotency_key": "turn_finished:3:00000000-0000-4000-8000-000000000104"
+      }
+    }
+  ]
+}

@@ -1,0 +1,388 @@
+{
+  "schema_version": 1,
+  "name": "disconnect",
+  "kind": "disconnect",
+  "provenance": {
+    "path": "src/websocket/listener/connection-lifecycle.test.ts",
+    "symbol": "test:connection cleanup preserves other subscribers",
+    "capture_boundary": "pinned AppServerClient + pinned source-test scenario boundary"
+  },
+  "supporting_provenance": [
+    {
+      "path": "src/websocket/listener/connection-state-sync.test.ts",
+      "symbol": "test:keeps attached App Server connections from bypassing the startup barrier",
+      "capture_boundary": "pinned AppServerClient + pinned source-test scenario boundary"
+    },
+    {
+      "path": "src/websocket/listener/turn-terminal-protocol.test.ts",
+      "symbol": "test:finishListenerTurn emits exactly one correlated terminal event",
+      "capture_boundary": "pinned AppServerClient + pinned source-test scenario boundary"
+    }
+  ],
+  "driver_proof": {
+    "command_types": [
+      "runtime_start",
+      "input",
+      "input",
+      "runtime_start",
+      "sync"
+    ],
+    "message_types": [
+      "runtime_start_response",
+      "input_accepted",
+      "input_accepted",
+      "runtime_start_response",
+      "sync_response",
+      "update_queue",
+      "stream_delta",
+      "turn_finished"
+    ]
+  },
+  "frames": [
+    {
+      "frame_index": 0,
+      "direction": "lifecycle",
+      "connection_ordinal": 1,
+      "wire": {
+        "type": "open"
+      }
+    },
+    {
+      "frame_index": 1,
+      "direction": "client_to_server",
+      "connection_ordinal": 1,
+      "wire": {
+        "type": "runtime_start",
+        "request_id": "request-runtime-1",
+        "agent_id": "00000000-0000-4000-8000-000000000001",
+        "conversation_id": "00000000-0000-4000-8000-000000000002"
+      }
+    },
+    {
+      "frame_index": 2,
+      "direction": "server_to_client",
+      "connection_ordinal": 1,
+      "wire": {
+        "type": "runtime_start_response",
+        "request_id": "request-runtime-1",
+        "success": true,
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "agent": null,
+        "conversation": null,
+        "created": {
+          "agent": false,
+          "conversation": false
+        }
+      }
+    },
+    {
+      "frame_index": 3,
+      "direction": "client_to_server",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-disconnect-active",
+      "wire": {
+        "type": "input",
+        "request_id": "request-disconnect-1",
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "payload": {
+          "kind": "create_message",
+          "messages": [
+            {
+              "role": "user",
+              "content": "<sanitized-trace>",
+              "client_message_id": "client-message-disconnect-active"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "frame_index": 4,
+      "direction": "server_to_client",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-disconnect-active",
+      "wire": {
+        "type": "input_accepted",
+        "request_id": "request-disconnect-1",
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "accepted": true,
+        "disposition": "started"
+      }
+    },
+    {
+      "frame_index": 5,
+      "direction": "lifecycle",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-disconnect-active",
+      "lease_id": "lease-disconnect",
+      "wire": {
+        "type": "turn_started",
+        "caused_by": "client-message-disconnect-active",
+        "lease_id": "lease-disconnect"
+      }
+    },
+    {
+      "frame_index": 6,
+      "direction": "lifecycle",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-disconnect-active",
+      "lease_id": "lease-disconnect",
+      "wire": {
+        "type": "lease_acquired",
+        "lease_id": "lease-disconnect",
+        "caused_by": "client-message-disconnect-active"
+      }
+    },
+    {
+      "frame_index": 7,
+      "direction": "client_to_server",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-disconnect-queued",
+      "wire": {
+        "type": "input",
+        "request_id": "request-disconnect-2",
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "payload": {
+          "kind": "create_message",
+          "messages": [
+            {
+              "role": "user",
+              "content": "<sanitized-trace>",
+              "client_message_id": "client-message-disconnect-queued"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "frame_index": 8,
+      "direction": "server_to_client",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-disconnect-queued",
+      "wire": {
+        "type": "input_accepted",
+        "request_id": "request-disconnect-2",
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "accepted": true,
+        "disposition": "queued"
+      }
+    },
+    {
+      "frame_index": 9,
+      "direction": "lifecycle",
+      "connection_ordinal": 1,
+      "wire": {
+        "type": "disconnect",
+        "channel": "control"
+      }
+    },
+    {
+      "frame_index": 10,
+      "direction": "lifecycle",
+      "connection_ordinal": 1,
+      "wire": {
+        "type": "connection_cleanup",
+        "cancelled": [
+          "client-message-disconnect-queued"
+        ]
+      }
+    },
+    {
+      "frame_index": 11,
+      "direction": "lifecycle",
+      "connection_ordinal": 2,
+      "wire": {
+        "type": "open"
+      }
+    },
+    {
+      "frame_index": 12,
+      "direction": "client_to_server",
+      "connection_ordinal": 2,
+      "wire": {
+        "type": "runtime_start",
+        "request_id": "request-reconnect-runtime",
+        "agent_id": "00000000-0000-4000-8000-000000000001",
+        "conversation_id": "00000000-0000-4000-8000-000000000002"
+      }
+    },
+    {
+      "frame_index": 13,
+      "direction": "server_to_client",
+      "connection_ordinal": 2,
+      "wire": {
+        "type": "runtime_start_response",
+        "request_id": "request-reconnect-runtime",
+        "success": true,
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "agent": null,
+        "conversation": null,
+        "created": {
+          "agent": false,
+          "conversation": false
+        }
+      }
+    },
+    {
+      "frame_index": 14,
+      "direction": "client_to_server",
+      "connection_ordinal": 2,
+      "wire": {
+        "type": "sync",
+        "request_id": "request-reconnect-sync",
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "recover_approvals": false
+      }
+    },
+    {
+      "frame_index": 15,
+      "direction": "server_to_client",
+      "connection_ordinal": 2,
+      "wire": {
+        "type": "sync_response",
+        "request_id": "request-reconnect-sync",
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "success": true
+      }
+    },
+    {
+      "frame_index": 16,
+      "direction": "lifecycle",
+      "connection_ordinal": 2,
+      "wire": {
+        "type": "broadcast_begin",
+        "emission": "emission-1",
+        "message_type": "update_queue",
+        "subscriber_ordinals": [
+          2
+        ],
+        "payload_sha256": "54f9d4690af63f8ebc284fd3412206fc35fa058c63c5948e70383b5fdd01a6ae"
+      }
+    },
+    {
+      "frame_index": 17,
+      "direction": "server_to_client",
+      "connection_ordinal": 2,
+      "broadcast_emission": "emission-1",
+      "wire": {
+        "type": "update_queue",
+        "queue": [],
+        "removed": [
+          {
+            "client_message_id": "client-message-disconnect-queued",
+            "disposition": "cancelled"
+          }
+        ],
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "event_seq": 1,
+        "emitted_at": "2000-01-01T00:00:01.000Z",
+        "idempotency_key": "update_queue:1:00000000-0000-4000-8000-000000000102"
+      }
+    },
+    {
+      "frame_index": 18,
+      "direction": "lifecycle",
+      "connection_ordinal": 2,
+      "caused_by": "client-message-disconnect-active",
+      "lease_id": "lease-disconnect",
+      "wire": {
+        "type": "broadcast_begin",
+        "emission": "emission-2",
+        "message_type": "stream_delta",
+        "subscriber_ordinals": [
+          2
+        ],
+        "payload_sha256": "75062ea146217af8a497c138cb580984cdb924704969ca1e06488bb350c8648b"
+      }
+    },
+    {
+      "frame_index": 19,
+      "direction": "server_to_client",
+      "connection_ordinal": 2,
+      "broadcast_emission": "emission-2",
+      "caused_by": "client-message-disconnect-active",
+      "lease_id": "lease-disconnect",
+      "lease_current": true,
+      "wire": {
+        "type": "stream_delta",
+        "delta": {
+          "id": "00000000-0000-4000-8000-000000000014",
+          "date": "2000-01-01T00:00:04.000Z",
+          "message_type": "message"
+        },
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "event_seq": 2,
+        "emitted_at": "2000-01-01T00:00:02.000Z",
+        "idempotency_key": "stream_delta:2:00000000-0000-4000-8000-000000000103"
+      }
+    },
+    {
+      "frame_index": 20,
+      "direction": "lifecycle",
+      "connection_ordinal": 2,
+      "caused_by": "client-message-disconnect-active",
+      "lease_id": "lease-disconnect",
+      "wire": {
+        "type": "broadcast_begin",
+        "emission": "emission-3",
+        "message_type": "turn_finished",
+        "subscriber_ordinals": [
+          2
+        ],
+        "payload_sha256": "060707a56ffa108b5926fd060b9befa55902ab9645f343a0b0ad3fd0b5b980cc"
+      }
+    },
+    {
+      "frame_index": 21,
+      "direction": "server_to_client",
+      "connection_ordinal": 2,
+      "broadcast_emission": "emission-3",
+      "caused_by": "client-message-disconnect-active",
+      "lease_id": "lease-disconnect",
+      "lease_current": true,
+      "wire": {
+        "type": "turn_finished",
+        "turn_id": "00000000-0000-4000-8000-000000000090",
+        "run_id": "00000000-0000-4000-8000-000000000091",
+        "stop_reason": "end_turn",
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "event_seq": 3,
+        "emitted_at": "2000-01-01T00:00:03.000Z",
+        "idempotency_key": "turn_finished:3:00000000-0000-4000-8000-000000000104"
+      }
+    }
+  ]
+}

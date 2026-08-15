@@ -1,0 +1,259 @@
+{
+  "schema_version": 1,
+  "name": "idempotency",
+  "kind": "idempotency",
+  "provenance": {
+    "path": "src/websocket/listener/turn-input-state.test.ts",
+    "symbol": "describe:listener turn input state",
+    "capture_boundary": "pinned AppServerClient + pinned source-test scenario boundary"
+  },
+  "supporting_provenance": [
+    {
+      "path": "src/websocket/listener/message-router.test.ts",
+      "symbol": "test:preserves the acting user on a directly-owned input and deduplicates retries",
+      "capture_boundary": "pinned AppServerClient + pinned source-test scenario boundary"
+    },
+    {
+      "path": "src/websocket/listener/turn-terminal-protocol.test.ts",
+      "symbol": "test:finishListenerTurn emits exactly one correlated terminal event",
+      "capture_boundary": "pinned AppServerClient + pinned source-test scenario boundary"
+    }
+  ],
+  "driver_proof": {
+    "command_types": [
+      "runtime_start",
+      "input",
+      "input"
+    ],
+    "message_types": [
+      "runtime_start_response",
+      "input_accepted",
+      "input_accepted",
+      "stream_delta",
+      "turn_finished"
+    ]
+  },
+  "frames": [
+    {
+      "frame_index": 0,
+      "direction": "lifecycle",
+      "connection_ordinal": 1,
+      "wire": {
+        "type": "open"
+      }
+    },
+    {
+      "frame_index": 1,
+      "direction": "client_to_server",
+      "connection_ordinal": 1,
+      "wire": {
+        "type": "runtime_start",
+        "request_id": "request-runtime-1",
+        "agent_id": "00000000-0000-4000-8000-000000000001",
+        "conversation_id": "00000000-0000-4000-8000-000000000002"
+      }
+    },
+    {
+      "frame_index": 2,
+      "direction": "server_to_client",
+      "connection_ordinal": 1,
+      "wire": {
+        "type": "runtime_start_response",
+        "request_id": "request-runtime-1",
+        "success": true,
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "agent": null,
+        "conversation": null,
+        "created": {
+          "agent": false,
+          "conversation": false
+        }
+      }
+    },
+    {
+      "frame_index": 3,
+      "direction": "client_to_server",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-idempotent",
+      "wire": {
+        "type": "input",
+        "request_id": "request-idempotency-1",
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "payload": {
+          "kind": "create_message",
+          "messages": [
+            {
+              "role": "user",
+              "content": "<sanitized-trace>",
+              "client_message_id": "client-message-idempotent"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "frame_index": 4,
+      "direction": "server_to_client",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-idempotent",
+      "wire": {
+        "type": "input_accepted",
+        "request_id": "request-idempotency-1",
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "accepted": true,
+        "disposition": "started"
+      }
+    },
+    {
+      "frame_index": 5,
+      "direction": "lifecycle",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-idempotent",
+      "lease_id": "lease-idempotent",
+      "wire": {
+        "type": "turn_started",
+        "caused_by": "client-message-idempotent",
+        "lease_id": "lease-idempotent"
+      }
+    },
+    {
+      "frame_index": 6,
+      "direction": "lifecycle",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-idempotent",
+      "lease_id": "lease-idempotent",
+      "wire": {
+        "type": "lease_acquired",
+        "lease_id": "lease-idempotent",
+        "caused_by": "client-message-idempotent"
+      }
+    },
+    {
+      "frame_index": 7,
+      "direction": "client_to_server",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-idempotent",
+      "wire": {
+        "type": "input",
+        "request_id": "request-idempotency-2",
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "payload": {
+          "kind": "create_message",
+          "messages": [
+            {
+              "role": "user",
+              "content": "<sanitized-trace>",
+              "client_message_id": "client-message-idempotent"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "frame_index": 8,
+      "direction": "server_to_client",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-idempotent",
+      "wire": {
+        "type": "input_accepted",
+        "request_id": "request-idempotency-2",
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "accepted": true,
+        "disposition": "started"
+      }
+    },
+    {
+      "frame_index": 9,
+      "direction": "lifecycle",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-idempotent",
+      "lease_id": "lease-idempotent",
+      "wire": {
+        "type": "broadcast_begin",
+        "emission": "emission-1",
+        "message_type": "stream_delta",
+        "subscriber_ordinals": [
+          1
+        ],
+        "payload_sha256": "e40e8beb1b417f1ba12785e00da3701e25c4fba03a0e1b7032135526ee75f018"
+      }
+    },
+    {
+      "frame_index": 10,
+      "direction": "server_to_client",
+      "connection_ordinal": 1,
+      "broadcast_emission": "emission-1",
+      "caused_by": "client-message-idempotent",
+      "lease_id": "lease-idempotent",
+      "lease_current": true,
+      "wire": {
+        "type": "stream_delta",
+        "delta": {
+          "id": "00000000-0000-4000-8000-000000000019",
+          "date": "2000-01-01T00:00:09.000Z",
+          "message_type": "message"
+        },
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "event_seq": 1,
+        "emitted_at": "2000-01-01T00:00:01.000Z",
+        "idempotency_key": "stream_delta:1:00000000-0000-4000-8000-000000000102"
+      }
+    },
+    {
+      "frame_index": 11,
+      "direction": "lifecycle",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-idempotent",
+      "lease_id": "lease-idempotent",
+      "wire": {
+        "type": "broadcast_begin",
+        "emission": "emission-2",
+        "message_type": "turn_finished",
+        "subscriber_ordinals": [
+          1
+        ],
+        "payload_sha256": "060707a56ffa108b5926fd060b9befa55902ab9645f343a0b0ad3fd0b5b980cc"
+      }
+    },
+    {
+      "frame_index": 12,
+      "direction": "server_to_client",
+      "connection_ordinal": 1,
+      "broadcast_emission": "emission-2",
+      "caused_by": "client-message-idempotent",
+      "lease_id": "lease-idempotent",
+      "lease_current": true,
+      "wire": {
+        "type": "turn_finished",
+        "turn_id": "00000000-0000-4000-8000-000000000090",
+        "run_id": "00000000-0000-4000-8000-000000000091",
+        "stop_reason": "end_turn",
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "event_seq": 2,
+        "emitted_at": "2000-01-01T00:00:02.000Z",
+        "idempotency_key": "turn_finished:2:00000000-0000-4000-8000-000000000103"
+      }
+    }
+  ]
+}

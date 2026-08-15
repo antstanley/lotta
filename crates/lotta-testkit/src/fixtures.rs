@@ -6,6 +6,8 @@ pub mod persistence;
 /// Typed access to the deterministic provider stream corpus.
 pub mod providers;
 mod sha256;
+/// Typed access and semantic comparison for reference command/event traces.
+pub mod traces;
 use std::fs::{File, ReadDir};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};

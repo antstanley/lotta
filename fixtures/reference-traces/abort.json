@@ -1,0 +1,250 @@
+{
+  "schema_version": 1,
+  "name": "abort",
+  "kind": "abort",
+  "provenance": {
+    "path": "src/websocket/listener/turn-terminal-protocol.test.ts",
+    "symbol": "test:finishListenerTurn emits exactly one correlated terminal event",
+    "capture_boundary": "pinned AppServerClient + pinned source-test scenario boundary"
+  },
+  "supporting_provenance": [
+    {
+      "path": "src/websocket/listener/protocol-ergonomics.test.ts",
+      "symbol": "test:abort_message sends an ack response when request_id is provided",
+      "capture_boundary": "pinned AppServerClient + pinned source-test scenario boundary"
+    },
+    {
+      "path": "src/websocket/listener/turn-terminal-protocol.test.ts",
+      "symbol": "test:finishListenerTurn emits exactly one correlated terminal event",
+      "capture_boundary": "pinned AppServerClient + pinned source-test scenario boundary"
+    }
+  ],
+  "driver_proof": {
+    "command_types": [
+      "runtime_start",
+      "input",
+      "abort_message"
+    ],
+    "message_types": [
+      "runtime_start_response",
+      "input_accepted",
+      "abort_message_response",
+      "stream_delta",
+      "turn_finished"
+    ]
+  },
+  "frames": [
+    {
+      "frame_index": 0,
+      "direction": "lifecycle",
+      "connection_ordinal": 1,
+      "wire": {
+        "type": "open"
+      }
+    },
+    {
+      "frame_index": 1,
+      "direction": "client_to_server",
+      "connection_ordinal": 1,
+      "wire": {
+        "type": "runtime_start",
+        "request_id": "request-runtime-1",
+        "agent_id": "00000000-0000-4000-8000-000000000001",
+        "conversation_id": "00000000-0000-4000-8000-000000000002"
+      }
+    },
+    {
+      "frame_index": 2,
+      "direction": "server_to_client",
+      "connection_ordinal": 1,
+      "wire": {
+        "type": "runtime_start_response",
+        "request_id": "request-runtime-1",
+        "success": true,
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "agent": null,
+        "conversation": null,
+        "created": {
+          "agent": false,
+          "conversation": false
+        }
+      }
+    },
+    {
+      "frame_index": 3,
+      "direction": "client_to_server",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-abort",
+      "wire": {
+        "type": "input",
+        "request_id": "request-abort-input",
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "payload": {
+          "kind": "create_message",
+          "messages": [
+            {
+              "role": "user",
+              "content": "<sanitized-trace>",
+              "client_message_id": "client-message-abort"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "frame_index": 4,
+      "direction": "server_to_client",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-abort",
+      "wire": {
+        "type": "input_accepted",
+        "request_id": "request-abort-input",
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "accepted": true,
+        "disposition": "started"
+      }
+    },
+    {
+      "frame_index": 5,
+      "direction": "lifecycle",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-abort",
+      "lease_id": "lease-abort",
+      "wire": {
+        "type": "turn_started",
+        "caused_by": "client-message-abort",
+        "lease_id": "lease-abort"
+      }
+    },
+    {
+      "frame_index": 6,
+      "direction": "lifecycle",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-abort",
+      "lease_id": "lease-abort",
+      "wire": {
+        "type": "lease_acquired",
+        "lease_id": "lease-abort",
+        "caused_by": "client-message-abort"
+      }
+    },
+    {
+      "frame_index": 7,
+      "direction": "client_to_server",
+      "connection_ordinal": 1,
+      "wire": {
+        "type": "abort_message",
+        "request_id": "request-abort",
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "run_id": "00000000-0000-4000-8000-000000000040"
+      }
+    },
+    {
+      "frame_index": 8,
+      "direction": "server_to_client",
+      "connection_ordinal": 1,
+      "wire": {
+        "type": "abort_message_response",
+        "request_id": "request-abort",
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "aborted": true,
+        "success": true
+      }
+    },
+    {
+      "frame_index": 9,
+      "direction": "lifecycle",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-abort",
+      "lease_id": "lease-abort",
+      "wire": {
+        "type": "broadcast_begin",
+        "emission": "emission-1",
+        "message_type": "stream_delta",
+        "subscriber_ordinals": [
+          1
+        ],
+        "payload_sha256": "a1e86b52634568d33cb610abb1fcab4ebe247ee2669240e7ba9b5ba9e7f9c229"
+      }
+    },
+    {
+      "frame_index": 10,
+      "direction": "server_to_client",
+      "connection_ordinal": 1,
+      "broadcast_emission": "emission-1",
+      "caused_by": "client-message-abort",
+      "lease_id": "lease-abort",
+      "lease_current": true,
+      "wire": {
+        "type": "stream_delta",
+        "delta": {
+          "id": "00000000-0000-4000-8000-000000000013",
+          "date": "2000-01-01T00:00:03.000Z",
+          "message_type": "message",
+          "type": "message",
+          "delta": "<sanitized-trace>"
+        },
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "event_seq": 1,
+        "emitted_at": "2000-01-01T00:00:01.000Z",
+        "idempotency_key": "stream_delta:1:00000000-0000-4000-8000-000000000102"
+      }
+    },
+    {
+      "frame_index": 11,
+      "direction": "lifecycle",
+      "connection_ordinal": 1,
+      "caused_by": "client-message-abort",
+      "lease_id": "lease-abort",
+      "wire": {
+        "type": "broadcast_begin",
+        "emission": "emission-2",
+        "message_type": "turn_finished",
+        "subscriber_ordinals": [
+          1
+        ],
+        "payload_sha256": "4e434ab27bc6a2fb232d002fd1bf04ff2fefcdee82a4c8bc41659a7d5dc049a1"
+      }
+    },
+    {
+      "frame_index": 12,
+      "direction": "server_to_client",
+      "connection_ordinal": 1,
+      "broadcast_emission": "emission-2",
+      "caused_by": "client-message-abort",
+      "lease_id": "lease-abort",
+      "lease_current": true,
+      "wire": {
+        "type": "turn_finished",
+        "turn_id": "00000000-0000-4000-8000-000000000090",
+        "run_id": "00000000-0000-4000-8000-000000000091",
+        "stop_reason": "abort",
+        "runtime": {
+          "agent_id": "00000000-0000-4000-8000-000000000001",
+          "conversation_id": "00000000-0000-4000-8000-000000000002"
+        },
+        "event_seq": 2,
+        "emitted_at": "2000-01-01T00:00:02.000Z",
+        "idempotency_key": "turn_finished:2:00000000-0000-4000-8000-000000000103"
+      }
+    }
+  ]
+}
