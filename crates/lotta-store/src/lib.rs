@@ -20,6 +20,8 @@ pub mod migration;
 /// Baseline-compatible local-backend paths and encoded keys.
 pub mod paths;
 mod refresh;
+/// Opaque bounded baseline side-store persistence.
+pub mod side;
 /// Bounded append-only transcript persistence.
 pub mod transcript;
 /// Non-mutating strict transcript diagnostics.
@@ -35,6 +37,7 @@ pub use conversation::CONVERSATIONS_PER_AGENT_MAX;
 pub use error::{StoreError, StoreErrorKind};
 pub use lock::{LOTTA_STORAGE_LOCK_WAIT_MS, LottaStorageLock};
 pub use paths::{ConversationKey, LETTA_LOCAL_BACKEND_DIR, StorePaths};
+pub use side::{ChannelFile, OpaqueFile, ProjectFile, SidePaths, SideRevision};
 pub use transcript::{TRANSCRIPT_BYTES_MAX, TRANSCRIPT_LINE_BYTES_MAX};
 
 #[cfg(test)]

@@ -97,6 +97,21 @@ pub fn atomic_write_observed(
     logged_once(|| atomic_write_unlocked(path, bytes, mode, observer))
 }
 
+pub(crate) fn atomic_write_with_expected_observed(
+    path: &Path,
+    bytes: &[u8],
+    mode: WriteMode,
+    expected: &FileRevision,
+    observer: &dyn AtomicObserver,
+) -> Result<(), StoreError> {
+    logged_once(|| {
+        validate_target(path, bytes)?;
+        let root = backend_root(path)?;
+        let lock = LottaStorageLock::try_acquire_confined(root)?;
+        atomic_write_held(path, bytes, mode, expected, &lock, observer)
+    })
+}
+
 pub(crate) fn atomic_write_expected_locked(
     path: &Path,
     bytes: &[u8],
@@ -302,7 +317,11 @@ impl FileRevision {
         Self::sample_bounded(root, path, max_bytes, &NoopObserver)
     }
 
-    fn sample(root: &Path, path: &Path, observer: &dyn AtomicObserver) -> Result<Self, StoreError> {
+    pub(crate) fn sample(
+        root: &Path,
+        path: &Path,
+        observer: &dyn AtomicObserver,
+    ) -> Result<Self, StoreError> {
         Self::sample_bounded(root, path, ATOMIC_WRITE_BYTES_MAX as u64, observer)
     }
 
