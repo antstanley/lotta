@@ -18,6 +18,8 @@ mod lock;
 /// Baseline-compatible local-backend paths and encoded keys.
 pub mod paths;
 mod refresh;
+/// Bounded append-only transcript persistence.
+pub mod transcript;
 
 pub use adapter::{LOCAL_STORE_BLOCKING_MAX, LocalStore};
 pub use agent::AGENTS_MAX;
@@ -29,6 +31,7 @@ pub use conversation::CONVERSATIONS_PER_AGENT_MAX;
 pub use error::{StoreError, StoreErrorKind};
 pub use lock::{LOTTA_STORAGE_LOCK_WAIT_MS, LottaStorageLock};
 pub use paths::{ConversationKey, LETTA_LOCAL_BACKEND_DIR, StorePaths};
+pub use transcript::{TRANSCRIPT_BYTES_MAX, TRANSCRIPT_LINE_BYTES_MAX};
 
 #[cfg(test)]
 mod tests;

@@ -14,6 +14,7 @@ pub const ATOMIC_WRITE_RETRIES_MAX: usize = 3;
 /// Maximum payload accepted by the shared atomic record primitive.
 pub const ATOMIC_WRITE_BYTES_MAX: usize = 8 * 1_024 * 1_024;
 const TEMP_CREATE_RETRIES_MAX: usize = 64;
+const CHECKSUM_BUFFER_BYTES: usize = 64 * 1_024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Permission policy applied to an atomic replacement target.
@@ -104,6 +105,17 @@ pub(crate) fn atomic_write_expected_locked(
     lock: &LottaStorageLock,
 ) -> Result<(), StoreError> {
     logged_once(|| atomic_write_held(path, bytes, mode, expected, lock, &NoopObserver))
+}
+
+pub(crate) fn atomic_write_locked(
+    path: &Path,
+    bytes: &[u8],
+    mode: WriteMode,
+    lock: &LottaStorageLock,
+) -> Result<(), StoreError> {
+    let root = backend_root(path)?;
+    let expected = FileRevision::sample(root, path, &NoopObserver)?;
+    logged_once(|| atomic_write_held(path, bytes, mode, &expected, lock, &NoopObserver))
 }
 
 fn atomic_write_unlocked(
@@ -232,11 +244,24 @@ impl FileRevision {
     }
 
     pub(crate) fn sample_path(path: &Path) -> Result<Self, StoreError> {
+        Self::sample_path_bounded(path, ATOMIC_WRITE_BYTES_MAX as u64)
+    }
+
+    pub(crate) fn sample_path_bounded(path: &Path, max_bytes: u64) -> Result<Self, StoreError> {
         let root = backend_root(path)?;
-        Self::sample(root, path, &NoopObserver)
+        Self::sample_bounded(root, path, max_bytes, &NoopObserver)
     }
 
     fn sample(root: &Path, path: &Path, observer: &dyn AtomicObserver) -> Result<Self, StoreError> {
+        Self::sample_bounded(root, path, ATOMIC_WRITE_BYTES_MAX as u64, observer)
+    }
+
+    fn sample_bounded(
+        root: &Path,
+        path: &Path,
+        max_bytes: u64,
+        observer: &dyn AtomicObserver,
+    ) -> Result<Self, StoreError> {
         match std::fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::absent()),
             Err(error) => Err(StoreError::from_io(path, &error)),
@@ -245,15 +270,22 @@ impl FileRevision {
             }
             Ok(metadata) => {
                 validate_regular_file(root, path)?;
-                if metadata.len() > ATOMIC_WRITE_BYTES_MAX as u64 {
-                    return Err(StoreError::new(StoreErrorKind::Limit, path));
+                validate_revision_length(metadata.len(), max_bytes, path)?;
+                let modified = observer.source_modified(path, &metadata)?;
+                let checksum = bounded_checksum(root, path, metadata.len(), max_bytes)?;
+                let after = std::fs::symlink_metadata(path)
+                    .map_err(|error| StoreError::from_io(path, &error))?;
+                if !after.is_file()
+                    || after.len() != metadata.len()
+                    || observer.source_modified(path, &after)? != modified
+                {
+                    return Err(StoreError::new(StoreErrorKind::StorageConflict, path));
                 }
-                let bytes = bounded_read(path, metadata.len())?;
                 Ok(Self {
                     exists: true,
-                    modified: Some(observer.source_modified(path, &metadata)?),
+                    modified: Some(modified),
                     length: metadata.len(),
-                    checksum: Sha256::digest(bytes).into(),
+                    checksum,
                 })
             }
         }
@@ -282,21 +314,64 @@ fn ensure_revision(
     }
 }
 
-fn bounded_read(path: &Path, length: u64) -> Result<Vec<u8>, StoreError> {
-    let length =
-        usize::try_from(length).map_err(|_| StoreError::new(StoreErrorKind::Limit, path))?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(length)
-        .map_err(|_| StoreError::new(StoreErrorKind::Limit, path))?;
+fn bounded_checksum(
+    root: &Path,
+    path: &Path,
+    expected_len: u64,
+    max_bytes: u64,
+) -> Result<[u8; 32], StoreError> {
     let mut file = File::open(path).map_err(|error| StoreError::from_io(path, &error))?;
-    std::io::Read::take(&mut file, ATOMIC_WRITE_BYTES_MAX as u64 + 1)
-        .read_to_end(&mut bytes)
+    validate_regular_file(root, path)?;
+    let opened = file
+        .metadata()
         .map_err(|error| StoreError::from_io(path, &error))?;
-    if bytes.len() != length {
+    if opened.len() != expected_len || opened.len() > max_bytes {
         return Err(StoreError::new(StoreErrorKind::StorageConflict, path));
     }
-    Ok(bytes)
+    let mut digest = Sha256::new();
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(CHECKSUM_BUFFER_BYTES)
+        .map_err(|_| StoreError::new(StoreErrorKind::Limit, path))?;
+    buffer.resize(CHECKSUM_BUFFER_BYTES, 0_u8);
+    let mut total = 0_u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| StoreError::from_io(path, &error))?;
+        if read == 0 {
+            break;
+        }
+        let read_u64 =
+            u64::try_from(read).map_err(|_| StoreError::new(StoreErrorKind::Limit, path))?;
+        total = total
+            .checked_add(read_u64)
+            .ok_or_else(|| StoreError::new(StoreErrorKind::Limit, path))?;
+        if total > max_bytes {
+            return Err(StoreError::new(StoreErrorKind::StorageConflict, path));
+        }
+        digest.update(&buffer[..read]);
+    }
+    let after = file
+        .metadata()
+        .map_err(|error| StoreError::from_io(path, &error))?;
+    validate_regular_file(root, path)?;
+    if total != expected_len || after.len() != expected_len {
+        return Err(StoreError::new(StoreErrorKind::StorageConflict, path));
+    }
+    Ok(digest.finalize().into())
+}
+
+pub(crate) fn validate_revision_length(
+    length: u64,
+    max_bytes: u64,
+    path: &Path,
+) -> Result<(), StoreError> {
+    if length > max_bytes {
+        Err(StoreError::new(StoreErrorKind::Limit, path))
+    } else {
+        Ok(())
+    }
 }
 
 fn create_temp(root: &Path, parent: &Path, target: &Path) -> Result<(PathBuf, File), StoreError> {

@@ -356,15 +356,42 @@ mod atomic {
     #[test]
     fn writes_via_temp_and_rename() {
         let (_owned, paths) = root("atomic-write");
-        let path = paths.agents().join("record.json");
-        atomic_write(&path, b"first", WriteMode::Standard).expect("create");
-        atomic_write(&path, b"second", WriteMode::Standard).expect("replace");
-        assert_eq!(std::fs::read(&path).expect("record"), b"second");
+        let record = paths.agents().join("record.json");
+        atomic_write(&record, b"first", WriteMode::Standard).expect("create");
+        atomic_write(&record, b"second", WriteMode::Standard).expect("replace");
+        assert_eq!(std::fs::read(&record).expect("record"), b"second");
+        let transcript = paths.conversations().join("key/manifest.json");
+        let manifest = lotta_domain::TranscriptManifest {
+            schema_version: 2,
+            message_format: lotta_domain::TranscriptMessageFormat::PiSessionEntryJsonl,
+            provider_stack: lotta_domain::ProviderStack::PiAi,
+            created_at: lotta_domain::Timestamp::parse_persisted_rfc3339(
+                "2026-08-15T01:02:03.456Z",
+            )
+            .expect("timestamp"),
+            migrated_from: None,
+            migrated_at: None,
+            backup_path: None,
+        };
+        let bytes =
+            crate::transcript::manifest::encode(&manifest, &transcript).expect("manifest encode");
+        crate::atomic::atomic_write(&transcript, &bytes, WriteMode::Standard)
+            .expect("manifest atomic write");
         let names = std::fs::read_dir(paths.agents())
             .expect("directory")
             .map(|entry| entry.expect("entry").file_name())
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["record.json"]);
+        assert_eq!(
+            crate::transcript::manifest::read(&transcript).expect("manifest"),
+            manifest
+        );
+        assert_eq!(
+            std::fs::read_dir(transcript.parent().expect("parent"))
+                .expect("transcript directory")
+                .count(),
+            1
+        );
     }
 
     #[test]

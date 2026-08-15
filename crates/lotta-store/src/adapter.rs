@@ -63,6 +63,10 @@ impl LocalStore {
         store
     }
 
+    pub(crate) fn blocking_pool(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.blocking)
+    }
+
     /// Updates one known agent field while preserving compatible fields and requiring the loaded
     /// filesystem revision at commit.
     ///
@@ -339,7 +343,7 @@ impl<'a> BoundedJson<'a> {
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
-    fn error(&self) -> StoreError {
+    pub(crate) fn error(&self) -> StoreError {
         StoreError::new(
             if self.failed {
                 StoreErrorKind::Limit
@@ -348,6 +352,9 @@ impl<'a> BoundedJson<'a> {
             },
             self.path,
         )
+    }
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
     }
 }
 impl Write for BoundedJson<'_> {
