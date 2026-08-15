@@ -1,5 +1,7 @@
+use crate::atomic::{FileRevision, atomic_write_expected_locked};
 use crate::confinement::{backend_root, validate_existing, validate_regular_file};
-use crate::{StoreError, StoreErrorKind, StorePaths, WriteMode, atomic_delete, atomic_write};
+use crate::refresh::RecordCache;
+use crate::{LottaStorageLock, StoreError, StoreErrorKind, StorePaths, WriteMode, atomic_delete};
 use lotta_domain::{Agent, AgentId, Conversation, ConversationId};
 use lotta_runtime::RuntimeError;
 use lotta_runtime::ports::{AgentStore, ConversationStore, PortFuture};
@@ -20,6 +22,9 @@ static BLOCKING_POOL: OnceLock<Arc<Semaphore>> = OnceLock::new();
 pub struct LocalStore {
     paths: StorePaths,
     blocking: Arc<Semaphore>,
+    cache: RecordCache,
+    agents_max: usize,
+    conversations_per_agent_max: usize,
 }
 
 impl LocalStore {
@@ -29,12 +34,112 @@ impl LocalStore {
         let blocking = Arc::clone(
             BLOCKING_POOL.get_or_init(|| Arc::new(Semaphore::new(LOCAL_STORE_BLOCKING_MAX))),
         );
-        Self { paths, blocking }
+        Self {
+            paths,
+            blocking,
+            cache: RecordCache::new(),
+            agents_max: crate::agent::AGENTS_MAX,
+            conversations_per_agent_max: crate::conversation::CONVERSATIONS_PER_AGENT_MAX,
+        }
     }
     /// Returns the adapter's storage layout.
     #[must_use]
     pub const fn paths(&self) -> &StorePaths {
         &self.paths
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limits(paths: StorePaths, agents: usize, conversations: usize) -> Self {
+        let mut store = Self::new(paths);
+        store.agents_max = agents;
+        store.conversations_per_agent_max = conversations;
+        store
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_cache_limit(paths: StorePaths, cache_entries: usize) -> Self {
+        let mut store = Self::new(paths);
+        store.cache = RecordCache::with_limit(cache_entries);
+        store
+    }
+
+    /// Updates one known agent field while preserving compatible fields and requiring the loaded
+    /// filesystem revision at commit.
+    ///
+    /// # Errors
+    /// Returns typed read, validation, conflict, lock, limit, or durable-write failures.
+    pub async fn update_agent_name(
+        &self,
+        id: &AgentId,
+        name: lotta_domain::NonEmptyString,
+    ) -> Result<Agent, StoreError> {
+        self.update_agent_name_observed(id, name, |_| Ok(())).await
+    }
+
+    pub(crate) async fn update_agent_name_observed(
+        &self,
+        id: &AgentId,
+        name: lotta_domain::NonEmptyString,
+        observer: impl FnOnce(&Path) -> Result<(), StoreError> + Send + 'static,
+    ) -> Result<Agent, StoreError> {
+        let paths = self.paths.clone();
+        let cache = self.cache.clone();
+        let id = id.clone();
+        run_blocking(Arc::clone(&self.blocking), move || {
+            crate::agent::update_name(&paths, &id, name, &cache, observer)
+        })
+        .await
+    }
+
+    /// Archives or unarchives a conversation with explicit-null unarchive semantics.
+    ///
+    /// # Errors
+    /// Returns typed read, identity, conflict, lock, limit, or durable-write failures.
+    pub async fn set_conversation_archived(
+        &self,
+        agent: &AgentId,
+        conversation: &ConversationId,
+        archived: bool,
+        now: lotta_domain::Timestamp,
+    ) -> Result<Conversation, StoreError> {
+        let paths = self.paths.clone();
+        let cache = self.cache.clone();
+        let agent = agent.clone();
+        let conversation = conversation.clone();
+        run_blocking(Arc::clone(&self.blocking), move || {
+            crate::conversation::archive(&paths, &agent, &conversation, archived, now, &cache)
+        })
+        .await
+    }
+
+    /// Sets a conversation model/settings override without touching its owning agent record.
+    ///
+    /// # Errors
+    /// Returns typed read, identity, conflict, lock, limit, or durable-write failures.
+    pub async fn set_conversation_model_override(
+        &self,
+        agent: &AgentId,
+        conversation: &ConversationId,
+        model: Option<String>,
+        settings: lotta_domain::BoundedMap<1_024>,
+        now: lotta_domain::Timestamp,
+    ) -> Result<Conversation, StoreError> {
+        let paths = self.paths.clone();
+        let cache = self.cache.clone();
+        let agent = agent.clone();
+        let conversation = conversation.clone();
+        run_blocking(Arc::clone(&self.blocking), move || {
+            crate::conversation::model_override(
+                &paths,
+                &agent,
+                &conversation,
+                model,
+                settings,
+                now,
+                &cache,
+            )
+        })
+        .await
     }
 }
 
@@ -42,11 +147,15 @@ impl AgentStore for LocalStore {
     fn load(&self, id: &AgentId) -> PortFuture<'_, Agent> {
         let path = self.paths.agent_record(id);
         let pool = Arc::clone(&self.blocking);
+        let cache = self.cache.clone();
+        let expected = id.clone();
         Box::pin(async move {
             let path = path.map_err(RuntimeError::from)?;
-            run_blocking(pool, move || read_json(&path))
-                .await
-                .map_err(Into::into)
+            run_blocking(pool, move || {
+                crate::agent::load(&path, &expected, &cache).map(|v| v.0)
+            })
+            .await
+            .map_err(Into::into)
         })
     }
     fn list(&self, items: Sender<Agent>, cancellation: CancellationToken) -> PortFuture<'_, ()> {
@@ -67,11 +176,16 @@ impl AgentStore for LocalStore {
         let path = self.paths.agent_record(&agent.id);
         let value = agent.clone();
         let pool = Arc::clone(&self.blocking);
+        let paths = self.paths.clone();
+        let cache = self.cache.clone();
+        let limit = self.agents_max;
         Box::pin(async move {
-            let path = path.map_err(RuntimeError::from)?;
-            run_blocking(pool, move || write_json(&path, &value))
-                .await
-                .map_err(Into::into)
+            path.map_err(RuntimeError::from)?;
+            run_blocking(pool, move || {
+                crate::agent::save(&paths, &value, &cache, limit)
+            })
+            .await
+            .map_err(Into::into)
         })
     }
     fn delete(&self, id: &AgentId) -> PortFuture<'_, ()> {
@@ -79,9 +193,13 @@ impl AgentStore for LocalStore {
         let pool = Arc::clone(&self.blocking);
         Box::pin(async move {
             let path = path.map_err(RuntimeError::from)?;
-            run_blocking(pool, move || atomic_delete(&path))
-                .await
-                .map_err(Into::into)
+            let cache = self.cache.clone();
+            run_blocking(pool, move || {
+                atomic_delete(&path)?;
+                cache.invalidate(&path)
+            })
+            .await
+            .map_err(Into::into)
         })
     }
 }
@@ -93,21 +211,17 @@ impl ConversationStore for LocalStore {
             .conversation_dir(agent, conversation)
             .map(|path| path.join("conversation.json"));
         let expected_agent = agent.clone();
+        let expected_conversation = conversation.clone();
         let pool = Arc::clone(&self.blocking);
+        let cache = self.cache.clone();
         Box::pin(async move {
             let path = path.map_err(RuntimeError::from)?;
-            let value: Conversation = run_blocking(pool, {
-                let path = path.clone();
-                move || read_json(&path)
+            run_blocking(pool, move || {
+                crate::conversation::load(&path, &expected_agent, &expected_conversation, &cache)
+                    .map(|v| v.0)
             })
             .await
-            .map_err(RuntimeError::from)?;
-            if value.agent_id != expected_agent {
-                return Err(RuntimeError::NotFound {
-                    context: path.display().to_string(),
-                });
-            }
-            Ok(value)
+            .map_err(Into::into)
         })
     }
     fn list_for_agent(
@@ -138,11 +252,16 @@ impl ConversationStore for LocalStore {
             .map(|path| path.join("conversation.json"));
         let value = conversation.clone();
         let pool = Arc::clone(&self.blocking);
+        let paths = self.paths.clone();
+        let cache = self.cache.clone();
+        let limit = self.conversations_per_agent_max;
         Box::pin(async move {
-            let path = path.map_err(RuntimeError::from)?;
-            run_blocking(pool, move || write_json(&path, &value))
-                .await
-                .map_err(Into::into)
+            path.map_err(RuntimeError::from)?;
+            run_blocking(pool, move || {
+                crate::conversation::save(&paths, &value, &cache, limit)
+            })
+            .await
+            .map_err(Into::into)
         })
     }
     fn delete(&self, agent: &AgentId, conversation: &ConversationId) -> PortFuture<'_, ()> {
@@ -156,7 +275,7 @@ impl ConversationStore for LocalStore {
             let path = path.map_err(RuntimeError::from)?;
             let value: Conversation = run_blocking(Arc::clone(&pool), {
                 let path = path.clone();
-                move || read_json(&path)
+                move || read_record(&path)
             })
             .await
             .map_err(RuntimeError::from)?;
@@ -165,9 +284,13 @@ impl ConversationStore for LocalStore {
                     context: path.display().to_string(),
                 });
             }
-            run_blocking(pool, move || atomic_delete(&path))
-                .await
-                .map_err(Into::into)
+            let cache = self.cache.clone();
+            run_blocking(pool, move || {
+                atomic_delete(&path)?;
+                cache.invalidate(&path)
+            })
+            .await
+            .map_err(Into::into)
         })
     }
 }
@@ -188,10 +311,16 @@ pub(crate) async fn run_blocking<T: Send + 'static>(
     .map_err(|_| StoreError::new(StoreErrorKind::Io, "blocking-join"))?
 }
 
-fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), StoreError> {
+pub(crate) fn write_record_locked<T: serde::Serialize>(
+    path: &Path,
+    value: &T,
+    revision: &FileRevision,
+    lock: &LottaStorageLock,
+) -> Result<(), StoreError> {
     let mut sink = BoundedJson::new(path);
     serde_json::to_writer_pretty(&mut sink, value).map_err(|_| sink.error())?;
-    atomic_write(path, sink.as_bytes(), WriteMode::Standard)
+    sink.write_all(b"\n").map_err(|_| sink.error())?;
+    atomic_write_expected_locked(path, sink.as_bytes(), WriteMode::Standard, revision, lock)
 }
 
 pub(crate) struct BoundedJson<'a> {
@@ -243,8 +372,66 @@ impl Write for BoundedJson<'_> {
     }
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, StoreError> {
+pub(crate) fn read_record<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, StoreError> {
     read_json_inner(path).map_err(StoreError::log)
+}
+
+fn reject_duplicate_json_keys(bytes: &[u8], path: &Path) -> Result<(), StoreError> {
+    use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
+    use std::collections::BTreeSet;
+    struct Seed;
+    struct JsonVisitor;
+    impl<'de> DeserializeSeed<'de> for Seed {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(self, value: D) -> Result<(), D::Error> {
+            value.deserialize_any(JsonVisitor)
+        }
+    }
+    impl<'de> Visitor<'de> for JsonVisitor {
+        type Value = ();
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("JSON value without duplicate keys")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            let mut keys = BTreeSet::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if !keys.insert(key) {
+                    return Err(serde::de::Error::custom("duplicate object key"));
+                }
+                map.next_value_seed(Seed)?;
+            }
+            Ok(())
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<(), A::Error> {
+            while sequence.next_element_seed(Seed)?.is_some() {}
+            Ok(())
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_str<E>(self, _: &str) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_none<E>(self) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_unit<E>(self) -> Result<(), E> {
+            Ok(())
+        }
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    Seed.deserialize(&mut deserializer)
+        .and_then(|()| deserializer.end())
+        .map_err(|_| StoreError::new(StoreErrorKind::Parse, path))
 }
 
 fn read_json_inner<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, StoreError> {
@@ -268,7 +455,36 @@ fn read_json_inner<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Sto
     if bytes.len() != length {
         return Err(StoreError::new(StoreErrorKind::StorageConflict, path));
     }
+    reject_duplicate_json_keys(&bytes, path)?;
     serde_json::from_slice(&bytes).map_err(|_| StoreError::new(StoreErrorKind::Parse, path))
+}
+
+pub(crate) enum RecordKind {
+    Agent,
+}
+
+pub(crate) fn count_records(directory: &Path, _kind: RecordKind) -> Result<usize, StoreError> {
+    Ok(sorted_files(directory)?.len())
+}
+
+pub(crate) fn count_conversations_for_agent(
+    directory: &Path,
+    agent: &AgentId,
+) -> Result<usize, StoreError> {
+    let mut count = 0_usize;
+    for path in sorted_files(directory)? {
+        let record = path.join("conversation.json");
+        if !record.is_file() {
+            continue;
+        }
+        let value: Conversation = read_record(&record)?;
+        if &value.agent_id == agent {
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| StoreError::new(StoreErrorKind::Limit, directory))?;
+        }
+    }
+    Ok(count)
 }
 
 fn push_bounded<T>(values: &mut Vec<T>, value: T, path: &Path) -> Result<(), StoreError> {
@@ -334,7 +550,7 @@ fn load_conversations(directory: &Path, agent: &AgentId) -> Result<Vec<Conversat
             }
             Ok(_) => {}
         }
-        let value: Conversation = read_json(&record)?;
+        let value: Conversation = read_record(&record)?;
         if &value.agent_id == agent {
             push_bounded(&mut values, value, directory)?;
         }
@@ -354,7 +570,7 @@ fn load_agents(directory: &Path) -> Result<Vec<Agent>, StoreError> {
         if metadata.is_dir() || path.extension().and_then(|value| value.to_str()) != Some("json") {
             return Err(StoreError::new(StoreErrorKind::InvalidPath, path));
         }
-        let value = read_json(&path)?;
+        let value = read_record(&path)?;
         push_bounded(&mut values, value, directory)?;
     }
     Ok(values)

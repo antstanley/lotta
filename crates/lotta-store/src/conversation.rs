@@ -1,0 +1,152 @@
+use crate::adapter::{read_record, write_record_locked};
+use crate::atomic::FileRevision;
+use crate::refresh::{RecordCache, Snapshot};
+use crate::{LottaStorageLock, StoreError, StoreErrorKind, StorePaths};
+use lotta_domain::{AgentId, BoundedMap, Conversation, ConversationId, Timestamp};
+use std::path::Path;
+
+/// Maximum number of persisted conversations belonging to one agent.
+pub const CONVERSATIONS_PER_AGENT_MAX: usize = 100_000;
+
+pub(crate) fn load(
+    path: &Path,
+    agent: &AgentId,
+    conversation: &ConversationId,
+    cache: &RecordCache,
+) -> Result<(Conversation, FileRevision), StoreError> {
+    let revision = FileRevision::sample_path(path)?;
+    if let Some(Snapshot::Conversation(value)) = cache.matching(path, &revision)? {
+        validate_identity(path, &value, agent, conversation)?;
+        return Ok((value, revision));
+    }
+    let value: Conversation = read_record(path)?;
+    validate_identity(path, &value, agent, conversation)?;
+    cache.insert(
+        path,
+        revision.clone(),
+        Snapshot::Conversation(value.clone()),
+    )?;
+    Ok((value, revision))
+}
+
+pub(crate) fn save(
+    paths: &StorePaths,
+    value: &Conversation,
+    cache: &RecordCache,
+    limit: usize,
+) -> Result<(), StoreError> {
+    let path = record_path(paths, &value.agent_id, &value.id)?;
+    let lock = LottaStorageLock::try_acquire(paths.root())?;
+    let revision = FileRevision::sample_path(&path)?;
+    if revision.exists() {
+        let existing: Conversation = read_record(&path)?;
+        validate_identity(&path, &existing, &value.agent_id, &value.id)?;
+    } else {
+        ensure_create_capacity(paths, &value.agent_id, limit, &path)?;
+    }
+    write_record_locked(&path, value, &revision, &lock)?;
+    refresh_after_write(&path, value, cache)
+}
+
+pub(crate) fn archive(
+    paths: &StorePaths,
+    agent: &AgentId,
+    conversation: &ConversationId,
+    archived: bool,
+    now: Timestamp,
+    cache: &RecordCache,
+) -> Result<Conversation, StoreError> {
+    update(paths, agent, conversation, cache, |value| {
+        value.archived = archived;
+        value.archived_at = if archived {
+            match value.archived_at {
+                Some(Some(first)) => Some(Some(first)),
+                _ => Some(Some(now)),
+            }
+        } else {
+            Some(None)
+        };
+        value.updated_at = now;
+    })
+}
+
+pub(crate) fn model_override(
+    paths: &StorePaths,
+    agent: &AgentId,
+    conversation: &ConversationId,
+    model: Option<String>,
+    settings: BoundedMap<1_024>,
+    now: Timestamp,
+    cache: &RecordCache,
+) -> Result<Conversation, StoreError> {
+    update(paths, agent, conversation, cache, |value| {
+        value.model = Some(model);
+        value.model_settings = Some(settings);
+        value.updated_at = now;
+    })
+}
+
+fn update(
+    paths: &StorePaths,
+    agent: &AgentId,
+    conversation: &ConversationId,
+    cache: &RecordCache,
+    mutation: impl FnOnce(&mut Conversation),
+) -> Result<Conversation, StoreError> {
+    let path = record_path(paths, agent, conversation)?;
+    let (mut value, revision) = load(&path, agent, conversation, cache)?;
+    mutation(&mut value);
+    let lock = LottaStorageLock::try_acquire(paths.root())?;
+    let result = write_record_locked(&path, &value, &revision, &lock);
+    if result.is_err() {
+        cache.invalidate(&path)?;
+        return result.map(|()| value);
+    }
+    refresh_after_write(&path, &value, cache)?;
+    Ok(value)
+}
+
+fn refresh_after_write(
+    path: &Path,
+    value: &Conversation,
+    cache: &RecordCache,
+) -> Result<(), StoreError> {
+    cache.invalidate(path)?;
+    let revision = FileRevision::sample_path(path)?;
+    cache.insert(path, revision, Snapshot::Conversation(value.clone()))
+}
+
+fn ensure_create_capacity(
+    paths: &StorePaths,
+    agent: &AgentId,
+    maximum: usize,
+    path: &Path,
+) -> Result<(), StoreError> {
+    let count = super::adapter::count_conversations_for_agent(&paths.conversations(), agent)?;
+    if count >= maximum {
+        return Err(StoreError::new(StoreErrorKind::Limit, path));
+    }
+    Ok(())
+}
+
+pub(crate) fn record_path(
+    paths: &StorePaths,
+    agent: &AgentId,
+    conversation: &ConversationId,
+) -> Result<std::path::PathBuf, StoreError> {
+    Ok(paths
+        .conversation_dir(agent, conversation)?
+        .join("conversation.json"))
+}
+
+fn validate_identity(
+    path: &Path,
+    value: &Conversation,
+    agent: &AgentId,
+    conversation: &ConversationId,
+) -> Result<(), StoreError> {
+    if &value.agent_id != agent || &value.id != conversation {
+        return Err(StoreError::new(StoreErrorKind::Parse, path));
+    }
+    Ok(())
+}

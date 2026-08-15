@@ -5,6 +5,8 @@ use lotta_testkit::roots::TemporaryRoot;
 use std::path::Path;
 use std::sync::Mutex;
 
+mod records;
+
 fn root(label: &str) -> (TemporaryRoot, StorePaths) {
     let root = TemporaryRoot::new(label).expect("temporary root");
     let paths = StorePaths::new(root.path().join("backend")).expect("store paths");
@@ -744,6 +746,393 @@ mod adapter {
     }
 }
 
+mod agent {
+    use super::*;
+    mod bounds {
+        use super::*;
+        use lotta_runtime::RuntimeError;
+        use lotta_runtime::ports::{AgentStore, ConversationStore};
+
+        #[tokio::test]
+        async fn creation_caps() {
+            assert_eq!(crate::AGENTS_MAX, 100_000);
+            assert_eq!(crate::CONVERSATIONS_PER_AGENT_MAX, 100_000);
+            let (_owned, paths) = root("creation-caps");
+            let first = LocalStore::with_limits(paths.clone(), 2, 2);
+            let second = LocalStore::with_limits(paths, 2, 2);
+            let agents = [
+                lotta_testkit::contract::fixtures::agent("agent-cap-a"),
+                lotta_testkit::contract::fixtures::agent("agent-cap-b"),
+                lotta_testkit::contract::fixtures::agent("agent-cap-c"),
+            ];
+            AgentStore::save(&first, &agents[0])
+                .await
+                .expect("below cap");
+            AgentStore::save(&second, &agents[1]).await.expect("at cap");
+            assert!(matches!(
+                AgentStore::save(&first, &agents[2]).await,
+                Err(RuntimeError::LimitExceeded { .. })
+            ));
+            AgentStore::save(&first, &agents[0]).await.expect("replace");
+            let conversations = ["one", "two", "three"]
+                .map(|id| lotta_testkit::contract::fixtures::conversation("agent-cap-a", id));
+            ConversationStore::save(&first, &conversations[0])
+                .await
+                .expect("below conversation cap");
+            ConversationStore::save(&second, &conversations[1])
+                .await
+                .expect("at conversation cap");
+            assert!(matches!(
+                ConversationStore::save(&first, &conversations[2]).await,
+                Err(RuntimeError::LimitExceeded { .. })
+            ));
+            ConversationStore::save(&first, &conversations[0])
+                .await
+                .expect("replace conversation");
+        }
+    }
+    use lotta_domain::{Agent, NonEmptyString};
+    use lotta_runtime::ports::AgentStore;
+
+    #[tokio::test]
+    async fn preserves_unknown() {
+        let (_owned, paths) = root("agent-unknown");
+        let id = AgentId::accept("agent-unknown").expect("id");
+        let path = paths.agent_record(&id).expect("path");
+        atomic_write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "id":"agent-unknown","name":"old","description":null,
+                "system":"","tags":[],"model":"openai/gpt-5",
+                "model_settings":{"future_nested":{"v":1}},
+                "future_flag":{"enabled":true}
+            }))
+            .expect("fixture json")
+            .as_slice(),
+            WriteMode::Standard,
+        )
+        .expect("fixture");
+        let store = LocalStore::new(paths);
+        store
+            .update_agent_name(&id, NonEmptyString::new("new").expect("name"))
+            .await
+            .expect("update");
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("record")).expect("json");
+        assert_eq!(json["future_flag"]["enabled"], true);
+        assert_eq!(json["model_settings"]["future_nested"]["v"], 1);
+        assert_eq!(json["description"], serde_json::Value::Null);
+        assert!(!json.as_object().expect("object").contains_key("hidden"));
+        let loaded = AgentStore::load(&store, &id).await.expect("public reload");
+        assert_eq!(loaded.name.as_str(), "new");
+    }
+
+    #[tokio::test]
+    async fn generic_save_rejects_existing_agent_identity_mismatch() {
+        let (_owned, paths) = root("agent-save-identity");
+        let wanted = lotta_testkit::contract::fixtures::agent("agent-wanted");
+        let other = lotta_testkit::contract::fixtures::agent("agent-other");
+        let path = paths.agent_record(&wanted.id).expect("path");
+        let original = serde_json::to_vec_pretty(&other).expect("serialize");
+        atomic_write(&path, &original, WriteMode::Standard).expect("mismatched fixture");
+        let before = std::fs::read(&path).expect("before");
+        let store = LocalStore::new(paths);
+        assert!(AgentStore::load(&store, &wanted.id).await.is_err());
+        let error = AgentStore::save(&store, &wanted)
+            .await
+            .expect_err("identity mismatch");
+        assert!(matches!(
+            error,
+            lotta_runtime::RuntimeError::InvalidData { .. }
+        ));
+        assert_eq!(std::fs::read(path).expect("survives"), before);
+    }
+
+    #[tokio::test]
+    async fn external_change_conflicts_public_update() {
+        let (_owned, paths) = root("agent-update-conflict");
+        let id = AgentId::accept("agent-conflict").expect("id");
+        let store = LocalStore::new(paths.clone());
+        let agent: Agent = serde_json::from_value(serde_json::json!({
+            "id":"agent-conflict","name":"old","description":null,"system":"",
+            "tags":[],"model":"openai/gpt-5","model_settings":{}
+        }))
+        .expect("agent");
+        AgentStore::save(&store, &agent).await.expect("save");
+        let path = paths.agent_record(&id).expect("path");
+        let external = serde_json::to_vec(&serde_json::json!({
+            "id":"agent-conflict","name":"external","description":null,
+            "system":"","tags":[],"model":"openai/gpt-5","model_settings":{}
+        }))
+        .expect("external json");
+        let result = store
+            .update_agent_name_observed(
+                &id,
+                NonEmptyString::new("lotta").expect("name"),
+                move |path| {
+                    std::fs::write(path, &external).map_err(|e| StoreError::from_io(path, &e))
+                },
+            )
+            .await;
+        assert_eq!(
+            result.expect_err("conflict").kind(),
+            StoreErrorKind::StorageConflict
+        );
+        assert!(
+            String::from_utf8(std::fs::read(path).expect("external survives"))
+                .expect("utf8")
+                .contains("external")
+        );
+    }
+}
+
+mod conversation {
+    use super::*;
+    use lotta_domain::{BoundedMap, Timestamp};
+    use lotta_runtime::ports::{AgentStore, ConversationStore};
+    use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn preserves_unknown() {
+        let (_owned, paths) = root("conversation-unknown");
+        let agent = AgentId::accept("agent-unknown-conversation").expect("agent");
+        let id = ConversationId::accept("conversation-unknown").expect("conversation");
+        let path = crate::conversation::record_path(&paths, &agent, &id).expect("path");
+        let fixture = serde_json::to_vec(&serde_json::json!({
+            "id":"conversation-unknown",
+            "agent_id":"agent-unknown-conversation","archived":false,
+            "archived_at":null,"created_at":"2026-01-01T00:00:00Z",
+            "updated_at":"2026-01-01T00:00:00Z","last_message_at":null,
+            "summary":null,"in_context_message_ids":[],
+            "future_flag":{"enabled":true},
+            "opaque_settings":{"future":"kept"}
+        }))
+        .expect("fixture json");
+        atomic_write(&path, &fixture, WriteMode::Standard).expect("fixture");
+        let store = LocalStore::new(paths);
+        let now = Timestamp::parse_persisted_rfc3339("2026-01-01T00:00:01Z").expect("now");
+        store
+            .set_conversation_archived(&agent, &id, true, now)
+            .await
+            .expect("archive");
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("record")).expect("json");
+        assert_eq!(json["future_flag"]["enabled"], true);
+        assert_eq!(json["opaque_settings"]["future"], "kept");
+        assert_eq!(json["summary"], serde_json::Value::Null);
+        assert!(!json.as_object().expect("object").contains_key("model"));
+        assert!(!json.as_object().expect("object").contains_key("hidden"));
+        let loaded = ConversationStore::load(&store, &agent, &id)
+            .await
+            .expect("public reload");
+        assert!(loaded.archived);
+    }
+
+    #[tokio::test]
+    async fn generic_save_rejects_named_conversation_agent_collision() {
+        let (_owned, paths) = root("conversation-save-identity");
+        let wanted = lotta_testkit::contract::fixtures::conversation("agent-a", "shared-id");
+        let other = lotta_testkit::contract::fixtures::conversation("agent-b", "shared-id");
+        let path = crate::conversation::record_path(&paths, &wanted.agent_id, &wanted.id)
+            .expect("named path");
+        let original = serde_json::to_vec_pretty(&other).expect("serialize");
+        atomic_write(&path, &original, WriteMode::Standard).expect("mismatched fixture");
+        let before = std::fs::read(&path).expect("before");
+        let store = LocalStore::new(paths);
+        assert!(
+            ConversationStore::load(&store, &wanted.agent_id, &wanted.id)
+                .await
+                .is_err()
+        );
+        let error = ConversationStore::save(&store, &wanted)
+            .await
+            .expect_err("identity mismatch");
+        assert!(matches!(
+            error,
+            lotta_runtime::RuntimeError::InvalidData { .. }
+        ));
+        assert_eq!(std::fs::read(path).expect("survives"), before);
+    }
+
+    #[tokio::test]
+    async fn archival() {
+        let (_owned, paths) = root("conversation-archival");
+        let store = LocalStore::new(paths);
+        let agent = lotta_testkit::contract::fixtures::agent("agent-archive");
+        let conversation = lotta_testkit::contract::fixtures::conversation(
+            "agent-archive",
+            "conversation-archive",
+        );
+        AgentStore::save(&store, &agent).await.expect("agent");
+        ConversationStore::save(&store, &conversation)
+            .await
+            .expect("conversation");
+        let first = Timestamp::parse_persisted_rfc3339("2026-01-01T00:00:01Z").expect("first");
+        let archived = store
+            .set_conversation_archived(&agent.id, &conversation.id, true, first)
+            .await
+            .expect("archive");
+        assert!(archived.archived);
+        assert_eq!(archived.archived_at, Some(Some(first)));
+        let second = Timestamp::parse_persisted_rfc3339("2026-01-01T00:00:02Z").expect("second");
+        let repeated = store
+            .set_conversation_archived(&agent.id, &conversation.id, true, second)
+            .await
+            .expect("repeat archive");
+        assert_eq!(repeated.archived_at, Some(Some(first)));
+        assert_eq!(repeated.updated_at, second);
+        let third = Timestamp::parse_persisted_rfc3339("2026-01-01T00:00:03Z").expect("third");
+        let active = store
+            .set_conversation_archived(&agent.id, &conversation.id, false, third)
+            .await
+            .expect("unarchive");
+        assert!(!active.archived);
+        assert_eq!(active.archived_at, Some(None));
+        let original_agent = AgentStore::load(&store, &agent.id)
+            .await
+            .expect("agent before");
+        let settings = BoundedMap::<1_024>::new(BTreeMap::new()).expect("settings");
+        let changed = store
+            .set_conversation_model_override(
+                &agent.id,
+                &conversation.id,
+                Some("openai/gpt-5-mini".into()),
+                settings,
+                second,
+            )
+            .await
+            .expect("override");
+        assert_eq!(changed.model, Some(Some("openai/gpt-5-mini".into())));
+        assert_eq!(
+            AgentStore::load(&store, &agent.id)
+                .await
+                .expect("agent after"),
+            original_agent
+        );
+    }
+}
+
+mod refresh {
+    use super::*;
+    use lotta_domain::Agent;
+    use lotta_runtime::ports::AgentStore;
+
+    fn fixture(id: &str, name: &str) -> Agent {
+        serde_json::from_value(serde_json::json!({
+            "id":id,"name":name,"description":null,"system":"","tags":[],
+            "model":"openai/gpt-5","model_settings":{}
+        }))
+        .expect("agent")
+    }
+
+    #[tokio::test]
+    async fn detects_external_write() {
+        let (_owned, paths) = root("refresh-write");
+        let id = AgentId::accept("agent-refresh").expect("id");
+        let store = LocalStore::new(paths.clone());
+        AgentStore::save(&store, &fixture("agent-refresh", "outside!"))
+            .await
+            .expect("save");
+        assert_eq!(
+            AgentStore::load(&store, &id)
+                .await
+                .expect("load")
+                .name
+                .as_str(),
+            "outside!"
+        );
+        let path = paths.agent_record(&id).expect("path");
+        let mut external =
+            serde_json::to_vec_pretty(&fixture("agent-refresh", "external")).expect("serialize");
+        external.push(b'\n');
+        let prior = std::fs::metadata(&path)
+            .expect("prior metadata")
+            .modified()
+            .expect("prior mtime");
+        let original_len = std::fs::metadata(&path).expect("prior metadata").len();
+        assert_eq!(external.len() as u64, original_len);
+        std::fs::write(&path, external).expect("external rewrite");
+        let advanced = prior
+            .checked_add(std::time::Duration::from_secs(2))
+            .expect("checked mtime");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("record")
+            .set_times(std::fs::FileTimes::new().set_modified(advanced))
+            .expect("advance mtime");
+        let actual = std::fs::metadata(&path)
+            .expect("changed metadata")
+            .modified()
+            .expect("changed mtime");
+        assert_eq!(actual, advanced);
+        assert_ne!(actual, prior);
+        assert_eq!(
+            AgentStore::load(&store, &id)
+                .await
+                .expect("refresh")
+                .name
+                .as_str(),
+            "external"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_cache_evicts_without_failing_public_loads() {
+        assert_eq!(crate::refresh::RECORD_CACHE_ENTRIES_MAX, 200_000);
+        let (_owned, paths) = root("refresh-eviction");
+        let store = LocalStore::with_cache_limit(paths, 2);
+        let ids = ["agent-cache-a", "agent-cache-b", "agent-cache-c"];
+        for id in ids {
+            AgentStore::save(&store, &fixture(id, id))
+                .await
+                .expect("save through bounded cache");
+        }
+        for _ in 0..3 {
+            for id in ids {
+                let id = AgentId::accept(id).expect("id");
+                assert_eq!(AgentStore::load(&store, &id).await.expect("reload").id, id);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn detects_delete_and_same_mtime_replacement() {
+        let (_owned, paths) = root("refresh-integrity");
+        let id = AgentId::accept("agent-refresh-integrity").expect("id");
+        let store = LocalStore::new(paths.clone());
+        AgentStore::save(&store, &fixture("agent-refresh-integrity", "aaaa"))
+            .await
+            .expect("save");
+        AgentStore::load(&store, &id).await.expect("cache");
+        let path = paths.agent_record(&id).expect("path");
+        let modified = std::fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        let mut bytes = serde_json::to_vec_pretty(&fixture("agent-refresh-integrity", "bbbb"))
+            .expect("serialize");
+        bytes.push(b'\n');
+        std::fs::write(&path, bytes).expect("replace");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("file")
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .expect("mtime");
+        assert_eq!(
+            AgentStore::load(&store, &id)
+                .await
+                .expect("checksum refresh")
+                .name
+                .as_str(),
+            "bbbb"
+        );
+        std::fs::remove_file(&path).expect("delete");
+        assert!(AgentStore::load(&store, &id).await.is_err());
+    }
+}
+
 mod lock {
     use super::*;
 
@@ -756,6 +1145,27 @@ mod lock {
         assert_eq!(second.kind(), StoreErrorKind::LottaLock);
         drop(first);
         LottaStorageLock::try_acquire(paths.root()).expect("RAII release");
+    }
+
+    #[test]
+    fn expected_write_rejects_guard_for_different_root() {
+        let (_left, left) = root("lock-root-left");
+        let (_right, right) = root("lock-root-right");
+        let path = left.root().join("record.json");
+        let revision = crate::atomic::FileRevision::sample_path(&path).expect("revision");
+        let guard = LottaStorageLock::try_acquire(right.root()).expect("wrong guard");
+        let result = crate::atomic::atomic_write_expected_locked(
+            &path,
+            b"{}\n",
+            WriteMode::Standard,
+            &revision,
+            &guard,
+        );
+        assert_eq!(
+            result.expect_err("root mismatch").kind(),
+            StoreErrorKind::LottaLock
+        );
+        assert!(!path.exists());
     }
 
     #[test]

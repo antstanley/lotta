@@ -80,7 +80,7 @@ impl AtomicObserver for NoopObserver {}
 /// # Errors
 /// Returns typed path, lock, conflict, limit, or filesystem failures.
 pub fn atomic_write(path: &Path, bytes: &[u8], mode: WriteMode) -> Result<(), StoreError> {
-    logged_once(|| atomic_write_inner(path, bytes, mode, &NoopObserver))
+    logged_once(|| atomic_write_unlocked(path, bytes, mode, &NoopObserver))
 }
 
 /// Atomically replaces one file with an observer at actual production step boundaries.
@@ -93,23 +93,50 @@ pub fn atomic_write_observed(
     mode: WriteMode,
     observer: &dyn AtomicObserver,
 ) -> Result<(), StoreError> {
-    logged_once(|| atomic_write_inner(path, bytes, mode, observer))
+    logged_once(|| atomic_write_unlocked(path, bytes, mode, observer))
 }
 
-fn atomic_write_inner(
+pub(crate) fn atomic_write_expected_locked(
+    path: &Path,
+    bytes: &[u8],
+    mode: WriteMode,
+    expected: &FileRevision,
+    lock: &LottaStorageLock,
+) -> Result<(), StoreError> {
+    logged_once(|| atomic_write_held(path, bytes, mode, expected, lock, &NoopObserver))
+}
+
+fn atomic_write_unlocked(
     path: &Path,
     bytes: &[u8],
     mode: WriteMode,
     observer: &dyn AtomicObserver,
 ) -> Result<(), StoreError> {
     validate_target(path, bytes)?;
+    let root = backend_root(path)?;
+    let lock = LottaStorageLock::try_acquire_confined(root)?;
+    let expected = FileRevision::sample(root, path, observer)?;
+    atomic_write_held(path, bytes, mode, &expected, &lock, observer)
+}
+
+fn atomic_write_held(
+    path: &Path,
+    bytes: &[u8],
+    mode: WriteMode,
+    expected: &FileRevision,
+    lock: &LottaStorageLock,
+    observer: &dyn AtomicObserver,
+) -> Result<(), StoreError> {
+    validate_target(path, bytes)?;
     let parent = path.parent().ok_or_else(|| invalid_path(path))?;
     let root = backend_root(path)?;
+    if !lock.guards_root(root) {
+        return Err(StoreError::new(StoreErrorKind::LottaLock, path));
+    }
     create_confined_parent(root, parent)?;
     apply_directory_mode(parent, mode)?;
     validate_existing(root, path)?;
-    let _lock = LottaStorageLock::try_acquire_confined(root)?;
-    let source = Revision::sample(root, path, observer)?;
+    let source = expected.clone();
     let mut last = None;
     for attempt in 1..=ATOMIC_WRITE_RETRIES_MAX {
         if let Err(error) = observer.attempt(attempt, path) {
@@ -133,7 +160,7 @@ fn write_precommit(
     path: &Path,
     bytes: &[u8],
     mode: WriteMode,
-    source: &Revision,
+    source: &FileRevision,
     observer: &dyn AtomicObserver,
 ) -> Result<PathBuf, StoreError> {
     let parent = path.parent().ok_or_else(|| invalid_path(path))?;
@@ -182,7 +209,7 @@ fn atomic_delete_inner(path: &Path, observer: &dyn AtomicObserver) -> Result<(),
     let root = backend_root(path)?;
     validate_regular_file(root, path)?;
     let _lock = LottaStorageLock::try_acquire_confined(root)?;
-    let source = Revision::sample(root, path, observer)?;
+    let source = FileRevision::sample(root, path, observer)?;
     observer.before_remove(path)?;
     ensure_revision(root, path, &source, observer)?;
     validate_regular_file(root, path)?;
@@ -192,14 +219,23 @@ fn atomic_delete_inner(path: &Path, observer: &dyn AtomicObserver) -> Result<(),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct Revision {
+pub(crate) struct FileRevision {
     exists: bool,
     modified: Option<SystemTime>,
     length: u64,
     checksum: [u8; 32],
 }
 
-impl Revision {
+impl FileRevision {
+    pub(crate) const fn exists(&self) -> bool {
+        self.exists
+    }
+
+    pub(crate) fn sample_path(path: &Path) -> Result<Self, StoreError> {
+        let root = backend_root(path)?;
+        Self::sample(root, path, &NoopObserver)
+    }
+
     fn sample(root: &Path, path: &Path, observer: &dyn AtomicObserver) -> Result<Self, StoreError> {
         match std::fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::absent()),
@@ -236,10 +272,10 @@ impl Revision {
 fn ensure_revision(
     root: &Path,
     path: &Path,
-    expected: &Revision,
+    expected: &FileRevision,
     observer: &dyn AtomicObserver,
 ) -> Result<(), StoreError> {
-    if &Revision::sample(root, path, observer)? == expected {
+    if &FileRevision::sample(root, path, observer)? == expected {
         Ok(())
     } else {
         Err(StoreError::new(StoreErrorKind::StorageConflict, path))

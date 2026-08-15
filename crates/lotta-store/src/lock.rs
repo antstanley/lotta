@@ -16,6 +16,7 @@ const LOCK_FILE_NAME: &str = ".lotta-storage.lock";
 pub struct LottaStorageLock {
     file: File,
     path: PathBuf,
+    root: PathBuf,
 }
 
 impl LottaStorageLock {
@@ -49,13 +50,21 @@ impl LottaStorageLock {
             std::fs::TryLockError::WouldBlock => StoreError::new(StoreErrorKind::LottaLock, &path),
             std::fs::TryLockError::Error(error) => StoreError::from_io(&path, &error),
         })?;
-        Ok(Self { file, path })
+        Ok(Self {
+            file,
+            path,
+            root: root.to_path_buf(),
+        })
     }
 
     /// Returns the lock-file path for safe diagnostics.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn guards_root(&self, root: &Path) -> bool {
+        self.root == root
     }
 }
 
