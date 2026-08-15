@@ -11,6 +11,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  protocol-fixture:
+    name: protocol-fixture
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Check out pinned Letta Code protocol source
+        uses: actions/checkout@v4
+        with:
+          repository: letta-ai/letta-code
+          ref: 300f923f16cc8eee50656d7da732902c1dea2b65
+          path: letta-code
+      - name: Check extractor syntax and bounded resolution
+        run: |
+          node --check tools/extract-protocol-fixture.mjs
+          node tools/extract-protocol-fixture.mjs --self-test
+      - name: Check protocol fixture twice without writing
+        run: |
+          node tools/extract-protocol-fixture.mjs --source letta-code --check
+          node tools/extract-protocol-fixture.mjs --source letta-code --check
+          git diff --exit-code -- fixtures/protocol/discriminants.json
+
   quality:
     name: ${{ matrix.gate }}
     runs-on: ubuntu-latest
