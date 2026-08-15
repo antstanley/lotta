@@ -62,7 +62,9 @@ fn rejects_corrupted_over_capacity_without_harming_existing() {
         RuntimeEntry {
             generation: 99_999,
             owner: LifecycleOwner::new(scope("corrupt", 1), uuid::Uuid::from_u128(99_999)),
-            residency: RuntimeResidency::new(0, 0, false, 0),
+            queue: ConversationQueue::default(),
+            admission_history: AdmissionHistory::default(),
+            residency: RuntimeResidency::new(0, false, 0),
         },
     );
     let result = registry.get_or_create(&scope("rejected", 1), uuid::Uuid::from_u128(50_001));

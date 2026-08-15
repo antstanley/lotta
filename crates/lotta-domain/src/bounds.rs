@@ -148,6 +148,8 @@ pub(crate) const JSON_PROPERTIES_MAX: usize = 1_024;
 pub(crate) const PERMISSION_SUGGESTIONS_ITEMS_MAX: usize = 128;
 pub(crate) const DIFFS_ITEMS_MAX: usize = 1_024;
 pub(crate) const ADMISSION_HISTORY_ITEMS_MAX: usize = 300;
+/// Maximum queue items consumed before the caller must yield.
+pub const QUEUE_PUMP_BATCH_MAX: usize = 64;
 
 /// The nine canonical resource bounds in specification order.
 pub const RESOURCE_BOUNDS: [ResourceBound; 9] = [

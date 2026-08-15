@@ -44,6 +44,12 @@ pub struct AdmissionHistory {
 }
 
 impl AdmissionHistory {
+    /// Returns the previously recorded disposition without changing history.
+    #[must_use]
+    pub fn prior(&self, client_message_id: &NonEmptyString) -> Option<InputDisposition> {
+        self.entries.get(client_message_id.as_str()).copied()
+    }
+
     /// Returns a prior disposition, or records and returns a new one.
     ///
     /// # Panics

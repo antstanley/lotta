@@ -1,8 +1,10 @@
 //! Bounded listener-owned runtime registry.
 
-use crate::{LifecycleOwner, RuntimeError};
+use crate::{ConversationQueue, LifecycleOwner, PumpMutation, QueueMutation, RuntimeError};
 use lotta_domain::bounds::RUNTIMES_MAX;
-use lotta_domain::{AgentId, ConversationId, RuntimeScope, TurnStateKind};
+use lotta_domain::{
+    AdmissionHistory, AgentId, ConversationId, NonEmptyString, RuntimeScope, TurnStateKind,
+};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -45,44 +47,43 @@ pub struct RuntimeHandle {
 /// Complete auxiliary snapshot controlling runtime residency.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeResidency {
-    queue_item_count: usize,
     pending_approval_count: usize,
     interrupted_result_present: bool,
     sandbox_subscription_count: usize,
 }
 
 impl RuntimeResidency {
-    /// Creates the complete four-term auxiliary residency snapshot.
+    /// Creates the complete three-term auxiliary residency snapshot.
     #[must_use]
     pub const fn new(
-        queue_item_count: usize,
         pending_approval_count: usize,
         interrupted_result_present: bool,
         sandbox_subscription_count: usize,
     ) -> Self {
         Self {
-            queue_item_count,
             pending_approval_count,
             interrupted_result_present,
             sandbox_subscription_count,
         }
     }
 
-    /// ORs live lifecycle state with the exact four auxiliary terms.
+    /// ORs live lifecycle and queue state with the exact three auxiliary terms.
     #[must_use]
-    pub fn requires_residency(self, lifecycle: TurnStateKind) -> bool {
+    pub fn requires_residency(self, lifecycle: TurnStateKind, queue_len: usize) -> bool {
         lifecycle != TurnStateKind::Idle
-            || self.queue_item_count > 0
+            || queue_len > 0
             || self.pending_approval_count > 0
             || self.interrupted_result_present
             || self.sandbox_subscription_count > 0
     }
 }
 
-struct RuntimeEntry {
-    generation: u64,
-    owner: LifecycleOwner,
-    residency: RuntimeResidency,
+pub(crate) struct RuntimeEntry {
+    pub(crate) generation: u64,
+    pub(crate) owner: LifecycleOwner,
+    pub(crate) queue: ConversationQueue,
+    pub(crate) admission_history: AdmissionHistory,
+    pub(crate) residency: RuntimeResidency,
 }
 
 /// Result of publishing a complete residency snapshot.
@@ -168,6 +169,72 @@ impl ListenerRuntime {
         self.current_entry(handle).map(|entry| &entry.owner)
     }
 
+    /// Returns the exact handle's immutable pending queue.
+    #[must_use]
+    pub fn queue(&self, handle: &RuntimeHandle) -> Option<&ConversationQueue> {
+        self.current_entry(handle).map(|entry| &entry.queue)
+    }
+
+    /// Dequeues the pending queue head for an exact runtime generation.
+    ///
+    /// # Errors
+    /// Returns an error for a missing/stale handle or queue mutation failure.
+    pub fn dequeue_queue(
+        &mut self,
+        handle: &RuntimeHandle,
+    ) -> Result<Option<QueueMutation>, RuntimeError> {
+        self.current_entry_mut(handle)?.queue.dequeue()
+    }
+
+    /// Removes a queued item with the wire `dequeued` disposition.
+    ///
+    /// # Errors
+    /// Returns an error for a missing/stale handle or queue mutation failure.
+    pub fn remove_queued(
+        &mut self,
+        handle: &RuntimeHandle,
+        id: &NonEmptyString,
+    ) -> Result<Option<QueueMutation>, RuntimeError> {
+        self.current_entry_mut(handle)?.queue.remove(id)
+    }
+
+    /// Cancels a queued item with the wire `cancelled` disposition.
+    ///
+    /// # Errors
+    /// Returns an error for a missing/stale handle or queue mutation failure.
+    pub fn cancel_queued(
+        &mut self,
+        handle: &RuntimeHandle,
+        id: &NonEmptyString,
+    ) -> Result<Option<QueueMutation>, RuntimeError> {
+        self.current_entry_mut(handle)?.queue.cancel(id)
+    }
+
+    /// Drops a queued item with the internal stale-generation reason.
+    ///
+    /// # Errors
+    /// Returns an error for a missing/stale handle or queue mutation failure.
+    pub fn drop_stale_queued(
+        &mut self,
+        handle: &RuntimeHandle,
+        id: &NonEmptyString,
+    ) -> Result<Option<QueueMutation>, RuntimeError> {
+        self.current_entry_mut(handle)?.queue.drop_stale(id)
+    }
+
+    /// Pumps an exact runtime's queue using its live lifecycle state.
+    ///
+    /// # Errors
+    /// Returns an error for a missing/stale handle or queue mutation failure.
+    pub fn pump_queue(
+        &mut self,
+        handle: &RuntimeHandle,
+    ) -> Result<Option<PumpMutation>, RuntimeError> {
+        let entry = self.current_entry_mut(handle)?;
+        let state = entry.owner.projection().state();
+        entry.queue.pump(state)
+    }
+
     /// Returns the exact handle's mutable lifecycle owner.
     ///
     /// # Errors
@@ -211,7 +278,9 @@ impl ListenerRuntime {
         let entry = RuntimeEntry {
             generation,
             owner: LifecycleOwner::new(scope.clone(), owner_id),
-            residency: RuntimeResidency::new(0, 0, false, 0),
+            queue: ConversationQueue::default(),
+            admission_history: AdmissionHistory::default(),
+            residency: RuntimeResidency::new(0, false, 0),
         };
         self.entries.insert(key.clone(), entry);
         Ok(RuntimeHandle { key, generation })
@@ -226,12 +295,10 @@ impl ListenerRuntime {
         handle: &RuntimeHandle,
         snapshot: RuntimeResidency,
     ) -> Result<ResidencyUpdate, RuntimeError> {
-        let lifecycle = self
-            .lifecycle(handle)
-            .ok_or_else(stale_handle)?
-            .projection()
-            .state();
-        if snapshot.requires_residency(lifecycle) {
+        let entry = self.current_entry(handle).ok_or_else(stale_handle)?;
+        let lifecycle = entry.owner.projection().state();
+        let queue_len = entry.queue.len();
+        if snapshot.requires_residency(lifecycle, queue_len) {
             self.lifecycle_mut(handle)?;
             if let Some(entry) = self.entries.get_mut(&handle.key) {
                 entry.residency = snapshot;
@@ -242,10 +309,23 @@ impl ListenerRuntime {
         Ok(ResidencyUpdate::Evicted)
     }
 
-    fn current_entry(&self, handle: &RuntimeHandle) -> Option<&RuntimeEntry> {
+    pub(crate) fn current_entry(&self, handle: &RuntimeHandle) -> Option<&RuntimeEntry> {
         self.entries
             .get(&handle.key)
             .filter(|entry| entry.generation == handle.generation)
+    }
+
+    pub(crate) fn current_entry_mut(
+        &mut self,
+        handle: &RuntimeHandle,
+    ) -> Result<&mut RuntimeEntry, RuntimeError> {
+        let Some(entry) = self.entries.get_mut(&handle.key) else {
+            return Err(stale_handle());
+        };
+        if entry.generation != handle.generation {
+            return Err(stale_handle());
+        }
+        Ok(entry)
     }
 }
 
@@ -269,3 +349,6 @@ mod architecture_scan;
 mod eviction;
 #[cfg(test)]
 mod keying;
+#[cfg(test)]
+#[path = "registry/tests/queue_ownership.rs"]
+mod queue_ownership;

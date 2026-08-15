@@ -8,6 +8,8 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+/// Serialized per-runtime input admission.
+pub mod admission;
 /// Validated, bounded values shared by runtime ports.
 pub mod boundary;
 /// Immutable Task 06 runtime resource bounds exported for inward-dependent adapters.
@@ -18,6 +20,10 @@ pub mod lease;
 pub mod lifecycle;
 /// Effect interfaces implemented by adapters outside this crate.
 pub mod ports;
+/// Bounded per-conversation FIFO queue.
+pub mod queue;
+/// Authoritative queue mutation snapshots.
+pub mod queue_snapshot;
 /// Bounded listener-owned runtime registry.
 pub mod registry;
 /// Explicit task-local per-turn context.
@@ -25,8 +31,11 @@ pub mod scope_context;
 /// Worktree watcher lifetime state.
 pub mod worktree_watcher;
 
+pub use admission::{AdmissionOutcome, AdmissionRequest, AdmissionRoute};
 pub use lease::{CancellationPolicy, LeaseEffect, LeaseGuard, SuppressionReason};
 pub use lifecycle::{LifecycleOwner, LifecycleProjection};
+pub use queue::{ConversationQueue, PumpDirective, PumpMutation};
+pub use queue_snapshot::{QueueMutation, QueueMutationEvent, QueueSnapshot};
 pub use registry::{ListenerRuntime, ResidencyUpdate, RuntimeHandle, RuntimeKey, RuntimeResidency};
 pub use scope_context::{
     ScopeContextInput, ScopeContextSnapshot, WorkspaceSandbox, scope_operation, spawn_scoped,

@@ -10,7 +10,7 @@ fn scope() -> RuntimeScope {
 }
 
 fn quiescent() -> RuntimeResidency {
-    RuntimeResidency::new(0, 0, false, 0)
+    RuntimeResidency::new(0, false, 0)
 }
 
 fn create(registry: &mut ListenerRuntime) -> RuntimeHandle {
@@ -46,19 +46,20 @@ fn stays_resident_while_lifecycle() {
 
 #[test]
 fn stays_resident_while_queue() {
-    assert_auxiliary(RuntimeResidency::new(1, 0, false, 0));
+    let snapshot = RuntimeResidency::new(0, false, 0);
+    assert!(snapshot.requires_residency(TurnStateKind::Idle, 1));
 }
 #[test]
 fn stays_resident_while_approval() {
-    assert_auxiliary(RuntimeResidency::new(0, 1, false, 0));
+    assert_auxiliary(RuntimeResidency::new(1, false, 0));
 }
 #[test]
 fn stays_resident_while_interrupted_result() {
-    assert_auxiliary(RuntimeResidency::new(0, 0, true, 0));
+    assert_auxiliary(RuntimeResidency::new(0, true, 0));
 }
 #[test]
 fn stays_resident_while_sandbox_subscription() {
-    assert_auxiliary(RuntimeResidency::new(0, 0, false, 1));
+    assert_auxiliary(RuntimeResidency::new(0, false, 1));
 }
 
 #[test]
@@ -82,7 +83,7 @@ fn no_runtime_idle_timer() {
 fn assert_auxiliary(snapshot: RuntimeResidency) {
     let mut registry = ListenerRuntime::new();
     let handle = create(&mut registry);
-    assert!(snapshot.requires_residency(TurnStateKind::Idle));
+    assert!(snapshot.requires_residency(TurnStateKind::Idle, 0));
     assert_one_hot(registry, &handle, snapshot);
 }
 

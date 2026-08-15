@@ -107,7 +107,7 @@ async fn independent_from_runtime_registry() {
     let handle = registry
         .get_or_create(&scope, uuid::Uuid::from_u128(1))
         .unwrap_or_else(|error| panic!("runtime: {error}"));
-    let residency = RuntimeResidency::new(1, 0, false, 0);
+    let residency = RuntimeResidency::new(1, false, 0);
     let _update = registry.set_residency(&handle, residency);
     advance(&clock, WORKTREE_WATCHER_IDLE_STOP_MS).await;
     assert!(!watcher.is_active());

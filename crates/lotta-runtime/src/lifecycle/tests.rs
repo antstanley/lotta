@@ -320,9 +320,9 @@ fn source_contract_uses_live_owner_and_four_checks() {
     }
     let registry = include_str!("../registry.rs");
     assert!(registry.contains("owner: LifecycleOwner"));
-    assert!(!registry.contains("lifecycle: TurnStateKind,"));
+    assert!(!registry.contains("lifecycle_snapshot: TurnStateKind,"));
     let _unused_types = (
         RuntimeKey::from(&scope()),
-        RuntimeResidency::new(0, 0, false, 0),
+        RuntimeResidency::new(0, false, 0),
     );
 }
