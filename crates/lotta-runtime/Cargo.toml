@@ -14,5 +14,10 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+chrono.workspace = true
+syn = { version = "2.0.106", features = ["full", "visit"] }
+walkdir = "2.5.0"
+
 [lints]
 workspace = true

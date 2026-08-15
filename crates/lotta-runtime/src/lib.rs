@@ -14,6 +14,19 @@ pub mod boundary;
 pub mod bounds;
 /// Effect interfaces implemented by adapters outside this crate.
 pub mod ports;
+/// Bounded listener-owned runtime registry.
+pub mod registry;
+/// Explicit task-local per-turn context.
+pub mod scope_context;
+/// Worktree watcher lifetime state.
+pub mod worktree_watcher;
+
+pub use registry::{ListenerRuntime, ResidencyUpdate, RuntimeHandle, RuntimeKey, RuntimeResidency};
+pub use scope_context::{
+    ScopeContextInput, ScopeContextSnapshot, WorkspaceSandbox, scope_operation, spawn_scoped,
+    try_current,
+};
+pub use worktree_watcher::{WORKTREE_WATCHER_IDLE_STOP_MS, WorktreeWatcher};
 
 /// Stable runtime-boundary failure shared by all core ports.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
