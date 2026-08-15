@@ -1,0 +1,1 @@
+{"type":"error","kind":"invalid_request","code":"fixture_invalid_request","context":"SANITIZED_FIXTURE_INVALID_REQUEST","provenance":{"source_test":"src/backend/pi-stream-adapter.test.ts","source_symbol":"normalizeLocalProviderError","capture_boundary":"pinned_error_normalization_boundary"}}

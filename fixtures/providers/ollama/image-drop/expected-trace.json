@@ -1,0 +1,17 @@
+[
+  {
+    "type": "TextDelta",
+    "text": "SANITIZED_FIXTURE_TEXT"
+  },
+  {
+    "type": "Usage",
+    "input_tokens": 3,
+    "output_tokens": 2,
+    "cached_input_tokens": 0,
+    "reasoning_tokens": 0
+  },
+  {
+    "type": "Stop",
+    "reason": "end_turn"
+  }
+]

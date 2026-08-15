@@ -1,0 +1,1 @@
+{"type":"error","kind":"authorization","code":"fixture_authorization","context":"SANITIZED_FIXTURE_AUTHORIZATION","provenance":{"source_test":"src/backend/pi-stream-adapter.test.ts","source_symbol":"normalizeLocalProviderError","capture_boundary":"pinned_error_normalization_boundary"}}

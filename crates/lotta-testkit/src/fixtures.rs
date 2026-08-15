@@ -3,6 +3,8 @@ use serde::de::DeserializeOwned;
 
 /// Typed access to the deterministic persistence compatibility corpus.
 pub mod persistence;
+/// Typed access to the deterministic provider stream corpus.
+pub mod providers;
 mod sha256;
 use std::fs::{File, ReadDir};
 use std::io::Read;

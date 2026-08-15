@@ -1,0 +1,1 @@
+{"type":"error","kind":"context_overflow","code":"fixture_context_overflow","context":"SANITIZED_FIXTURE_CONTEXT_OVERFLOW","provenance":{"source_test":"src/backend/pi-stream-adapter.test.ts","source_symbol":"normalizeLocalProviderError","capture_boundary":"pinned_error_normalization_boundary"}}

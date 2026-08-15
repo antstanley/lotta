@@ -1,0 +1,25 @@
+[
+  {
+    "type": "ReasoningDelta",
+    "text": "SANITIZED_FIXTURE_REASONING"
+  },
+  {
+    "type": "RedactedReasoning",
+    "marker": "<redacted-fixture>"
+  },
+  {
+    "type": "TextDelta",
+    "text": "SANITIZED_FIXTURE_TEXT"
+  },
+  {
+    "type": "Usage",
+    "input_tokens": 4,
+    "output_tokens": 2,
+    "cached_input_tokens": 0,
+    "reasoning_tokens": 0
+  },
+  {
+    "type": "Stop",
+    "reason": "end_turn"
+  }
+]

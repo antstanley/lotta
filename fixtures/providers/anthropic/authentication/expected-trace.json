@@ -1,0 +1,8 @@
+[
+  {
+    "type": "Error",
+    "kind": "authentication",
+    "code": "fixture_authentication",
+    "context": "SANITIZED_FIXTURE_AUTHENTICATION"
+  }
+]

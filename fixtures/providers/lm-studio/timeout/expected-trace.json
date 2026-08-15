@@ -1,0 +1,8 @@
+[
+  {
+    "type": "Error",
+    "kind": "timeout",
+    "code": "fixture_timeout",
+    "context": "SANITIZED_FIXTURE_TIMEOUT"
+  }
+]

@@ -1,0 +1,43 @@
+{
+  "method": "POST",
+  "endpoint": "/api/chat",
+  "body": {
+    "model": "fixture-model",
+    "messages": [
+      {
+        "role": "system",
+        "content": "SANITIZED_FIXTURE_SYSTEM"
+      },
+      {
+        "role": "user",
+        "content": "SANITIZED_FIXTURE_USER",
+        "images": []
+      }
+    ],
+    "stream": true,
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "fixture_tool",
+          "description": "SANITIZED_FIXTURE_TOOL",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "a": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "a"
+            ]
+          }
+        }
+      }
+    ],
+    "options": {
+      "num_ctx": 8192,
+      "num_predict": 256
+    }
+  }
+}

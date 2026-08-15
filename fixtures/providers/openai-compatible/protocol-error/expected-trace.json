@@ -1,0 +1,8 @@
+[
+  {
+    "type": "Error",
+    "kind": "protocol",
+    "code": "fixture_protocol",
+    "context": "SANITIZED_FIXTURE_PROTOCOL_ERROR"
+  }
+]

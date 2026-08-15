@@ -1,0 +1,1 @@
+{"type":"error","kind":"unavailable","code":"fixture_unavailable","context":"SANITIZED_FIXTURE_UNAVAILABLE","provenance":{"source_test":"src/backend/pi-stream-adapter.test.ts","source_symbol":"normalizeLocalProviderError","capture_boundary":"pinned_error_normalization_boundary"}}

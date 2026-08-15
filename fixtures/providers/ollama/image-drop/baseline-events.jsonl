@@ -1,0 +1,3 @@
+{"type":"text_delta","text":"SANITIZED_FIXTURE_TEXT","provenance":{"source_test":"src/backend/pi-stream-adapter.test.ts","source_symbol":"streamFromEvents","capture_boundary":"pinned_pi_ai_test_boundary"}}
+{"type":"usage","input_tokens":3,"output_tokens":2,"cached_input_tokens":0,"reasoning_tokens":0,"provenance":{"source_test":"src/backend/pi-stream-adapter.test.ts","source_symbol":"createUsageStatisticsChunk","capture_boundary":"pinned_pi_ai_test_boundary"}}
+{"type":"done","reason":"end_turn","provenance":{"source_test":"src/backend/pi-stream-adapter.test.ts","source_symbol":"streamFromEvents","capture_boundary":"pinned_pi_ai_test_boundary"}}

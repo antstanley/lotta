@@ -1,0 +1,44 @@
+{
+  "method": "POST",
+  "endpoint": "/v1/chat/completions",
+  "compatibility": "openai-compatible",
+  "body": {
+    "model": "fixture-model",
+    "messages": [
+      {
+        "role": "system",
+        "content": "SANITIZED_FIXTURE_SYSTEM"
+      },
+      {
+        "role": "user",
+        "content": "SANITIZED_FIXTURE_USER"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "fixture_tool",
+          "description": "SANITIZED_FIXTURE_TOOL",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "a": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "a"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 256,
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    }
+  }
+}

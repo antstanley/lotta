@@ -1,0 +1,8 @@
+[
+  {
+    "type": "Error",
+    "kind": "invalid_request",
+    "code": "fixture_invalid_request",
+    "context": "SANITIZED_FIXTURE_INVALID_REQUEST"
+  }
+]

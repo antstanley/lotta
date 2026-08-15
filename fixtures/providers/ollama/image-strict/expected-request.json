@@ -1,0 +1,5 @@
+{
+  "outcome": "preflight_error",
+  "error_kind": "invalid_request",
+  "reason": "SANITIZED_FIXTURE_UNSUPPORTED_IMAGE_STRICT"
+}

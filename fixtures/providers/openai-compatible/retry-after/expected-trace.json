@@ -1,0 +1,8 @@
+[
+  {
+    "type": "Error",
+    "kind": "rate_limit",
+    "code": "fixture_rate_limit",
+    "context": "SANITIZED_FIXTURE_RETRY_AFTER"
+  }
+]

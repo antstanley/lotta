@@ -1,0 +1,1029 @@
+{
+  "schema_version": 1,
+  "source_commit": "300f923f16cc8eee50656d7da732902c1dea2b65",
+  "pi_ai_version": "0.82.1",
+  "generator": "tools/capture-provider-streams.mjs",
+  "provenance": "Deterministic capture from pinned baseline mock/pi-ai boundary and source tests",
+  "capture_boundary": "Sanitized source-test fixtures, not live API traffic",
+  "source_regions": [
+    {
+      "path": "src/backend/dev/pi-api-streams.ts",
+      "symbol": "knownApiStreams",
+      "sha256": "59ecc9c7eac63838b17eecef56480c9ebdbe7632ea27e9711a29db5214263b58"
+    },
+    {
+      "path": "src/backend/dev/pi-stream-adapter.ts",
+      "symbol": "toPiMessage",
+      "sha256": "04ff2642eaceca6bb101a2f0fc894069c3af8343a9548365b88fc49b5f567c32"
+    },
+    {
+      "path": "src/backend/dev/pi-stream-adapter.ts",
+      "symbol": "toPiTools",
+      "sha256": "d7f9ea6b9258f60b6348b8279be5259c46b6d9da40fa679776041ec471fb818a"
+    },
+    {
+      "path": "src/backend/dev/pi-stream-adapter.ts",
+      "symbol": "PiStreamAdapter",
+      "sha256": "66560992b51b9a872fba9be5844a9c57b76f260eb72f544870057f0607ff18a1"
+    },
+    {
+      "path": "src/backend/dev/pi-image-elision.ts",
+      "symbol": "elideImagePayloadsForProviderRetry",
+      "sha256": "4d53daa42f2d3c5ad7199cd1626e05d9a80b0c7ecdeb5b8202f7a9e9b11d0214"
+    },
+    {
+      "path": "src/backend/dev/provider-turn-executor.ts",
+      "symbol": "providerStreamPart",
+      "sha256": "5163694277ec7c7b5e90ee88ccce3767fe2927b6fc5cad9cb08ec338cd16b2f5"
+    },
+    {
+      "path": "src/backend/dev/provider-turn-executor.ts",
+      "symbol": "createProviderLettaStream",
+      "sha256": "1d9e42b5a57cfbd915d2a6aaaaeadc6d2c57f14fabed246278173fd9db3a2809"
+    },
+    {
+      "path": "src/backend/dev/local-provider-errors.ts",
+      "symbol": "normalizeLocalProviderError",
+      "sha256": "ff3468b988a5fca7fc1b5ea0088ba44589675514e701040981958fd0031e18e1"
+    },
+    {
+      "path": "src/backend/dev/local-provider-errors.ts",
+      "symbol": "localProviderRetryDelayMs",
+      "sha256": "fd71ca18e317afce35986531ae722f4ef0c3d48296ed34a6aad8302818f35d97"
+    },
+    {
+      "path": "src/backend/local/local-stream-chunks.ts",
+      "symbol": "attachLocalMessage",
+      "sha256": "df349eba721787977e2c9bd7e54e6c6970c8b1e626d23295ecaebd26264a3388"
+    },
+    {
+      "path": "src/backend/dev/pi-provider-registry.ts",
+      "symbol": "builtinCatalogModels",
+      "sha256": "6c9903aead6ad9ae56ab1e946b719f6fdb77ca295a391f9c57815907cb93e522"
+    },
+    {
+      "path": "src/backend/dev/pi-ollama-provider.ts",
+      "symbol": "ollamaDiscover",
+      "sha256": "57305d02648073d5b77f292f83cefd6cf5acaf09a1e2b89331d9b52380071f66"
+    },
+    {
+      "path": "src/backend/dev/pi-ollama-provider.ts",
+      "symbol": "createOllamaPiProvider",
+      "sha256": "b5641ac77d86224aa0b9784f2c6b72e8a8d5e09d1db31e3057c834a28bd2ecde"
+    },
+    {
+      "path": "src/backend/dev/pi-llama-cpp-provider.ts",
+      "symbol": "llamaCppDiscover",
+      "sha256": "1a442b07048275fd1bfcae8697b1d54578b975160d58933c5beef130dcc6c902"
+    },
+    {
+      "path": "src/backend/dev/pi-llama-cpp-provider.ts",
+      "symbol": "createLlamaCppPiProvider",
+      "sha256": "48b408c70739ae97d7dcb066e575c52dd8768c0377f700d8b183f13cbd68752c"
+    },
+    {
+      "path": "src/backend/dev/pi-openai-compatible-provider.ts",
+      "symbol": "openAICompatibleDiscover",
+      "sha256": "ec2cc43317987ed4406a4d8de52be4394db171217b5bb542ccb88eda7ff42623"
+    },
+    {
+      "path": "src/backend/dev/pi-openai-compatible-provider.ts",
+      "symbol": "createOpenAICompatiblePiProvider",
+      "sha256": "036f8f9969d1e6e9fdb435ef61757af4e95ea909b8c82c86c515adb020af5108"
+    },
+    {
+      "path": "src/backend/dev/pi-local-endpoint-provider.ts",
+      "symbol": "createLocalEndpointPiProvider",
+      "sha256": "b217b693c1bc80d0f62e78d18c97299f97d47e3d3db583e9f08a4ed9ffc4813d"
+    },
+    {
+      "path": "src/backend/dev/pi-lmstudio-provider.ts",
+      "symbol": "lmStudioDiscover",
+      "sha256": "0fe41d6c8d6d6eb7ed63cec33bfcd8000b5d68cf31a911e5203b5f48fea92adb"
+    },
+    {
+      "path": "src/backend/dev/pi-lmstudio-provider.ts",
+      "symbol": "createLmStudioPiProvider",
+      "sha256": "3e9dccaeea2b5596a2f57ac4880ad2845edd4e2e658e56ce026cede6d8b06266"
+    },
+    {
+      "path": "src/backend/pi-stream-adapter.test.ts",
+      "symbol": "streamFromEvents",
+      "sha256": "528966f085a229fc2a04c0cb42b2d3c80cce5d48fec9e26e59df7f5464a1ddb2"
+    },
+    {
+      "path": "src/backend/pi-stream-adapter-context-pressure.test.ts",
+      "symbol": "streamFromMessage",
+      "sha256": "c8a1aa2ff3d26a0cf8177a21f6548a9608cf177bb70f5be1eaea206568714fb2"
+    },
+    {
+      "path": "src/backend/pi-stream-adapter-local-endpoint.test.ts",
+      "symbol": "input",
+      "sha256": "57abc0ff80553571bf69e5be5bd6088bf7f27b9501fa015cf72289feff42a162"
+    },
+    {
+      "path": "src/backend/provider-turn-executor.test.ts",
+      "symbol": "assistantMessage",
+      "sha256": "bf8a8b29c3dd750fd648071e2fbfc96ce2d2a3d9a3635e353be1a8cb74315628"
+    }
+  ],
+  "dialects": [
+    "openai-compatible",
+    "anthropic",
+    "ollama",
+    "lm-studio",
+    "llama-cpp"
+  ],
+  "dimensions": [
+    "request_mapping",
+    "event_order",
+    "tool_call_assembly",
+    "usage",
+    "cancellation",
+    "errors",
+    "timeout",
+    "context_overflow",
+    "retry_after",
+    "image_policy"
+  ],
+  "cases": [
+    {
+      "id": "openai-compatible/happy-tool",
+      "dialect": "openai-compatible",
+      "name": "happy-tool",
+      "paths": [
+        "openai-compatible/happy-tool/request.json",
+        "openai-compatible/happy-tool/expected-request.json",
+        "openai-compatible/happy-tool/raw-stream.txt",
+        "openai-compatible/happy-tool/baseline-events.jsonl",
+        "openai-compatible/happy-tool/expected-trace.json"
+      ],
+      "raw_format": "sse",
+      "dimensions": [
+        "request_mapping",
+        "event_order",
+        "tool_call_assembly",
+        "usage"
+      ],
+      "reasoning": {
+        "visible": false,
+        "redacted": false
+      },
+      "terminal_kind": "stop"
+    },
+    {
+      "id": "anthropic/reasoning-redacted",
+      "dialect": "anthropic",
+      "name": "reasoning-redacted",
+      "paths": [
+        "anthropic/reasoning-redacted/request.json",
+        "anthropic/reasoning-redacted/expected-request.json",
+        "anthropic/reasoning-redacted/raw-stream.txt",
+        "anthropic/reasoning-redacted/baseline-events.jsonl",
+        "anthropic/reasoning-redacted/expected-trace.json"
+      ],
+      "raw_format": "anthropic_sse",
+      "dimensions": [
+        "event_order",
+        "usage"
+      ],
+      "reasoning": {
+        "visible": true,
+        "redacted": true
+      },
+      "terminal_kind": "stop"
+    },
+    {
+      "id": "ollama/cancelled",
+      "dialect": "ollama",
+      "name": "cancelled",
+      "paths": [
+        "ollama/cancelled/request.json",
+        "ollama/cancelled/expected-request.json",
+        "ollama/cancelled/raw-stream.txt",
+        "ollama/cancelled/baseline-events.jsonl",
+        "ollama/cancelled/expected-trace.json"
+      ],
+      "raw_format": "ndjson",
+      "dimensions": [
+        "cancellation",
+        "errors"
+      ],
+      "reasoning": {
+        "visible": false,
+        "redacted": false
+      },
+      "terminal_kind": "error"
+    },
+    {
+      "id": "lm-studio/timeout",
+      "dialect": "lm-studio",
+      "name": "timeout",
+      "paths": [
+        "lm-studio/timeout/request.json",
+        "lm-studio/timeout/expected-request.json",
+        "lm-studio/timeout/raw-stream.txt",
+        "lm-studio/timeout/baseline-events.jsonl",
+        "lm-studio/timeout/expected-trace.json"
+      ],
+      "raw_format": "sse",
+      "dimensions": [
+        "timeout",
+        "errors"
+      ],
+      "reasoning": {
+        "visible": false,
+        "redacted": false
+      },
+      "terminal_kind": "error"
+    },
+    {
+      "id": "llama-cpp/context-overflow",
+      "dialect": "llama-cpp",
+      "name": "context-overflow",
+      "paths": [
+        "llama-cpp/context-overflow/request.json",
+        "llama-cpp/context-overflow/expected-request.json",
+        "llama-cpp/context-overflow/raw-stream.txt",
+        "llama-cpp/context-overflow/baseline-events.jsonl",
+        "llama-cpp/context-overflow/expected-trace.json"
+      ],
+      "raw_format": "sse",
+      "dimensions": [
+        "context_overflow",
+        "errors"
+      ],
+      "reasoning": {
+        "visible": false,
+        "redacted": false
+      },
+      "terminal_kind": "error"
+    },
+    {
+      "id": "openai-compatible/retry-after",
+      "dialect": "openai-compatible",
+      "name": "retry-after",
+      "paths": [
+        "openai-compatible/retry-after/request.json",
+        "openai-compatible/retry-after/expected-request.json",
+        "openai-compatible/retry-after/raw-stream.txt",
+        "openai-compatible/retry-after/baseline-events.jsonl",
+        "openai-compatible/retry-after/expected-trace.json"
+      ],
+      "raw_format": "sse",
+      "dimensions": [
+        "retry_after",
+        "errors"
+      ],
+      "reasoning": {
+        "visible": false,
+        "redacted": false
+      },
+      "terminal_kind": "error"
+    },
+    {
+      "id": "ollama/image-drop",
+      "dialect": "ollama",
+      "name": "image-drop",
+      "paths": [
+        "ollama/image-drop/request.json",
+        "ollama/image-drop/expected-request.json",
+        "ollama/image-drop/raw-stream.txt",
+        "ollama/image-drop/baseline-events.jsonl",
+        "ollama/image-drop/expected-trace.json"
+      ],
+      "raw_format": "ndjson",
+      "dimensions": [
+        "image_policy",
+        "request_mapping"
+      ],
+      "reasoning": {
+        "visible": false,
+        "redacted": false
+      },
+      "terminal_kind": "stop"
+    },
+    {
+      "id": "ollama/image-strict",
+      "dialect": "ollama",
+      "name": "image-strict",
+      "paths": [
+        "ollama/image-strict/request.json",
+        "ollama/image-strict/expected-request.json",
+        "ollama/image-strict/raw-stream.txt",
+        "ollama/image-strict/baseline-events.jsonl",
+        "ollama/image-strict/expected-trace.json"
+      ],
+      "raw_format": "ndjson",
+      "dimensions": [
+        "image_policy",
+        "request_mapping"
+      ],
+      "reasoning": {
+        "visible": false,
+        "redacted": false
+      },
+      "terminal_kind": "error"
+    },
+    {
+      "id": "anthropic/authentication",
+      "dialect": "anthropic",
+      "name": "authentication",
+      "paths": [
+        "anthropic/authentication/request.json",
+        "anthropic/authentication/expected-request.json",
+        "anthropic/authentication/raw-stream.txt",
+        "anthropic/authentication/baseline-events.jsonl",
+        "anthropic/authentication/expected-trace.json"
+      ],
+      "raw_format": "anthropic_sse",
+      "dimensions": [
+        "errors"
+      ],
+      "reasoning": {
+        "visible": false,
+        "redacted": false
+      },
+      "terminal_kind": "error"
+    },
+    {
+      "id": "openai-compatible/authorization",
+      "dialect": "openai-compatible",
+      "name": "authorization",
+      "paths": [
+        "openai-compatible/authorization/request.json",
+        "openai-compatible/authorization/expected-request.json",
+        "openai-compatible/authorization/raw-stream.txt",
+        "openai-compatible/authorization/baseline-events.jsonl",
+        "openai-compatible/authorization/expected-trace.json"
+      ],
+      "raw_format": "sse",
+      "dimensions": [
+        "errors"
+      ],
+      "reasoning": {
+        "visible": false,
+        "redacted": false
+      },
+      "terminal_kind": "error"
+    },
+    {
+      "id": "lm-studio/invalid-request",
+      "dialect": "lm-studio",
+      "name": "invalid-request",
+      "paths": [
+        "lm-studio/invalid-request/request.json",
+        "lm-studio/invalid-request/expected-request.json",
+        "lm-studio/invalid-request/raw-stream.txt",
+        "lm-studio/invalid-request/baseline-events.jsonl",
+        "lm-studio/invalid-request/expected-trace.json"
+      ],
+      "raw_format": "sse",
+      "dimensions": [
+        "errors"
+      ],
+      "reasoning": {
+        "visible": false,
+        "redacted": false
+      },
+      "terminal_kind": "error"
+    },
+    {
+      "id": "anthropic/quota",
+      "dialect": "anthropic",
+      "name": "quota",
+      "paths": [
+        "anthropic/quota/request.json",
+        "anthropic/quota/expected-request.json",
+        "anthropic/quota/raw-stream.txt",
+        "anthropic/quota/baseline-events.jsonl",
+        "anthropic/quota/expected-trace.json"
+      ],
+      "raw_format": "anthropic_sse",
+      "dimensions": [
+        "errors"
+      ],
+      "reasoning": {
+        "visible": false,
+        "redacted": false
+      },
+      "terminal_kind": "error"
+    },
+    {
+      "id": "llama-cpp/overloaded",
+      "dialect": "llama-cpp",
+      "name": "overloaded",
+      "paths": [
+        "llama-cpp/overloaded/request.json",
+        "llama-cpp/overloaded/expected-request.json",
+        "llama-cpp/overloaded/raw-stream.txt",
+        "llama-cpp/overloaded/baseline-events.jsonl",
+        "llama-cpp/overloaded/expected-trace.json"
+      ],
+      "raw_format": "sse",
+      "dimensions": [
+        "errors"
+      ],
+      "reasoning": {
+        "visible": false,
+        "redacted": false
+      },
+      "terminal_kind": "error"
+    },
+    {
+      "id": "ollama/unavailable",
+      "dialect": "ollama",
+      "name": "unavailable",
+      "paths": [
+        "ollama/unavailable/request.json",
+        "ollama/unavailable/expected-request.json",
+        "ollama/unavailable/raw-stream.txt",
+        "ollama/unavailable/baseline-events.jsonl",
+        "ollama/unavailable/expected-trace.json"
+      ],
+      "raw_format": "ndjson",
+      "dimensions": [
+        "errors"
+      ],
+      "reasoning": {
+        "visible": false,
+        "redacted": false
+      },
+      "terminal_kind": "error"
+    },
+    {
+      "id": "openai-compatible/protocol-error",
+      "dialect": "openai-compatible",
+      "name": "protocol-error",
+      "paths": [
+        "openai-compatible/protocol-error/request.json",
+        "openai-compatible/protocol-error/expected-request.json",
+        "openai-compatible/protocol-error/raw-stream.txt",
+        "openai-compatible/protocol-error/baseline-events.jsonl",
+        "openai-compatible/protocol-error/expected-trace.json"
+      ],
+      "raw_format": "sse",
+      "dimensions": [
+        "errors"
+      ],
+      "reasoning": {
+        "visible": false,
+        "redacted": false
+      },
+      "terminal_kind": "error"
+    },
+    {
+      "id": "lm-studio/unknown-error",
+      "dialect": "lm-studio",
+      "name": "unknown-error",
+      "paths": [
+        "lm-studio/unknown-error/request.json",
+        "lm-studio/unknown-error/expected-request.json",
+        "lm-studio/unknown-error/raw-stream.txt",
+        "lm-studio/unknown-error/baseline-events.jsonl",
+        "lm-studio/unknown-error/expected-trace.json"
+      ],
+      "raw_format": "sse",
+      "dimensions": [
+        "errors"
+      ],
+      "reasoning": {
+        "visible": false,
+        "redacted": false
+      },
+      "terminal_kind": "error"
+    }
+  ],
+  "error_kind_to_case": [
+    [
+      "authentication",
+      "anthropic/authentication"
+    ],
+    [
+      "authorization",
+      "openai-compatible/authorization"
+    ],
+    [
+      "invalid_request",
+      "ollama/image-strict"
+    ],
+    [
+      "rate_limit",
+      "openai-compatible/retry-after"
+    ],
+    [
+      "quota",
+      "anthropic/quota"
+    ],
+    [
+      "timeout",
+      "lm-studio/timeout"
+    ],
+    [
+      "context_overflow",
+      "llama-cpp/context-overflow"
+    ],
+    [
+      "overloaded",
+      "llama-cpp/overloaded"
+    ],
+    [
+      "unavailable",
+      "ollama/unavailable"
+    ],
+    [
+      "protocol",
+      "openai-compatible/protocol-error"
+    ],
+    [
+      "cancelled",
+      "ollama/cancelled"
+    ],
+    [
+      "unknown",
+      "lm-studio/unknown-error"
+    ]
+  ],
+  "inventory": [
+    {
+      "path": "anthropic/authentication/baseline-events.jsonl",
+      "kind": "jsonl",
+      "bytes": 290,
+      "sha256": "7e4288ed79539ae8989cb796077b734f75bab6e28a86aa0f0c415a98bb4dafa5"
+    },
+    {
+      "path": "anthropic/authentication/expected-request.json",
+      "kind": "json",
+      "bytes": 755,
+      "sha256": "db45f757956289265ce4a4886a3e446f8378a42bf06d15a908c0c6afb737fc8c"
+    },
+    {
+      "path": "anthropic/authentication/expected-trace.json",
+      "kind": "json",
+      "bytes": 151,
+      "sha256": "d676f3f169a8e423c1de854d6e1c891069b3dc8a6daf497f29b2a8d5fdefdc9b"
+    },
+    {
+      "path": "anthropic/authentication/raw-stream.txt",
+      "kind": "raw",
+      "bytes": 115,
+      "sha256": "29d59fb3e890ae96b17282bc85960532ca6f98aa8468b6fcd65e547d75fa092e"
+    },
+    {
+      "path": "anthropic/authentication/request.json",
+      "kind": "json",
+      "bytes": 958,
+      "sha256": "06c4d173848ffe10931e66c8c7011fa9b143998cfb2291d85ef5c7e00e2c79c6"
+    },
+    {
+      "path": "anthropic/quota/baseline-events.jsonl",
+      "kind": "jsonl",
+      "bytes": 263,
+      "sha256": "d6edeb01f2ad57828893efc417867989a0cf40d0e1418766561b749277a0b18b"
+    },
+    {
+      "path": "anthropic/quota/expected-request.json",
+      "kind": "json",
+      "bytes": 755,
+      "sha256": "db45f757956289265ce4a4886a3e446f8378a42bf06d15a908c0c6afb737fc8c"
+    },
+    {
+      "path": "anthropic/quota/expected-trace.json",
+      "kind": "json",
+      "bytes": 124,
+      "sha256": "ab40419b6ac7f3c875d3f7ba1c3c16468cda36dda0b01ce004ce39f52a73961d"
+    },
+    {
+      "path": "anthropic/quota/raw-stream.txt",
+      "kind": "raw",
+      "bytes": 97,
+      "sha256": "e43a749a7b4ba8a61c777cdf23bd8de2cd83cac506b80081815668860c9382e4"
+    },
+    {
+      "path": "anthropic/quota/request.json",
+      "kind": "json",
+      "bytes": 958,
+      "sha256": "06c4d173848ffe10931e66c8c7011fa9b143998cfb2291d85ef5c7e00e2c79c6"
+    },
+    {
+      "path": "anthropic/reasoning-redacted/baseline-events.jsonl",
+      "kind": "jsonl",
+      "bytes": 1086,
+      "sha256": "e212578976412129f058cda4b0b2eba7d151e909007336bc9d730ce42403b67f"
+    },
+    {
+      "path": "anthropic/reasoning-redacted/expected-request.json",
+      "kind": "json",
+      "bytes": 782,
+      "sha256": "f4380ed9cd79c6903bde42b2f0cfddb044e886d15788dde0bc06435b2c74bbf7"
+    },
+    {
+      "path": "anthropic/reasoning-redacted/expected-trace.json",
+      "kind": "json",
+      "bytes": 419,
+      "sha256": "ca27755d9911e0bc94d58d512c2a00bc888a3aebd202ac1a6347c2f2ac563fe2"
+    },
+    {
+      "path": "anthropic/reasoning-redacted/raw-stream.txt",
+      "kind": "raw",
+      "bytes": 1057,
+      "sha256": "9771f39fce818903215c2ad16c8258011a714fb7d652c584712eb276b5ea3ff2"
+    },
+    {
+      "path": "anthropic/reasoning-redacted/request.json",
+      "kind": "json",
+      "bytes": 957,
+      "sha256": "a9e20af3936d37efbe4c31c64c2e95ef08dced226e3a1ee9372a0394806aca71"
+    },
+    {
+      "path": "llama-cpp/context-overflow/baseline-events.jsonl",
+      "kind": "jsonl",
+      "bytes": 296,
+      "sha256": "cdc4ab605142d6037266a89da41bb3f68cec4955f73ee121c8f1cbceb4bb9248"
+    },
+    {
+      "path": "llama-cpp/context-overflow/expected-request.json",
+      "kind": "json",
+      "bytes": 889,
+      "sha256": "bbfa7cc044e459e753f45f64a3023765db2a467d6ec5c01a272690ba762e61da"
+    },
+    {
+      "path": "llama-cpp/context-overflow/expected-trace.json",
+      "kind": "json",
+      "bytes": 157,
+      "sha256": "3ed24ae0a48f2ec70e46648a41fb2bd4d539745ec9bb26efba904f276055d9a3"
+    },
+    {
+      "path": "llama-cpp/context-overflow/raw-stream.txt",
+      "kind": "raw",
+      "bytes": 137,
+      "sha256": "e8704fa22adbb27c7fbae03ae0a2e3518667e23464cc02fd214783125a1b30b2"
+    },
+    {
+      "path": "llama-cpp/context-overflow/request.json",
+      "kind": "json",
+      "bytes": 958,
+      "sha256": "afafb19b64fb36a90d08931e27a75e75124f2059e8bbe318c48883641c1b691b"
+    },
+    {
+      "path": "llama-cpp/overloaded/baseline-events.jsonl",
+      "kind": "jsonl",
+      "bytes": 278,
+      "sha256": "58ab518fbf66f63e34011777023f2250a11cc9f53553d01a1bf97a3cfcde5ef6"
+    },
+    {
+      "path": "llama-cpp/overloaded/expected-request.json",
+      "kind": "json",
+      "bytes": 889,
+      "sha256": "bbfa7cc044e459e753f45f64a3023765db2a467d6ec5c01a272690ba762e61da"
+    },
+    {
+      "path": "llama-cpp/overloaded/expected-trace.json",
+      "kind": "json",
+      "bytes": 139,
+      "sha256": "caa59f0acb2225316477433e52a23b092d438cad2abdea3c8b8b0b1cd70d067a"
+    },
+    {
+      "path": "llama-cpp/overloaded/raw-stream.txt",
+      "kind": "raw",
+      "bytes": 119,
+      "sha256": "edb8fcb8ecd57b7a45b9f100bf04acec930a28d22b848852cb7866a3e07683f3"
+    },
+    {
+      "path": "llama-cpp/overloaded/request.json",
+      "kind": "json",
+      "bytes": 958,
+      "sha256": "afafb19b64fb36a90d08931e27a75e75124f2059e8bbe318c48883641c1b691b"
+    },
+    {
+      "path": "lm-studio/invalid-request/baseline-events.jsonl",
+      "kind": "jsonl",
+      "bytes": 293,
+      "sha256": "d3760c00c964f97bf903e00a142747f77f90e1cd53e3f5686fbcbb2a8013e98a"
+    },
+    {
+      "path": "lm-studio/invalid-request/expected-request.json",
+      "kind": "json",
+      "bytes": 889,
+      "sha256": "782e501a683268bc255eab0caed91c67cd2e8fdc1a829f88880aef446d3490fd"
+    },
+    {
+      "path": "lm-studio/invalid-request/expected-trace.json",
+      "kind": "json",
+      "bytes": 154,
+      "sha256": "6768f42fb984af62bcefa9bbc7c4eaf094ec2746e21f493604740f03fbba9e71"
+    },
+    {
+      "path": "lm-studio/invalid-request/raw-stream.txt",
+      "kind": "raw",
+      "bytes": 134,
+      "sha256": "6d0de3a4ff6a42b8fbe0457a329e2d24f99f5066032765a7848f98159de8cc8e"
+    },
+    {
+      "path": "lm-studio/invalid-request/request.json",
+      "kind": "json",
+      "bytes": 958,
+      "sha256": "8281392d3a20fa2385b396c5ad35250e004f471b2b2cfa13e48592128a4fc9d9"
+    },
+    {
+      "path": "lm-studio/timeout/baseline-events.jsonl",
+      "kind": "jsonl",
+      "bytes": 269,
+      "sha256": "4221acdbae693e883dead659f5153e2d15dbad67ee153c0c33ac51cdd30a562a"
+    },
+    {
+      "path": "lm-studio/timeout/expected-request.json",
+      "kind": "json",
+      "bytes": 889,
+      "sha256": "782e501a683268bc255eab0caed91c67cd2e8fdc1a829f88880aef446d3490fd"
+    },
+    {
+      "path": "lm-studio/timeout/expected-trace.json",
+      "kind": "json",
+      "bytes": 130,
+      "sha256": "a13c30359b6c3351f1b5e0f41f7c37160931573b565318bd29bb2aeeebb01d38"
+    },
+    {
+      "path": "lm-studio/timeout/raw-stream.txt",
+      "kind": "raw",
+      "bytes": 110,
+      "sha256": "4fb94770a601d1b602b78f8fdb9151edf4a876d80b895ed16e1c886a8f34d1df"
+    },
+    {
+      "path": "lm-studio/timeout/request.json",
+      "kind": "json",
+      "bytes": 958,
+      "sha256": "8281392d3a20fa2385b396c5ad35250e004f471b2b2cfa13e48592128a4fc9d9"
+    },
+    {
+      "path": "lm-studio/unknown-error/baseline-events.jsonl",
+      "kind": "jsonl",
+      "bytes": 275,
+      "sha256": "acd9ddf2a9c4ca3c5a5c7a9a9f33f8a843af9b183c29d2578ef5c86dd30953c5"
+    },
+    {
+      "path": "lm-studio/unknown-error/expected-request.json",
+      "kind": "json",
+      "bytes": 889,
+      "sha256": "782e501a683268bc255eab0caed91c67cd2e8fdc1a829f88880aef446d3490fd"
+    },
+    {
+      "path": "lm-studio/unknown-error/expected-trace.json",
+      "kind": "json",
+      "bytes": 136,
+      "sha256": "4b7445be78773b95e75d30d0c4787367192cf18f1b6621a165edbdaa4d6f033b"
+    },
+    {
+      "path": "lm-studio/unknown-error/raw-stream.txt",
+      "kind": "raw",
+      "bytes": 116,
+      "sha256": "d716d2855260cc8160bd7a4e16198cdd68244eff4acbc0c0095b36801d764d8b"
+    },
+    {
+      "path": "lm-studio/unknown-error/request.json",
+      "kind": "json",
+      "bytes": 958,
+      "sha256": "8281392d3a20fa2385b396c5ad35250e004f471b2b2cfa13e48592128a4fc9d9"
+    },
+    {
+      "path": "ollama/cancelled/baseline-events.jsonl",
+      "kind": "jsonl",
+      "bytes": 657,
+      "sha256": "25b2ffe89fe32b212e5b6795bd2aebedf1b1eccbad7358f71ad2b9161df48ac9"
+    },
+    {
+      "path": "ollama/cancelled/expected-request.json",
+      "kind": "json",
+      "bytes": 809,
+      "sha256": "6b82053be3d13fa3c8284f646ffb7a7729026d239519a6a3bce10564a2e641e8"
+    },
+    {
+      "path": "ollama/cancelled/expected-trace.json",
+      "kind": "json",
+      "bytes": 207,
+      "sha256": "49e6c88dfccb0b96cf18385808ed466eefe3f0306794af52e60f6ea1e2cc77f5"
+    },
+    {
+      "path": "ollama/cancelled/raw-stream.txt",
+      "kind": "raw",
+      "bytes": 71,
+      "sha256": "75faa03923d4d2d18fb9493e2d7971c3c6a8b20a81cf25656d151f52b069408e"
+    },
+    {
+      "path": "ollama/cancelled/request.json",
+      "kind": "json",
+      "bytes": 952,
+      "sha256": "b27119c2031d38e76a3ef797a5dee02f4ecbedbed5cadd8316a426ee268096e7"
+    },
+    {
+      "path": "ollama/image-drop/baseline-events.jsonl",
+      "kind": "jsonl",
+      "bytes": 653,
+      "sha256": "7d403f8f6d0cecb46013729d339e65483d2c380df026418b4a428033f2e990c0"
+    },
+    {
+      "path": "ollama/image-drop/expected-request.json",
+      "kind": "json",
+      "bytes": 831,
+      "sha256": "9f975b68568a7e27ed863530ec40a611e9f41c781297918a90bfab88c4abaf9f"
+    },
+    {
+      "path": "ollama/image-drop/expected-trace.json",
+      "kind": "json",
+      "bytes": 261,
+      "sha256": "6852bfbc9a7308d587eeae9284ea98c71ae2de2f1d8bb30f281cf147399d3e8d"
+    },
+    {
+      "path": "ollama/image-drop/raw-stream.txt",
+      "kind": "raw",
+      "bytes": 353,
+      "sha256": "39b751b1146dda6d105a37239573eb0225c422adcebfa0fbae8e6ad8bd3a70d5"
+    },
+    {
+      "path": "ollama/image-drop/request.json",
+      "kind": "json",
+      "bytes": 1064,
+      "sha256": "12a35005d53b14eac7a1b73bf6c2d0b9717ca5619a244a53cef304f15513ce1a"
+    },
+    {
+      "path": "ollama/image-strict/baseline-events.jsonl",
+      "kind": "jsonl",
+      "bytes": 290,
+      "sha256": "18d48fe99bd8c6f58b52069e5cf59a2eb336fb4ee0b64c9bbf76c513cf1785a7"
+    },
+    {
+      "path": "ollama/image-strict/expected-request.json",
+      "kind": "json",
+      "bytes": 128,
+      "sha256": "8fc90c0b9d5393353806886ca796f9c6c1c38895023a93b4a78a5eba7a1113f9"
+    },
+    {
+      "path": "ollama/image-strict/expected-trace.json",
+      "kind": "json",
+      "bytes": 151,
+      "sha256": "f5f3d791e35652c4aa58bd3649d748e8135aa672167d2dc32fc0f84a28d1b18a"
+    },
+    {
+      "path": "ollama/image-strict/raw-stream.txt",
+      "kind": "raw",
+      "bytes": 80,
+      "sha256": "f811aaa4d4cacb65580882c506e5238e85907b9a04cc513e86f84ada8eeeeeae"
+    },
+    {
+      "path": "ollama/image-strict/request.json",
+      "kind": "json",
+      "bytes": 1066,
+      "sha256": "385758e150db5009c5f9a0aeb69d6b0ff2613d81273dd1cdba4c5badab6e8637"
+    },
+    {
+      "path": "ollama/unavailable/baseline-events.jsonl",
+      "kind": "jsonl",
+      "bytes": 281,
+      "sha256": "c5771e80186e037551f0d1dd50883c9e58209bcfb28b1c7b6ef3db9d563ca070"
+    },
+    {
+      "path": "ollama/unavailable/expected-request.json",
+      "kind": "json",
+      "bytes": 809,
+      "sha256": "6b82053be3d13fa3c8284f646ffb7a7729026d239519a6a3bce10564a2e641e8"
+    },
+    {
+      "path": "ollama/unavailable/expected-trace.json",
+      "kind": "json",
+      "bytes": 142,
+      "sha256": "f71e689585304c3573ae7ed91572e3be6de46614015e6bfcbd6b4e282511a797"
+    },
+    {
+      "path": "ollama/unavailable/raw-stream.txt",
+      "kind": "raw",
+      "bytes": 75,
+      "sha256": "df08f682824c73954aafe218d96c93c5eb524bfc66c719e06eba84f0a2dd74f9"
+    },
+    {
+      "path": "ollama/unavailable/request.json",
+      "kind": "json",
+      "bytes": 952,
+      "sha256": "b27119c2031d38e76a3ef797a5dee02f4ecbedbed5cadd8316a426ee268096e7"
+    },
+    {
+      "path": "openai-compatible/authorization/baseline-events.jsonl",
+      "kind": "jsonl",
+      "bytes": 287,
+      "sha256": "1a53201d63a4d23786584f3227b51d0fabb7fb0ed5a2b2bf288d6f0fc80c5089"
+    },
+    {
+      "path": "openai-compatible/authorization/expected-request.json",
+      "kind": "json",
+      "bytes": 897,
+      "sha256": "cede6440f6dacc62cf8e42f12b644c17d445f9e396e57f113bb21f85c64f454a"
+    },
+    {
+      "path": "openai-compatible/authorization/expected-trace.json",
+      "kind": "json",
+      "bytes": 148,
+      "sha256": "a56009a8207a97b5c7c07b9e5cfa932e505142079cbdf921a0eb97cc5b5b5dcb"
+    },
+    {
+      "path": "openai-compatible/authorization/raw-stream.txt",
+      "kind": "raw",
+      "bytes": 128,
+      "sha256": "4b37324700878bcaa8d678036dcc853b55e79563eeb2b5f9572e416502e17365"
+    },
+    {
+      "path": "openai-compatible/authorization/request.json",
+      "kind": "json",
+      "bytes": 974,
+      "sha256": "0e43a373bea547cbb4cb17e3fa83c22173b0a28e35b04e6cfdf8d4edc167de69"
+    },
+    {
+      "path": "openai-compatible/happy-tool/baseline-events.jsonl",
+      "kind": "jsonl",
+      "bytes": 2047,
+      "sha256": "d98c520fb87e09891e5bde21742ad78c32cf00a040b43d521c1589b1e0e9bc63"
+    },
+    {
+      "path": "openai-compatible/happy-tool/expected-request.json",
+      "kind": "json",
+      "bytes": 897,
+      "sha256": "cede6440f6dacc62cf8e42f12b644c17d445f9e396e57f113bb21f85c64f454a"
+    },
+    {
+      "path": "openai-compatible/happy-tool/expected-trace.json",
+      "kind": "json",
+      "bytes": 927,
+      "sha256": "38ed478fcd72f55ad690d4f238061f8cace4956a537dfb8f1f90587c575b8135"
+    },
+    {
+      "path": "openai-compatible/happy-tool/raw-stream.txt",
+      "kind": "raw",
+      "bytes": 624,
+      "sha256": "d9fb03f75ca145d13221333af74899e1f973922babbca389a745e6f05ac2634e"
+    },
+    {
+      "path": "openai-compatible/happy-tool/request.json",
+      "kind": "json",
+      "bytes": 974,
+      "sha256": "0e43a373bea547cbb4cb17e3fa83c22173b0a28e35b04e6cfdf8d4edc167de69"
+    },
+    {
+      "path": "openai-compatible/protocol-error/baseline-events.jsonl",
+      "kind": "jsonl",
+      "bytes": 278,
+      "sha256": "013b56c9ecd873c4373dc8d6dfb2e2687da405ec10c6f8df178e76e1ec10eb4d"
+    },
+    {
+      "path": "openai-compatible/protocol-error/expected-request.json",
+      "kind": "json",
+      "bytes": 897,
+      "sha256": "cede6440f6dacc62cf8e42f12b644c17d445f9e396e57f113bb21f85c64f454a"
+    },
+    {
+      "path": "openai-compatible/protocol-error/expected-trace.json",
+      "kind": "json",
+      "bytes": 139,
+      "sha256": "19d011f2e8b63090ca50b7f9a39223552e6fd469c7035c8e461fb97d5a9e5015"
+    },
+    {
+      "path": "openai-compatible/protocol-error/raw-stream.txt",
+      "kind": "raw",
+      "bytes": 119,
+      "sha256": "ebf1015cafa8d16056067769932ebfa27d099a13e33431e3c4047688595b2dd5"
+    },
+    {
+      "path": "openai-compatible/protocol-error/request.json",
+      "kind": "json",
+      "bytes": 974,
+      "sha256": "0e43a373bea547cbb4cb17e3fa83c22173b0a28e35b04e6cfdf8d4edc167de69"
+    },
+    {
+      "path": "openai-compatible/retry-after/baseline-events.jsonl",
+      "kind": "jsonl",
+      "bytes": 279,
+      "sha256": "0a6d5023267c8cd90ad2a91d73074639ff476816e020254c682c7c5829adefd8"
+    },
+    {
+      "path": "openai-compatible/retry-after/expected-request.json",
+      "kind": "json",
+      "bytes": 897,
+      "sha256": "cede6440f6dacc62cf8e42f12b644c17d445f9e396e57f113bb21f85c64f454a"
+    },
+    {
+      "path": "openai-compatible/retry-after/expected-trace.json",
+      "kind": "json",
+      "bytes": 140,
+      "sha256": "12dbef4b796f08bad848e8cbe7815fe75584127bd222e0ed6a98c0eb0a701b38"
+    },
+    {
+      "path": "openai-compatible/retry-after/raw-stream.txt",
+      "kind": "raw",
+      "bytes": 142,
+      "sha256": "da7f5ebdc5c0a8ebfa66f1de8603fa12588a2ea4c56d0f8ca6621f988b19b0ee"
+    },
+    {
+      "path": "openai-compatible/retry-after/request.json",
+      "kind": "json",
+      "bytes": 974,
+      "sha256": "0e43a373bea547cbb4cb17e3fa83c22173b0a28e35b04e6cfdf8d4edc167de69"
+    }
+  ]
+}

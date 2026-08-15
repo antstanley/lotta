@@ -1,0 +1,8 @@
+[
+  {
+    "type": "Error",
+    "kind": "unavailable",
+    "code": "fixture_unavailable",
+    "context": "SANITIZED_FIXTURE_UNAVAILABLE"
+  }
+]

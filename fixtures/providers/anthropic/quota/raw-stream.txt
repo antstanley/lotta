@@ -1,0 +1,2 @@
+event: error
+data: {"type":"error","error":{"type":"quota","message":"SANITIZED_FIXTURE_quota"}}

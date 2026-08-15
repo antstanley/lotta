@@ -1,0 +1,8 @@
+[
+  {
+    "type": "Error",
+    "kind": "quota",
+    "code": "fixture_quota",
+    "context": "SANITIZED_FIXTURE_QUOTA"
+  }
+]

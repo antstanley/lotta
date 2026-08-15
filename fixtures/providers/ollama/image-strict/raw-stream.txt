@@ -1,0 +1,1 @@
+{"error":{"type":"invalid_request","message":"SANITIZED_FIXTURE_image-strict"}}

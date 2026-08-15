@@ -1,0 +1,52 @@
+[
+  {
+    "type": "TextDelta",
+    "text": "SANITIZED_FIXTURE_TEXT"
+  },
+  {
+    "type": "ProviderMetadata",
+    "entries": [
+      {
+        "key": "fixture_request_id",
+        "value": "SANITIZED_FIXTURE_ID"
+      }
+    ]
+  },
+  {
+    "type": "ToolCallStart",
+    "call_id": "fixture-call",
+    "name": "fixture_tool"
+  },
+  {
+    "type": "ToolCallArgumentsDelta",
+    "call_id": "fixture-call",
+    "bytes_base64": "eyJhIjo="
+  },
+  {
+    "type": "ToolCallArgumentsDelta",
+    "call_id": "fixture-call",
+    "bytes_base64": "MX0="
+  },
+  {
+    "type": "ToolCallEnd",
+    "call_id": "fixture-call"
+  },
+  {
+    "type": "Usage",
+    "input_tokens": 5,
+    "output_tokens": 2,
+    "cached_input_tokens": 0,
+    "reasoning_tokens": 0
+  },
+  {
+    "type": "Usage",
+    "input_tokens": 5,
+    "output_tokens": 4,
+    "cached_input_tokens": 0,
+    "reasoning_tokens": 0
+  },
+  {
+    "type": "Stop",
+    "reason": "tool_use"
+  }
+]

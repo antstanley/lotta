@@ -31,14 +31,19 @@ jobs:
           node tools/extract-protocol-fixture.mjs --self-test
           node --check tools/extract-persistence-fixtures.mjs
           node tools/extract-persistence-fixtures.mjs --self-test
+          node --check tools/capture-provider-streams.mjs
+          node tools/capture-provider-streams.mjs --self-test
       - name: Check fixtures twice without writing
         run: |
           node tools/extract-protocol-fixture.mjs --source letta-code --check
           node tools/extract-protocol-fixture.mjs --source letta-code --check
           node tools/extract-persistence-fixtures.mjs --source letta-code --check
           node tools/extract-persistence-fixtures.mjs --source letta-code --check
+          node tools/capture-provider-streams.mjs --source letta-code --check
+          node tools/capture-provider-streams.mjs --source letta-code --check
           git diff --exit-code -- fixtures/protocol/discriminants.json
           git diff --exit-code -- fixtures/persistence
+          git diff --exit-code -- fixtures/providers
 
   quality:
     name: ${{ matrix.gate }}

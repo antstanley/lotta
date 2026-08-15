@@ -1,0 +1,8 @@
+[
+  {
+    "type": "Error",
+    "kind": "context_overflow",
+    "code": "fixture_context_overflow",
+    "context": "SANITIZED_FIXTURE_CONTEXT_OVERFLOW"
+  }
+]

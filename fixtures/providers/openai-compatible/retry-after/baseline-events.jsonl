@@ -1,0 +1,1 @@
+{"type":"error","kind":"rate_limit","code":"fixture_rate_limit","context":"SANITIZED_FIXTURE_RETRY_AFTER","provenance":{"source_test":"src/backend/pi-stream-adapter.test.ts","source_symbol":"normalizeLocalProviderError","capture_boundary":"pinned_error_normalization_boundary"}}

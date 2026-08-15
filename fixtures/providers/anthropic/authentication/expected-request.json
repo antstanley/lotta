@@ -1,0 +1,39 @@
+{
+  "method": "POST",
+  "endpoint": "/v1/messages",
+  "headers": {
+    "anthropic-version": "SANITIZED_FIXTURE_VERSION"
+  },
+  "body": {
+    "model": "fixture-model",
+    "system": "SANITIZED_FIXTURE_SYSTEM",
+    "messages": [
+      {
+        "role": "user",
+        "content": "SANITIZED_FIXTURE_USER"
+      }
+    ],
+    "max_tokens": 256,
+    "stream": true,
+    "tools": [
+      {
+        "name": "fixture_tool",
+        "description": "SANITIZED_FIXTURE_TOOL",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "a": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "a"
+          ]
+        }
+      }
+    ],
+    "thinking": {
+      "type": "disabled"
+    }
+  }
+}

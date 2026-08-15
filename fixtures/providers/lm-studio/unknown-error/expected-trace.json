@@ -1,0 +1,8 @@
+[
+  {
+    "type": "Error",
+    "kind": "unknown",
+    "code": "fixture_unknown",
+    "context": "SANITIZED_FIXTURE_UNKNOWN_ERROR"
+  }
+]

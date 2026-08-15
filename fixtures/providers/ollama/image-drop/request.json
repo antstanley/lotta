@@ -1,0 +1,56 @@
+{
+  "model": {
+    "handle": "ollama/fixture-model",
+    "provider_id": "ollama",
+    "available": true,
+    "context_window": 8192,
+    "model_settings": {
+      "fixture": true
+    }
+  },
+  "system": "SANITIZED_FIXTURE_SYSTEM",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "SANITIZED_FIXTURE_USER"
+        },
+        {
+          "type": "image",
+          "media_type": "image/png",
+          "base64": "UE5H"
+        }
+      ],
+      "tool_call_id": null
+    }
+  ],
+  "tools": [
+    {
+      "name": "fixture_tool",
+      "description": "SANITIZED_FIXTURE_TOOL",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "a"
+        ]
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "image_policy": "drop",
+  "context_tokens_max": 8192,
+  "output_tokens_max": 256,
+  "reasoning": {
+    "enabled": false,
+    "effort": "medium",
+    "tier": null
+  },
+  "deadline_ms": 1000
+}

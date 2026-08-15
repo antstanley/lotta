@@ -1,0 +1,12 @@
+[
+  {
+    "type": "TextDelta",
+    "text": "SANITIZED_FIXTURE_TEXT"
+  },
+  {
+    "type": "Error",
+    "kind": "cancelled",
+    "code": "fixture_cancelled",
+    "context": "SANITIZED_FIXTURE_CANCELLED"
+  }
+]

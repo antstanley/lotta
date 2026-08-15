@@ -1,0 +1,8 @@
+[
+  {
+    "type": "Error",
+    "kind": "overloaded",
+    "code": "fixture_overloaded",
+    "context": "SANITIZED_FIXTURE_OVERLOADED"
+  }
+]
