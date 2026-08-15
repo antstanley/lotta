@@ -1,0 +1,9 @@
+{
+  "behavior": "lotta_hardening_preserves_canonical_original",
+  "mutation": "candidate_not_committed",
+  "indexed_files": [
+    "input",
+    "candidate",
+    "expected"
+  ]
+}

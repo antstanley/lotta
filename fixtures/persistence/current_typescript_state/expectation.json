@@ -1,0 +1,8 @@
+{
+  "behavior": "rust_reads",
+  "mutation": "none",
+  "indexed_files": [
+    "agents",
+    "conversations"
+  ]
+}

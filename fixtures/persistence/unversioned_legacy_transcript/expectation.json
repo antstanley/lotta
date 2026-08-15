@@ -1,0 +1,8 @@
+{
+  "behavior": "transcript_migration_required",
+  "mutation": "backup_then_explicit_conversion",
+  "indexed_files": [
+    "agents",
+    "conversations"
+  ]
+}

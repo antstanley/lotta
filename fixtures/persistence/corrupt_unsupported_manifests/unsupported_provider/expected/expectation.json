@@ -1,0 +1,5 @@
+{
+  "behavior": "reject",
+  "reason": "unsupported_provider",
+  "active_bytes_preserved": true
+}

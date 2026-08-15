@@ -1,0 +1,9 @@
+{
+  "behavior": "orphan_removed_from_active_projection",
+  "mutation": "conversation_ids_repaired_source_unchanged",
+  "indexed_files": [
+    "agents",
+    "conversations",
+    "expected-active-projection.json"
+  ]
+}

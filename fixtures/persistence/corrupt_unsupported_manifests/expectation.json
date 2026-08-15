@@ -1,0 +1,9 @@
+{
+  "behavior": "reject_all_subcases",
+  "mutation": "none",
+  "indexed_files": [
+    "corrupt_json",
+    "unsupported_schema",
+    "unsupported_provider"
+  ]
+}

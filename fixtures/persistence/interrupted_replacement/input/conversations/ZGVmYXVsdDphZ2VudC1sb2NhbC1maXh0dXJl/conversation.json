@@ -1,0 +1,13 @@
+{
+  "id": "conversation-fixture",
+  "agent_id": "agent-local-fixture",
+  "archived": false,
+  "archived_at": null,
+  "created_at": "2000-01-01T00:00:00.000Z",
+  "updated_at": "2000-01-01T00:00:00.000Z",
+  "last_message_at": "2000-01-01T00:00:00.000Z",
+  "summary": "SANITIZED_FIXTURE_SUMMARY",
+  "in_context_message_ids": [
+    "msg-active-fixture"
+  ]
+}

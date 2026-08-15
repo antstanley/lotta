@@ -1,0 +1,670 @@
+{
+  "schema_version": 1,
+  "source_commit": "300f923f16cc8eee50656d7da732902c1dea2b65",
+  "generator": "tools/extract-persistence-fixtures.mjs",
+  "derivation": "Source-derived deterministic Node harness reproducing pinned persisted layouts and formats without importing runtime packages.",
+  "placeholder_policy": "All content is synthetic SANITIZED_FIXTURE_* data. Credential-like fields may contain only <redacted-fixture> or not-needed.",
+  "ids": {
+    "agent": "agent-local-fixture",
+    "conversation": "conversation-fixture"
+  },
+  "keys": {
+    "agent": {
+      "source": "agent-local-fixture",
+      "encoded": "YWdlbnQtbG9jYWwtZml4dHVyZQ"
+    },
+    "default_conversation": {
+      "source": "default:agent-local-fixture",
+      "encoded": "ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl"
+    },
+    "named_conversation": {
+      "source": "conversation:conversation-fixture",
+      "encoded": "Y29udmVyc2F0aW9uOmNvbnZlcnNhdGlvbi1maXh0dXJl"
+    }
+  },
+  "cases": [
+    {
+      "case_id": 1,
+      "obligation": 1,
+      "relative_root": "current_typescript_state",
+      "source_format": "schema2-pi-session-entry-jsonl",
+      "expected_rust_behavior": "reads_current",
+      "expected_typescript_behavior": "writes_current",
+      "expected_recovery_or_mutation": "none"
+    },
+    {
+      "case_id": 2,
+      "obligation": 2,
+      "relative_root": "rust_target_state",
+      "source_format": "schema2-pi-session-entry-jsonl",
+      "expected_rust_behavior": "writes_exact_wire",
+      "expected_typescript_behavior": "reads_exact_wire",
+      "expected_recovery_or_mutation": "none"
+    },
+    {
+      "case_id": 3,
+      "obligation": 3,
+      "relative_root": "unversioned_legacy_transcript",
+      "source_format": "unversioned-legacy-ui-jsonl",
+      "expected_rust_behavior": "requires_explicit_migration",
+      "expected_typescript_behavior": "requires_explicit_migration",
+      "expected_recovery_or_mutation": "backup_then_conversion"
+    },
+    {
+      "case_id": 4,
+      "obligation": 3,
+      "relative_root": "versioned_legacy_transcript",
+      "source_format": "schema1-pi-ai-message-jsonl",
+      "expected_rust_behavior": "upgrades_on_nonempty_persistence",
+      "expected_typescript_behavior": "upgrades_on_nonempty_persistence",
+      "expected_recovery_or_mutation": "schema2_rewrite"
+    },
+    {
+      "case_id": 5,
+      "obligation": 4,
+      "relative_root": "baseline_tolerated_versioned_rows",
+      "source_format": "schema2-tolerated-rows",
+      "expected_rust_behavior": "loads_message_entries",
+      "expected_typescript_behavior": "ignores_session_header",
+      "expected_recovery_or_mutation": "none"
+    },
+    {
+      "case_id": 6,
+      "obligation": 5,
+      "relative_root": "orphan_result_repair_input",
+      "source_format": "schema2-orphan-tool-result",
+      "expected_rust_behavior": "repairs_active_projection",
+      "expected_typescript_behavior": "repairs_active_projection",
+      "expected_recovery_or_mutation": "conversation_only"
+    },
+    {
+      "case_id": 7,
+      "obligation": 6,
+      "relative_root": "interrupted_append",
+      "source_format": "schema2-truncated-jsonl",
+      "expected_rust_behavior": "recovers_complete_prefix",
+      "expected_typescript_behavior": "not_applicable_rust_hardening",
+      "expected_recovery_or_mutation": "discard_truncated_tail"
+    },
+    {
+      "case_id": 8,
+      "obligation": 6,
+      "relative_root": "interrupted_replacement",
+      "source_format": "schema2-replacement-evidence",
+      "expected_rust_behavior": "preserves_original",
+      "expected_typescript_behavior": "not_applicable_rust_hardening",
+      "expected_recovery_or_mutation": "candidate_not_committed"
+    },
+    {
+      "case_id": 9,
+      "obligation": 7,
+      "relative_root": "corrupt_unsupported_manifests",
+      "source_format": "corrupt-and-unsupported-manifests",
+      "expected_rust_behavior": "rejects_without_mutation",
+      "expected_typescript_behavior": "rejects_without_mutation",
+      "expected_recovery_or_mutation": "none"
+    }
+  ],
+  "intentional_invalid_files": [
+    "interrupted_append/input/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/messages.jsonl",
+    "corrupt_unsupported_manifests/corrupt_json/input/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/manifest.json",
+    "corrupt_unsupported_manifests/unsupported_schema/input/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/manifest.json"
+  ],
+  "side_stores": [
+    {
+      "path": "side_stores/home/.letta/settings.json",
+      "format": "json"
+    },
+    {
+      "path": "side_stores/letta_home/crons.json",
+      "format": "json"
+    },
+    {
+      "path": "side_stores/letta_home/runs/schedule-fixture.jsonl",
+      "format": "jsonl"
+    },
+    {
+      "path": "side_stores/providers/auth.json",
+      "format": "json"
+    },
+    {
+      "path": "side_stores/home/.letta/channels/pending-control-requests.json",
+      "format": "json"
+    },
+    {
+      "path": "side_stores/home/.letta/channels/telegram/config.yaml",
+      "format": "yaml"
+    },
+    {
+      "path": "side_stores/home/.letta/channels/telegram/accounts.json",
+      "format": "json"
+    },
+    {
+      "path": "side_stores/home/.letta/channels/telegram/routing.yaml",
+      "format": "json"
+    },
+    {
+      "path": "side_stores/home/.letta/channels/telegram/pairing.yaml",
+      "format": "json"
+    },
+    {
+      "path": "side_stores/home/.letta/channels/telegram/targets.json",
+      "format": "json"
+    },
+    {
+      "path": "side_stores/workspace/.letta/settings.json",
+      "format": "json"
+    },
+    {
+      "path": "side_stores/workspace/.letta/settings.local.json",
+      "format": "json"
+    }
+  ],
+  "inventory_schema": "Every corpus file except self-referential index.json is listed by sorted path, semantic kind, byte count, and SHA-256. index.json is additionally included in the complete loader and sanitization scan.",
+  "inventory": [
+    {
+      "path": "baseline_tolerated_versioned_rows/agents/YWdlbnQtbG9jYWwtZml4dHVyZQ.json",
+      "semantic_kind": "json",
+      "byte_count": 258,
+      "sha256": "0965ea64782d37369b6f8d8afb922c13a78c7b25b93c7a6ffae754ddc8827792"
+    },
+    {
+      "path": "baseline_tolerated_versioned_rows/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/conversation.json",
+      "semantic_kind": "json",
+      "byte_count": 358,
+      "sha256": "86fea559beb0db6b5581ec8dc09c64f4b9e26a246526314a715dc7a9f53f85c0"
+    },
+    {
+      "path": "baseline_tolerated_versioned_rows/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/manifest.json",
+      "semantic_kind": "json",
+      "byte_count": 145,
+      "sha256": "a4a424341166cc116b457be28573e96ce0c46548ee5561b7c7f6e57261c6f847"
+    },
+    {
+      "path": "baseline_tolerated_versioned_rows/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/messages.jsonl",
+      "semantic_kind": "jsonl",
+      "byte_count": 438,
+      "sha256": "390d903e5522de989dcce5ef760442444c4f1e920157bfca24887210af0e865c"
+    },
+    {
+      "path": "baseline_tolerated_versioned_rows/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/system-prompt.json",
+      "semantic_kind": "json",
+      "byte_count": 184,
+      "sha256": "e5dfc35540f1a72792cfea691b3ee08896d325f5a8f6fbec25f0bbab0c5c3714"
+    },
+    {
+      "path": "baseline_tolerated_versioned_rows/expectation.json",
+      "semantic_kind": "json",
+      "byte_count": 156,
+      "sha256": "8e734a24a12d9541f9419204064f179b546344c86706bcd92eba81868b168ce5"
+    },
+    {
+      "path": "corrupt_unsupported_manifests/corrupt_json/expected/active-bytes",
+      "semantic_kind": "bytes",
+      "byte_count": 437,
+      "sha256": "0e34965eef6b055c18e169074583753147b2850abdf266b780b4afd1de5d62ef"
+    },
+    {
+      "path": "corrupt_unsupported_manifests/corrupt_json/expected/expectation.json",
+      "semantic_kind": "json",
+      "byte_count": 95,
+      "sha256": "2de5675db60d5a4e4ed06b242fb9b22ce3dc87e93b6dbccfefe46966cc95fb89"
+    },
+    {
+      "path": "corrupt_unsupported_manifests/corrupt_json/input/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/manifest.json",
+      "semantic_kind": "json",
+      "byte_count": 56,
+      "sha256": "da1d229856ee263e1cde2292b26e56c894fd162107b2b01d2cf76de9fc0715e8"
+    },
+    {
+      "path": "corrupt_unsupported_manifests/corrupt_json/input/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/messages.jsonl",
+      "semantic_kind": "jsonl",
+      "byte_count": 437,
+      "sha256": "0e34965eef6b055c18e169074583753147b2850abdf266b780b4afd1de5d62ef"
+    },
+    {
+      "path": "corrupt_unsupported_manifests/expectation.json",
+      "semantic_kind": "json",
+      "byte_count": 161,
+      "sha256": "dbbb59842fa803de31b4d31544fa358fc6d402e85bd556c06530f93c9e166a96"
+    },
+    {
+      "path": "corrupt_unsupported_manifests/unsupported_provider/expected/active-bytes",
+      "semantic_kind": "bytes",
+      "byte_count": 437,
+      "sha256": "0e34965eef6b055c18e169074583753147b2850abdf266b780b4afd1de5d62ef"
+    },
+    {
+      "path": "corrupt_unsupported_manifests/unsupported_provider/expected/expectation.json",
+      "semantic_kind": "json",
+      "byte_count": 97,
+      "sha256": "30e1b602df42bcc1803d5010371e0293fe14dd8883e580904400672af2208887"
+    },
+    {
+      "path": "corrupt_unsupported_manifests/unsupported_provider/input/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/manifest.json",
+      "semantic_kind": "json",
+      "byte_count": 168,
+      "sha256": "c30503ea46260617a3ded837aa7b58635d4b6d3cc0dad572232f24fc9018aa24"
+    },
+    {
+      "path": "corrupt_unsupported_manifests/unsupported_provider/input/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/messages.jsonl",
+      "semantic_kind": "jsonl",
+      "byte_count": 437,
+      "sha256": "0e34965eef6b055c18e169074583753147b2850abdf266b780b4afd1de5d62ef"
+    },
+    {
+      "path": "corrupt_unsupported_manifests/unsupported_schema/expected/active-bytes",
+      "semantic_kind": "bytes",
+      "byte_count": 437,
+      "sha256": "0e34965eef6b055c18e169074583753147b2850abdf266b780b4afd1de5d62ef"
+    },
+    {
+      "path": "corrupt_unsupported_manifests/unsupported_schema/expected/expectation.json",
+      "semantic_kind": "json",
+      "byte_count": 95,
+      "sha256": "f2c307d1735b0f51e268ddb26d3950154cb9886155ff05f9d13cae9774f52c49"
+    },
+    {
+      "path": "corrupt_unsupported_manifests/unsupported_schema/input/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/manifest.json",
+      "semantic_kind": "json",
+      "byte_count": 146,
+      "sha256": "b87f78d90eebf2d6bbd9ce668060a200cc7842f2272ea00a5daefc3e40c81d57"
+    },
+    {
+      "path": "corrupt_unsupported_manifests/unsupported_schema/input/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/messages.jsonl",
+      "semantic_kind": "jsonl",
+      "byte_count": 437,
+      "sha256": "0e34965eef6b055c18e169074583753147b2850abdf266b780b4afd1de5d62ef"
+    },
+    {
+      "path": "current_typescript_state/agents/YWdlbnQtbG9jYWwtZml4dHVyZQ.json",
+      "semantic_kind": "json",
+      "byte_count": 258,
+      "sha256": "0965ea64782d37369b6f8d8afb922c13a78c7b25b93c7a6ffae754ddc8827792"
+    },
+    {
+      "path": "current_typescript_state/conversations/Y29udmVyc2F0aW9uOmNvbnZlcnNhdGlvbi1maXh0dXJl/conversation.json",
+      "semantic_kind": "json",
+      "byte_count": 353,
+      "sha256": "150faff7d0fc30d07f3bc7f9c7833336b2c671b89b1beffc7148ae2d5358aef5"
+    },
+    {
+      "path": "current_typescript_state/conversations/Y29udmVyc2F0aW9uOmNvbnZlcnNhdGlvbi1maXh0dXJl/manifest.json",
+      "semantic_kind": "json",
+      "byte_count": 145,
+      "sha256": "a4a424341166cc116b457be28573e96ce0c46548ee5561b7c7f6e57261c6f847"
+    },
+    {
+      "path": "current_typescript_state/conversations/Y29udmVyc2F0aW9uOmNvbnZlcnNhdGlvbi1maXh0dXJl/messages.jsonl",
+      "semantic_kind": "jsonl",
+      "byte_count": 427,
+      "sha256": "19b246d6850d81d22239416c25b5621541f33e4ff861689beb6df70e77581a6c"
+    },
+    {
+      "path": "current_typescript_state/conversations/Y29udmVyc2F0aW9uOmNvbnZlcnNhdGlvbi1maXh0dXJl/system-prompt.json",
+      "semantic_kind": "json",
+      "byte_count": 184,
+      "sha256": "e5dfc35540f1a72792cfea691b3ee08896d325f5a8f6fbec25f0bbab0c5c3714"
+    },
+    {
+      "path": "current_typescript_state/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/conversation.json",
+      "semantic_kind": "json",
+      "byte_count": 353,
+      "sha256": "150faff7d0fc30d07f3bc7f9c7833336b2c671b89b1beffc7148ae2d5358aef5"
+    },
+    {
+      "path": "current_typescript_state/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/manifest.json",
+      "semantic_kind": "json",
+      "byte_count": 145,
+      "sha256": "a4a424341166cc116b457be28573e96ce0c46548ee5561b7c7f6e57261c6f847"
+    },
+    {
+      "path": "current_typescript_state/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/messages.jsonl",
+      "semantic_kind": "jsonl",
+      "byte_count": 426,
+      "sha256": "8b787aede81e5cc4c1a01128340e8b1818c6e27ec7e568dac72eb52feb3927c6"
+    },
+    {
+      "path": "current_typescript_state/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/system-prompt.json",
+      "semantic_kind": "json",
+      "byte_count": 184,
+      "sha256": "e5dfc35540f1a72792cfea691b3ee08896d325f5a8f6fbec25f0bbab0c5c3714"
+    },
+    {
+      "path": "current_typescript_state/expectation.json",
+      "semantic_kind": "json",
+      "byte_count": 113,
+      "sha256": "4d6869dc8d546e5a2ebaebd1cf50c04f80043b6c440d8827d0f8951a232f454f"
+    },
+    {
+      "path": "interrupted_append/expectation.json",
+      "semantic_kind": "json",
+      "byte_count": 161,
+      "sha256": "58a4d44168685c4e5b000bf326676ace25d0a01c477d189d8c993a7b6b4dc8cc"
+    },
+    {
+      "path": "interrupted_append/expected/complete-prefix.jsonl",
+      "semantic_kind": "jsonl",
+      "byte_count": 434,
+      "sha256": "471c642fc565f8e26d767edaf7d06a9c5540546be627ae606b7025e2b976355e"
+    },
+    {
+      "path": "interrupted_append/input/agents/YWdlbnQtbG9jYWwtZml4dHVyZQ.json",
+      "semantic_kind": "json",
+      "byte_count": 258,
+      "sha256": "0965ea64782d37369b6f8d8afb922c13a78c7b25b93c7a6ffae754ddc8827792"
+    },
+    {
+      "path": "interrupted_append/input/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/conversation.json",
+      "semantic_kind": "json",
+      "byte_count": 353,
+      "sha256": "150faff7d0fc30d07f3bc7f9c7833336b2c671b89b1beffc7148ae2d5358aef5"
+    },
+    {
+      "path": "interrupted_append/input/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/manifest.json",
+      "semantic_kind": "json",
+      "byte_count": 145,
+      "sha256": "a4a424341166cc116b457be28573e96ce0c46548ee5561b7c7f6e57261c6f847"
+    },
+    {
+      "path": "interrupted_append/input/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/messages.jsonl",
+      "semantic_kind": "jsonl",
+      "byte_count": 521,
+      "sha256": "40cf6ddd11e3b9c8d8d5e15353fcbe8212f0eb0cc63b954a04c1b039e465e2cf"
+    },
+    {
+      "path": "interrupted_append/input/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/system-prompt.json",
+      "semantic_kind": "json",
+      "byte_count": 184,
+      "sha256": "e5dfc35540f1a72792cfea691b3ee08896d325f5a8f6fbec25f0bbab0c5c3714"
+    },
+    {
+      "path": "interrupted_replacement/candidate/agents/YWdlbnQtbG9jYWwtZml4dHVyZQ.json",
+      "semantic_kind": "json",
+      "byte_count": 258,
+      "sha256": "0965ea64782d37369b6f8d8afb922c13a78c7b25b93c7a6ffae754ddc8827792"
+    },
+    {
+      "path": "interrupted_replacement/candidate/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/conversation.json",
+      "semantic_kind": "json",
+      "byte_count": 358,
+      "sha256": "26e5d228d39257838a0330dbecaba49d1f4bd725e0ff101eeced8424f0272dce"
+    },
+    {
+      "path": "interrupted_replacement/candidate/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/manifest.json",
+      "semantic_kind": "json",
+      "byte_count": 145,
+      "sha256": "a4a424341166cc116b457be28573e96ce0c46548ee5561b7c7f6e57261c6f847"
+    },
+    {
+      "path": "interrupted_replacement/candidate/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/messages.jsonl",
+      "semantic_kind": "jsonl",
+      "byte_count": 447,
+      "sha256": "e8c6191665f1971f3f114c1c9b0dedfeb9ffeb573c94cf88dfc332c0310e7a79"
+    },
+    {
+      "path": "interrupted_replacement/candidate/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/system-prompt.json",
+      "semantic_kind": "json",
+      "byte_count": 184,
+      "sha256": "e5dfc35540f1a72792cfea691b3ee08896d325f5a8f6fbec25f0bbab0c5c3714"
+    },
+    {
+      "path": "interrupted_replacement/expectation.json",
+      "semantic_kind": "json",
+      "byte_count": 177,
+      "sha256": "8590c508256bb6f53bffe9928e144446d91830bcd06a98ff00d629679924330b"
+    },
+    {
+      "path": "interrupted_replacement/expected/active-messages.jsonl",
+      "semantic_kind": "jsonl",
+      "byte_count": 438,
+      "sha256": "595f035c010428855907dfb784614307d9837728772027d47f1ce80b205db0cd"
+    },
+    {
+      "path": "interrupted_replacement/input/agents/YWdlbnQtbG9jYWwtZml4dHVyZQ.json",
+      "semantic_kind": "json",
+      "byte_count": 258,
+      "sha256": "0965ea64782d37369b6f8d8afb922c13a78c7b25b93c7a6ffae754ddc8827792"
+    },
+    {
+      "path": "interrupted_replacement/input/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/conversation.json",
+      "semantic_kind": "json",
+      "byte_count": 355,
+      "sha256": "decc246b8a8823c98071f44850a499e7d5bda0ce2989a6f3566f591a85388f24"
+    },
+    {
+      "path": "interrupted_replacement/input/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/manifest.json",
+      "semantic_kind": "json",
+      "byte_count": 145,
+      "sha256": "a4a424341166cc116b457be28573e96ce0c46548ee5561b7c7f6e57261c6f847"
+    },
+    {
+      "path": "interrupted_replacement/input/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/messages.jsonl",
+      "semantic_kind": "jsonl",
+      "byte_count": 438,
+      "sha256": "595f035c010428855907dfb784614307d9837728772027d47f1ce80b205db0cd"
+    },
+    {
+      "path": "interrupted_replacement/input/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/system-prompt.json",
+      "semantic_kind": "json",
+      "byte_count": 184,
+      "sha256": "e5dfc35540f1a72792cfea691b3ee08896d325f5a8f6fbec25f0bbab0c5c3714"
+    },
+    {
+      "path": "orphan_result_repair_input/agents/YWdlbnQtbG9jYWwtZml4dHVyZQ.json",
+      "semantic_kind": "json",
+      "byte_count": 258,
+      "sha256": "0965ea64782d37369b6f8d8afb922c13a78c7b25b93c7a6ffae754ddc8827792"
+    },
+    {
+      "path": "orphan_result_repair_input/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/conversation.json",
+      "semantic_kind": "json",
+      "byte_count": 423,
+      "sha256": "de0dde7b6bfc661b0e8bb6cc3331c9622158a950eb77a61140e2b9a691096b75"
+    },
+    {
+      "path": "orphan_result_repair_input/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/manifest.json",
+      "semantic_kind": "json",
+      "byte_count": 145,
+      "sha256": "a4a424341166cc116b457be28573e96ce0c46548ee5561b7c7f6e57261c6f847"
+    },
+    {
+      "path": "orphan_result_repair_input/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/messages.jsonl",
+      "semantic_kind": "jsonl",
+      "byte_count": 1575,
+      "sha256": "089a6a877872c75e2c3f19b82583166cfc6f289117201cccb6a7091431a71f63"
+    },
+    {
+      "path": "orphan_result_repair_input/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/system-prompt.json",
+      "semantic_kind": "json",
+      "byte_count": 184,
+      "sha256": "e5dfc35540f1a72792cfea691b3ee08896d325f5a8f6fbec25f0bbab0c5c3714"
+    },
+    {
+      "path": "orphan_result_repair_input/expectation.json",
+      "semantic_kind": "json",
+      "byte_count": 217,
+      "sha256": "59e267fd93d6d303f96cd2083162e8bffd464ac1a1d992f620024b014224bc86"
+    },
+    {
+      "path": "orphan_result_repair_input/expected-active-projection.json",
+      "semantic_kind": "json",
+      "byte_count": 214,
+      "sha256": "2d9f8fcf1cdcd9e19f9eff4ee3aeb192432663930c97cf0eb5231d932759de11"
+    },
+    {
+      "path": "rust_target_state/agents/YWdlbnQtbG9jYWwtZml4dHVyZQ.json",
+      "semantic_kind": "json",
+      "byte_count": 258,
+      "sha256": "0965ea64782d37369b6f8d8afb922c13a78c7b25b93c7a6ffae754ddc8827792"
+    },
+    {
+      "path": "rust_target_state/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/conversation.json",
+      "semantic_kind": "json",
+      "byte_count": 353,
+      "sha256": "150faff7d0fc30d07f3bc7f9c7833336b2c671b89b1beffc7148ae2d5358aef5"
+    },
+    {
+      "path": "rust_target_state/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/manifest.json",
+      "semantic_kind": "json",
+      "byte_count": 145,
+      "sha256": "a4a424341166cc116b457be28573e96ce0c46548ee5561b7c7f6e57261c6f847"
+    },
+    {
+      "path": "rust_target_state/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/messages.jsonl",
+      "semantic_kind": "jsonl",
+      "byte_count": 430,
+      "sha256": "d25cea1b856ec5dd4e4786eaaa7071f9d6420f0b13c88b20034a60152719c25c"
+    },
+    {
+      "path": "rust_target_state/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/system-prompt.json",
+      "semantic_kind": "json",
+      "byte_count": 184,
+      "sha256": "e5dfc35540f1a72792cfea691b3ee08896d325f5a8f6fbec25f0bbab0c5c3714"
+    },
+    {
+      "path": "rust_target_state/expectation.json",
+      "semantic_kind": "json",
+      "byte_count": 135,
+      "sha256": "1ed28f8f442b05a91790ee4989c66da33cb000833f2f00e543dcdafb578b8fbf"
+    },
+    {
+      "path": "side_stores/home/.letta/channels/pending-control-requests.json",
+      "semantic_kind": "json",
+      "byte_count": 21,
+      "sha256": "5824b184c28cf0c23227b846f1229c9a2786e9589f1d0c28158b18c65dd022b3"
+    },
+    {
+      "path": "side_stores/home/.letta/channels/telegram/accounts.json",
+      "semantic_kind": "json",
+      "byte_count": 21,
+      "sha256": "ea3a37f3ab4f732e1eb08d6b11e3b1a6f1ef59c1fc21acea22accdd9ac771a17"
+    },
+    {
+      "path": "side_stores/home/.letta/channels/telegram/config.yaml",
+      "semantic_kind": "yaml_or_json",
+      "byte_count": 179,
+      "sha256": "ee5cccd7412a4c4bca971fbe46be21e839b68580b90c6d343e4db76c285135ea"
+    },
+    {
+      "path": "side_stores/home/.letta/channels/telegram/pairing.yaml",
+      "semantic_kind": "yaml_or_json",
+      "byte_count": 38,
+      "sha256": "d309a9e6f6bc3848e1647d6bd6f237e76725cc643a0641da5d48532fbbb79b81"
+    },
+    {
+      "path": "side_stores/home/.letta/channels/telegram/routing.yaml",
+      "semantic_kind": "yaml_or_json",
+      "byte_count": 19,
+      "sha256": "e88c0e7ed6d665ec175a908cbfaa1262893cbe3760c643faf24a04ebcff73e36"
+    },
+    {
+      "path": "side_stores/home/.letta/channels/telegram/targets.json",
+      "semantic_kind": "json",
+      "byte_count": 20,
+      "sha256": "0ba13550eb7db21ef23d06c35f26efe15b1f7db7fd4b4357c1e0cdb6fe15aa93"
+    },
+    {
+      "path": "side_stores/home/.letta/settings.json",
+      "semantic_kind": "json",
+      "byte_count": 555,
+      "sha256": "e67c78bf9e6880e9de561a0833b7d850e63197b3574e863206349b3137577179"
+    },
+    {
+      "path": "side_stores/letta_home/crons.json",
+      "semantic_kind": "json",
+      "byte_count": 913,
+      "sha256": "8524066bd66e72650853dfe977c851cf3201b7d9450a872ea773baf8df1fd1d9"
+    },
+    {
+      "path": "side_stores/letta_home/runs/schedule-fixture.jsonl",
+      "semantic_kind": "jsonl",
+      "byte_count": 240,
+      "sha256": "664e5740bc995816a8251584ff5b04c249f8f00c5d8ac764245716bb99040b8e"
+    },
+    {
+      "path": "side_stores/providers/auth.json",
+      "semantic_kind": "json",
+      "byte_count": 449,
+      "sha256": "d126514d8cdada0fbb84cd76c4193f3b6e3b3bbfa9f23b4413c59cef995f7bd8"
+    },
+    {
+      "path": "side_stores/workspace/.letta/settings.json",
+      "semantic_kind": "json",
+      "byte_count": 3,
+      "sha256": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356"
+    },
+    {
+      "path": "side_stores/workspace/.letta/settings.local.json",
+      "semantic_kind": "json",
+      "byte_count": 41,
+      "sha256": "539bc55d4dc61aa129f58b5c71160737436512f801a65fdf4071de6acf0b0976"
+    },
+    {
+      "path": "unversioned_legacy_transcript/agents/YWdlbnQtbG9jYWwtZml4dHVyZQ.json",
+      "semantic_kind": "json",
+      "byte_count": 258,
+      "sha256": "0965ea64782d37369b6f8d8afb922c13a78c7b25b93c7a6ffae754ddc8827792"
+    },
+    {
+      "path": "unversioned_legacy_transcript/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/conversation.json",
+      "semantic_kind": "json",
+      "byte_count": 351,
+      "sha256": "39ce4f60f187d7613fb5a83d57aa76a241e444f328985c25224d7cec335fad72"
+    },
+    {
+      "path": "unversioned_legacy_transcript/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/messages.jsonl",
+      "semantic_kind": "jsonl",
+      "byte_count": 154,
+      "sha256": "d70234e59cf749df56ae6590fd91ee00595f270ae49f1950d4945c984f5ef364"
+    },
+    {
+      "path": "unversioned_legacy_transcript/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/system-prompt.json",
+      "semantic_kind": "json",
+      "byte_count": 184,
+      "sha256": "e5dfc35540f1a72792cfea691b3ee08896d325f5a8f6fbec25f0bbab0c5c3714"
+    },
+    {
+      "path": "unversioned_legacy_transcript/expectation.json",
+      "semantic_kind": "json",
+      "byte_count": 159,
+      "sha256": "a8c9fdceaa98761be4989ede7868e5f542487fa39e6605cbef89fd828b1347f2"
+    },
+    {
+      "path": "versioned_legacy_transcript/agents/YWdlbnQtbG9jYWwtZml4dHVyZQ.json",
+      "semantic_kind": "json",
+      "byte_count": 258,
+      "sha256": "0965ea64782d37369b6f8d8afb922c13a78c7b25b93c7a6ffae754ddc8827792"
+    },
+    {
+      "path": "versioned_legacy_transcript/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/conversation.json",
+      "semantic_kind": "json",
+      "byte_count": 355,
+      "sha256": "9f98cb3032f9a58d563863d9fee397edbac393b98257daa3057caaa7fda2d4a6"
+    },
+    {
+      "path": "versioned_legacy_transcript/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/manifest.json",
+      "semantic_kind": "json",
+      "byte_count": 142,
+      "sha256": "6a9ac10366990022062424878f8a9c6f033564d415657bbb1414ff453fa315a6"
+    },
+    {
+      "path": "versioned_legacy_transcript/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/messages.jsonl",
+      "semantic_kind": "jsonl",
+      "byte_count": 192,
+      "sha256": "6c111f6b8e032a8ef5e3f16f95b5eada650d0422bce73aa92ba6a5e5ad7b5e97"
+    },
+    {
+      "path": "versioned_legacy_transcript/conversations/ZGVmYXVsdDphZ2VudC1sb2NhbC1maXh0dXJl/system-prompt.json",
+      "semantic_kind": "json",
+      "byte_count": 184,
+      "sha256": "e5dfc35540f1a72792cfea691b3ee08896d325f5a8f6fbec25f0bbab0c5c3714"
+    },
+    {
+      "path": "versioned_legacy_transcript/expectation.json",
+      "semantic_kind": "json",
+      "byte_count": 166,
+      "sha256": "e6fbe11f4bcf5c83b327ac804d998b7d5fae01d1c6ec1d6b75c944ab114e8d14"
+    }
+  ]
+}

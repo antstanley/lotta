@@ -1,0 +1,8 @@
+{
+  "behavior": "loader_ignores_session_header_and_loads_message_entry",
+  "mutation": "none",
+  "indexed_files": [
+    "agents",
+    "conversations"
+  ]
+}

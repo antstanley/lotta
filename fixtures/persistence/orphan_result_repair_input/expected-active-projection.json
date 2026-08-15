@@ -1,0 +1,11 @@
+{
+  "message_ids": [
+    "msg-assistant-fixture",
+    "msg-result-valid-fixture"
+  ],
+  "removed_message_ids": [
+    "msg-result-orphan-fixture"
+  ],
+  "transcript_mutated": false,
+  "conversation_mutated": true
+}

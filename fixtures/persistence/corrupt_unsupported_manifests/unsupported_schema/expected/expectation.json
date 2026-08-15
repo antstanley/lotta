@@ -1,0 +1,5 @@
+{
+  "behavior": "reject",
+  "reason": "unsupported_schema",
+  "active_bytes_preserved": true
+}

@@ -1,0 +1,19 @@
+{
+  "lastAgent": null,
+  "tokenStreaming": false,
+  "reasoningTabCycleEnabled": false,
+  "showCompactions": false,
+  "conversationSwitchAlertEnabled": false,
+  "sessionContextEnabled": true,
+  "autoConversationTitles": false,
+  "autoConversationTitlesRollbackApplied": true,
+  "autoSwapOnQuotaLimit": true,
+  "includeWorktreeTool": true,
+  "recentModels": [],
+  "memoryReminderInterval": 25,
+  "reflectionTrigger": "step-count",
+  "reflectionStepCount": 25,
+  "reflectionMerge": "auto",
+  "reflectionMergeInstructions": "",
+  "globalSharedBlockIds": []
+}

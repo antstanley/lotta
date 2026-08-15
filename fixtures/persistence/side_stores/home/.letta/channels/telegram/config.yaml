@@ -1,0 +1,8 @@
+enabled: false
+token: <redacted-fixture>
+dm_policy: pairing
+allowed_users: []
+group_mode: open
+transcribe_voice: false
+rich_private_chat_default: true
+rich_draft_streaming: false

@@ -1,0 +1,8 @@
+{
+  "behavior": "load_then_upgrade_on_nonempty_persistence",
+  "mutation": "backup_and_schema2_rewrite",
+  "indexed_files": [
+    "agents",
+    "conversations"
+  ]
+}

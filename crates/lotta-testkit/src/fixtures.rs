@@ -1,8 +1,19 @@
 use crate::{FIXTURE_BYTES_MAX, TestkitError};
 use serde::de::DeserializeOwned;
-use std::fs::File;
+
+/// Typed access to the deterministic persistence compatibility corpus.
+pub mod persistence;
+mod sha256;
+use std::fs::{File, ReadDir};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+
+/// Maximum entries returned by one bounded fixture-tree listing.
+pub const FIXTURE_TREE_FILES_MAX: usize = 256;
+/// Maximum fixture-tree directory depth.
+pub const FIXTURE_TREE_DEPTH_MAX: usize = 16;
+/// Maximum bytes in a fixture-relative path.
+pub const FIXTURE_PATH_BYTES_MAX: usize = 900;
 
 /// Loader confined to one canonical, static fixture tree.
 ///
@@ -49,11 +60,11 @@ impl FixtureLoader {
         Ok(Self { root })
     }
 
-    /// Loads and generically deserializes one validated relative JSON fixture.
+    /// Loads one validated relative fixture as bounded bytes.
     ///
     /// # Errors
-    /// Returns a typed missing, malformed, UTF-8, confined-path, limit, or filesystem error.
-    pub fn load<T: DeserializeOwned>(&self, relative: impl AsRef<Path>) -> Result<T, TestkitError> {
+    /// Returns a typed missing, confined-path, limit, or filesystem error.
+    pub fn load_bytes(&self, relative: impl AsRef<Path>) -> Result<Vec<u8>, TestkitError> {
         let (relative, display) = validate_relative(relative.as_ref())?;
         let path = self.root.join(&relative);
         reject_symlink_components(&self.root, &relative, &display)?;
@@ -62,12 +73,135 @@ impl FixtureLoader {
             return Err(confined_error(&display));
         }
         let file = File::open(canonical).map_err(|error| open_error(error.kind(), &display))?;
-        let bytes = bounded_read(file, &display)?;
-        let text = std::str::from_utf8(&bytes).map_err(|_| TestkitError::InvalidUtf8Fixture {
-            path: display.clone(),
-        })?;
-        serde_json::from_str(text).map_err(|_| TestkitError::MalformedFixture { path: display })
+        bounded_read(file, &display)
     }
+
+    /// Loads one validated relative UTF-8 fixture as bounded text.
+    ///
+    /// # Errors
+    /// Returns a typed missing, UTF-8, confined-path, limit, or filesystem error.
+    pub fn load_text(&self, relative: impl AsRef<Path>) -> Result<String, TestkitError> {
+        let path = relative.as_ref();
+        let display = validate_relative(path)?.1;
+        String::from_utf8(self.load_bytes(path)?)
+            .map_err(|_| TestkitError::InvalidUtf8Fixture { path: display })
+    }
+
+    /// Lists every regular file below a confined fixture directory without recursion.
+    ///
+    /// # Errors
+    /// Returns a typed error for missing roots, symlinks, special files, or bound violations.
+    pub fn list_tree(&self, relative: impl AsRef<Path>) -> Result<Vec<String>, TestkitError> {
+        let (relative, display) = validate_relative(relative.as_ref())?;
+        let base = self.root.join(&relative);
+        reject_symlink_components(&self.root, &relative, &display)?;
+        let mut files = Vec::new();
+        let mut stack = vec![(base.clone(), 0_usize)];
+        while let Some((directory, depth)) = stack.pop() {
+            if depth > FIXTURE_TREE_DEPTH_MAX {
+                return Err(TestkitError::LimitExceeded {
+                    context: "fixture tree depth",
+                });
+            }
+            let entries = std::fs::read_dir(&directory).map_err(|_| local_error(&display))?;
+            list_entries(&base, depth, entries, &mut stack, &mut files)?;
+        }
+        files.sort();
+        Ok(files)
+    }
+
+    /// Lists immediate regular-file and directory children of a confined fixture directory.
+    ///
+    /// Directory names have a trailing slash. The result is sorted and rejects links, special
+    /// entries, excessive paths, and an excessive entry count before retaining names.
+    ///
+    /// # Errors
+    /// Returns a typed error for missing roots, symlinks, special files, or bound violations.
+    pub fn list_children(&self, relative: impl AsRef<Path>) -> Result<Vec<String>, TestkitError> {
+        let (relative, display) = validate_relative(relative.as_ref())?;
+        let base = self.root.join(&relative);
+        reject_symlink_components(&self.root, &relative, &display)?;
+        let entries = std::fs::read_dir(base).map_err(|_| local_error(&display))?;
+        immediate_entries(entries)
+    }
+
+    /// Loads and generically deserializes one validated relative JSON fixture.
+    ///
+    /// # Errors
+    /// Returns a typed missing, malformed, UTF-8, confined-path, limit, or filesystem error.
+    pub fn load<T: DeserializeOwned>(&self, relative: impl AsRef<Path>) -> Result<T, TestkitError> {
+        let path = relative.as_ref();
+        let display = validate_relative(path)?.1;
+        let text = self.load_text(path)?;
+        serde_json::from_str(&text).map_err(|_| TestkitError::MalformedFixture { path: display })
+    }
+}
+
+fn immediate_entries(entries: ReadDir) -> Result<Vec<String>, TestkitError> {
+    let mut output = Vec::new();
+    for entry in entries {
+        if output.len() >= FIXTURE_TREE_FILES_MAX {
+            return Err(TestkitError::LimitExceeded {
+                context: "fixture directory entries",
+            });
+        }
+        let entry = entry.map_err(|_| local_error("fixture-directory"))?;
+        let kind = entry
+            .file_type()
+            .map_err(|_| local_error("fixture-directory"))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.len() > FIXTURE_PATH_BYTES_MAX || kind.is_symlink() {
+            return Err(confined_error("fixture-directory"));
+        }
+        if kind.is_dir() {
+            output.push(format!("{name}/"));
+        } else if kind.is_file() {
+            output.push(name);
+        } else {
+            return Err(confined_error("fixture-directory"));
+        }
+    }
+    output.sort();
+    Ok(output)
+}
+
+fn list_entries(
+    root: &Path,
+    depth: usize,
+    entries: ReadDir,
+    stack: &mut Vec<(PathBuf, usize)>,
+    files: &mut Vec<String>,
+) -> Result<(), TestkitError> {
+    for entry in entries {
+        if files.len().saturating_add(stack.len()) >= FIXTURE_TREE_FILES_MAX {
+            return Err(TestkitError::LimitExceeded {
+                context: "fixture tree entries",
+            });
+        }
+        let entry = entry.map_err(|_| local_error("fixture-tree"))?;
+        let kind = entry.file_type().map_err(|_| local_error("fixture-tree"))?;
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| confined_error("fixture-tree"))?;
+        let text = relative.to_string_lossy().replace('\\', "/");
+        if relative.as_os_str().len() > FIXTURE_PATH_BYTES_MAX || kind.is_symlink() {
+            return Err(confined_error("fixture-tree"));
+        }
+        if kind.is_dir() {
+            if depth >= FIXTURE_TREE_DEPTH_MAX {
+                return Err(TestkitError::LimitExceeded {
+                    context: "fixture tree depth",
+                });
+            }
+            stack.push((path, depth + 1));
+        } else if kind.is_file() {
+            files.push(text);
+        } else {
+            return Err(confined_error("fixture-tree"));
+        }
+    }
+    Ok(())
 }
 
 fn bounded_read(file: File, display: &str) -> Result<Vec<u8>, TestkitError> {
@@ -333,6 +467,74 @@ mod tests {
             "fixture exceeds byte limit: fixtures/above.json"
         );
         assert_confined(&error, &case.path, &[]);
+    }
+
+    #[test]
+    fn fixtures_list_immediate_children() {
+        let case = FixtureCase::new("children");
+        case.write("tree/file.json", b"{}");
+        case.write("tree/nested/value.json", b"{}");
+        assert_eq!(
+            case.loader().list_children("tree").expect("children"),
+            ["file.json", "nested/"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixtures_tree_rejects_symlink_and_special() {
+        use std::os::unix::fs::symlink;
+        let links = FixtureCase::new("tree-link");
+        links.write("tree/value", b"x");
+        symlink("value", links.path.join("tree/link")).expect("tree symlink");
+        assert!(matches!(
+            links.loader().list_tree("tree"),
+            Err(TestkitError::ConfinedPath { .. })
+        ));
+        let special = FixtureCase::new("tree-special");
+        fs::create_dir(special.path.join("tree")).expect("tree");
+        let fifo = special.path.join("tree/fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo");
+        assert!(status.success());
+        assert!(matches!(
+            special.loader().list_tree("tree"),
+            Err(TestkitError::ConfinedPath { .. })
+        ));
+    }
+
+    #[test]
+    fn fixtures_tree_rejects_depth_count_and_path_limits() {
+        let depth = FixtureCase::new("tree-depth");
+        let deep = (0..=super::FIXTURE_TREE_DEPTH_MAX + 1)
+            .map(|value| format!("d{value}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        depth.write(&format!("{deep}/value"), b"x");
+        assert!(matches!(
+            depth.loader().list_tree("d0"),
+            Err(TestkitError::LimitExceeded { .. })
+        ));
+        let count = FixtureCase::new("tree-count");
+        for value in 0..=super::FIXTURE_TREE_FILES_MAX {
+            count.write(&format!("tree/{value}"), b"x");
+        }
+        assert!(matches!(
+            count.loader().list_tree("tree"),
+            Err(TestkitError::LimitExceeded { .. })
+        ));
+        let path = FixtureCase::new("tree-path");
+        let long_path = (0..8)
+            .map(|value| format!("{value}{}", "x".repeat(112)))
+            .collect::<Vec<_>>()
+            .join("/");
+        path.write(&format!("tree/{long_path}"), b"x");
+        assert!(matches!(
+            path.loader().list_tree("tree"),
+            Err(TestkitError::ConfinedPath { .. })
+        ));
     }
 
     #[test]

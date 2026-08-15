@@ -1,0 +1,8 @@
+{
+  "behavior": "lotta_hardening_recovers_complete_jsonl_prefix",
+  "mutation": "discard_truncated_tail",
+  "indexed_files": [
+    "input",
+    "expected"
+  ]
+}

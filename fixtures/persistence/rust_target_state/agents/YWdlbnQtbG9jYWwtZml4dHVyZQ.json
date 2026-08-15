@@ -1,0 +1,11 @@
+{
+  "id": "agent-local-fixture",
+  "name": "SANITIZED_FIXTURE_AGENT",
+  "description": "SANITIZED_FIXTURE_DESCRIPTION",
+  "system": "SANITIZED_FIXTURE_SYSTEM",
+  "tags": [
+    "SANITIZED_FIXTURE_TAG"
+  ],
+  "model": "fixture/model",
+  "model_settings": {}
+}

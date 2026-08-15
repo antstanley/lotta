@@ -1,0 +1,8 @@
+{
+  "behavior": "typescript_reads_exact_wire_keys",
+  "mutation": "none",
+  "indexed_files": [
+    "agents",
+    "conversations"
+  ]
+}

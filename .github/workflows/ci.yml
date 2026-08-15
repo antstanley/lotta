@@ -29,11 +29,16 @@ jobs:
         run: |
           node --check tools/extract-protocol-fixture.mjs
           node tools/extract-protocol-fixture.mjs --self-test
-      - name: Check protocol fixture twice without writing
+          node --check tools/extract-persistence-fixtures.mjs
+          node tools/extract-persistence-fixtures.mjs --self-test
+      - name: Check fixtures twice without writing
         run: |
           node tools/extract-protocol-fixture.mjs --source letta-code --check
           node tools/extract-protocol-fixture.mjs --source letta-code --check
+          node tools/extract-persistence-fixtures.mjs --source letta-code --check
+          node tools/extract-persistence-fixtures.mjs --source letta-code --check
           git diff --exit-code -- fixtures/protocol/discriminants.json
+          git diff --exit-code -- fixtures/persistence
 
   quality:
     name: ${{ matrix.gate }}
