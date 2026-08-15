@@ -8,7 +8,7 @@ mod append;
 pub mod bounds;
 pub mod load;
 pub mod manifest;
-mod projection;
+pub(crate) mod projection;
 mod repair;
 pub(crate) mod session_header;
 #[cfg(test)]

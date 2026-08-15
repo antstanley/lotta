@@ -19,6 +19,8 @@ mod lock;
 pub mod migration;
 /// Baseline-compatible local-backend paths and encoded keys.
 pub mod paths;
+/// Bounded canonical JSON/JSONL query API.
+pub mod query;
 mod refresh;
 /// Opaque bounded baseline side-store persistence.
 pub mod side;

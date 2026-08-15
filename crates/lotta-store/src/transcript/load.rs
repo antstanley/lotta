@@ -98,6 +98,69 @@ pub(crate) fn load_observed(
     })
 }
 
+pub(crate) fn load_search_nonmutating(
+    paths: &TranscriptPaths,
+    messages_max: usize,
+) -> Result<Vec<LocalMessage>, StoreError> {
+    if messages_max == 0 {
+        return Err(StoreError::new(StoreErrorKind::Limit, &paths.messages));
+    }
+    let conversation_revision = FileRevision::sample_path(&paths.conversation)?;
+    let conversation: Conversation = read_record(&paths.conversation)?;
+    ensure_revision(&paths.conversation, &conversation_revision, false)?;
+    let manifest_revision = FileRevision::sample_path(&paths.manifest)?;
+    let format = match std::fs::symlink_metadata(&paths.manifest) {
+        Ok(_) => manifest::read(&paths.manifest)
+            .ok()
+            .map(|value| value.message_format),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(StoreError::from_io(&paths.manifest, &error)),
+    };
+    ensure_revision(&paths.manifest, &manifest_revision, false)?;
+    let message_revision =
+        FileRevision::sample_path_bounded(&paths.messages, bounds::TRANSCRIPT_BYTES_MAX)?;
+    let mut messages = Vec::new();
+    messages
+        .try_reserve(messages_max)
+        .map_err(|_| StoreError::new(StoreErrorKind::Limit, &paths.messages))?;
+    match std::fs::symlink_metadata(&paths.messages) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(messages),
+        Err(error) => return Err(StoreError::from_io(&paths.messages, &error)),
+        Ok(_) => {}
+    }
+    bounds::read_rows(&paths.root, &paths.messages, |_, row| {
+        if row.iter().all(u8::is_ascii_whitespace) {
+            return Ok(());
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(row) else {
+            return Ok(());
+        };
+        let parsed = match format {
+            Some(TranscriptMessageFormat::PiSessionEntryJsonl) => {
+                current_message(&value, &paths.messages).ok().flatten()
+            }
+            Some(TranscriptMessageFormat::PiAiMessageJsonl) => {
+                parse_message(value, &paths.messages).ok()
+            }
+            None => current_message(&value, &paths.messages).ok().flatten(),
+        };
+        if let Some(message) = parsed {
+            if messages.len() >= messages_max {
+                return Err(StoreError::new(StoreErrorKind::Limit, &paths.messages));
+            }
+            messages.push(message);
+        }
+        Ok(())
+    })?;
+    ensure_revision(&paths.messages, &message_revision, true)?;
+    projection::active(
+        messages,
+        conversation.in_context_message_ids.as_slice(),
+        &paths.messages,
+    )
+    .map(|projection| projection.messages)
+}
+
 fn ensure_revision(
     path: &Path,
     expected: &FileRevision,

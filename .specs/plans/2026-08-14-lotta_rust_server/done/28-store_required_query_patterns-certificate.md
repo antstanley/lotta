@@ -24,39 +24,52 @@ obligation names (a file location, a named test result, or an execution trace) �
 - **O1 — All ten §Required query patterns have an implementation and a test asserting the stated required behavior**
   - *Claim:* Each row of the §Required query patterns table maps to a named test that asserts its behavior, not merely that the query returns.
   - *Evidence to collect:* Run `cargo nextest run -p lotta-store -E 'test(query::)'` — expect ten cases named for the ten table rows. Read the test list and confirm the mapping is one-to-one with the table.
-  - *Status:* ☐ unverified
+  - *Status:* ☑ SATISFIED — broad `query::` ran exactly 10/10. The ten direct test
+    identities map one-to-one to the ten required-query rows and assert behavior, negatives,
+    confinement, bounds, and stable ordering rather than mere successful return.
 
 - **O2 — Every projection key resolves to the same source local message**
   - *Claim:* Looking up a message by its `letta-msg-` projection ID and by its `ui-msg-` transcript ID returns the same underlying record.
   - *Evidence to collect:* Run `cargo nextest run -p lotta-store -E 'test(query::projection::same_source_message)'` — expect PASS; the test asserts identity of the resolved record, not only field equality.
   - *Checks:* Resolve the ID type at each lookup site — confirm the projection lookup takes the `letta-msg-` form and the transcript lookup the `ui-msg-` form. `01-domain-model.md` §ID scheme reserves them for different surfaces and `letta-msg-` is not stored in transcript JSONL.
-  - *Status:* ☐ unverified
+  - *Status:* ☑ SATISFIED — exact `query::projection::same_source_message` passed 1/1.
+    Every conversation, merged-agent, resume, and search projection resolves through its carried
+    scope to the same canonical `SourceMessageKey` and `ui-msg-` source record; canonical slots,
+    legacy fallback, overflow, and collision rejection are mutation-sensitive.
 
 - **O3 — `default` never crosses agents and a wrong-prefix agent ID returns 404 rather than a lookup miss**
   - *Claim:* Resolving `default` under agent A never returns agent B's conversation, and `agent-cloud-x` yields a 404-class error.
   - *Evidence to collect:* Run `cargo nextest run -p lotta-store -E 'test(query::scope_isolation) + test(query::wrong_prefix_404)'` — expect both PASS.
-  - *Status:* ☐ unverified
+  - *Status:* ☑ SATISFIED — exact scope/wrong-prefix selector passed 2/2. Two agents' virtual
+    `default` conversations remain isolated, and absent, cloud-prefix, malformed, and traversal-like
+    agent IDs return the safe `NotFound` class.
 
 - **O4 — List ordering is deterministic and cursor behavior is stable across repeated calls with unchanged state**
   - *Claim:* Two identical list calls return identical order, and paging with a cursor visits every item exactly once.
   - *Evidence to collect:* Run `cargo nextest run -p lotta-store -E 'test(query::deterministic_order) + test(query::cursor_covers_all)'` — expect both PASS; the cursor case asserts the union of pages equals the full set with no duplicates.
-  - *Status:* ☐ unverified
+  - *Status:* ☑ SATISFIED — exact order/cursor selector passed 2/2. Four visible conversations,
+    including timestamp ties, repeat in one total order; page-size-one traversal equals the full
+    list with every item exactly once and no duplicates.
 
 - **O5 — Meets the repo definition of done (tests, lint/format, named-constant limits — see plan.md baseline)**
   - *Claim:* The repo-wide gates named in the plan's definition-of-done baseline pass for this change.
   - *Evidence to collect:* Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo nextest run --workspace --all-features`, and `cargo deny check` — expect exit code 0 from each. Read every constant this task introduces and confirm it is a `const` whose name puts units last (`development-guidelines.md` §Naming), and that each function the task added stays within 70 lines and 100 columns.
-  - *Status:* ☐ unverified
+  - *Status:* ☑ SATISFIED — final formatting, strict all-target/all-feature Clippy, strict
+    Rustdoc, dependency policy, production source/module/column gates, every new limit's
+    below/at/above cases, and the all-feature workspace suite passed; workspace count is 826/826.
 
 - **O6 — Reviewable: a reviewer runs `cargo nextest run -p lotta-store -E 'test(query::)'` and sees one passing case per row of `01-domain-model.md` §Required query patterns, including the projection-identity and scope-isolation cases**
   - *Claim:* All ten query behaviors pass.
   - *Evidence to collect:* Run the filter and confirm ten cases and zero failures.
-  - *Status:* ☐ unverified
+  - *Status:* ☑ SATISFIED — the reviewer-visible broad selector reports exactly 10/10, including
+    direct projection identity and scope isolation. The distinct clean re-review returned
+    `VERDICT: CORRECT / DONE` after all nine prior blockers were remediated.
 
 ## Regression check
 
 For each unit this task changes, the validator traces one downstream caller:
 
-- `crates/lotta-store/src/transcript/load.rs` (Task 25) supplies the active projection these queries read; confirm `transcript::load::tolerances` still passes : ☐ (PRESERVED / REGRESSION)
+- `crates/lotta-store/src/transcript/load.rs` (Task 25) supplies the active projection these queries read; confirm `transcript::load::tolerances` still passes : ☑ PRESERVED (exact selector 4/4; shared nonmutating search projection also proves orphan removal and clipping without repair writes)
 
 ## Residue
 
@@ -71,6 +84,8 @@ check found a REGRESSION; **PARTIAL** if every obligation is SATISFIED except on
 more UNVERIFIED and no regression; **DONE** only if every obligation is SATISFIED and
 the regression check is PRESERVED.
 
-VERDICT: ☐ (DONE | PARTIAL | NOT_DONE)
-CONFIDENCE: ☐ (high | medium | low)
-SUMMARY: ☐
+VERDICT: DONE
+CONFIDENCE: high
+SUMMARY: O1–O6 are satisfied by the exact ten query identities, direct projection/scope/order
+selectors, all-bound and confinement evidence, the preserved Task 25 projection regression, and
+the 826/826 workspace run. Final clean re-review: `VERDICT: CORRECT / DONE`.
