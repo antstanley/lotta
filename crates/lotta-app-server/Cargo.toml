@@ -5,5 +5,22 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[dependencies]
+axum.workspace = true
+base64.workspace = true
+hmac.workspace = true
+lotta-domain = { version = "0.1.0", path = "../lotta-domain" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3.20", default-features = false, features = ["fmt"] }
+
 [lints]
 workspace = true

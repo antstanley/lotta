@@ -50,6 +50,12 @@ impl<'de> Deserialize<'de> for NonEmptyString {
 pub struct Timestamp(DateTime<Utc>);
 
 impl Timestamp {
+    /// Constructs a timestamp from an already UTC date-time without failure.
+    #[must_use]
+    pub const fn from_utc(value: DateTime<Utc>) -> Self {
+        Self(value)
+    }
+
     /// Captures the current instant exclusively from an injected clock.
     ///
     /// # Panics
