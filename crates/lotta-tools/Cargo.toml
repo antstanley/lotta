@@ -21,6 +21,8 @@ tokio.workspace = true
 tokio-util.workspace = true
 
 [dev-dependencies]
+lotta-memfs = { version = "0.1.0", path = "../lotta-memfs" }
+lotta-testkit = { version = "0.1.0", path = "../lotta-testkit" }
 sha2.workspace = true
 
 [lints]

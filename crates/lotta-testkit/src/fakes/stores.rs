@@ -12,8 +12,8 @@ use lotta_runtime::boundary::{
 };
 use lotta_runtime::bounds::{MEMFS_DIFF_CHUNK_BYTES_MAX, MEMORY_FILES_MAX};
 use lotta_runtime::ports::{
-    AgentStore, ConversationStore, MemFsHistoryEntry, MemFsPort, MemFsStatus, MemFsTreeEntry,
-    TranscriptItem, TranscriptStore,
+    AgentStore, ConversationStore, MemFsHistoryEntry, MemFsMutation, MemFsPort, MemFsStatus,
+    MemFsTransactionResult, MemFsTreeEntry, TranscriptItem, TranscriptStore,
 };
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -590,6 +590,51 @@ impl MemFsPort for FakeMemFs {
             Self::check_snapshot_retention(repository, &repository.files, true, 0)?;
             let files = repository.files.clone();
             Self::commit_snapshot(repository, message, files)
+        })
+    }
+
+    fn transact(
+        &self,
+        agent_id: &AgentId,
+        mutations: &[MemFsMutation],
+        message: &CommitMessage,
+        _: &lotta_runtime::ports::MemFsCommitAuthor,
+    ) -> lotta_runtime::ports::PortFuture<'_, MemFsTransactionResult> {
+        let agent_id = agent_id.clone();
+        let mutations = mutations.to_vec();
+        let message = message.clone();
+        Box::pin(async move {
+            let mut repositories = lock(&self.repositories);
+            let repository = repositories
+                .get_mut(&agent_id)
+                .ok_or_else(|| not_found("memfs"))?;
+            let mut files = repository.files.clone();
+            for mutation in mutations {
+                match mutation {
+                    MemFsMutation::Write { path, contents } => {
+                        files.insert(path, contents);
+                    }
+                    MemFsMutation::Delete { path } => {
+                        files.remove(&path).ok_or_else(|| not_found("memfs file"))?;
+                    }
+                    MemFsMutation::Rename { source, target } => {
+                        let value = files
+                            .remove(&source)
+                            .ok_or_else(|| not_found("memfs file"))?;
+                        if files.insert(target, value).is_some() {
+                            return Err(RuntimeError::Conflict {
+                                context: "memfs rename".into(),
+                            });
+                        }
+                    }
+                }
+            }
+            if files == repository.files {
+                return Ok(MemFsTransactionResult::NoChange);
+            }
+            Self::check_snapshot_retention(repository, &files, true, 0)?;
+            let revision = Self::commit_snapshot(repository, message, files)?;
+            Ok(MemFsTransactionResult::Committed(revision))
         })
     }
 

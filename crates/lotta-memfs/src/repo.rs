@@ -5,8 +5,10 @@ use cap_std::fs::Dir;
 use lotta_domain::AgentId;
 use lotta_runtime::RuntimeError;
 use lotta_runtime::boundary::{InitialMemoryBlocks, MemoryFileContent, RepositoryPath, RevisionId};
-use lotta_runtime::ports::MemFsHistoryEntry;
-use std::collections::BTreeSet;
+use lotta_runtime::ports::{
+    MemFsCommitAuthor, MemFsHistoryEntry, MemFsMutation, MemFsTransactionResult,
+};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -329,6 +331,122 @@ pub(crate) fn commit(repo: &Path, message: &str) -> Result<RevisionId, RuntimeEr
     Ok(revision)
 }
 
+pub(crate) fn transact(
+    repo: &Path,
+    directory: &Dir,
+    mutations: &[MemFsMutation],
+    message: &str,
+    author: &MemFsCommitAuthor,
+) -> Result<MemFsTransactionResult, RuntimeError> {
+    ensure_clean(repo)?;
+    let snapshots = snapshot_mutations(directory, mutations)?;
+    let result = apply_and_commit(repo, directory, mutations, message, author);
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            rollback_transaction(repo, directory, &snapshots)?;
+            Err(error)
+        }
+    }
+}
+
+fn ensure_clean(repo: &Path) -> Result<(), RuntimeError> {
+    let status = git::checked(repo, ["status", "--porcelain=v1", "-z"], "git status")?;
+    if status.is_empty() {
+        Ok(())
+    } else {
+        Err(conflict("dirty memory repository"))
+    }
+}
+
+fn snapshot_mutations(
+    directory: &Dir,
+    mutations: &[MemFsMutation],
+) -> Result<BTreeMap<RepositoryPath, Option<MemoryFileContent>>, RuntimeError> {
+    let mut snapshots = BTreeMap::new();
+    for mutation in mutations {
+        let paths: &[RepositoryPath] = match mutation {
+            MemFsMutation::Write { path, .. } | MemFsMutation::Delete { path } => {
+                std::slice::from_ref(path)
+            }
+            MemFsMutation::Rename { source, target } => {
+                for path in [source, target] {
+                    snapshot_path(directory, path, &mut snapshots)?;
+                }
+                continue;
+            }
+        };
+        snapshot_path(directory, &paths[0], &mut snapshots)?;
+    }
+    Ok(snapshots)
+}
+
+fn snapshot_path(
+    directory: &Dir,
+    path: &RepositoryPath,
+    snapshots: &mut BTreeMap<RepositoryPath, Option<MemoryFileContent>>,
+) -> Result<(), RuntimeError> {
+    if snapshots.contains_key(path) {
+        return Ok(());
+    }
+    let value = match fs::read_file(directory, path) {
+        Ok(value) => Some(value),
+        Err(RuntimeError::NotFound { .. }) => None,
+        Err(error) => return Err(error),
+    };
+    snapshots.insert(path.clone(), value);
+    Ok(())
+}
+
+fn apply_and_commit(
+    repo: &Path,
+    directory: &Dir,
+    mutations: &[MemFsMutation],
+    message: &str,
+    author: &MemFsCommitAuthor,
+) -> Result<MemFsTransactionResult, RuntimeError> {
+    for mutation in mutations {
+        match mutation {
+            MemFsMutation::Write { path, contents } => fs::write_file(directory, path, contents)?,
+            MemFsMutation::Delete { path } => fs::delete_file(directory, path)?,
+            MemFsMutation::Rename { source, target } => {
+                fs::rename_file(directory, source, target)?;
+            }
+        }
+    }
+    git::checked(repo, ["add", "--all", "--"], "git stage")?;
+    if git::checked(repo, ["diff", "--cached", "--quiet"], "git staged diff").is_ok() {
+        return Ok(MemFsTransactionResult::NoChange);
+    }
+    let branch = symbolic_branch(repo)?;
+    let revision = commit_staged_as(repo, message, &branch, true, author)?;
+    ensure_clean(repo)?;
+    post_commit_push(repo);
+    Ok(MemFsTransactionResult::Committed(revision))
+}
+
+fn rollback_transaction(
+    repo: &Path,
+    directory: &Dir,
+    snapshots: &BTreeMap<RepositoryPath, Option<MemoryFileContent>>,
+) -> Result<(), RuntimeError> {
+    for (path, value) in snapshots {
+        match value {
+            Some(contents) => fs::write_file(directory, path, contents)?,
+            None => match fs::delete_file(directory, path) {
+                Ok(()) | Err(RuntimeError::NotFound { .. }) => (),
+                Err(error) => return Err(error),
+            },
+        }
+    }
+    git::checked(
+        repo,
+        ["reset", "--mixed", "HEAD", "--"],
+        "git rollback index",
+    )?;
+    ensure_clean(repo)
+}
+
 fn symbolic_branch(repo: &Path) -> Result<String, RuntimeError> {
     let output = git::checked(
         repo,
@@ -366,6 +484,20 @@ pub(crate) fn commit_staged(
     branch: &str,
     validate: bool,
 ) -> Result<RevisionId, RuntimeError> {
+    let author = MemFsCommitAuthor {
+        name: lotta_runtime::boundary::CommitMessage::new("Letta Agent".into())?,
+        email: lotta_runtime::boundary::CommitMessage::new("lotta-memfs@localhost".into())?,
+    };
+    commit_staged_as(repo, message, branch, validate, &author)
+}
+
+fn commit_staged_as(
+    repo: &Path,
+    message: &str,
+    branch: &str,
+    validate: bool,
+    author: &MemFsCommitAuthor,
+) -> Result<RevisionId, RuntimeError> {
     let tree = staged_tree(repo)?;
     if validate {
         validation::validate_staged(repo)?;
@@ -375,13 +507,18 @@ pub(crate) fn commit_staged(
     }
     let old = optional_head(repo)?;
     let mut args = Vec::new();
-    for value in git::identity_args() {
-        args.try_reserve(1)
-            .map_err(|_| RuntimeError::LimitExceeded {
-                context: crate::MEMORY_FILES_MAX.name.into(),
-            })?;
-        args.push(value);
-    }
+    let name = format!("user.name={}", author.name.as_str());
+    let email = format!("user.email={}", author.email.as_str());
+    args.extend([
+        "-c",
+        name.as_str(),
+        "-c",
+        email.as_str(),
+        "-c",
+        "commit.gpgSign=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+    ]);
     args.extend(["commit-tree", tree.as_str()]);
     if let Some(parent) = old.as_ref() {
         args.extend(["-p", parent.as_str()]);

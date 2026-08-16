@@ -12,7 +12,10 @@ mod transcript;
 
 pub use ids::IdGenerator;
 pub use lotta_domain::Clock;
-pub use memfs::{MemFsHistoryEntry, MemFsPort, MemFsStatus, MemFsTreeEntry};
+pub use memfs::{
+    MemFsCommitAuthor, MemFsHistoryEntry, MemFsMutation, MemFsPort, MemFsStatus,
+    MemFsTransactionResult, MemFsTreeEntry,
+};
 pub use process::{
     ChildProcessPort, InteractiveSandboxPort, PROCESS_TIMEOUT_DISABLED, ProcessEvent, ProcessInput,
     ProcessOutcome, ProcessRequest, ProcessSession, ProcessSessionFuture, ProcessSessionParts,

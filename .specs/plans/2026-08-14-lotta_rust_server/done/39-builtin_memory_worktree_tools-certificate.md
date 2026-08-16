@@ -1,7 +1,7 @@
 # Done Certificate — Task 39: Memory and worktree built-in tools
 
 **Task:** [39-builtin_memory_worktree_tools.md](39-builtin_memory_worktree_tools.md) · **Plan:** [plan.md](../plan.md)
-**State:** Authored 2026-08-14 — unverified
+**State:** Verified 2026-08-16 — DONE
 
 > Verification protocol for Task 39. A validating agent discharges it: collect each
 > obligation's evidence, run its checks, set the Status, then derive the Conclusion by the
@@ -24,39 +24,39 @@ obligation names (a file location, a named test result, or an execution trace) �
 - **O1 — Memory edit and apply-patch mutate through the MemFS port and produce a Git commit, with the working tree left clean**
   - *Claim:* Each operation results in exactly one commit whose tree contains the edit, and `git status` is clean afterwards.
   - *Evidence to collect:* Run `cargo nextest run -p lotta-tools -E 'test(builtin::memory::commits)'` — expect one case per operation asserting commit count and clean status.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED — edit and full patch each produce exactly one Task 29 transaction/commit with exact tree and clean status; no-op commits zero and injected failure leaves no partial effect.
 
 - **O2 — Every memory path is confined below the agent memory root; `..`, absolute paths, and symlink escapes are rejected**
   - *Claim:* The three escape classes fail before any write.
   - *Evidence to collect:* Run `cargo nextest run -p lotta-tools -E 'test(builtin::memory::confinement)'` — expect three negative cases, each asserting zero writes reached the port.
   - *Checks:* Resolve the confinement root — confirm it is the agent's `memfs/<agent-id>/memory/` root from Task 29, not the workspace sandbox root. The two roots differ and using the wrong one would let a memory tool write into the workspace.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED — exact confinement selector passes 5/5, including schema-valid traversal, absolute, and real symlink escapes with zero transactions and an unchanged peer.
 
 - **O3 — Worktree enter takes an ownership lock that a second concurrent enter cannot acquire, and exit releases it**
   - *Claim:* A second enter for the same worktree fails while the first holds the lock, and succeeds after exit.
   - *Evidence to collect:* Run `cargo nextest run -p lotta-tools -E 'test(builtin::worktree::ownership_lock)'` — expect `second_enter_blocked` and `enter_after_exit_succeeds` to pass.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED — ownership selector passes 5/5; production executor evidence proves Enter A, blocked Enter B, Exit A, then successful Enter B.
 
 - **O4 — Entering a worktree provisions includes, hooks, and settings, and both families are classified sequential**
   - *Claim:* A newly entered worktree contains the provisioned artifacts, and both tool families report the sequential parallel-safety classification.
   - *Evidence to collect:* Run `cargo nextest run -p lotta-tools -E 'test(builtin::worktree::provisioning) + test(builtin::memory::is_sequential)'` — expect both PASS; the second reads the Task 08 classification field.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED — actual Enter provisions includes, relative hooks, local settings, and dependency symlinks; unsafe inputs are bounded best-effort skips, and both families are Sequential.
 
 - **O5 — Meets the repo definition of done (tests, lint/format, named-constant limits — see plan.md baseline)**
   - *Claim:* The repo-wide gates named in the plan's definition-of-done baseline pass for this change.
   - *Evidence to collect:* Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo nextest run --workspace --all-features`, and `cargo deny check` — expect exit code 0 from each. Read every constant this task introduces and confirm it is a `const` whose name puts units last (`development-guidelines.md` §Naming), and that each function the task added stays within 70 lines and 100 columns.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED — fmt, strict workspace Clippy, workspace nextest 1,255/1,255, private Rustdoc, and `cargo deny check` pass; touched Rust meets file/function/column limits.
 
 - **O6 — Reviewable: a reviewer runs `cargo nextest run -p lotta-tools -E 'test(builtin::memory::) + test(builtin::worktree::)'` and sees commits, path confinement, the ownership lock, and provisioning pass**
   - *Claim:* The memory and worktree built-in modules pass.
   - *Evidence to collect:* Run the filter and confirm zero failures and the `ownership_lock` cases.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED — clean reviewer ran the combined Task 39 selector 24/24 and found no remaining obligation or regression.
 
 ## Regression check
 
 For each unit this task changes, the validator traces one downstream caller:
 
-- `crates/lotta-memfs/src/repo.rs` (Task 29) performs the commits; confirm `ops::` still passes with tool-driven writes : ☐ (PRESERVED / REGRESSION)
+- `crates/lotta-memfs/src/repo.rs` (Task 29) performs the commits; confirm `ops::` still passes with tool-driven writes : ☒ PRESERVED — 81/81.
 
 ## Residue
 
@@ -71,6 +71,6 @@ check found a REGRESSION; **PARTIAL** if every obligation is SATISFIED except on
 more UNVERIFIED and no regression; **DONE** only if every obligation is SATISFIED and
 the regression check is PRESERVED.
 
-VERDICT: ☐ (DONE | PARTIAL | NOT_DONE)
-CONFIDENCE: ☐ (high | medium | low)
-SUMMARY: ☐
+VERDICT: ☒ DONE
+CONFIDENCE: ☒ high
+SUMMARY: Native memory edit/patch operations commit atomically through MemFS with confined paths, while trusted worktree enter/exit provides atomic ownership, exact Git modes, bounded best-effort provisioning, and failure-safe context transitions; all repository gates pass.

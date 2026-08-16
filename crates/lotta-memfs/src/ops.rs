@@ -9,7 +9,10 @@ use lotta_runtime::boundary::{
     CommitMessage, DiffChunk, InitialMemoryBlocks, MemoryFileContent, RepositoryPath, RevisionId,
     WorktreeId,
 };
-use lotta_runtime::ports::{MemFsHistoryEntry, MemFsPort, MemFsStatus, MemFsTreeEntry, PortFuture};
+use lotta_runtime::ports::{
+    MemFsCommitAuthor, MemFsHistoryEntry, MemFsMutation, MemFsPort, MemFsStatus,
+    MemFsTransactionResult, MemFsTreeEntry, PortFuture,
+};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
@@ -499,6 +502,29 @@ impl MemFsPort for GitMemFs {
         let path = self.repo(agent_id);
         let message = message.clone();
         boxed(async move { locked(move || repo::commit(&path?, message.as_str())).await })
+    }
+
+    fn transact(
+        &self,
+        agent_id: &AgentId,
+        mutations: &[MemFsMutation],
+        message: &CommitMessage,
+        author: &MemFsCommitAuthor,
+    ) -> PortFuture<'_, MemFsTransactionResult> {
+        let path = self.repo(agent_id);
+        let backend = Arc::clone(&self.backend);
+        let agent = agent_id.clone();
+        let mutations = mutations.to_vec();
+        let message = message.clone();
+        let author = author.clone();
+        boxed(async move {
+            locked(move || {
+                let path = path?;
+                let directory = open_repo_dir(&backend, &agent)?;
+                repo::transact(&path, &directory, &mutations, message.as_str(), &author)
+            })
+            .await
+        })
     }
 
     fn create_worktree(&self, agent_id: &AgentId) -> PortFuture<'_, WorktreeId> {

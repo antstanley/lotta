@@ -32,6 +32,48 @@ pub struct MemFsHistoryEntry {
     pub summary: CommitMessage,
 }
 
+/// One explicit file mutation in an atomic memory transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MemFsMutation {
+    /// Write or replace one regular file.
+    Write {
+        /// Confined repository-relative path.
+        path: RepositoryPath,
+        /// Complete bounded file contents.
+        contents: MemoryFileContent,
+    },
+    /// Delete one regular file.
+    Delete {
+        /// Confined repository-relative path.
+        path: RepositoryPath,
+    },
+    /// Rename one regular file.
+    Rename {
+        /// Existing confined source.
+        source: RepositoryPath,
+        /// Absent confined target.
+        target: RepositoryPath,
+    },
+}
+
+/// Explicit bounded author identity for one memory commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemFsCommitAuthor {
+    /// Author display name.
+    pub name: CommitMessage,
+    /// Author email.
+    pub email: CommitMessage,
+}
+
+/// Atomic memory transaction and commit result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MemFsTransactionResult {
+    /// No effective tree change; no commit was created.
+    NoChange,
+    /// Exactly one commit was created.
+    Committed(RevisionId),
+}
+
 /// Owns filesystem and revision effects for one independent memory repository per agent.
 ///
 /// # Preconditions
@@ -120,6 +162,17 @@ pub trait MemFsPort: Send + Sync {
     /// The adapter must run the repository's current pre-commit validation before creating any
     /// commit and translate validation failures into [`crate::RuntimeError`].
     fn commit(&self, agent_id: &AgentId, message: &CommitMessage) -> PortFuture<'_, RevisionId>;
+    /// Applies explicit mutations and creates at most one commit atomically.
+    ///
+    /// Adapters must reject an initially dirty repository, rollback all files and index state on
+    /// any mutation, validation, hook, or commit failure, and leave the repository clean.
+    fn transact(
+        &self,
+        agent_id: &AgentId,
+        mutations: &[MemFsMutation],
+        message: &CommitMessage,
+        author: &MemFsCommitAuthor,
+    ) -> PortFuture<'_, MemFsTransactionResult>;
     /// Creates an isolated reflection worktree represented by an opaque ID.
     fn create_worktree(&self, agent_id: &AgentId) -> PortFuture<'_, WorktreeId>;
     /// Merges a completed opaque worktree and returns the merge revision.

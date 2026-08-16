@@ -202,6 +202,15 @@ impl MemFsPort for EvidenceMemFs {
     fn commit(&self, _: &AgentId, _: &CommitMessage) -> PortFuture<'_, RevisionId> {
         unsupported()
     }
+    fn transact(
+        &self,
+        _: &AgentId,
+        _: &[lotta_runtime::ports::MemFsMutation],
+        _: &CommitMessage,
+        _: &lotta_runtime::ports::MemFsCommitAuthor,
+    ) -> PortFuture<'_, lotta_runtime::ports::MemFsTransactionResult> {
+        unsupported()
+    }
     fn create_worktree(&self, _: &AgentId) -> PortFuture<'_, WorktreeId> {
         unsupported()
     }
