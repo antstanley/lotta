@@ -124,6 +124,14 @@ impl SecretDelivery {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_empty_secret_delivery() -> SecretDelivery {
+    SecretDelivery {
+        kind: SecretDeliveryKind::ChildEnvironment,
+        values: Arc::new(Vec::new()),
+    }
+}
+
 impl fmt::Debug for SecretDelivery {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SecretDelivery([REDACTED])")
@@ -142,7 +150,7 @@ pub struct RawToolExecutionRequest {
     pub definition: Arc<ToolDefinition>,
     /// Resolved model-facing name.
     pub model_name: ModelFacingToolName,
-    secrets: SecretDelivery,
+    pub(crate) secrets: SecretDelivery,
 }
 
 impl RawToolExecutionRequest {

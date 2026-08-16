@@ -7,7 +7,7 @@ publish.workspace = true
 
 [dependencies]
 lotta-runtime = { version = "0.1.0", path = "../lotta-runtime" }
-lotta-tools = { version = "0.1.0", path = "../lotta-tools" }
+lotta-tools = { version = "0.1.0", path = "../lotta-tools", default-features = false }
 tokio.workspace = true
 tokio-util.workspace = true
 

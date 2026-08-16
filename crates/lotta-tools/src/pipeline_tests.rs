@@ -727,6 +727,17 @@ async fn sandbox_stage_follows_permission_for_effect_recheck_ownership() {
     assert_eq!(sandbox, permission + 1);
 }
 
+#[test]
+fn task56_owns_approval_request_consumption_boundary() {
+    let source = include_str!("builtin/interaction/mod.rs");
+    let pipeline = include_str!("pipeline.rs");
+    let bundle = include_str!("builtin/task40.rs");
+    assert!(bundle.contains("Task 56 owns runtime permission-request consumption"));
+    assert!(source.contains("pub async fn request_approval"));
+    assert!(!pipeline.contains("InteractionPort"));
+    assert!(!pipeline.contains("request_approval"));
+}
+
 #[tokio::test]
 async fn permission_deny_and_ask_stop_later_effects() {
     for (decision, expected) in [

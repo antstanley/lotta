@@ -6,11 +6,13 @@ mod frontmatter;
 mod loader;
 #[path = "script_policy.rs"]
 mod script_runner;
+mod tool_port;
 
 pub use discovery::{SkillDiscovery, SkillRoots};
 pub use frontmatter::{ParsedSkillDocument, parse_skill_document};
 pub use loader::{LoadedSkill, SkillCompanion, SkillLoader};
 pub use script_runner::{SkillScriptError, SkillScriptRunner};
+pub use tool_port::SkillToolPort;
 
 use std::path::PathBuf;
 
