@@ -7,6 +7,7 @@
 #![deny(missing_docs)]
 
 pub mod allowlist;
+pub mod builtin;
 pub mod clamp;
 pub mod limits;
 pub mod names;

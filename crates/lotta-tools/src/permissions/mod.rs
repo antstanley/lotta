@@ -12,8 +12,7 @@ use lotta_runtime::ports::{
     PermissionAction, ToolApprovalPolicy, ToolDefinition, ValidatedToolInput,
 };
 use matcher::{
-    PermissionEffect, PermissionError, PermissionMatchInput, PermissionRule, canonical_tool_name,
-    canonicalize_invocation_path, canonicalize_root, path_within,
+    PermissionEffect, PermissionError, PermissionMatchInput, PermissionRule, canonicalize_root,
 };
 use scopes::{
     LoadedPermissions, PERMISSION_ADDITIONAL_DIRECTORIES_MAX, PERMISSION_RULES_PER_CATEGORY_MAX,
@@ -22,6 +21,8 @@ use scopes::{
 /// Maximum rules accepted from each check-time session or mod layer.
 pub const PERMISSION_RULES_AT_CHECK_MAX: usize = 1_024;
 use std::path::{Path, PathBuf};
+
+pub use matcher::{canonical_tool_name, canonicalize_invocation_path, path_within};
 
 /// Exhaustive policy result consumed by the tool pipeline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

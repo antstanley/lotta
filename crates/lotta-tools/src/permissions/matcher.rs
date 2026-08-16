@@ -193,8 +193,14 @@ pub fn canonical_tool_name(value: &str) -> &str {
         "Bash" | "shell" | "Shell" | "shell_command" | "ShellCommand" | "exec_command"
         | "write_stdin" | "run_shell_command" | "RunShellCommand" => "Bash",
         "Read" | "read_file" | "ReadFile" | "read_file_gemini" | "ReadFileGemini"
-        | "read_many_files" | "ReadManyFiles" | "view_image" | "ViewImage" => "Read",
-        "Write" | "write_file" | "WriteFile" | "write_file_gemini" | "WriteFileGemini" => "Write",
+        | "read_many_files" | "ReadManyFiles" | "view_image" | "ViewImage"
+        | "read_artifact_file" => "Read",
+        "Write"
+        | "write_file"
+        | "WriteFile"
+        | "write_file_gemini"
+        | "WriteFileGemini"
+        | "write_artifact_file" => "Write",
         "Edit" | "MultiEdit" | "NotebookEdit" | "replace" | "Replace" | "apply_patch"
         | "ApplyPatch" | "memory_apply_patch" => "Edit",
         "Glob" | "glob_gemini" | "GlobGemini" => "Glob",

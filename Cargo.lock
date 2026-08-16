@@ -1007,9 +1007,13 @@ dependencies = [
 name = "lotta-tools"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "cap-fs-ext",
+ "cap-std",
  "jsonschema",
  "lotta-domain",
  "lotta-runtime",
+ "regex",
  "serde",
  "serde_json",
  "tokio",

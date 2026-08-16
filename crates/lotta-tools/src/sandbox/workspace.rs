@@ -109,11 +109,30 @@ impl<'a> WorkspaceSandboxGate<'a> {
 
 impl SandboxGate for WorkspaceSandboxGate<'_> {
     fn check(&self, invocation: SandboxInvocation<'_>) -> Result<SandboxDecision, SandboxError> {
+        if matches!(
+            invocation.internal_name,
+            "read_artifact_file" | "write_artifact_file"
+        ) {
+            return Ok(SandboxDecision::Allow);
+        }
         let family = canonical_tool_name(invocation.internal_name);
         if family == "Bash" || !is_file_family(family) {
             return Ok(SandboxDecision::Allow);
         }
-        let values = path_values(invocation.input.as_value(), family)?;
+        let values = if invocation.internal_name == "apply_patch" {
+            let patch = invocation
+                .input
+                .as_value()
+                .get("input")
+                .and_then(Value::as_str)
+                .ok_or(SandboxError)?;
+            crate::builtin::file::patch::scan_paths(patch).map_err(|()| SandboxError)?
+        } else if invocation.internal_name == "read_many_files" {
+            validate_read_many(invocation.input.as_value())?;
+            vec!["."]
+        } else {
+            path_values(invocation.input.as_value(), family)?
+        };
         for value in values {
             let path = canonicalize_invocation_path(self.cwd, value).map_err(|_| SandboxError)?;
             if !path_within(&path, self.policy.root()) {
@@ -139,10 +158,39 @@ fn path_values<'a>(value: &'a Value, family: &str) -> Result<Vec<&'a str>, Sandb
     {
         output.push(value);
     }
-    if output.is_empty() {
-        return Err(SandboxError);
+    if output.is_empty() && matches!(family, "Glob" | "Grep") {
+        output.push(".");
     }
-    Ok(output)
+    if output.is_empty() {
+        Err(SandboxError)
+    } else {
+        Ok(output)
+    }
+}
+
+fn validate_read_many(value: &Value) -> Result<(), SandboxError> {
+    let object = value.as_object().ok_or(SandboxError)?;
+    for key in ["include", "exclude"] {
+        let Some(values) = object.get(key) else {
+            continue;
+        };
+        let values = values.as_array().ok_or(SandboxError)?;
+        if values.len() > 32 || (key == "include" && values.is_empty()) {
+            return Err(SandboxError);
+        }
+        for value in values {
+            let pattern = value.as_str().ok_or(SandboxError)?;
+            if pattern.is_empty()
+                || pattern.len() > 4_096
+                || pattern.starts_with('/')
+                || pattern.contains('\\')
+                || pattern.split('/').any(|part| part == "..")
+            {
+                return Err(SandboxError);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn pattern_is_path_like(value: &str) -> bool {

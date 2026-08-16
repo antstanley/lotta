@@ -374,7 +374,12 @@ mod workspace {
             let malformed = sandbox_input(serde_json::json!({"dir_path": 7}));
             assert_eq!(sandbox_check(&gate, alias, &malformed), Err(SandboxError));
             let missing = sandbox_input(serde_json::json!({"pattern": "*"}));
-            assert_eq!(sandbox_check(&gate, alias, &missing), Err(SandboxError));
+            let expected = if matches!(alias, "glob_gemini" | "search_file_content") {
+                Ok(SandboxDecision::Allow)
+            } else {
+                Err(SandboxError)
+            };
+            assert_eq!(sandbox_check(&gate, alias, &missing), expected);
         }
     }
 
