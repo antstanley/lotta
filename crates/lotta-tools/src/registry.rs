@@ -1,7 +1,8 @@
 //! Atomic bounded registry snapshots.
 
+use crate::pipeline::ToolExecutor;
 use crate::{allowlist::ToolAllowlist, names, toolset::ToolsetId};
-use lotta_runtime::ports::{ModelFacingToolName, ToolDefinition, ToolPort};
+use lotta_runtime::ports::{ModelFacingToolName, ToolDefinition};
 use std::{
     collections::BTreeMap,
     fmt,
@@ -14,13 +15,13 @@ pub struct ToolRegistration {
     /// Shared definition whose internal name identifies the implementation.
     pub definition: Arc<ToolDefinition>,
     /// Shared executor used by every protocol alias.
-    pub executor: Arc<dyn ToolPort>,
+    pub executor: Arc<dyn ToolExecutor>,
 }
 
 impl ToolRegistration {
     /// Replaces the executor while retaining the definition.
     #[must_use]
-    pub fn with_executor(mut self, executor: Arc<dyn ToolPort>) -> Self {
+    pub fn with_executor(mut self, executor: Arc<dyn ToolExecutor>) -> Self {
         self.executor = executor;
         self
     }
@@ -34,7 +35,7 @@ pub struct RegisteredTool {
     /// Validated model-facing name resolved for this snapshot.
     pub model_name: ModelFacingToolName,
     /// Shared executor.
-    pub executor: Arc<dyn ToolPort>,
+    pub executor: Arc<dyn ToolExecutor>,
 }
 
 /// Typed registry construction or synchronization error.
@@ -274,8 +275,8 @@ pub(crate) mod tests {
 
     pub(crate) mod support {
         use super::*;
+        use crate::pipeline::{ExecutorFuture, RawToolExecutionRequest, RawToolOutcome};
         use lotta_runtime::{
-            RuntimeError,
             bounds::{
                 EXTERNAL_TOOL_CALL_TIMEOUT_MS, TOOL_RESULT_BYTES_MAX, TOOL_RESULT_MODEL_CHARS_MAX,
             },
@@ -283,9 +284,11 @@ pub(crate) mod tests {
         };
         use std::{future, time::Duration};
         pub(crate) struct Stub;
-        impl ToolPort for Stub {
-            fn execute(&self, _: ToolExecutionRequest) -> PortFuture<'_, ToolOutcome> {
-                Box::pin(future::pending::<Result<ToolOutcome, RuntimeError>>())
+        impl ToolExecutor for Stub {
+            fn execute(&self, _: RawToolExecutionRequest) -> ExecutorFuture<'_> {
+                Box::pin(future::pending::<
+                    Result<RawToolOutcome, crate::pipeline::ExecutorError>,
+                >())
             }
         }
         pub(crate) fn registration(internal: &str, model: &str) -> ToolRegistration {
