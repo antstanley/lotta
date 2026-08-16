@@ -901,6 +901,15 @@ dependencies = [
 [[package]]
 name = "lotta-extensions"
 version = "0.1.0"
+dependencies = [
+ "lotta-domain",
+ "lotta-memfs",
+ "lotta-runtime",
+ "lotta-tools",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
 
 [[package]]
 name = "lotta-memfs"

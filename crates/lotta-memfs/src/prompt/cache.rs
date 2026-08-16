@@ -5,10 +5,11 @@ use cap_std::fs::{Dir, OpenOptions};
 use lotta_runtime::RuntimeError;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
 const CACHE_FILE: &str = "system-prompt.json";
@@ -39,8 +40,16 @@ pub struct CacheDelivery {
 /// Validated absolute, existing, non-symlink conversation cache directory.
 pub struct CacheRoot {
     directory: Arc<Dir>,
+    skill_identity: Arc<Mutex<SkillIdentity>>,
+    transaction: Arc<AsyncMutex<()>>,
     #[cfg(test)]
     hooks: Option<Arc<TestHooks>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SkillIdentity {
+    Unknown,
+    Known { skill: [u8; 32], record: [u8; 32] },
 }
 
 impl CacheRoot {
@@ -64,6 +73,8 @@ impl CacheRoot {
             Dir::open_ambient_dir(canonical, ambient_authority()).map_err(|_| permission())?;
         Ok(Self {
             directory: Arc::new(directory),
+            skill_identity: Arc::new(Mutex::new(SkillIdentity::Unknown)),
+            transaction: Arc::new(AsyncMutex::new(())),
             #[cfg(test)]
             hooks: None,
         })
@@ -117,7 +128,8 @@ impl CacheRoot {
         serde_json::to_writer_pretty(&mut bytes, &stable)
             .map_err(|_| invalid("prompt cache JSON"))?;
         bytes.write_all(b"\n").map_err(|_| limit())?;
-        atomic_replace(&self.directory, &bytes.bytes)
+        atomic_replace(&self.directory, &bytes.bytes)?;
+        self.set_skill_identity(SkillIdentity::Unknown)
     }
 
     /// Reuses or compiles against committed `MemFS` authority and persists stable delivery state.
@@ -136,30 +148,43 @@ impl CacheRoot {
         cancellation: CancellationToken,
     ) -> Result<CacheDelivery, RuntimeError> {
         check_cancelled(&cancellation)?;
+        let _transaction = self.transaction.lock().await;
+        check_cancelled(&cancellation)?;
         let candidate_hash = super::compile::hash_raw_system(inputs.raw_system().as_str());
+        let candidate_skill_identity = selected_skill_identity(inputs)?;
         check_cancelled(&cancellation)?;
         let revision = compiler.committed_revision(inputs.agent_id()).await?;
         check_cancelled(&cancellation)?;
         if let Some(existing) = self.load_async(cancellation.clone()).await? {
+            let existing_record_identity = stable_record_identity(&existing);
+            let same_skill_identity =
+                self.skill_identity_matches(candidate_skill_identity, existing_record_identity)?;
             if existing.raw_system_hash == candidate_hash
                 && existing.memfs_revision == revision_string(revision.as_ref())
+                && same_skill_identity
             {
+                self.set_known_identity(candidate_skill_identity, &existing)?;
                 return Ok(reused(existing));
             }
-            let same_hash = existing.raw_system_hash == candidate_hash;
+            let same_base_prompt =
+                existing.raw_system_hash == candidate_hash && same_skill_identity;
             let fresh = compiler
                 .compile_at_revision(inputs, revision.as_ref(), cancellation.clone())
                 .await?;
             check_cancelled(&cancellation)?;
-            return self
-                .deliver_changed(existing, fresh, same_hash, capability, cancellation)
-                .await;
+            let delivery = self
+                .deliver_changed(existing, fresh, same_base_prompt, capability, cancellation)
+                .await?;
+            self.set_known_identity(candidate_skill_identity, &delivery.persisted)?;
+            return Ok(delivery);
         }
         let fresh = compiler
             .compile_at_revision(inputs, revision.as_ref(), cancellation.clone())
             .await?;
         check_cancelled(&cancellation)?;
-        self.persist_async(fresh.clone(), cancellation).await?;
+        self.persist_internal_async(fresh.clone(), cancellation)
+            .await?;
+        self.set_known_identity(candidate_skill_identity, &fresh)?;
         Ok(rendered(fresh))
     }
 
@@ -170,6 +195,8 @@ impl CacheRoot {
         check_cancelled(&cancellation)?;
         let root = Self {
             directory: Arc::clone(&self.directory),
+            skill_identity: Arc::clone(&self.skill_identity),
+            transaction: Arc::clone(&self.transaction),
             #[cfg(test)]
             hooks: self.hooks.clone(),
         };
@@ -180,22 +207,72 @@ impl CacheRoot {
         result
     }
 
-    async fn persist_async(
+    async fn persist_internal_async(
         &self,
         record: CompiledPromptRecord,
         cancellation: CancellationToken,
     ) -> Result<(), RuntimeError> {
+        self.set_skill_identity(SkillIdentity::Unknown)?;
         check_cancelled(&cancellation)?;
         let root = Self {
             directory: Arc::clone(&self.directory),
+            skill_identity: Arc::clone(&self.skill_identity),
+            transaction: Arc::clone(&self.transaction),
             #[cfg(test)]
             hooks: self.hooks.clone(),
         };
-        let result = tokio::task::spawn_blocking(move || root.persist(&record))
+        let result = tokio::task::spawn_blocking(move || root.persist_stable(&record))
             .await
             .map_err(|_| adapter("prompt cache worker"))?;
         check_cancelled(&cancellation)?;
         result
+    }
+
+    fn persist_stable(&self, record: &CompiledPromptRecord) -> Result<(), RuntimeError> {
+        #[cfg(test)]
+        self.run_hook(HookPoint::Persist)?;
+        validate_target(&self.directory)?;
+        let stable = record.clone().stable();
+        let mut bytes = BoundedCacheBytes::default();
+        serde_json::to_writer_pretty(&mut bytes, &stable)
+            .map_err(|_| invalid("prompt cache JSON"))?;
+        bytes.write_all(b"\n").map_err(|_| limit())?;
+        atomic_replace(&self.directory, &bytes.bytes)?;
+        #[cfg(test)]
+        self.run_hook(HookPoint::AfterPersist)?;
+        Ok(())
+    }
+
+    fn skill_identity_matches(
+        &self,
+        skill: [u8; 32],
+        record: [u8; 32],
+    ) -> Result<bool, RuntimeError> {
+        let state = self
+            .skill_identity
+            .lock()
+            .map_err(|_| adapter("prompt cache skill identity lock"))?;
+        Ok(*state == SkillIdentity::Known { skill, record })
+    }
+
+    fn set_known_identity(
+        &self,
+        skill: [u8; 32],
+        record: &CompiledPromptRecord,
+    ) -> Result<(), RuntimeError> {
+        self.set_skill_identity(SkillIdentity::Known {
+            skill,
+            record: stable_record_identity(record),
+        })
+    }
+
+    fn set_skill_identity(&self, identity: SkillIdentity) -> Result<(), RuntimeError> {
+        let mut state = self
+            .skill_identity
+            .lock()
+            .map_err(|_| adapter("prompt cache skill identity lock"))?;
+        *state = identity;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -216,13 +293,13 @@ impl CacheRoot {
         &self,
         existing: CompiledPromptRecord,
         compiled: CompiledPromptRecord,
-        same_hash: bool,
+        same_base_prompt: bool,
         capability: DeliveryCapability,
         cancellation: CancellationToken,
     ) -> Result<CacheDelivery, RuntimeError> {
-        if same_hash && capability == DeliveryCapability::MidConversationSystem {
+        if same_base_prompt && capability == DeliveryCapability::MidConversationSystem {
             let persisted = stable_memory_update(&existing, &compiled)?;
-            self.persist_async(persisted.clone(), cancellation.clone())
+            self.persist_internal_async(persisted.clone(), cancellation.clone())
                 .await?;
             let mut delivery = existing;
             delivery.core_memory.clone_from(&compiled.core_memory);
@@ -235,9 +312,57 @@ impl CacheRoot {
                 rendered: true,
             });
         }
-        self.persist_async(compiled.clone(), cancellation).await?;
+        self.persist_internal_async(compiled.clone(), cancellation)
+            .await?;
         Ok(rendered(compiled))
     }
+}
+
+fn stable_record_identity(record: &CompiledPromptRecord) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    fn field(hasher: &mut Sha256, tag: u8, value: &[u8]) {
+        hasher.update([tag]);
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+
+    fn optional_field(hasher: &mut Sha256, tag: u8, value: Option<&str>) {
+        hasher.update([tag]);
+        match value {
+            Some(value) => {
+                hasher.update([1]);
+                hasher.update((value.len() as u64).to_be_bytes());
+                hasher.update(value.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"lotta.compiled-prompt-record.v1\0");
+    field(&mut hasher, 1, record.content.as_bytes());
+    field(&mut hasher, 2, record.core_memory.as_bytes());
+    optional_field(
+        &mut hasher,
+        3,
+        record.mid_conversation_system_prompt.as_deref(),
+    );
+    let timestamp = record
+        .compiled_at
+        .as_utc()
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    field(&mut hasher, 4, timestamp.as_bytes());
+    field(&mut hasher, 5, record.raw_system_hash.as_bytes());
+    optional_field(&mut hasher, 6, record.memfs_revision.as_deref());
+    hasher.finalize().into()
+}
+
+fn selected_skill_identity(inputs: &PromptInputs) -> Result<[u8; 32], RuntimeError> {
+    use sha2::{Digest, Sha256};
+
+    let rendered = super::skills::render_skills(inputs.skills())?;
+    Ok(Sha256::digest(rendered.as_bytes()).into())
 }
 
 fn revision_string(revision: Option<&lotta_runtime::boundary::RevisionId>) -> Option<String> {
@@ -520,6 +645,7 @@ fn check_cancelled(token: &CancellationToken) -> Result<(), RuntimeError> {
 enum HookPoint {
     Load,
     Persist,
+    AfterPersist,
     BeforeOpen,
 }
 
@@ -577,6 +703,7 @@ impl TestHooks {
 mod tests {
     use super::*;
     use crate::prompt::test_support::*;
+    use crate::prompt::{PromptSections, PromptSkill};
     use crate::tests::{message, path, valid};
     use lotta_runtime::ports::MemFsPort;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -585,6 +712,21 @@ mod tests {
         while !hooks.entered.load(Ordering::SeqCst) {
             tokio::task::yield_now().await;
         }
+    }
+
+    fn skill_inputs(raw: &str, at: &str, skills: Vec<PromptSkill>) -> PromptInputs {
+        PromptInputs::new(
+            prompt_text(raw),
+            agent(),
+            conversation(),
+            0,
+            timestamp(at),
+            PromptSections {
+                skills,
+                ..PromptSections::default()
+            },
+        )
+        .expect("skill inputs")
     }
 
     async fn nonblocking_case(point: HookPoint, preload: bool) {
@@ -787,6 +929,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unchanged_nonempty_skill_set_reuses_and_record_stays_six_fields() {
+        let (root, port, _) = setup().await;
+        let store = cache(&root, "unchanged-nonempty-skills");
+        let renders = AtomicUsize::new(0);
+        let skill =
+            || vec![PromptSkill::new("alpha".into(), "Alpha skill".into(), None).expect("alpha")];
+        let first = store
+            .get_or_compile(
+                &compiler(&port, &renders),
+                &skill_inputs("raw", "2000-01-01T00:00:00Z", skill()),
+                DeliveryCapability::RequestBoundaryOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("first");
+        let second = store
+            .get_or_compile(
+                &compiler(&port, &renders),
+                &skill_inputs("raw", "2001-01-01T00:00:00Z", skill()),
+                DeliveryCapability::RequestBoundaryOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("second");
+        assert_eq!(renders.load(Ordering::SeqCst), 1);
+        assert!(!second.rendered);
+        assert_eq!(second.persisted.content, first.persisted.content);
+        let value = serde_json::to_value(&second.persisted).expect("stable JSON");
+        let keys = value
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            [
+                "compiledAt",
+                "content",
+                "coreMemory",
+                "memfsRevision",
+                "rawSystemHash"
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn unchanged_pair_reuses() {
         let (root, port, _) = setup().await;
         let store = cache(&root, "owned-cache-one");
@@ -803,6 +992,334 @@ mod tests {
                 .expect("cache");
         }
         assert_eq!(renders.load(Ordering::SeqCst), 1);
+    }
+
+    async fn mid_conversation_skill_change(
+        first: Vec<PromptSkill>,
+        second: Vec<PromptSkill>,
+    ) -> CacheDelivery {
+        let (root, port, _) = setup().await;
+        let store = cache(&root, "mid-conversation-skill-change");
+        let renders = AtomicUsize::new(0);
+        store
+            .get_or_compile(
+                &compiler(&port, &renders),
+                &skill_inputs("raw", "2000-01-01T00:00:00Z", first),
+                DeliveryCapability::MidConversationSystem,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("first");
+        let delivery = store
+            .get_or_compile(
+                &compiler(&port, &renders),
+                &skill_inputs("raw", "2001-01-01T00:00:00Z", second),
+                DeliveryCapability::MidConversationSystem,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("second");
+        assert_eq!(renders.load(Ordering::SeqCst), 2);
+        assert!(delivery.rendered);
+        assert!(delivery.delivery.mid_conversation_system_prompt.is_none());
+        assert_eq!(delivery.delivery, delivery.persisted);
+        delivery
+    }
+
+    #[tokio::test]
+    async fn mid_conversation_added_skill_replaces_stale_base_prompt() {
+        let delivery = mid_conversation_skill_change(
+            Vec::new(),
+            vec![PromptSkill::new("alpha".into(), "Alpha skill".into(), None).expect("alpha")],
+        )
+        .await;
+        assert!(delivery.persisted.content.contains("alpha"));
+    }
+
+    #[tokio::test]
+    async fn mid_conversation_changed_skill_replaces_stale_base_prompt() {
+        let delivery = mid_conversation_skill_change(
+            vec![PromptSkill::new("alpha".into(), "Alpha skill".into(), None).expect("alpha")],
+            vec![PromptSkill::new("beta".into(), "Beta skill".into(), None).expect("beta")],
+        )
+        .await;
+        assert!(delivery.persisted.content.contains("beta"));
+        assert!(!delivery.persisted.content.contains("alpha"));
+    }
+
+    #[tokio::test]
+    async fn mid_conversation_removed_skill_replaces_stale_base_prompt() {
+        let delivery = mid_conversation_skill_change(
+            vec![PromptSkill::new("alpha".into(), "Alpha skill".into(), None).expect("alpha")],
+            Vec::new(),
+        )
+        .await;
+        assert!(!delivery.persisted.content.contains("<available_skills>"));
+    }
+
+    #[tokio::test]
+    async fn unknown_preexisting_cache_rerenders_once_then_reuses() {
+        let (root, port, _) = setup().await;
+        let first_store = cache(&root, "unknown-preexisting");
+        let renders = AtomicUsize::new(0);
+        let make_inputs = |at| {
+            skill_inputs(
+                "raw",
+                at,
+                vec![PromptSkill::new("alpha".into(), "Alpha skill".into(), None).expect("alpha")],
+            )
+        };
+        first_store
+            .get_or_compile(
+                &compiler(&port, &renders),
+                &make_inputs("2000-01-01T00:00:00Z"),
+                DeliveryCapability::RequestBoundaryOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("seed");
+        let second_store = CacheRoot::new(
+            &std::fs::canonicalize(root.0.join("unknown-preexisting")).expect("canonical"),
+        )
+        .expect("cache");
+        for at in ["2001-01-01T00:00:00Z", "2002-01-01T00:00:00Z"] {
+            second_store
+                .get_or_compile(
+                    &compiler(&port, &renders),
+                    &make_inputs(at),
+                    DeliveryCapability::RequestBoundaryOnly,
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("cache");
+        }
+        assert_eq!(renders.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cross_root_replacement_never_reuses_wrong_skill() {
+        let (root, port, _) = setup().await;
+        let directory = root.0.join("cross-root-replacement");
+        std::fs::create_dir(&directory).expect("directory");
+        let canonical = std::fs::canonicalize(&directory).expect("canonical");
+        let store_a = CacheRoot::new(&canonical).expect("store a");
+        let store_b = CacheRoot::new(&canonical).expect("store b");
+        let renders = AtomicUsize::new(0);
+        let make_inputs = |at: &str, name: &str, description: &str| {
+            skill_inputs(
+                "raw",
+                at,
+                vec![PromptSkill::new(name.into(), description.into(), None).expect("skill")],
+            )
+        };
+
+        let alpha = store_a
+            .get_or_compile(
+                &compiler(&port, &renders),
+                &make_inputs("2000-01-01T00:00:00Z", "alpha", "Alpha skill"),
+                DeliveryCapability::RequestBoundaryOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("alpha");
+        let beta = store_b
+            .get_or_compile(
+                &compiler(&port, &renders),
+                &make_inputs("2001-01-01T00:00:00Z", "beta", "Beta skill"),
+                DeliveryCapability::RequestBoundaryOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("beta");
+        let repaired = store_a
+            .get_or_compile(
+                &compiler(&port, &renders),
+                &make_inputs("2002-01-01T00:00:00Z", "alpha", "Alpha skill"),
+                DeliveryCapability::RequestBoundaryOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("repaired alpha");
+        let reused = store_a
+            .get_or_compile(
+                &compiler(&port, &renders),
+                &make_inputs("2003-01-01T00:00:00Z", "alpha", "Alpha skill"),
+                DeliveryCapability::RequestBoundaryOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("reused alpha");
+
+        assert_eq!(renders.load(Ordering::SeqCst), 3);
+        assert!(alpha.persisted.content.contains("alpha"));
+        assert!(beta.persisted.content.contains("beta"));
+        assert!(repaired.rendered);
+        assert!(repaired.persisted.content.contains("alpha"));
+        assert!(!repaired.persisted.content.contains("beta"));
+        assert!(!reused.rendered);
+        assert_eq!(reused.persisted, repaired.persisted);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_durable_persist_leaves_identity_unknown() {
+        let (root, port, _) = setup().await;
+        let store = cache(&root, "cancel-after-persist");
+        let renders = AtomicUsize::new(0);
+        let make_inputs = |at: &str, name: &str, description: &str| {
+            skill_inputs(
+                "raw",
+                at,
+                vec![PromptSkill::new(name.into(), description.into(), None).expect("skill")],
+            )
+        };
+        store
+            .get_or_compile(
+                &compiler(&port, &renders),
+                &make_inputs("2000-01-01T00:00:00Z", "alpha", "Alpha skill"),
+                DeliveryCapability::RequestBoundaryOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("seed alpha");
+
+        let hooks = TestHooks::blocking(HookPoint::AfterPersist);
+        let store = store.with_hooks(Arc::clone(&hooks));
+        let cancellation = CancellationToken::new();
+        let beta_compiler = compiler(&port, &renders);
+        let beta_inputs = make_inputs("2001-01-01T00:00:00Z", "beta", "Beta skill");
+        let work = store.get_or_compile(
+            &beta_compiler,
+            &beta_inputs,
+            DeliveryCapability::RequestBoundaryOnly,
+            cancellation.clone(),
+        );
+        let cancel = async {
+            wait_entered(&hooks).await;
+            cancellation.cancel();
+            hooks.released.store(true, Ordering::SeqCst);
+        };
+        let (result, ()) = tokio::join!(work, cancel);
+        assert!(matches!(result, Err(RuntimeError::Cancelled { .. })));
+        assert_eq!(hooks.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            store
+                .load()
+                .expect("disk beta")
+                .expect("record")
+                .content
+                .contains("beta")
+        );
+
+        let repaired = store
+            .get_or_compile(
+                &compiler(&port, &renders),
+                &make_inputs("2002-01-01T00:00:00Z", "alpha", "Alpha skill"),
+                DeliveryCapability::RequestBoundaryOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("repair alpha");
+        let reused = store
+            .get_or_compile(
+                &compiler(&port, &renders),
+                &make_inputs("2003-01-01T00:00:00Z", "alpha", "Alpha skill"),
+                DeliveryCapability::RequestBoundaryOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("reuse alpha");
+        assert_eq!(renders.load(Ordering::SeqCst), 3);
+        assert!(repaired.rendered);
+        assert!(repaired.persisted.content.contains("alpha"));
+        assert!(!repaired.persisted.content.contains("beta"));
+        assert!(!reused.rendered);
+    }
+
+    #[tokio::test]
+    async fn changed_skill_set_recompiles() {
+        let (root, port, _) = setup().await;
+        let store = cache(&root, "owned-cache-skill-change");
+        let renders = AtomicUsize::new(0);
+        let first = skill_inputs(
+            "raw",
+            "2000-01-01T00:00:00Z",
+            vec![PromptSkill::new("alpha".into(), "Alpha skill".into(), None).expect("alpha")],
+        );
+        let second = skill_inputs(
+            "raw",
+            "2001-01-01T00:00:00Z",
+            vec![PromptSkill::new("beta".into(), "Beta skill".into(), None).expect("beta")],
+        );
+        store
+            .get_or_compile(
+                &compiler(&port, &renders),
+                &first,
+                DeliveryCapability::RequestBoundaryOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("first");
+        let delivery = store
+            .get_or_compile(
+                &compiler(&port, &renders),
+                &second,
+                DeliveryCapability::RequestBoundaryOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("second");
+        assert_eq!(renders.load(Ordering::SeqCst), 2);
+        assert!(delivery.persisted.content.contains("beta"));
+        assert!(!delivery.persisted.content.contains("alpha"));
+        let CompiledPromptRecord {
+            content: _,
+            core_memory: _,
+            mid_conversation_system_prompt: _,
+            compiled_at: _,
+            raw_system_hash: _,
+            memfs_revision: _,
+        } = &delivery.persisted;
+    }
+
+    #[tokio::test]
+    async fn removed_skill_set_recompiles() {
+        let (root, port, _) = setup().await;
+        let store = cache(&root, "owned-cache-skill-remove");
+        let renders = AtomicUsize::new(0);
+        let first = skill_inputs(
+            "raw",
+            "2000-01-01T00:00:00Z",
+            vec![PromptSkill::new("alpha".into(), "Alpha skill".into(), None).expect("alpha")],
+        );
+        let second = skill_inputs("raw", "2001-01-01T00:00:00Z", Vec::new());
+        store
+            .get_or_compile(
+                &compiler(&port, &renders),
+                &first,
+                DeliveryCapability::RequestBoundaryOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("first");
+        let delivery = store
+            .get_or_compile(
+                &compiler(&port, &renders),
+                &second,
+                DeliveryCapability::RequestBoundaryOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("second");
+        assert_eq!(renders.load(Ordering::SeqCst), 2);
+        assert!(!delivery.persisted.content.contains("<available_skills>"));
+        let CompiledPromptRecord {
+            content: _,
+            core_memory: _,
+            mid_conversation_system_prompt: _,
+            compiled_at: _,
+            raw_system_hash: _,
+            memfs_revision: _,
+        } = &delivery.persisted;
     }
 
     #[tokio::test]
