@@ -81,7 +81,7 @@ uuid = { version = "1.16.0", features = ["serde"] }
 [workspace.dependencies.tokio]
 version = "1.47.1"
 default-features = false
-features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "test-util", "time"]
+features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"]
 
 [workspace.lints.rust]
 missing_docs = "deny"

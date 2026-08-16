@@ -1,12 +1,13 @@
 //! Ordered tool execution pipeline.
 //!
-//! Permission and sandbox are explicit allow stubs; Tasks 34–35 replace their bodies.
+//! Permission and sandbox gates run before secret resolution and execution.
 
 use crate::{
     clamp::{ClampError, OverflowWriter, clamp_text},
     limits,
     permissions::{PermissionDecision, PermissionGate, PermissionInvocation},
     registry::RegistrySnapshot,
+    sandbox::{SandboxDecision, SandboxGate, SandboxInvocation},
     scrub::{ScrubError, scrub_text},
 };
 use lotta_domain::BoundedJsonValue;
@@ -309,6 +310,8 @@ pub enum PipelineError {
     PermissionDenied,
     /// Permission policy requires interactive approval.
     ApprovalRequired,
+    /// Sandbox gate infrastructure failed.
+    Sandbox,
     /// Secret bounds or resolution failed.
     SecretDelivery,
     /// Raw result exceeded definition/global byte limits.
@@ -341,6 +344,8 @@ pub struct PipelineRequest<'a> {
     pub hooks: &'a dyn PipelineHooks,
     /// Permission gate.
     pub permissions: &'a dyn PermissionGate,
+    /// Sandbox gate.
+    pub sandbox: &'a dyn SandboxGate,
     /// Secret resolver.
     pub secrets: &'a dyn SecretResolver,
     /// Enum-only trace sink.
@@ -365,6 +370,7 @@ pub async fn execute(request: PipelineRequest<'_>) -> Result<ToolOutcome, Pipeli
         cancellation,
         hooks,
         permissions,
+        sandbox,
         secrets,
         trace,
         overflow,
@@ -377,6 +383,7 @@ pub async fn execute(request: PipelineRequest<'_>) -> Result<ToolOutcome, Pipeli
         cancellation,
         hooks,
         permissions,
+        sandbox,
         secrets,
         trace,
         overflow,
@@ -394,6 +401,7 @@ struct PipelineServices<'a> {
     cancellation: CancellationToken,
     hooks: &'a dyn PipelineHooks,
     permissions: &'a dyn PermissionGate,
+    sandbox: &'a dyn SandboxGate,
     secrets: &'a dyn SecretResolver,
     trace: &'a dyn TraceSink,
     overflow: &'a dyn OverflowWriter,
@@ -450,7 +458,16 @@ async fn execute_stages(
     request
         .trace
         .record(TraceEvent::Stage(PipelineStage::Sandbox));
-    sandbox_allow();
+    let sandbox = request
+        .sandbox
+        .check(SandboxInvocation {
+            internal_name: tool.definition.internal_name.as_str(),
+            input: &input,
+        })
+        .map_err(|_| PipelineError::Sandbox)?;
+    if sandbox == SandboxDecision::Deny {
+        return sandbox_denied(request, tool);
+    }
     request
         .trace
         .record(TraceEvent::Stage(PipelineStage::SecretSubstitution));
@@ -552,7 +569,31 @@ fn admit_raw(
     Ok(raw)
 }
 
-fn sandbox_allow() {}
+fn sandbox_denied(
+    request: &PipelineServices<'_>,
+    tool: &crate::registry::RegisteredTool,
+) -> Result<(RawToolOutcome, SecretDelivery), PipelineError> {
+    let raw = RawToolOutcome::Failure(ToolOutcome::SandboxDenied {
+        message: ToolOutcomeMessage::new("workspace sandbox denied".into())
+            .map_err(|_| PipelineError::Sandbox)?,
+    });
+    request
+        .trace
+        .record(TraceEvent::Stage(PipelineStage::PostHook));
+    request
+        .hooks
+        .post(PostHookStatus::Failed)
+        .map_err(PipelineError::Owner)?;
+    let delivery = SecretDelivery {
+        kind: if tool.definition.execution_owner == ToolExecutionOwner::Rust {
+            SecretDeliveryKind::ChildEnvironment
+        } else {
+            SecretDeliveryKind::ProviderRequest
+        },
+        values: Arc::new(Vec::new()),
+    };
+    Ok((raw, delivery))
+}
 
 fn resolve_secrets(
     value: &Value,

@@ -1,9 +1,7 @@
 //! Tool registry, permission checks, and built-in executors.
 //!
-//! This crate implements tool ports and must not depend on transport adapters or unrelated
-//! concrete adapters. A future isolated OS-sandbox adapter may require an approved unsafe-code
-//! exception with SAFETY proofs, invariant tests, and explicit review ownership; no exception is
-//! enabled in this bootstrap.
+//! This crate implements tool ports and workspace-specific OS sandbox adapters without unsafe
+//! exceptions. Seatbelt and Bubblewrap execution uses only safe Tokio process APIs.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -15,6 +13,7 @@ pub mod names;
 pub mod permissions;
 pub mod pipeline;
 pub mod registry;
+pub mod sandbox;
 pub mod scrub;
 pub mod toolset;
 
@@ -33,5 +32,9 @@ pub use pipeline::{
 pub use registry::{
     RegisteredTool, RegistryError, RegistrySnapshot, TOOLS_LOADED_MAX, ToolRegistration,
     ToolRegistry,
+};
+pub use sandbox::{
+    AllowAllSandbox, OsSandbox, SandboxBackend, SandboxDecision, SandboxError, SandboxGate,
+    SandboxInvocation, WorkspacePolicy, WorkspaceSandboxGate,
 };
 pub use toolset::{ParseToolsetIdError, ToolsetId, ToolsetPreference};
