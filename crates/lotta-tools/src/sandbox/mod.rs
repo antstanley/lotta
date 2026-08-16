@@ -13,6 +13,9 @@ pub use policy::{
     AllowAllSandbox, SandboxDecision, SandboxError, SandboxGate, SandboxInvocation,
     WorkspacePolicy, WorkspaceSandboxGate,
 };
+pub(crate) use runner::SHELL_CHILD_KILL_GRACE_MS;
+#[cfg(test)]
+pub(crate) use runner::{KillPhase, kill_and_reap_observed};
 pub use runner::{OsSandbox, SandboxBackend};
 pub use seatbelt::{SEATBELT_PROFILE, SEATBELT_PROGRAM, seatbelt_arguments};
 pub use unsupported::unsupported_workspace_sandbox;

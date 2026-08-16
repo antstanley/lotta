@@ -283,7 +283,7 @@ impl<'de> Deserialize<'de> for SecretRedactionSpec {
     }
 }
 
-/// Validated tool timeout not exceeding the five-minute external-call maximum.
+/// Validated generic tool timeout not exceeding the five-minute external-call maximum.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ToolTimeout(Duration);
 impl ToolTimeout {
@@ -298,6 +298,22 @@ impl ToolTimeout {
         }
         if millis > EXTERNAL_TOOL_CALL_TIMEOUT_MS.value as u128 {
             return Err(limit(EXTERNAL_TOOL_CALL_TIMEOUT_MS.name));
+        }
+        Ok(Self(value))
+    }
+
+    /// Validates a positive shell-only timeout at or below 3,600,000 milliseconds.
+    ///
+    /// # Errors
+    /// Rejects zero, sub-millisecond, or above-shell-maximum durations.
+    pub fn new_shell(value: Duration) -> Result<Self, RuntimeError> {
+        const SHELL_TOOL_TIMEOUT_MS_MAX: u128 = 3_600_000;
+        let millis = value.as_millis();
+        if value.is_zero() || millis == 0 {
+            return Err(invalid("shell tool timeout"));
+        }
+        if millis > SHELL_TOOL_TIMEOUT_MS_MAX {
+            return Err(limit("SHELL_TOOL_TIMEOUT_MS_MAX"));
         }
         Ok(Self(value))
     }

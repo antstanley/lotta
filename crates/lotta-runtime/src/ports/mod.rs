@@ -13,7 +13,11 @@ mod transcript;
 pub use ids::IdGenerator;
 pub use lotta_domain::Clock;
 pub use memfs::{MemFsHistoryEntry, MemFsPort, MemFsStatus, MemFsTreeEntry};
-pub use process::{ChildProcessPort, ProcessEvent, ProcessOutcome, ProcessRequest, SandboxPort};
+pub use process::{
+    ChildProcessPort, InteractiveSandboxPort, PROCESS_TIMEOUT_DISABLED, ProcessEvent, ProcessInput,
+    ProcessOutcome, ProcessRequest, ProcessSession, ProcessSessionFuture, ProcessSessionParts,
+    SandboxPort,
+};
 pub use provider_contract::{
     ImagePolicy, ProviderContent, ProviderContentPart, ProviderDeadline, ProviderError,
     ProviderErrorContext, ProviderEventReceiver, ProviderEventSink, ProviderMessage,

@@ -295,6 +295,9 @@ mod adapters {
     }
 }
 
+#[path = "tests/interactive.rs"]
+mod interactive;
+
 mod workspace {
     use super::*;
 

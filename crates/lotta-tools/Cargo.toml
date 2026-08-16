@@ -13,10 +13,15 @@ lotta-domain = { version = "0.1.0", path = "../lotta-domain" }
 lotta-runtime = { version = "0.1.0", path = "../lotta-runtime" }
 jsonschema = { version = "0.32.1", default-features = false }
 regex = "1.11.2"
+rustix = { version = "1.0.8", features = ["process"] }
+pty-process.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
 
 [lints]
 workspace = true

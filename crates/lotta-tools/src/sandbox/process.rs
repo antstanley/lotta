@@ -8,17 +8,25 @@ use lotta_runtime::{
     RuntimeError,
     boundary::ProcessOutputChunk,
     bounds::PROCESS_OUTPUT_CHUNK_BYTES_MAX,
-    ports::{PortFuture, ProcessEvent, ProcessOutcome, ProcessRequest, SandboxPort},
+    ports::{
+        InteractiveSandboxPort, PROCESS_TIMEOUT_DISABLED, PortFuture, ProcessEvent, ProcessInput,
+        ProcessOutcome, ProcessRequest, ProcessSession, ProcessSessionFuture, SandboxPort,
+    },
 };
-use std::{path::PathBuf, process::Stdio};
+use std::{path::PathBuf, process::Stdio, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
-    sync::mpsc::{self, Sender},
+    sync::mpsc::{self, Receiver, Sender},
 };
 use tokio_util::sync::CancellationToken;
 
 const PROCESS_INTERNAL_EVENTS_MAX: usize = 16;
+
+const PROCESS_INPUT_CHANNEL_ITEMS_MAX: usize = 16;
+const PROCESS_EVENT_CHANNEL_ITEMS_MAX: usize = 16;
+pub(crate) const SHELL_CHILD_KILL_GRACE_MS: u64 = 2_000;
+const PROCESS_GROUP_KILL_RETRIES_MAX: usize = 32;
 #[cfg(target_os = "linux")]
 const SANDBOX_PATH_ENTRIES_MAX: usize = 256;
 
@@ -61,6 +69,48 @@ impl OsSandbox {
     #[must_use]
     pub const fn backend(&self) -> &SandboxBackend {
         &self.backend
+    }
+}
+
+impl InteractiveSandboxPort for OsSandbox {
+    fn start_session(
+        &self,
+        mut request: ProcessRequest,
+        cancellation: CancellationToken,
+    ) -> ProcessSessionFuture<'_> {
+        Box::pin(async move {
+            if self.backend == SandboxBackend::Unsupported {
+                return Err(unsupported_workspace_sandbox());
+            }
+            let cwd = validate_request(&self.policy, &request)?;
+            if cancellation.is_cancelled() {
+                return Err(cancelled());
+            }
+            request.stdin = None;
+            let (input_sender, input_receiver) = mpsc::channel(PROCESS_INPUT_CHANNEL_ITEMS_MAX);
+            let (event_sender, event_receiver) = mpsc::channel(PROCESS_EVENT_CHANNEL_ITEMS_MAX);
+            let policy = self.policy.clone();
+            let backend = self.backend.clone();
+            let child_cancellation = cancellation.clone();
+            let terminal = tokio::spawn(async move {
+                run_interactive_child(
+                    &policy,
+                    &backend,
+                    request,
+                    cwd,
+                    input_receiver,
+                    event_sender,
+                    child_cancellation,
+                )
+                .await
+            });
+            Ok(ProcessSession::new(
+                input_sender,
+                event_receiver,
+                cancellation,
+                terminal,
+            ))
+        })
     }
 }
 
@@ -146,6 +196,7 @@ async fn run_child(
     );
     let (outer, outer_arguments, sentinel) = outer_command(policy, backend, &request, &arguments)?;
     let mut command = Command::new(outer);
+    configure_process_group(&mut command);
     command
         .args(outer_arguments)
         .current_dir(cwd)
@@ -200,6 +251,131 @@ fn outer_command(
             "bwrap",
         )),
         SandboxBackend::Unsupported => Err(unsupported_workspace_sandbox()),
+    }
+}
+
+async fn run_interactive_child(
+    policy: &WorkspacePolicy,
+    backend: &SandboxBackend,
+    request: ProcessRequest,
+    cwd: PathBuf,
+    input: Receiver<ProcessInput>,
+    events: Sender<ProcessEvent>,
+    cancellation: CancellationToken,
+) -> Result<ProcessOutcome, RuntimeError> {
+    let source_arguments = request.arguments.as_slice();
+    let mut arguments = Vec::new();
+    arguments
+        .try_reserve_exact(source_arguments.len())
+        .map_err(|_| limit("process arguments"))?;
+    arguments.extend(
+        source_arguments
+            .iter()
+            .map(|value| value.as_str().to_owned()),
+    );
+    let (outer, outer_arguments, sentinel) = outer_command(policy, backend, &request, &arguments)?;
+    let (pty, pts) = pty_process::open().map_err(|_| adapter("pty"))?;
+    pty.resize(pty_process::Size::new(24, 80))
+        .map_err(|_| adapter("pty size"))?;
+    let environment = request
+        .environment
+        .as_slice()
+        .iter()
+        .map(|entry| (entry.name().as_str(), entry.value().as_str()));
+    // pty-process spawn performs setsid(2) and makes the child the session/process-group leader;
+    // group-directed cleanup below therefore reaches every PTY descendant without unsafe hooks.
+    let command = pty_process::Command::new(outer)
+        .args(outer_arguments)
+        .current_dir(cwd)
+        .env_clear()
+        .env("LETTA_SANDBOX", sentinel)
+        .envs(environment)
+        .kill_on_drop(true);
+    let child = command.spawn(pts).map_err(|_| adapter("spawn"))?;
+    let (reader, writer) = pty.into_split();
+    supervise_pty(
+        child,
+        (reader, writer),
+        input,
+        events,
+        cancellation,
+        request.timeout,
+        request.output_bytes_max.get(),
+    )
+    .await
+}
+
+async fn write_pty_stdin(
+    mut writer: pty_process::OwnedWritePty,
+    mut input: Receiver<ProcessInput>,
+) -> Result<(), RuntimeError> {
+    while let Some(message) = input.recv().await {
+        match message {
+            ProcessInput::Bytes(bytes) => writer
+                .write_all(bytes.as_slice())
+                .await
+                .map_err(|_| adapter("stdin"))?,
+            ProcessInput::Eof => break,
+        }
+    }
+    writer.shutdown().await.map_err(|_| adapter("stdin"))
+}
+
+async fn supervise_pty(
+    mut child: Child,
+    pty: (pty_process::OwnedReadPty, pty_process::OwnedWritePty),
+    input: Receiver<ProcessInput>,
+    events: Sender<ProcessEvent>,
+    cancellation: CancellationToken,
+    timeout: Duration,
+    output_bytes_max: usize,
+) -> Result<ProcessOutcome, RuntimeError> {
+    let (reader, writer) = pty;
+    let (internal_sender, mut internal_receiver) = mpsc::channel(PROCESS_INTERNAL_EVENTS_MAX);
+    let mut input_task = AbortOnDrop::new(tokio::spawn(write_pty_stdin(writer, input)));
+    let mut reader_task =
+        AbortOnDrop::new(tokio::spawn(read_stream(reader, internal_sender, true)));
+    let deadline = process_deadline(timeout);
+    tokio::pin!(deadline);
+    let mut total = 0usize;
+    let result = loop {
+        tokio::select! {
+            () = cancellation.cancelled() => break Err(cancelled()),
+            () = &mut deadline => break Ok(ProcessOutcome { exit_code: None, timed_out: true }),
+            value = internal_receiver.recv() => match value {
+                Some(Ok(event)) => {
+                    let forwarded =
+                        forward_event(event, &events, &mut total, output_bytes_max).await;
+                    if let Err(error) = forwarded {
+                        break Err(error);
+                    }
+                }
+                Some(Err(error)) => break Err(error),
+                None => match child.wait().await {
+                    Ok(status) => break Ok(ProcessOutcome {
+                        exit_code: status.code(),
+                        timed_out: false,
+                    }),
+                    Err(_) => break Err(adapter("wait")),
+                },
+            }
+        }
+    };
+    if child.id().is_some() {
+        kill_and_reap(&mut child).await;
+    }
+    input_task.abort();
+    reader_task.abort();
+    settle(&mut input_task).await;
+    settle(&mut reader_task).await;
+    result
+}
+
+async fn process_deadline(timeout: Duration) {
+    if timeout == PROCESS_TIMEOUT_DISABLED {
+        std::future::pending::<()>().await;
+    } else {
+        tokio::time::sleep(timeout).await;
     }
 }
 
@@ -262,7 +438,7 @@ async fn supervise(
     let (internal_sender, mut internal_receiver) = mpsc::channel(PROCESS_INTERNAL_EVENTS_MAX);
     let mut stdin_task = AbortOnDrop::new(tokio::spawn(write_stdin(stdin, input)));
     let (mut stdout_task, mut stderr_task) = spawn_readers(stdout, stderr, internal_sender);
-    let deadline = tokio::time::sleep(timeout);
+    let deadline = process_deadline(timeout);
     tokio::pin!(deadline);
     let mut total = 0usize;
     let mut stdin_done = false;
@@ -399,9 +575,95 @@ async fn forward_event(
         .map_err(|_| adapter("event receiver"))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KillPhase {
+    Term,
+    Kill,
+}
+
 async fn kill_and_reap(child: &mut Child) {
-    let _ignored = child.kill().await;
-    let _ignored = child.wait().await;
+    kill_and_reap_with(child, |_| {}).await;
+}
+
+#[cfg(test)]
+pub(crate) async fn kill_and_reap_observed<F>(child: &mut Child, observer: F)
+where
+    F: FnMut(KillPhase),
+{
+    kill_and_reap_with(child, observer).await;
+}
+
+async fn kill_and_reap_with<F>(child: &mut Child, mut observer: F)
+where
+    F: FnMut(KillPhase),
+{
+    let Some(group) = child.id().and_then(|value| i32::try_from(value).ok()) else {
+        let _ignored = child.wait().await;
+        return;
+    };
+    observer(KillPhase::Term);
+    if !signal_process_group(group, KillPhase::Term) {
+        let _ignored = child.kill().await;
+        let _ignored = child.wait().await;
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(SHELL_CHILD_KILL_GRACE_MS);
+    let direct_reaped = tokio::select! {
+        _ = child.wait() => true,
+        () = tokio::time::sleep_until(deadline) => false,
+    };
+    if !process_group_live(group) {
+        return;
+    }
+    tokio::time::sleep_until(deadline).await;
+    observer(KillPhase::Kill);
+    force_kill_process_group(group).await;
+    if !direct_reaped {
+        let _ignored = child.wait().await;
+    }
+}
+
+async fn force_kill_process_group(group: i32) {
+    for _ in 0..PROCESS_GROUP_KILL_RETRIES_MAX {
+        let _ignored = signal_process_group(group, KillPhase::Kill);
+        tokio::task::yield_now().await;
+        if !process_group_live(group) {
+            return;
+        }
+    }
+}
+
+fn configure_process_group(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(unix)]
+fn process_group_live(process_group: i32) -> bool {
+    use rustix::io::Errno;
+    use rustix::process::{Pid, test_kill_process_group};
+
+    let Some(group) = Pid::from_raw(process_group) else {
+        return false;
+    };
+    test_kill_process_group(group) != Err(Errno::SRCH)
+}
+
+#[cfg(not(unix))]
+fn process_group_live(_: i32) -> bool {
+    false
+}
+
+fn signal_process_group(process_group: i32, phase: KillPhase) -> bool {
+    use rustix::process::{Pid, Signal, kill_process_group};
+
+    let Some(group) = Pid::from_raw(process_group) else {
+        return false;
+    };
+    let signal = match phase {
+        KillPhase::Term => Signal::TERM,
+        KillPhase::Kill => Signal::KILL,
+    };
+    kill_process_group(group, signal).is_ok()
 }
 
 fn detect_backend() -> SandboxBackend {

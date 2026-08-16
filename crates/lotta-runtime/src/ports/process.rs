@@ -4,8 +4,11 @@ use crate::boundary::{
     ProcessStdin, Program,
 };
 use lotta_domain::RuntimeScope;
-use std::time::Duration;
-use tokio::sync::mpsc::Sender;
+use std::{future::Future, pin::Pin, time::Duration};
+use tokio::{
+    sync::mpsc::{Receiver, Sender},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 /// Complete validated request for one supervised process.
@@ -27,9 +30,12 @@ pub struct ProcessRequest {
     pub stdin: Option<ProcessStdin>,
     /// Maximum total output bytes, no greater than `PROCESS_OUTPUT_TOTAL_BYTES_MAX`.
     pub output_bytes_max: ProcessOutputBytesMax,
-    /// Maximum execution duration.
+    /// Maximum execution duration, or [`PROCESS_TIMEOUT_DISABLED`] for an owned persistent session.
     pub timeout: Duration,
 }
+
+/// Explicit sentinel disabling the process deadline for a manager-owned persistent session.
+pub const PROCESS_TIMEOUT_DISABLED: Duration = Duration::MAX;
 
 impl ProcessRequest {
     /// Constructs a process request after validating the caller-selected total output ceiling.
@@ -123,6 +129,108 @@ pub trait SandboxPort: Send + Sync {
         events: Sender<ProcessEvent>,
         cancellation: CancellationToken,
     ) -> PortFuture<'_, ProcessOutcome>;
+}
+
+/// Bounded input command for an interactive sandbox session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProcessInput {
+    /// Writes one bounded byte chunk to the live terminal.
+    Bytes(ProcessStdin),
+    /// Closes terminal input after all preceding writes.
+    Eof,
+}
+
+/// Owned components returned when a live sandbox session is transferred.
+pub type ProcessSessionParts = (
+    Sender<ProcessInput>,
+    Receiver<ProcessEvent>,
+    CancellationToken,
+    JoinHandle<Result<ProcessOutcome, crate::RuntimeError>>,
+);
+
+/// Owned live sandbox session. Dropping it cancels the process tree.
+pub struct ProcessSession {
+    /// Bounded terminal-input sender.
+    input: Option<Sender<ProcessInput>>,
+    /// Bounded ordered process events.
+    events: Option<Receiver<ProcessEvent>>,
+    /// Explicit process-tree cancellation.
+    cancellation: Option<CancellationToken>,
+    /// Owned terminal task that resolves only after cleanup and reaping.
+    terminal: Option<JoinHandle<Result<ProcessOutcome, crate::RuntimeError>>>,
+    /// Whether ownership has been transferred to the caller.
+    transferred: bool,
+}
+
+impl ProcessSession {
+    /// Constructs an owned session from bounded channels and its terminal task.
+    #[must_use]
+    pub fn new(
+        input: Sender<ProcessInput>,
+        events: Receiver<ProcessEvent>,
+        cancellation: CancellationToken,
+        terminal: JoinHandle<Result<ProcessOutcome, crate::RuntimeError>>,
+    ) -> Self {
+        Self {
+            input: Some(input),
+            events: Some(events),
+            cancellation: Some(cancellation),
+            terminal: Some(terminal),
+            transferred: false,
+        }
+    }
+
+    /// Splits this owned handle into bounded I/O, cancellation, and terminal ownership.
+    ///
+    /// # Errors
+    /// Returns the still-live session if its ownership was already internally transferred.
+    pub fn into_parts(mut self) -> Result<ProcessSessionParts, Self> {
+        let Some(input) = self.input.take() else {
+            return Err(self);
+        };
+        let Some(events) = self.events.take() else {
+            self.input = Some(input);
+            return Err(self);
+        };
+        let Some(cancellation) = self.cancellation.take() else {
+            self.input = Some(input);
+            self.events = Some(events);
+            return Err(self);
+        };
+        let Some(terminal) = self.terminal.take() else {
+            self.input = Some(input);
+            self.events = Some(events);
+            self.cancellation = Some(cancellation);
+            return Err(self);
+        };
+        self.transferred = true;
+        Ok((input, events, cancellation, terminal))
+    }
+}
+
+impl Drop for ProcessSession {
+    fn drop(&mut self) {
+        if !self.transferred
+            && self.terminal.is_some()
+            && let Some(cancellation) = &self.cancellation
+        {
+            cancellation.cancel();
+        }
+    }
+}
+
+/// Future returned while an interactive sandbox session is being created.
+pub type ProcessSessionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ProcessSession, crate::RuntimeError>> + Send + 'a>>;
+
+/// Starts interactive sandbox sessions through the same policy and renderer as one-shot execution.
+pub trait InteractiveSandboxPort: Send + Sync {
+    /// Starts one real PTY-backed session with bounded input and events.
+    fn start_session(
+        &self,
+        request: ProcessRequest,
+        cancellation: CancellationToken,
+    ) -> ProcessSessionFuture<'_>;
 }
 
 #[cfg(test)]
