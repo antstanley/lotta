@@ -53,6 +53,7 @@ publish = false
 [workspace.dependencies]
 axum = { version = "0.8.4", features = ["ws"] }
 cap-std = "4.0.2"
+cap-fs-ext = "4.0.2"
 base64 = "0.22.1"
 chrono = { version = "0.4.41", default-features = false, features = ["clock", "serde", "std"] }
 hmac = "0.12.1"

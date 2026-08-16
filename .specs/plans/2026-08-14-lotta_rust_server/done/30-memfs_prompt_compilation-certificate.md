@@ -1,7 +1,7 @@
 # Done Certificate — Task 30: System prompt compilation and cache reuse
 
 **Task:** [30-memfs_prompt_compilation.md](30-memfs_prompt_compilation.md) · **Plan:** [plan.md](../plan.md)
-**State:** Authored 2026-08-14 — unverified
+**State:** Verified 2026-08-15 — done
 
 > Verification protocol for Task 30. A validating agent discharges it: collect each
 > obligation's evidence, run its checks, set the Status, then derive the Conclusion by the
@@ -25,38 +25,50 @@ obligation names (a file location, a named test result, or an execution trace) �
   - *Claim:* Serializing the compiled record yields exactly `content`, `coreMemory`, `compiledAt`, `rawSystemHash`, and optionally `midConversationSystemPrompt` and `memfsRevision`.
   - *Evidence to collect:* Run `cargo nextest run -p lotta-memfs -E 'test(prompt::record_shape)'` — expect PASS; the test asserts the key set is exactly the allowed set, so an added field fails. Compare against the `fixtures/persistence/` prompt fixture.
   - *Checks:* Resolve what the record does not persist — confirm model/toolset inputs and a rendered-content hash are absent; §Prompt compilation states they are not persisted.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED
 
 - **O2 — Cache reuse compares only `rawSystemHash` and `memfsRevision`; an unchanged pair skips recompilation and a changed one forces it**
   - *Claim:* Two compilations with an unchanged hash and revision perform one render; changing either forces a second render.
   - *Evidence to collect:* Run `cargo nextest run -p lotta-memfs -E 'test(prompt::cache)'` — expect `unchanged_pair_reuses`, `changed_hash_recompiles`, and `changed_revision_recompiles` to pass, each asserting the render-call count via a counter.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED
 
 - **O3 — An uncommitted memory working tree is visible to tools but does not become authoritative prompt memory until committed**
   - *Claim:* Writing a memory file without committing leaves the compiled prompt unchanged while the file is readable through the memfs port.
   - *Evidence to collect:* Run `cargo nextest run -p lotta-memfs -E 'test(prompt::uncommitted_not_authoritative)'` — expect PASS; the test asserts the read succeeds and the compiled `content` is unchanged.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED
 
 - **O4 — A committed memory update is injected mid-conversation where the provider supports system messages, and otherwise applies at the next provider request boundary**
   - *Claim:* Both paths are exercised and produce the documented behavior.
   - *Evidence to collect:* Run `cargo nextest run -p lotta-memfs -E 'test(prompt::mid_conversation_injection)'` — expect a supporting-provider case producing `midConversationSystemPrompt` and a non-supporting case deferring to the next request.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED
 
 - **O5 — Meets the repo definition of done (tests, lint/format, named-constant limits — see plan.md baseline)**
   - *Claim:* The repo-wide gates named in the plan's definition-of-done baseline pass for this change.
   - *Evidence to collect:* Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo nextest run --workspace --all-features`, and `cargo deny check` — expect exit code 0 from each. Read every constant this task introduces and confirm it is a `const` whose name puts units last (`development-guidelines.md` §Naming), and that each function the task added stays within 70 lines and 100 columns.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED
 
 - **O6 — Reviewable: a reviewer runs `cargo nextest run -p lotta-memfs -E 'test(prompt::)'` and sees the exact six-field record, cache reuse on both keys, uncommitted-not-authoritative, and both mid-conversation paths pass**
   - *Claim:* The prompt module passes against the fixture.
   - *Evidence to collect:* Run the filter and confirm zero failures and that `record_shape` compared against `fixtures/persistence/`.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED
+
+## Verification record
+
+- `cargo nextest run -p lotta-memfs -E 'test(prompt::record_shape)'`: 1/1.
+- `cargo nextest run -p lotta-memfs -E 'test(prompt::cache)'`: 11/11.
+- `cargo nextest run -p lotta-memfs -E 'test(prompt::uncommitted_not_authoritative)'`: 1/1.
+- `cargo nextest run -p lotta-memfs -E 'test(prompt::mid_conversation_injection)'`: 1/1.
+- `cargo nextest run -p lotta-memfs -E 'test(prompt::)'`: 35/35 twice.
+- Full `lotta-memfs`: 72/72 twice; Task 29 `ops::` 20/20 and `repo::` 9/9.
+- Git-backed, testkit, and fake MemFS contracts: 3/3.
+- `cargo nextest run --workspace --all-features`: 898/898.
+- `cargo fmt --all --check`, strict workspace Clippy, strict private Rustdoc, and `cargo deny check`: pass.
 
 ## Regression check
 
 For each unit this task changes, the validator traces one downstream caller:
 
-- `crates/lotta-memfs/src/repo.rs` (Task 29) supplies the committed revision; confirm `ops::` still passes with the compiler reading revisions : ☐ (PRESERVED / REGRESSION)
+- `crates/lotta-memfs/src/repo.rs` (Task 29) supplies the committed revision; confirm `ops::` still passes with the compiler reading revisions : ☒ PRESERVED
 
 ## Residue
 
@@ -71,6 +83,6 @@ check found a REGRESSION; **PARTIAL** if every obligation is SATISFIED except on
 more UNVERIFIED and no regression; **DONE** only if every obligation is SATISFIED and
 the regression check is PRESERVED.
 
-VERDICT: ☐ (DONE | PARTIAL | NOT_DONE)
-CONFIDENCE: ☐ (high | medium | low)
-SUMMARY: ☐
+VERDICT: ☒ DONE
+CONFIDENCE: ☒ high
+SUMMARY: All six obligations and the Task 29 regression are satisfied. Exact evidence: record 1/1; cache 11/11; uncommitted authority 1/1; mid-conversation paths 1/1; broad prompt 35/35 twice; full MemFS 72/72 twice; Task 29 operations 20/20 and repository 9/9; Git/testkit/fake contracts 3/3; workspace nextest 898/898; fmt, strict workspace Clippy, strict private Rustdoc, and cargo deny pass.

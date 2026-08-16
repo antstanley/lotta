@@ -16,9 +16,9 @@ use tokio_util::sync::CancellationToken;
 
 static TEST_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-struct TestRoot(PathBuf);
+pub(crate) struct TestRoot(pub(crate) PathBuf);
 impl TestRoot {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -41,19 +41,19 @@ impl Drop for TestRoot {
 fn agent() -> AgentId {
     AgentId::accept("agent-local-test").expect("agent")
 }
-fn empty() -> InitialMemoryBlocks {
+pub(crate) fn empty() -> InitialMemoryBlocks {
     InitialMemoryBlocks::new(Vec::new()).expect("blocks")
 }
-fn path(value: &str) -> RepositoryPath {
+pub(crate) fn path(value: &str) -> RepositoryPath {
     RepositoryPath::new(value.into()).expect("path")
 }
-fn content(value: &str) -> MemoryFileContent {
+pub(crate) fn content(value: &str) -> MemoryFileContent {
     MemoryFileContent::new(value.as_bytes().to_vec()).expect("content")
 }
-fn valid(value: &str) -> MemoryFileContent {
+pub(crate) fn valid(value: &str) -> MemoryFileContent {
     content(&format!("---\ndescription: test\n---\n{value}"))
 }
-fn message(value: &str) -> CommitMessage {
+pub(crate) fn message(value: &str) -> CommitMessage {
     CommitMessage::new(value.into()).expect("message")
 }
 fn fixture() -> (TestRoot, GitMemFs, AgentId) {

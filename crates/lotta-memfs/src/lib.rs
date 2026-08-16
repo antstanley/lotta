@@ -10,6 +10,8 @@ mod fs;
 mod git;
 mod labels;
 mod ops;
+/// Committed-memory system prompt compilation and cache delivery.
+pub mod prompt;
 mod repo;
 mod validation;
 mod worktree;
@@ -17,6 +19,10 @@ mod worktree;
 pub use labels::{normalize_label, render_block};
 pub use lotta_runtime::bounds::{MEMORY_FILE_BYTES_MAX, MEMORY_FILES_MAX};
 pub use ops::GitMemFs;
+pub use prompt::{
+    CacheDelivery, CacheRoot, CompiledPromptRecord, DeliveryCapability, PromptCompiler,
+    PromptInputs, PromptSections, PromptSkill, PromptText,
+};
 
 #[cfg(test)]
 mod tests;

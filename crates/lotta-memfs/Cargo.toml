@@ -7,11 +7,15 @@ publish.workspace = true
 
 [dependencies]
 cap-std.workspace = true
+cap-fs-ext.workspace = true
+chrono.workspace = true
 lotta-domain = { version = "0.1.0", path = "../lotta-domain" }
 lotta-runtime = { version = "0.1.0", path = "../lotta-runtime" }
 tokio.workspace = true
 tokio-util.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 lotta-testkit = { version = "0.1.0", path = "../lotta-testkit" }
