@@ -1,0 +1,36 @@
+{
+  "source_commit":
+      "300f923f16cc8eee50656d7da732902c1dea2b65",
+  "sources": {
+    "src/backend/local/local-store.ts":
+      "b36e7b369a36519a1edbe320150f7da25bad3badaf39bd04ce81ac8f1c837f17",
+    "src/backend/local/local-backend.ts":
+      "50e6b7dd41a0f668c95ca099c30a2d3dd1dcd3b12ae977350cbfbc3e55152da9",
+    "src/backend/local/transcript-migration.ts":
+      "95c451b91f8e0fa6c0d16e886b600225329e8b4331a5d0c9ab768619cda2a3cf",
+    "src/backend/local/local-provider-auth-store.ts":
+      "e36529a2d5e877f958063ca9e25ad973013be27329fcf70de2e04a191d39a542",
+    "src/cron/cron-file.ts":
+      "af6510fe3e38664d1cb1fc5e81c6fe8c90e6fbbb54f729af11b6a9b4f7095023",
+    "src/cron/run-log.ts":
+      "6111d8f91264f6f4b0c17b9d3ae2c33944cbf81a188694ae04cd24507d3a30d8",
+    "src/settings-manager.ts":
+      "1c736bf5901fecd40da0bcbc2c378dc9794a5124b47c3ef2386394d485c2495d",
+    "src/channels/config.ts":
+      "33df6a47d34bee4c9cc642d1e58e78d38633ed3e29d35dae5e7dd0411daaa6b6",
+    "src/channels/accounts.ts":
+      "09f82b48c3d6975651fe7447f593ebd23abbbe461b96c238e75dc069096e2be2",
+    "src/channels/routing.ts":
+      "fd43563c36e9a5286d802257c103cc82a2f851c0de57a7ec092297a7055af402",
+    "src/channels/pairing.ts":
+      "edaba564f316bf6f896166938dca0c3905188a4d04714807591922a5d4a78969",
+    "src/channels/targets.ts":
+      "3e0b4ea1111f014f31b75fbad9c4c9f22a360f17000618ac4b3724dd526d7f55",
+    "src/channels/pending-control-requests.ts":
+      "08195bfe4389774029f74a62d85205347b8296423579dafa435956ef416fbe38",
+    "bun.lock":
+      "0a8cad33168b97cfd08958d29b853f683eff9a36f42d1709e761990a74adc26e",
+    "package.json":
+      "9bd4323b8b055c07fbfdf6755b3454e013abdbadd6049f2bc1209be228f76b00"
+  }
+}

@@ -6,6 +6,9 @@ yanked = "deny"
 version = 2
 confidence-threshold = 0.8
 allow = ["Apache-2.0", "BSD-3-Clause", "MIT", "Unicode-3.0"]
+exceptions = [
+    { allow = ["Apache-2.0 WITH LLVM-exception"], crate = "winx@0.36.4" },
+]
 
 [bans]
 multiple-versions = "deny"
@@ -13,6 +16,18 @@ wildcards = "deny"
 highlight = "all"
 skip = [
     { crate = "syn@2.0.119", reason = "Source audit uses Syn 2; Tokio macros use Syn 3" },
+    { crate = "io-lifetimes@2.0.4", reason = "cap-primitives 4.0.2 transitive" },
+    { crate = "windows-sys@0.59.0", reason = "cap-primitives 4.0.2 transitive" },
+    { crate = "windows-sys@0.60.2", reason = "cap-primitives 4.0.2 transitive" },
+    { crate = "windows-targets@0.52.6", reason = "cap-primitives 4.0.2 transitive" },
+    { crate = "windows_aarch64_gnullvm@0.52.6", reason = "cap-primitives 4.0.2 transitive" },
+    { crate = "windows_aarch64_msvc@0.52.6", reason = "cap-primitives 4.0.2 transitive" },
+    { crate = "windows_i686_gnu@0.52.6", reason = "cap-primitives 4.0.2 transitive" },
+    { crate = "windows_i686_gnullvm@0.52.6", reason = "cap-primitives 4.0.2 transitive" },
+    { crate = "windows_i686_msvc@0.52.6", reason = "cap-primitives 4.0.2 transitive" },
+    { crate = "windows_x86_64_gnu@0.52.6", reason = "cap-primitives 4.0.2 transitive" },
+    { crate = "windows_x86_64_gnullvm@0.52.6", reason = "cap-primitives 4.0.2 transitive" },
+    { crate = "windows_x86_64_msvc@0.52.6", reason = "cap-primitives 4.0.2 transitive" },
 ]
 
 [sources]

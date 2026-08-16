@@ -832,6 +832,7 @@ dependencies = [
  "chrono",
  "lotta-app-server",
  "lotta-domain",
+ "lotta-memfs",
  "lotta-runtime",
  "lotta-store",
  "lotta-testkit",

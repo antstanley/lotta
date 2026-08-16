@@ -16,6 +16,7 @@ thiserror.workspace = true
 [dev-dependencies]
 lotta-runtime = { version = "0.1.0", path = "crates/lotta-runtime" }
 lotta-testkit = { version = "0.1.0", path = "crates/lotta-testkit" }
+lotta-memfs = { version = "0.1.0", path = "crates/lotta-memfs" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -25,6 +26,10 @@ uuid.workspace = true
 [[test]]
 name = "slice"
 path = "tests/slice/main.rs"
+
+[[test]]
+name = "cross_runtime"
+path = "tests/conformance/cross_runtime.rs"
 
 [workspace]
 resolver = "3"
