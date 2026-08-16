@@ -124,6 +124,9 @@ async fn execute(tool: &crate::registry::RegisteredTool, value: serde_json::Valu
     let outcome = tool
         .executor
         .execute(RawToolExecutionRequest {
+            tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
+                lotta_runtime::boundary::ProviderName::new("raw-call".to_owned()).unwrap(),
+            ),
             input,
             cancellation: CancellationToken::new(),
             deadline: tool.definition.timeout,

@@ -330,6 +330,9 @@ mod workspace {
             let gate = WorkspaceSandboxGate::new(&fixture.policy, &fixture.own);
             let sink = RecordingSink::default();
             let outcome = execute(PipelineRequest {
+        tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
+            lotta_runtime::boundary::ProviderName::new("pipeline-call".to_owned()).unwrap(),
+        ),
                 registry: registry.snapshot().unwrap(),
                 model_name: "Read",
                 input: BoundedJsonValue::new(
@@ -496,6 +499,9 @@ mod outcome_kind {
         let persistence = RecordingSink::default();
         let emit = RecordingSink::default();
         let outcome = execute(PipelineRequest {
+        tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
+            lotta_runtime::boundary::ProviderName::new("pipeline-call".to_owned()).unwrap(),
+        ),
             registry: registry.snapshot().unwrap(),
             model_name: "Read",
             input: BoundedJsonValue::new(serde_json::json!({"file_path":"/outside"})).unwrap(),
@@ -551,6 +557,9 @@ mod outcome_kind {
         let counters = Counters::default();
         let sink = RecordingSink::default();
         let result = execute(PipelineRequest {
+        tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
+            lotta_runtime::boundary::ProviderName::new("pipeline-call".to_owned()).unwrap(),
+        ),
             registry: registry.snapshot().unwrap(),
             model_name: "Read",
             input: valid_input(),
@@ -578,6 +587,9 @@ mod outcome_kind {
         let counters = Counters::default();
         let sink = RecordingSink::default();
         let result = execute(PipelineRequest {
+        tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
+            lotta_runtime::boundary::ProviderName::new("pipeline-call".to_owned()).unwrap(),
+        ),
             registry: registry.snapshot().unwrap(),
             model_name: "Read",
             input: valid_input(),

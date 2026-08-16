@@ -197,6 +197,9 @@ async fn run_with_snapshot(
     let emit = Sink(Arc::clone(&state), "emit");
     let secrets = Secrets(Arc::clone(&state));
     execute(PipelineRequest {
+        tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
+            lotta_runtime::boundary::ProviderName::new("pipeline-call".to_owned()).unwrap(),
+        ),
         registry: snapshot,
         model_name: "Read",
         input: input(value),
@@ -700,6 +703,9 @@ async fn sandbox_stage_follows_permission_for_effect_recheck_ownership() {
     let secrets = Secrets(Arc::clone(&state));
     let registry = registry(Arc::clone(&state), Action::Success("x".into()));
     execute(PipelineRequest {
+        tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
+            lotta_runtime::boundary::ProviderName::new("pipeline-call".to_owned()).unwrap(),
+        ),
         registry: registry.snapshot().unwrap(),
         model_name: "Read",
         input: input(serde_json::json!({"command":"valid"})),
@@ -754,6 +760,9 @@ async fn permission_deny_and_ask_stop_later_effects() {
         let registry = registry(Arc::clone(&state), Action::Success("x".into()));
         let gate = FixedPermissions(decision);
         let error = execute(PipelineRequest {
+            tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
+                lotta_runtime::boundary::ProviderName::new("pipeline-call".to_owned()).unwrap(),
+            ),
             registry: registry.snapshot().unwrap(),
             model_name: "Read",
             input: input(serde_json::json!({"command":"valid"})),

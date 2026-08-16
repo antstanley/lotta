@@ -55,6 +55,10 @@ pub enum RegistryError {
     Allocation,
     /// A resolved model name failed runtime bounds.
     InvalidModelName,
+    /// The expected publication revision was stale.
+    RevisionMismatch,
+    /// The publication revision cannot advance.
+    RevisionExhausted,
 }
 
 impl fmt::Display for RegistryError {
@@ -103,7 +107,12 @@ impl RegistrySnapshot {
 /// Registry whose readers acquire one immutable snapshot atomically.
 pub struct ToolRegistry {
     builtins: BTreeMap<String, ToolRegistration>,
-    current: RwLock<Arc<RegistrySnapshot>>,
+    current: RwLock<PublishedSnapshot>,
+}
+
+struct PublishedSnapshot {
+    revision: u64,
+    snapshot: Arc<RegistrySnapshot>,
 }
 
 impl ToolRegistry {
@@ -126,7 +135,10 @@ impl ToolRegistry {
         }
         Ok(Self {
             builtins: indexed,
-            current: RwLock::new(Arc::new(empty_snapshot())),
+            current: RwLock::new(PublishedSnapshot {
+                revision: 0,
+                snapshot: Arc::new(empty_snapshot()),
+            }),
         })
     }
 
@@ -137,7 +149,7 @@ impl ToolRegistry {
     pub fn snapshot(&self) -> Result<Arc<RegistrySnapshot>, RegistryError> {
         self.current
             .read()
-            .map(|value| Arc::clone(&value))
+            .map(|value| Arc::clone(&value.snapshot))
             .map_err(|_| RegistryError::Poisoned)
     }
 
@@ -152,9 +164,68 @@ impl ToolRegistry {
         external: &[ToolRegistration],
         allowlist: Option<&[&str]>,
     ) -> Result<Arc<RegistrySnapshot>, RegistryError> {
-        let candidate = Arc::new(self.build(toolset, external, allowlist)?);
+        let candidate = self.compose(toolset, external, allowlist)?;
         let mut guard = self.current.write().map_err(|_| RegistryError::Poisoned)?;
-        *guard = Arc::clone(&candidate);
+        let next = guard
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::RevisionExhausted)?;
+        guard.revision = next;
+        guard.snapshot = Arc::clone(&candidate);
+        Ok(candidate)
+    }
+
+    /// Builds an immutable candidate without publishing or changing registry revision.
+    ///
+    /// # Errors
+    /// Returns the same bounded construction failures as [`Self::update`].
+    pub fn compose(
+        &self,
+        toolset: ToolsetId,
+        external: &[ToolRegistration],
+        allowlist: Option<&[&str]>,
+    ) -> Result<Arc<RegistrySnapshot>, RegistryError> {
+        Ok(Arc::new(self.build(toolset, external, allowlist)?))
+    }
+
+    /// Returns the current optimistic publication revision.
+    ///
+    /// # Errors
+    /// Returns [`RegistryError::Poisoned`] when synchronization was poisoned.
+    pub fn revision(&self) -> Result<u64, RegistryError> {
+        self.current
+            .read()
+            .map(|value| value.revision)
+            .map_err(|_| RegistryError::Poisoned)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_revision_for_test(&self, revision: u64) {
+        self.current.write().unwrap().revision = revision;
+    }
+
+    /// Publishes a complete candidate only when `expected_revision` is still current.
+    ///
+    /// # Errors
+    /// Returns candidate validation failures, stale revision, exhaustion, or poisoned synchronization.
+    pub fn publish(
+        &self,
+        expected_revision: u64,
+        toolset: ToolsetId,
+        external: &[ToolRegistration],
+        allowlist: Option<&[&str]>,
+    ) -> Result<Arc<RegistrySnapshot>, RegistryError> {
+        let candidate = self.compose(toolset, external, allowlist)?;
+        let mut guard = self.current.write().map_err(|_| RegistryError::Poisoned)?;
+        if guard.revision != expected_revision {
+            return Err(RegistryError::RevisionMismatch);
+        }
+        let next = guard
+            .revision
+            .checked_add(1)
+            .ok_or(RegistryError::RevisionExhausted)?;
+        guard.revision = next;
+        guard.snapshot = Arc::clone(&candidate);
         Ok(candidate)
     }
 

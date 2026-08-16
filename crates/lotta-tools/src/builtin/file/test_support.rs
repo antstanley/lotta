@@ -146,6 +146,9 @@ pub(super) async fn run_with_gate(
     };
     let records = Arc::new(Records::default());
     let result = execute(PipelineRequest {
+        tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
+            lotta_runtime::boundary::ProviderName::new("pipeline-call".to_owned()).unwrap(),
+        ),
         registry: snapshot,
         model_name: model,
         input: BoundedJsonValue::new(input).unwrap(),

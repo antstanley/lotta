@@ -9,6 +9,7 @@
 pub mod allowlist;
 pub mod builtin;
 pub mod clamp;
+pub mod external;
 pub mod limits;
 pub mod names;
 pub mod permissions;

@@ -196,6 +196,9 @@ async fn invoke(bundle: &WorktreeToolBundle, name: &str, input: serde_json::Valu
         .update(crate::toolset::ToolsetId::None, &[registration], None)
         .expect("snapshot");
     crate::execute(PipelineRequest {
+        tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
+            lotta_runtime::boundary::ProviderName::new("pipeline-call".to_owned()).unwrap(),
+        ),
         registry: snapshot,
         model_name: name,
         input: BoundedJsonValue::new(input).expect("input"),

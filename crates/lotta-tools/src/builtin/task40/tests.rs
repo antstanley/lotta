@@ -163,6 +163,9 @@ async fn execute_any(
 ) -> RawToolOutcome {
     tool.executor
         .execute(RawToolExecutionRequest {
+            tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
+                lotta_runtime::boundary::ProviderName::new("raw-call".to_owned()).unwrap(),
+            ),
             input: ValidatedToolInput::new(BoundedJsonValue::new(input).unwrap()).unwrap(),
             cancellation: CancellationToken::new(),
             deadline: tool.definition.timeout,
