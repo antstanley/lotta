@@ -5,6 +5,7 @@
 use crate::{
     clamp::{ClampError, OverflowWriter, clamp_text},
     limits,
+    permissions::{PermissionDecision, PermissionGate, PermissionInvocation},
     registry::RegistrySnapshot,
     scrub::{ScrubError, scrub_text},
 };
@@ -304,6 +305,10 @@ pub enum PipelineError {
     SchemaValidation,
     /// Hook or mod failed with bounded attribution.
     Owner(OwnerFailure),
+    /// Permission policy denied the invocation or rejected unsafe input.
+    PermissionDenied,
+    /// Permission policy requires interactive approval.
+    ApprovalRequired,
     /// Secret bounds or resolution failed.
     SecretDelivery,
     /// Raw result exceeded definition/global byte limits.
@@ -334,6 +339,8 @@ pub struct PipelineRequest<'a> {
     pub cancellation: CancellationToken,
     /// Hook seam.
     pub hooks: &'a dyn PipelineHooks,
+    /// Permission gate.
+    pub permissions: &'a dyn PermissionGate,
     /// Secret resolver.
     pub secrets: &'a dyn SecretResolver,
     /// Enum-only trace sink.
@@ -357,6 +364,7 @@ pub async fn execute(request: PipelineRequest<'_>) -> Result<ToolOutcome, Pipeli
         input,
         cancellation,
         hooks,
+        permissions,
         secrets,
         trace,
         overflow,
@@ -368,6 +376,7 @@ pub async fn execute(request: PipelineRequest<'_>) -> Result<ToolOutcome, Pipeli
         model_name,
         cancellation,
         hooks,
+        permissions,
         secrets,
         trace,
         overflow,
@@ -384,6 +393,7 @@ struct PipelineServices<'a> {
     model_name: &'a str,
     cancellation: CancellationToken,
     hooks: &'a dyn PipelineHooks,
+    permissions: &'a dyn PermissionGate,
     secrets: &'a dyn SecretResolver,
     trace: &'a dyn TraceSink,
     overflow: &'a dyn OverflowWriter,
@@ -425,7 +435,18 @@ async fn execute_stages(
     request
         .trace
         .record(TraceEvent::Stage(PipelineStage::Permission));
-    permission_allow();
+    match request
+        .permissions
+        .check(PermissionInvocation::from_definition(
+            &tool.definition,
+            &input,
+        ))
+        .map_err(|_| PipelineError::PermissionDenied)?
+    {
+        PermissionDecision::Allow => {}
+        PermissionDecision::Deny => return Err(PipelineError::PermissionDenied),
+        PermissionDecision::Ask => return Err(PipelineError::ApprovalRequired),
+    }
     request
         .trace
         .record(TraceEvent::Stage(PipelineStage::Sandbox));
@@ -531,7 +552,6 @@ fn admit_raw(
     Ok(raw)
 }
 
-fn permission_allow() {}
 fn sandbox_allow() {}
 
 fn resolve_secrets(

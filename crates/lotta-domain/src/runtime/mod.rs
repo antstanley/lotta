@@ -101,7 +101,7 @@ pub struct RuntimeConnection {
 }
 
 /// Runtime permission mode projected to clients.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum PermissionMode {
     /// Normal approval policy.
     #[serde(rename = "standard")]
@@ -110,6 +110,7 @@ pub enum PermissionMode {
     #[serde(rename = "acceptEdits")]
     AcceptEdits,
     /// Bypass normal permission checks.
+    #[default]
     #[serde(rename = "unrestricted")]
     Unrestricted,
     /// Strict permission policy.

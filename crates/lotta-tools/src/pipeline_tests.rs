@@ -76,6 +76,16 @@ impl SecretResolver for Secrets {
         })
     }
 }
+struct FixedPermissions(PermissionDecision);
+impl crate::permissions::PermissionGate for FixedPermissions {
+    fn check(
+        &self,
+        _: crate::permissions::PermissionInvocation<'_>,
+    ) -> Result<PermissionDecision, crate::permissions::matcher::PermissionError> {
+        Ok(self.0)
+    }
+}
+
 struct Overflow(Arc<Mutex<Option<String>>>);
 impl crate::clamp::OverflowWriter for Overflow {
     fn write(&self, _: &str, content: &str) -> Result<String, crate::clamp::ClampError> {
@@ -192,6 +202,7 @@ async fn run_with_snapshot(
         input: input(value),
         cancellation: CancellationToken::new(),
         hooks,
+        permissions: &crate::permissions::AllowAllPermissions,
         secrets: &secrets,
         trace: &trace,
         overflow,
@@ -674,6 +685,84 @@ async fn invalid_inputs_and_executor_failures_stop_effects() {
         .unwrap_err();
         assert_eq!(error, expected);
         assert_executor_failure(&state.lock().unwrap(), &error);
+    }
+}
+
+#[tokio::test]
+async fn sandbox_stage_follows_permission_for_effect_recheck_ownership() {
+    let state = Arc::new(Mutex::new(State::default()));
+    let hooks = Hooks(Arc::clone(&state), None, None);
+    let overflow = Overflow(Arc::new(Mutex::new(None)));
+    let trace = Trace(Arc::clone(&state));
+    let persistence = Sink(Arc::clone(&state), "persist");
+    let emit = Sink(Arc::clone(&state), "emit");
+    let secrets = Secrets(Arc::clone(&state));
+    let registry = registry(Arc::clone(&state), Action::Success("x".into()));
+    execute(PipelineRequest {
+        registry: registry.snapshot().unwrap(),
+        model_name: "Read",
+        input: input(serde_json::json!({"command":"valid"})),
+        cancellation: CancellationToken::new(),
+        hooks: &hooks,
+        permissions: &FixedPermissions(PermissionDecision::Allow),
+        secrets: &secrets,
+        trace: &trace,
+        overflow: &overflow,
+        persistence: &persistence,
+        emit: &emit,
+    })
+    .await
+    .unwrap();
+    let trace = &state.lock().unwrap().trace;
+    let permission = trace
+        .iter()
+        .position(|event| event == &TraceEvent::Stage(PipelineStage::Permission))
+        .unwrap();
+    let sandbox = trace
+        .iter()
+        .position(|event| event == &TraceEvent::Stage(PipelineStage::Sandbox))
+        .unwrap();
+    assert_eq!(sandbox, permission + 1);
+}
+
+#[tokio::test]
+async fn permission_deny_and_ask_stop_later_effects() {
+    for (decision, expected) in [
+        (PermissionDecision::Deny, PipelineError::PermissionDenied),
+        (PermissionDecision::Ask, PipelineError::ApprovalRequired),
+    ] {
+        let state = Arc::new(Mutex::new(State::default()));
+        let hooks = Hooks(Arc::clone(&state), None, None);
+        let overflow = Overflow(Arc::new(Mutex::new(None)));
+        let trace = Trace(Arc::clone(&state));
+        let persistence = Sink(Arc::clone(&state), "persist");
+        let emit = Sink(Arc::clone(&state), "emit");
+        let secrets = Secrets(Arc::clone(&state));
+        let registry = registry(Arc::clone(&state), Action::Success("x".into()));
+        let gate = FixedPermissions(decision);
+        let error = execute(PipelineRequest {
+            registry: registry.snapshot().unwrap(),
+            model_name: "Read",
+            input: input(serde_json::json!({"command":"valid"})),
+            cancellation: CancellationToken::new(),
+            hooks: &hooks,
+            permissions: &gate,
+            secrets: &secrets,
+            trace: &trace,
+            overflow: &overflow,
+            persistence: &persistence,
+            emit: &emit,
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error, expected);
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.trace.last(),
+            Some(&TraceEvent::Stage(PipelineStage::Permission))
+        );
+        assert_eq!(state.executed, 0);
+        assert!(state.effects.is_empty() && state.posts.is_empty() && state.resolved.is_empty());
     }
 }
 

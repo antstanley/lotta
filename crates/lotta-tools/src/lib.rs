@@ -12,6 +12,7 @@ pub mod allowlist;
 pub mod clamp;
 pub mod limits;
 pub mod names;
+pub mod permissions;
 pub mod pipeline;
 pub mod registry;
 pub mod scrub;
@@ -19,6 +20,10 @@ pub mod toolset;
 
 pub use allowlist::ToolAllowlist;
 pub use names::{ToolNameRow, internal_name, model_name, rows};
+pub use permissions::{
+    AllowAllPermissions, PermissionDecision, PermissionGate, PermissionInvocation,
+    PermissionPolicy, PolicyGate,
+};
 pub use pipeline::{
     ExecutorError, ExtensionOwner, ExtensionOwnerKind, NoopHooks, OutcomeSink, OwnerFailure,
     OwnerId, PipelineError, PipelineHooks, PipelineRequest, PipelineStage, PostHookStatus,
