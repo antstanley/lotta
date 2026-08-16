@@ -7,3 +7,16 @@
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+
+pub mod allowlist;
+pub mod names;
+pub mod registry;
+pub mod toolset;
+
+pub use allowlist::ToolAllowlist;
+pub use names::{ToolNameRow, internal_name, model_name, rows};
+pub use registry::{
+    RegisteredTool, RegistryError, RegistrySnapshot, TOOLS_LOADED_MAX, ToolRegistration,
+    ToolRegistry,
+};
+pub use toolset::{ParseToolsetIdError, ToolsetId, ToolsetPreference};
