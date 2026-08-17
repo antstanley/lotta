@@ -21,3 +21,5 @@ pub mod mods;
 pub mod sidecar;
 /// Skill discovery, loading, selection, and script execution policy.
 pub mod skills;
+/// Pinned, bounded, and confined built-in subagents.
+pub mod subagents;
