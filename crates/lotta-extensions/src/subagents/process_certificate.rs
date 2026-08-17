@@ -18,7 +18,11 @@ fn pinned() -> Option<PinnedLettaCodeSpec> {
     (root.is_dir() && bun.is_file()).then_some(PinnedLettaCodeSpec {
         bun_executable: bun,
         source_root: root.clone(),
-        cwd: PathBuf::from("/Volumes/Delorean/code/five-letters/lotta-workspaces/task-46"),
+        cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
+            .to_path_buf(),
         environment: BTreeMap::from([
             (
                 "HOME".into(),

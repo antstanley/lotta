@@ -150,6 +150,44 @@ fn conversation() -> Conversation {
     }
 }
 
+pub(super) mod model_fields {
+    use super::*;
+
+    pub(crate) fn agent_nested_handle_and_settings_round_trip() {
+        let mut value = agent();
+        value.model = non_empty("openrouter/deepseek/deepseek-v4-pro");
+        value.model_settings = serde_json::from_value(json!({
+            "reasoningEffort": "high",
+            "vendor": {"nested": null},
+        }))
+        .unwrap_or_else(|error| panic!("settings: {error}"));
+        let encoded =
+            serde_json::to_value(&value).unwrap_or_else(|error| panic!("encode agent: {error}"));
+        assert_eq!(encoded["model"], "openrouter/deepseek/deepseek-v4-pro");
+        assert_eq!(encoded["model_settings"]["reasoningEffort"], "high");
+        let decoded: Agent =
+            serde_json::from_value(encoded).unwrap_or_else(|error| panic!("decode agent: {error}"));
+        assert_eq!(decoded, value);
+    }
+
+    pub(crate) fn conversation_nested_handle_and_settings_round_trip() {
+        let mut value = conversation();
+        let handle = "cloudflare-ai-gateway/workers-ai/@cf/meta/llama-3.3";
+        value.model = Some(Some(handle.into()));
+        value.model_settings = Some(
+            serde_json::from_value(json!({"vendor": {"raw": null}}))
+                .unwrap_or_else(|error| panic!("settings: {error}")),
+        );
+        let encoded = serde_json::to_value(&value)
+            .unwrap_or_else(|error| panic!("encode conversation: {error}"));
+        assert_eq!(encoded["model"], handle);
+        assert!(encoded["model_settings"]["vendor"]["raw"].is_null());
+        let decoded: Conversation = serde_json::from_value(encoded)
+            .unwrap_or_else(|error| panic!("decode conversation: {error}"));
+        assert_eq!(decoded, value);
+    }
+}
+
 fn schedule() -> Schedule {
     Schedule {
         id: non_empty("schedule-1"),

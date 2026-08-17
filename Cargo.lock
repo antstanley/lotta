@@ -953,6 +953,13 @@ dependencies = [
 [[package]]
 name = "lotta-providers"
 version = "0.1.0"
+dependencies = [
+ "lotta-domain",
+ "lotta-runtime",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "lotta-runtime"

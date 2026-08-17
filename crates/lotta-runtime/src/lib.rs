@@ -20,6 +20,8 @@ pub mod hooks;
 pub mod lease;
 /// Runtime lifecycle ownership and projections.
 pub mod lifecycle;
+/// Dependency-neutral model precedence selection.
+pub mod model;
 /// Effect interfaces implemented by adapters outside this crate.
 pub mod ports;
 /// Bounded per-conversation FIFO queue.

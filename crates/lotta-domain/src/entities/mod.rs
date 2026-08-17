@@ -54,3 +54,18 @@ mod schedule_tests;
 mod schema_conformance;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod model_fields {
+    use super::tests;
+
+    #[test]
+    fn agent_fields() {
+        tests::model_fields::agent_nested_handle_and_settings_round_trip();
+    }
+
+    #[test]
+    fn conversation_fields() {
+        tests::model_fields::conversation_nested_handle_and_settings_round_trip();
+    }
+}

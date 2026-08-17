@@ -1054,7 +1054,10 @@ fn sandbox_command(
     let mut readonly = vec![
         spec.bun_executable.clone(),
         spec.source_root.clone(),
-        adapter.to_path_buf(),
+        adapter
+            .parent()
+            .ok_or(SpawnError::Unavailable)?
+            .to_path_buf(),
     ];
     if let Some(home) = spec.environment.get("HOME") {
         readonly.push(canonicalize_existing_or_parent(Path::new(home))?);

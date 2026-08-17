@@ -155,7 +155,8 @@ bound!(
 pub(crate) const EXTRAS_FIELDS_MAX: usize = 128;
 pub(crate) const STRING_ITEMS_MAX: usize = 1_024;
 pub(crate) const UNBOUNDED_COLLECTION_ITEMS_MAX: usize = 4_096;
-pub(crate) const UNBOUNDED_MAP_FIELDS_MAX: usize = 1_024;
+/// Canonical maximum fields retained by open compatible entity maps.
+pub const UNBOUNDED_MAP_FIELDS_MAX: usize = 1_024;
 pub(crate) const JSON_DEPTH_MAX: usize = 64;
 pub(crate) const JSON_ITEMS_MAX: usize = 4_096;
 pub(crate) const JSON_PROPERTIES_MAX: usize = 1_024;
