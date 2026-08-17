@@ -14,7 +14,7 @@ const PI_AI_VERSION = "0.82.1";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const OUT = resolve(ROOT, "fixtures/providers");
 const LIMITS = Object.freeze({
-  files: 80,
+  files: 81,
   bytes: 1048576,
   totalBytes: 4194304,
   depth: 4,
@@ -615,10 +615,23 @@ function buildCorpus(regions) {
     put(files, paths[2], rawFor(dialect, name, errorKind));
     put(files, paths[3], `${baseline.map(JSON.stringify).join("\n")}\n`);
     put(files, paths[4], json(normalizeBaseline(baseline)));
+    const hostTracePath = root === "openai-compatible/happy-tool"
+      ? `${root}/expected-host-trace.json` : null;
+    if (hostTracePath) {
+      const hostTrace = normalizeBaseline(baseline).map((event) => event.type === "ProviderMetadata"
+        ? { ...event, entries: event.entries.filter((entry) => entry.key !== "system_fingerprint") }
+        : event);
+      put(files, hostTracePath, json(hostTrace));
+    }
     records.push({ id: root, dialect, name, paths, raw_format: rawFormat,
       dimensions, reasoning: name === "reasoning-redacted" ?
         { visible: true, redacted: true } : { visible: false, redacted: false },
-      terminal_kind: terminalKind, response: responseFor(dialect, name, errorKind) });
+      terminal_kind: terminalKind, response: responseFor(dialect, name, errorKind),
+      ...(hostTracePath ? {
+        host_expected_trace: hostTracePath,
+        host_trace_provenance:
+          "pi-ai 0.82.1 omits OpenAI system_fingerprint from its public events",
+      } : {}) });
   }
   const inventory = [...files].map(([path, bytes]) => ({ path,
     kind: path.endsWith(".jsonl") ? "jsonl" : path.endsWith(".json") ? "json" : "raw",
@@ -731,7 +744,7 @@ function selfTest() {
   let rejected = false; try { sanitize("fixture", unsafe); } catch { rejected = true; }
   if (!rejected) fail("sanitization self-test");
   const corpus = buildCorpus([{ path: "fixture", symbol: "fixture", sha256: sha("fixture") }]);
-  if (corpus.files.size !== CASES.length * 5) fail("corpus inventory self-test");
+  if (corpus.files.size !== CASES.length * 5 + 1) fail("corpus inventory self-test");
   if (TRANSPORT.length !== 16 || LOCAL.length !== 9) fail("transport inventory self-test");
   for (const record of corpus.index.cases) {
     if (record.name !== "image-strict" && record.response === null) {

@@ -8,7 +8,7 @@ use serde::{Deserialize, Deserializer};
 pub(super) const DIALECT_COUNT: usize = 5;
 pub(super) const DIMENSION_COUNT: usize = 10;
 pub(super) const CASE_COUNT: usize = 16;
-pub(super) const INVENTORY_COUNT: usize = 80;
+pub(super) const INVENTORY_COUNT: usize = 81;
 pub(super) const ERROR_KIND_COUNT: usize = 12;
 pub(super) const TRACE_EVENTS_MAX: usize = 64;
 pub(super) const REPLAY_CHANNEL_EVENTS_MAX: usize = 8;
@@ -237,6 +237,12 @@ pub struct ProviderCaseRecord {
     /// Explicit response status and headers for cases replayed over a real transport.
     #[serde(default)]
     pub response: Option<ResponseFixture>,
+    /// Optional independently specified pinned compatibility-host trace.
+    #[serde(default)]
+    pub host_expected_trace: Option<String>,
+    /// Why the host trace differs from the canonical native trace.
+    #[serde(default)]
+    pub host_trace_provenance: Option<String>,
 }
 /// One indexed corpus file.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -308,6 +314,8 @@ pub struct ProviderCase {
     pub baseline_event_count: usize,
     /// Real Task07 expected trace.
     pub expected_trace: BoundedVec<ProviderEvent, TRACE_EVENTS_MAX>,
+    /// Optional pinned compatibility-host trace for a documented pi-ai information loss.
+    pub host_expected_trace: Option<BoundedVec<ProviderEvent, TRACE_EVENTS_MAX>>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]

@@ -1,0 +1,56 @@
+[
+  {
+    "type": "TextDelta",
+    "text": "SANITIZED_FIXTURE_TEXT_é☃𝄞"
+  },
+  {
+    "type": "ToolCallStart",
+    "call_id": "fixture-call",
+    "name": "fixture_tool"
+  },
+  {
+    "type": "ToolCallArgumentsDelta",
+    "call_id": "fixture-call",
+    "bytes_base64": "eyJhIjo="
+  },
+  {
+    "type": "ToolCallArgumentsDelta",
+    "call_id": "fixture-call",
+    "bytes_base64": "MX0="
+  },
+  {
+    "type": "ToolCallEnd",
+    "call_id": "fixture-call"
+  },
+  {
+    "type": "ProviderMetadata",
+    "entries": [
+      {
+        "key": "id",
+        "value": "fixture-chat"
+      },
+      {
+        "key": "model",
+        "value": "fixture-model"
+      }
+    ]
+  },
+  {
+    "type": "Usage",
+    "input_tokens": 5,
+    "output_tokens": 2,
+    "cached_input_tokens": 0,
+    "reasoning_tokens": 0
+  },
+  {
+    "type": "Usage",
+    "input_tokens": 5,
+    "output_tokens": 4,
+    "cached_input_tokens": 0,
+    "reasoning_tokens": 0
+  },
+  {
+    "type": "Stop",
+    "reason": "tool_use"
+  }
+]

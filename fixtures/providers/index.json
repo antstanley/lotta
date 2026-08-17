@@ -178,7 +178,9 @@
             "value": "text/event-stream"
           }
         ]
-      }
+      },
+      "host_expected_trace": "openai-compatible/happy-tool/expected-host-trace.json",
+      "host_trace_provenance": "pi-ai 0.82.1 omits OpenAI system_fingerprint from its public events"
     },
     {
       "id": "anthropic/reasoning-redacted",
@@ -1080,6 +1082,12 @@
       "kind": "jsonl",
       "bytes": 2129,
       "sha256": "b9f7ecd60902b8fa3f357c093d7fa185c9754f781c7db8be306d0a7d9994a7d0"
+    },
+    {
+      "path": "openai-compatible/happy-tool/expected-host-trace.json",
+      "kind": "json",
+      "bytes": 987,
+      "sha256": "97de8fe7e6acf078ee02a612153618cce5988f6113254432a6b962aa6a148a85"
     },
     {
       "path": "openai-compatible/happy-tool/expected-request.json",

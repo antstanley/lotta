@@ -20,6 +20,7 @@ mod test_support;
 #[cfg(test)]
 mod validation_certificate;
 
+use lotta_runtime::bounds::PROVIDER_REQUEST_BYTES_MAX;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -135,7 +136,8 @@ impl SidecarFrameLimit {
     /// Constructs the provider-host profile.
     #[must_use]
     pub const fn provider_host() -> Self {
-        Self(PROVIDER_RESPONSE_EVENT_BYTES_MAX)
+        const PROVIDER_HOST_ENVELOPE_BYTES_MAX: usize = 4 * 1024 * 1024;
+        Self(PROVIDER_REQUEST_BYTES_MAX.value + PROVIDER_HOST_ENVELOPE_BYTES_MAX)
     }
     /// Constructs a caller-bounded generic profile for future sidecar adapters.
     ///

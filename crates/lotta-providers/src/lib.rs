@@ -9,6 +9,9 @@
 /// Stable model identity, settings, resolution, catalog, and update services.
 pub mod model;
 
+/// Pinned pi-ai compatibility provider host.
+pub mod host;
+
 /// Local endpoint adapters and native model discovery.
 pub mod local;
 

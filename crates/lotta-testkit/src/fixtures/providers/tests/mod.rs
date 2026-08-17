@@ -24,7 +24,7 @@ fn index_is_complete() {
             .list_tree("providers")
             .expect("tree")
             .len(),
-        81
+        INVENTORY_COUNT + 1
     );
     for dialect in Dialect::ALL {
         assert!(value.cases.iter().any(|case| case.dialect == dialect));
@@ -213,7 +213,7 @@ fn each_dialect_has_distinct_wire_semantics() {
 fn sanitization_scans_complete_tree() {
     let loader = FixtureLoader::new();
     let tree = loader.list_tree("providers").expect("tree");
-    assert_eq!(tree.len(), 81);
+    assert_eq!(tree.len(), INVENTORY_COUNT + 1);
     for path in tree {
         let text = loader.load_text(format!("providers/{path}")).expect("utf8");
         for forbidden in [

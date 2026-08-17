@@ -49,6 +49,17 @@ pub fn load_case(
         return Err(ProviderFixtureError::Semantic("baseline expected equality"));
     }
     validate_trace(expected_trace.as_slice())?;
+    let host_expected_trace = record
+        .host_expected_trace
+        .as_ref()
+        .map(|path| -> Result<_, ProviderFixtureError> {
+            let records: BoundedVec<FixtureEventRecord, TRACE_EVENTS_MAX> =
+                loader.load(format!("providers/{path}"))?;
+            let trace = convert_trace(records.as_slice())?;
+            validate_trace(trace.as_slice())?;
+            Ok(trace)
+        })
+        .transpose()?;
     Ok(ProviderCase {
         record: record.clone(),
         request,
@@ -56,6 +67,7 @@ pub fn load_case(
         raw_stream,
         baseline_event_count: baseline_events.len(),
         expected_trace,
+        host_expected_trace,
     })
 }
 /// Loads every fixture case in index order.
@@ -170,7 +182,23 @@ fn validate_record(record: &ProviderCaseRecord) -> Result<(), ProviderFixtureErr
             return Err(ProviderFixtureError::Semantic("case path"));
         }
     }
+    validate_host_trace(record)?;
     validate_response(record)
+}
+
+fn validate_host_trace(record: &ProviderCaseRecord) -> Result<(), ProviderFixtureError> {
+    match (&record.host_expected_trace, &record.host_trace_provenance) {
+        (None, None) => Ok(()),
+        (Some(path), Some(provenance))
+            if record.id == "openai-compatible/happy-tool"
+                && path == "openai-compatible/happy-tool/expected-host-trace.json"
+                && provenance
+                    == "pi-ai 0.82.1 omits OpenAI system_fingerprint from its public events" =>
+        {
+            Ok(())
+        }
+        _ => Err(ProviderFixtureError::Semantic("host trace provenance")),
+    }
 }
 /// A plain JSON capture carries no framing, so its status and headers must be indexed and
 /// non-2xx; every recorded response must otherwise stay a well-formed replayable response.
