@@ -124,6 +124,20 @@ bound!(
     Reject
 );
 bound!(
+    MCP_SERVERS_PER_AGENT_MAX,
+    64,
+    "mcp_server_limit",
+    "mcp_server_limit_total",
+    Reject
+);
+bound!(
+    MCP_TOOLS_PER_SERVER_MAX,
+    512,
+    "mcp_tool_limit",
+    "mcp_tool_limit_total",
+    Reject
+);
+bound!(
     SCHEDULE_RUN_LOG_KEEP_LINES,
     2_000,
     "schedule_log_line_limit",
@@ -151,8 +165,8 @@ pub(crate) const ADMISSION_HISTORY_ITEMS_MAX: usize = 300;
 /// Maximum queue items consumed before the caller must yield.
 pub const QUEUE_PUMP_BATCH_MAX: usize = 64;
 
-/// The nine canonical resource bounds in specification order.
-pub const RESOURCE_BOUNDS: [ResourceBound; 9] = [
+/// The eleven canonical resource bounds in specification order.
+pub const RESOURCE_BOUNDS: [ResourceBound; 11] = [
     CONNECTIONS_MAX,
     RUNTIMES_MAX,
     RUNTIME_SUBSCRIPTIONS_PER_CONNECTION_MAX,
@@ -160,6 +174,8 @@ pub const RESOURCE_BOUNDS: [ResourceBound; 9] = [
     QUEUE_ITEMS_HARD_MAX,
     PENDING_APPROVALS_PER_RUNTIME_MAX,
     EXTERNAL_TOOLS_PER_RUNTIME_MAX,
+    MCP_SERVERS_PER_AGENT_MAX,
+    MCP_TOOLS_PER_SERVER_MAX,
     SCHEDULE_RUN_LOG_KEEP_LINES,
     SCHEDULE_RUN_LOG_BYTES_MAX,
 ];
@@ -568,6 +584,8 @@ pub(crate) fn assert_matches_spec_table() {
         QUEUE_ITEMS_HARD_MAX,
         PENDING_APPROVALS_PER_RUNTIME_MAX,
         EXTERNAL_TOOLS_PER_RUNTIME_MAX,
+        MCP_SERVERS_PER_AGENT_MAX,
+        MCP_TOOLS_PER_SERVER_MAX,
         SCHEDULE_RUN_LOG_KEEP_LINES,
         SCHEDULE_RUN_LOG_BYTES_MAX,
     ];
@@ -583,12 +601,17 @@ pub(crate) fn assert_units_last_naming() {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::too_many_lines,
-    reason = "the explicit nine-row table prevents drift"
-)]
-pub(crate) fn assert_at_limit_is_observable() {
-    let rows = [
+type ExpectedBound = (
+    &'static str,
+    usize,
+    &'static str,
+    &'static str,
+    BoundReached,
+);
+
+#[cfg(test)]
+fn expected_core_bounds() -> [ExpectedBound; 6] {
+    [
         (
             "CONNECTIONS_MAX",
             1_024,
@@ -631,11 +654,31 @@ pub(crate) fn assert_at_limit_is_observable() {
             "approval_limit_total",
             BoundReached::FailInvariant,
         ),
+    ]
+}
+
+#[cfg(test)]
+fn expected_extension_bounds() -> [ExpectedBound; 5] {
+    [
         (
             "EXTERNAL_TOOLS_PER_RUNTIME_MAX",
             256,
             "external_tool_limit",
             "external_tool_limit_total",
+            BoundReached::Reject,
+        ),
+        (
+            "MCP_SERVERS_PER_AGENT_MAX",
+            64,
+            "mcp_server_limit",
+            "mcp_server_limit_total",
+            BoundReached::Reject,
+        ),
+        (
+            "MCP_TOOLS_PER_SERVER_MAX",
+            512,
+            "mcp_tool_limit",
+            "mcp_tool_limit_total",
             BoundReached::Reject,
         ),
         (
@@ -652,71 +695,70 @@ pub(crate) fn assert_at_limit_is_observable() {
             "schedule_log_rotation_total",
             BoundReached::RotateLog,
         ),
-    ];
+    ]
+}
+
+#[cfg(test)]
+fn assert_bound_observations(bound: ResourceBound, row: ExpectedBound) {
+    let (name, value, event, counter, reached) = row;
+    assert_eq!(
+        (
+            bound.name,
+            bound.value,
+            bound.event,
+            bound.counter,
+            bound.reached
+        ),
+        row
+    );
+    assert!(bound.observe(value - 1).is_none());
+    assert_eq!(
+        bound.observe(value),
+        Some(BoundObservation {
+            name,
+            event,
+            counter,
+            reached,
+            actual: value,
+            exceeded: false,
+        })
+    );
+    assert_eq!(
+        bound.observe(value + 1),
+        Some(BoundObservation {
+            name,
+            event,
+            counter,
+            reached,
+            actual: value + 1,
+            exceeded: true,
+        })
+    );
+}
+
+#[cfg(test)]
+fn assert_reached_matrix() {
+    let count = |reached| {
+        RESOURCE_BOUNDS
+            .iter()
+            .filter(|b| b.reached == reached)
+            .count()
+    };
+    assert_eq!(count(BoundReached::Reject), 7);
+    assert_eq!(count(BoundReached::CoalescePendingWork), 1);
+    assert_eq!(count(BoundReached::FailInvariant), 1);
+    assert_eq!(count(BoundReached::RotateLog), 2);
+}
+
+#[cfg(test)]
+pub(crate) fn assert_at_limit_is_observable() {
+    let rows = expected_core_bounds()
+        .into_iter()
+        .chain(expected_extension_bounds());
     for (bound, row) in RESOURCE_BOUNDS.into_iter().zip(rows) {
-        let (name, value, event, counter, reached) = row;
-        assert_eq!(
-            (
-                bound.name,
-                bound.value,
-                bound.event,
-                bound.counter,
-                bound.reached
-            ),
-            row
-        );
-        assert!(bound.observe(value - 1).is_none());
-        assert_eq!(
-            bound.observe(value),
-            Some(BoundObservation {
-                name,
-                event,
-                counter,
-                reached,
-                actual: value,
-                exceeded: false,
-            })
-        );
-        assert_eq!(
-            bound.observe(value + 1),
-            Some(BoundObservation {
-                name,
-                event,
-                counter,
-                reached,
-                actual: value + 1,
-                exceeded: true,
-            })
-        );
+        assert_bound_observations(bound, row);
     }
-    assert_eq!(
-        RESOURCE_BOUNDS
-            .iter()
-            .filter(|b| b.reached == BoundReached::Reject)
-            .count(),
-        5
-    );
-    assert_eq!(
-        RESOURCE_BOUNDS
-            .iter()
-            .filter(|b| b.reached == BoundReached::CoalescePendingWork)
-            .count(),
-        1
-    );
-    assert_eq!(
-        RESOURCE_BOUNDS
-            .iter()
-            .filter(|b| b.reached == BoundReached::FailInvariant)
-            .count(),
-        1
-    );
-    assert_eq!(
-        RESOURCE_BOUNDS
-            .iter()
-            .filter(|b| b.reached == BoundReached::RotateLog)
-            .count(),
-        2
-    );
+    assert_reached_matrix();
 }
 
 #[cfg(test)]

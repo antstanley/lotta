@@ -903,6 +903,7 @@ name = "lotta-extensions"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "jsonschema",
  "lotta-domain",
  "lotta-memfs",
  "lotta-runtime",
@@ -913,6 +914,9 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

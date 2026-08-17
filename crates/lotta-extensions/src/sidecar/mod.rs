@@ -86,6 +86,8 @@ pub enum SidecarCapability {
     Provider,
     /// Pinned subagent host.
     Subagent,
+    /// Model Context Protocol stdio server.
+    Mcp,
 }
 /// Envelope role on the wire.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

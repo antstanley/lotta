@@ -70,6 +70,7 @@ impl std::error::Error for RegistryError {}
 
 /// Immutable complete registry snapshot.
 pub struct RegistrySnapshot {
+    toolset: ToolsetId,
     registrations: BTreeMap<String, Arc<RegisteredTool>>,
     model_to_internal: BTreeMap<String, String>,
 }
@@ -96,6 +97,19 @@ impl RegistrySnapshot {
         self.model_to_internal
             .get(name)
             .and_then(|internal| self.registrations.get(internal))
+    }
+    /// Returns the complete current registrations with their authoritative toolset.
+    #[must_use]
+    pub fn complete_registrations(&self) -> (ToolsetId, Vec<ToolRegistration>) {
+        let registrations = self
+            .registrations
+            .values()
+            .map(|registered| ToolRegistration {
+                definition: Arc::clone(&registered.definition),
+                executor: Arc::clone(&registered.executor),
+            })
+            .collect();
+        (self.toolset, registrations)
     }
     /// Returns exposed names in stable order.
     #[must_use]
@@ -207,7 +221,8 @@ impl ToolRegistry {
     /// Publishes a complete candidate only when `expected_revision` is still current.
     ///
     /// # Errors
-    /// Returns candidate validation failures, stale revision, exhaustion, or poisoned synchronization.
+    /// Returns candidate validation failures, stale revision, exhaustion, or poisoned
+    /// synchronization.
     pub fn publish(
         &self,
         expected_revision: u64,
@@ -268,7 +283,7 @@ impl ToolRegistry {
                 selected.push(resolve_name(registration, model)?);
             }
         }
-        build_snapshot(selected)
+        build_snapshot(toolset, selected)
     }
 
     fn select_builtins(
@@ -304,7 +319,10 @@ fn resolve_name(
     })
 }
 
-fn build_snapshot(selected: Vec<RegisteredTool>) -> Result<RegistrySnapshot, RegistryError> {
+fn build_snapshot(
+    toolset: ToolsetId,
+    selected: Vec<RegisteredTool>,
+) -> Result<RegistrySnapshot, RegistryError> {
     if selected.len() > TOOLS_LOADED_MAX {
         return Err(RegistryError::TooManyTools);
     }
@@ -325,6 +343,7 @@ fn build_snapshot(selected: Vec<RegisteredTool>) -> Result<RegistrySnapshot, Reg
         registrations.insert(internal, Arc::new(registration));
     }
     Ok(RegistrySnapshot {
+        toolset,
         registrations,
         model_to_internal,
     })
@@ -332,6 +351,7 @@ fn build_snapshot(selected: Vec<RegisteredTool>) -> Result<RegistrySnapshot, Reg
 
 fn empty_snapshot() -> RegistrySnapshot {
     RegistrySnapshot {
+        toolset: ToolsetId::None,
         registrations: BTreeMap::new(),
         model_to_internal: BTreeMap::new(),
     }

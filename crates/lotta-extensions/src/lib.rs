@@ -11,6 +11,8 @@
     clippy::struct_field_names
 )]
 
+/// Bounded Model Context Protocol client and adapters.
+pub mod mcp;
 /// Shared bounded local-pipe contract for extension sidecars.
 pub mod sidecar;
 /// Skill discovery, loading, selection, and script execution policy.

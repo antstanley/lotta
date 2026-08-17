@@ -383,7 +383,7 @@ mod tests {
                 "runtime bound leaked into domain: {prefix}"
             );
         }
-        assert_eq!(lotta_domain::bounds::RESOURCE_BOUNDS.len(), 9);
+        assert_eq!(lotta_domain::bounds::RESOURCE_BOUNDS.len(), 11);
         assert_eq!(crate::bounds::RUNTIME_RESOURCE_BOUNDS.len(), 19);
     }
 
