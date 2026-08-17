@@ -15,6 +15,8 @@
 pub mod hooks;
 /// Bounded Model Context Protocol client and adapters.
 pub mod mcp;
+/// External TypeScript mod compatibility host and scoped capability broker.
+pub mod mods;
 /// Shared bounded local-pipe contract for extension sidecars.
 pub mod sidecar;
 /// Skill discovery, loading, selection, and script execution policy.

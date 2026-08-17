@@ -230,7 +230,65 @@ impl ToolRegistry {
         external: &[ToolRegistration],
         allowlist: Option<&[&str]>,
     ) -> Result<Arc<RegistrySnapshot>, RegistryError> {
+        self.publish_transaction(expected_revision, toolset, external, allowlist, || {})
+    }
+
+    /// Publishes a candidate and invokes an infallible companion commit while the registry write
+    /// lock is held. The callback runs immediately before the Task 32 assignment, so companion
+    /// readers can be excluded by locks acquired by the caller before entering this transaction.
+    ///
+    /// # Errors
+    /// Candidate construction, stale revisions, exhaustion, and poisoned synchronization prevent
+    /// the callback from running and leave the exact prior snapshot and revision unchanged.
+    pub fn publish_transaction<F>(
+        &self,
+        expected_revision: u64,
+        toolset: ToolsetId,
+        external: &[ToolRegistration],
+        allowlist: Option<&[&str]>,
+        commit: F,
+    ) -> Result<Arc<RegistrySnapshot>, RegistryError>
+    where
+        F: FnOnce(),
+    {
+        self.publish_transaction_with_barrier(
+            expected_revision,
+            toolset,
+            external,
+            allowlist,
+            || {},
+            commit,
+        )
+    }
+
+    /// Publishes a candidate through an injected synchronization barrier.
+    ///
+    /// `barrier` runs after the candidate is fully composed and before the registry write lock is
+    /// acquired, which is the only window where a competing publication can still advance the
+    /// revision. Callers use it to prove that a losing transaction leaves the exact prior snapshot,
+    /// revision, and companion state untouched. `commit` runs while the write lock is held,
+    /// immediately before the assignment, so companion readers excluded by locks the caller already
+    /// holds never observe a partial world.
+    ///
+    /// # Errors
+    /// Candidate construction, stale revisions, exhaustion, and poisoned synchronization prevent
+    /// `commit` from running and leave the exact prior snapshot and revision unchanged. `barrier`
+    /// runs before those checks and therefore also runs for a losing transaction.
+    pub fn publish_transaction_with_barrier<B, F>(
+        &self,
+        expected_revision: u64,
+        toolset: ToolsetId,
+        external: &[ToolRegistration],
+        allowlist: Option<&[&str]>,
+        barrier: B,
+        commit: F,
+    ) -> Result<Arc<RegistrySnapshot>, RegistryError>
+    where
+        B: FnOnce(),
+        F: FnOnce(),
+    {
         let candidate = self.compose(toolset, external, allowlist)?;
+        barrier();
         let mut guard = self.current.write().map_err(|_| RegistryError::Poisoned)?;
         if guard.revision != expected_revision {
             return Err(RegistryError::RevisionMismatch);
@@ -239,6 +297,7 @@ impl ToolRegistry {
             .revision
             .checked_add(1)
             .ok_or(RegistryError::RevisionExhausted)?;
+        commit();
         guard.revision = next;
         guard.snapshot = Arc::clone(&candidate);
         Ok(candidate)

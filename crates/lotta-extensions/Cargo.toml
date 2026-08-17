@@ -11,11 +11,13 @@ lotta-runtime = { version = "0.1.0", path = "../lotta-runtime" }
 lotta-tools = { version = "0.1.0", path = "../lotta-tools", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 url.workspace = true
+rustix = { version = "1.0.8", features = ["process"] }
 jsonschema = { version = "0.32.1", default-features = false }
 
 [dev-dependencies]
