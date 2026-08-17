@@ -12,9 +12,12 @@ async fn two_calls_execute_sequentially_in_end_order() {
     });
     let provider = ScriptedProvider::new(vec![
         first,
-        vec![ProviderEvent::Stop {
-            reason: StopReason::EndTurn,
-        }],
+        vec![
+            ProviderEvent::TextDelta { text: text("done") },
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ],
     ]);
     let tool = SequencingTool::new(vec![outcome("one"), outcome("two")]);
     let effects = RecordingEffects::default();

@@ -60,16 +60,16 @@ pub enum ProviderReplayError {
     Fixture(#[from] ProviderFixtureError),
     /// Provider returned a failure outside its event trace.
     #[error("provider replay provider failure: {0}")]
-    Provider(RuntimeError),
+    Provider(Box<RuntimeError>),
     /// Bounded channel failed.
     #[error("provider replay channel failure: {0}")]
-    Channel(RuntimeError),
+    Channel(Box<RuntimeError>),
     /// Actual trace exceeded the bound.
     #[error("provider replay trace limit exceeded")]
     TraceLimit,
     /// First expected/actual divergence.
     #[error("{0}")]
-    Divergence(ProviderReplayDivergence),
+    Divergence(Box<ProviderReplayDivergence>),
 }
 
 /// Drives any provider port, concurrently drains bounded backpressure, and compares its trace.
@@ -82,14 +82,14 @@ pub async fn replay_provider(
 ) -> Result<(), ProviderReplayError> {
     let cancellation = case.request.cancellation.clone();
     let (sink, mut receiver) = provider_event_channel(REPLAY_CHANNEL_EVENTS_MAX, &cancellation)
-        .map_err(ProviderReplayError::Channel)?;
+        .map_err(|error| ProviderReplayError::Channel(Box::new(error)))?;
     let producer = provider.stream(case.request, sink);
     let consumer = async {
         let mut events = Vec::new();
         while let Some(event) = receiver
             .receive()
             .await
-            .map_err(ProviderReplayError::Channel)?
+            .map_err(|error| ProviderReplayError::Channel(Box::new(error)))?
         {
             if events.len() == TRACE_EVENTS_MAX {
                 return Err(ProviderReplayError::TraceLimit);
@@ -99,7 +99,7 @@ pub async fn replay_provider(
         Ok(events)
     };
     let (producer_result, actual) = tokio::join!(producer, consumer);
-    producer_result.map_err(ProviderReplayError::Provider)?;
+    producer_result.map_err(|error| ProviderReplayError::Provider(Box::new(error)))?;
     compare(case.expected_trace.as_slice(), &actual?)
 }
 fn compare(
@@ -109,17 +109,19 @@ fn compare(
     let count = expected.len().max(actual.len());
     for index in 0..count {
         if expected.get(index) != actual.get(index) {
-            return Err(ProviderReplayError::Divergence(ProviderReplayDivergence {
-                index,
-                expected: expected
-                    .get(index)
-                    .cloned()
-                    .map_or(ProviderReplaySide::Missing, ProviderReplaySide::Event),
-                actual: actual
-                    .get(index)
-                    .cloned()
-                    .map_or(ProviderReplaySide::Missing, ProviderReplaySide::Event),
-            }));
+            return Err(ProviderReplayError::Divergence(Box::new(
+                ProviderReplayDivergence {
+                    index,
+                    expected: expected
+                        .get(index)
+                        .cloned()
+                        .map_or(ProviderReplaySide::Missing, ProviderReplaySide::Event),
+                    actual: actual
+                        .get(index)
+                        .cloned()
+                        .map_or(ProviderReplaySide::Missing, ProviderReplaySide::Event),
+                },
+            )));
         }
     }
     Ok(())

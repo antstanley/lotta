@@ -67,9 +67,12 @@ async fn stable_id_reaches_result_and_continuation_request() {
     });
     let provider = ScriptedProvider::new(vec![
         first,
-        vec![ProviderEvent::Stop {
-            reason: StopReason::EndTurn,
-        }],
+        vec![
+            ProviderEvent::TextDelta { text: text("done") },
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ],
     ]);
     let tool = SequencingTool::new(vec![outcome("ok")]);
     let effects = RecordingEffects::default();

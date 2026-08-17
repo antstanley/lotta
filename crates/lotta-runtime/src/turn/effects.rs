@@ -1,6 +1,7 @@
 use super::TurnProjection;
 use crate::RuntimeError;
 use crate::ports::{StopReason, ToolCallId, ToolOutcome};
+use crate::retry::RetryEvent;
 
 /// One normalized result associated with its stable provider call identifier.
 #[derive(Clone, Debug, PartialEq)]
@@ -14,6 +15,8 @@ pub struct ToolResultRecord {
 /// Ordered event emitted by the owner-local turn boundary.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TurnEvent {
+    /// One retry/fallback status before its associated action.
+    Retry(RetryEvent),
     /// One provider projection in arrival order.
     StreamDelta(TurnProjection),
     /// One completed tool result in tool-call end order.

@@ -19,7 +19,7 @@ async fn assert_failure(
         handle.clone(),
         lease,
         request(),
-        TurnPorts::new(&provider, &tool, &catalog(catalog_names), &effects),
+        TurnPorts::direct(&provider, &tool, &catalog(catalog_names), &effects),
     )
     .await
     .unwrap_err();
@@ -114,6 +114,7 @@ async fn incomplete_call_at_stop() {
 #[tokio::test]
 async fn provider_event_error() {
     let error = ProviderError::Unknown(ProviderErrorContext {
+        retry_after: None,
         code: ProviderName::new("fake".into()).unwrap(),
         context: ProviderEventText::new("safe".into()).unwrap(),
     });

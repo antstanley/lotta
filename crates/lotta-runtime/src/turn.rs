@@ -10,7 +10,9 @@ mod turn_loop;
 pub use effects::{ToolResultRecord, TurnEffectPort, TurnEvent};
 pub use projection::{ProjectionKind, TurnProjection};
 pub use tool_calls::TurnToolCatalog;
-pub use turn_loop::{TurnPorts, TurnRunOutcome, run_turn};
+pub use turn_loop::{
+    ConfiguredFallback, ProviderTurnExecutorPort, TurnPorts, TurnProvider, TurnRunOutcome, run_turn,
+};
 
 #[cfg(test)]
 #[path = "turn/bounds.rs"]

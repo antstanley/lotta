@@ -6,6 +6,10 @@ use crate::ports::{
     ProviderRequest, StopReason, ToolApprovalPolicy, ToolCallAccumulator, ToolCallId,
     ToolExecutionOwner, ToolExecutionRequest, ToolPort, ValidatedToolInput, provider_event_channel,
 };
+use crate::retry::{
+    Clock, EventSink, FallbackRoute, ProviderRoute, RETRY_EVENT_CHANNEL_CAPACITY, RetryEvent,
+    RetryExecutor, RetryPolicy, RetryTerminal, Sleeper,
+};
 use crate::{
     CancellationPolicy, LeaseEffect, LeaseGuard, ListenerRuntime, RuntimeError, RuntimeHandle,
 };
@@ -53,8 +57,8 @@ impl ProviderStepState {
 
 /// Borrowed ports used by one turn run.
 pub struct TurnPorts<'a> {
-    /// Normalized provider stream boundary.
-    pub provider: &'a dyn ProviderPort,
+    /// Runtime retry composition over the normalized provider boundary.
+    pub provider: TurnProvider<'a>,
     /// Local tool execution boundary.
     pub tools: &'a dyn ToolPort,
     /// Tools admitted for this turn.
@@ -64,16 +68,64 @@ pub struct TurnPorts<'a> {
 }
 
 impl<'a> TurnPorts<'a> {
-    /// Groups the four borrowed turn ports for an ergonomic [`run_turn`] call.
+    /// Groups production ports with an explicitly unconfigured fallback.
     #[must_use]
-    pub const fn new(
+    pub fn new(
+        provider: &'a dyn ProviderPort,
+        tools: &'a dyn ToolPort,
+        catalog: &'a TurnToolCatalog,
+        effects: &'a dyn TurnEffectPort,
+    ) -> Self {
+        Self::configured(
+            ProviderRoute::new("native", "configured"),
+            provider,
+            None,
+            tools,
+            catalog,
+            effects,
+        )
+    }
+
+    /// Builds production retry composition from an immutable validated fallback option.
+    #[must_use]
+    pub fn configured(
+        route: ProviderRoute,
+        provider: &'a dyn ProviderPort,
+        fallback: Option<ConfiguredFallback<'a>>,
+        tools: &'a dyn ToolPort,
+        catalog: &'a TurnToolCatalog,
+        effects: &'a dyn TurnEffectPort,
+    ) -> Self {
+        let fallback_port = fallback.as_ref().map(|value| value.provider);
+        let fallback_route = fallback.map(|value| value.route);
+        Self {
+            provider: TurnProvider::Retrying {
+                route,
+                source: provider,
+                fallback: fallback_port,
+                executor: std::sync::Arc::new(ProductionRetryExecutor {
+                    clock: crate::retry::SystemClock::default(),
+                    sleeper: crate::retry::TokioSleeper,
+                    events: TurnRetryEventSink::new(),
+                    fallback: fallback_route,
+                }),
+            },
+            tools,
+            catalog,
+            effects,
+        }
+    }
+
+    /// Explicit single-attempt compatibility composition for tests and legacy callers.
+    #[must_use]
+    pub const fn direct(
         provider: &'a dyn ProviderPort,
         tools: &'a dyn ToolPort,
         catalog: &'a TurnToolCatalog,
         effects: &'a dyn TurnEffectPort,
     ) -> Self {
         Self {
-            provider,
+            provider: TurnProvider::Direct(provider),
             tools,
             catalog,
             effects,
@@ -81,10 +133,185 @@ impl<'a> TurnPorts<'a> {
     }
 }
 
+/// Typed immutable fallback composition supplied by runtime/model configuration.
+pub struct ConfiguredFallback<'a> {
+    /// Validated one-way route and destination request model.
+    pub route: FallbackRoute,
+    /// Destination single-attempt provider adapter.
+    pub provider: &'a dyn ProviderPort,
+}
+
+/// Task19 provider execution boundary, either direct or centrally retried.
+#[derive(Clone)]
+pub enum TurnProvider<'a> {
+    /// Direct single-attempt port retained for compatibility callers.
+    Direct(&'a dyn ProviderPort),
+    /// Production central retry composition.
+    Retrying {
+        /// Initial immutable route.
+        route: ProviderRoute,
+        /// Initial single-attempt adapter.
+        source: &'a dyn ProviderPort,
+        /// Optional destination single-attempt adapter.
+        fallback: Option<&'a dyn ProviderPort>,
+        /// Runtime retry executor.
+        executor: std::sync::Arc<dyn ProviderTurnExecutorPort + 'a>,
+    },
+}
+
+/// Object-safe execution boundary implemented by a configured [`RetryExecutor`].
+pub trait ProviderTurnExecutorPort: Send + Sync {
+    /// Creates the retry-event channel for one provider step, when supported.
+    ///
+    /// # Errors
+    /// Returns a typed channel installation error.
+    fn begin_retry_step(
+        &self,
+    ) -> Result<Option<tokio::sync::mpsc::Receiver<RetryEvent>>, RuntimeError> {
+        Ok(None)
+    }
+
+    /// Closes this provider step's retry-event sender.
+    ///
+    /// # Errors
+    /// Returns a typed channel closure error.
+    fn end_retry_step(&self) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    /// Executes attempts and emits one successful stream or one terminal failure.
+    fn execute<'a>(
+        &'a self,
+        route: ProviderRoute,
+        source: &'a dyn ProviderPort,
+        fallback: Option<&'a dyn ProviderPort>,
+        request: ProviderRequest,
+        output: crate::ports::ProviderEventSink,
+    ) -> crate::ports::PortFuture<'a, RetryTerminal>;
+}
+
+impl<C, S, E> ProviderTurnExecutorPort for RetryExecutor<'_, C, S, E>
+where
+    C: Clock + ?Sized,
+    S: Sleeper + ?Sized,
+    E: EventSink + ?Sized,
+{
+    fn execute<'a>(
+        &'a self,
+        route: ProviderRoute,
+        source: &'a dyn ProviderPort,
+        fallback: Option<&'a dyn ProviderPort>,
+        request: ProviderRequest,
+        output: crate::ports::ProviderEventSink,
+    ) -> crate::ports::PortFuture<'a, RetryTerminal> {
+        Box::pin(self.execute(route, source, fallback, request, output))
+    }
+}
+
+struct TurnRetryEventSink {
+    sender: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<RetryEvent>>>,
+}
+
+impl TurnRetryEventSink {
+    const fn new() -> Self {
+        Self {
+            sender: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn begin_step(&self) -> Result<tokio::sync::mpsc::Receiver<RetryEvent>, RuntimeError> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(RETRY_EVENT_CHANNEL_CAPACITY);
+        let mut current = self.sender.lock().map_err(retry_channel_lock)?;
+        if current.replace(sender).is_some() {
+            return Err(RuntimeError::InvalidData {
+                context: "retry event step already active".into(),
+            });
+        }
+        Ok(receiver)
+    }
+
+    fn end_step(&self) -> Result<(), RuntimeError> {
+        self.sender.lock().map_err(retry_channel_lock)?.take();
+        Ok(())
+    }
+}
+
+fn retry_channel_lock<T>(_: std::sync::PoisonError<T>) -> RuntimeError {
+    RuntimeError::AdapterFailure {
+        code: "retry_event_channel",
+        context: "retry event sender lock".into(),
+    }
+}
+
+impl EventSink for TurnRetryEventSink {
+    fn emit(&self, event: RetryEvent) -> crate::ports::PortFuture<'_, ()> {
+        let sender = self
+            .sender
+            .lock()
+            .map_err(retry_channel_lock)
+            .map(|value| value.clone());
+        Box::pin(async move {
+            let sender = sender?.ok_or_else(|| RuntimeError::InvalidData {
+                context: "retry event step is not active".into(),
+            })?;
+            sender
+                .send(event)
+                .await
+                .map_err(|_| RuntimeError::AdapterFailure {
+                    code: "retry_event_channel",
+                    context: "retry event receiver closed".into(),
+                })
+        })
+    }
+}
+
+struct ProductionRetryExecutor {
+    clock: crate::retry::SystemClock,
+    sleeper: crate::retry::TokioSleeper,
+    events: TurnRetryEventSink,
+    fallback: Option<FallbackRoute>,
+}
+
+impl ProviderTurnExecutorPort for ProductionRetryExecutor {
+    fn begin_retry_step(
+        &self,
+    ) -> Result<Option<tokio::sync::mpsc::Receiver<RetryEvent>>, RuntimeError> {
+        self.events.begin_step().map(Some)
+    }
+
+    fn end_retry_step(&self) -> Result<(), RuntimeError> {
+        self.events.end_step()
+    }
+
+    fn execute<'a>(
+        &'a self,
+        route: ProviderRoute,
+        source: &'a dyn ProviderPort,
+        fallback: Option<&'a dyn ProviderPort>,
+        request: ProviderRequest,
+        output: crate::ports::ProviderEventSink,
+    ) -> crate::ports::PortFuture<'a, RetryTerminal> {
+        Box::pin(async move {
+            RetryExecutor::new(
+                &self.clock,
+                &self.sleeper,
+                &self.events,
+                RetryPolicy::default(),
+                self.fallback.as_ref(),
+            )
+            .execute(route, source, fallback, request, output)
+            .await
+        })
+    }
+}
+
 struct TurnContext<'a> {
     runtime: &'a mut ListenerRuntime,
     guard: LeaseGuard,
-    ports: TurnPorts<'a>,
+    provider: TurnProvider<'a>,
+    tools: &'a dyn ToolPort,
+    catalog: &'a TurnToolCatalog,
+    effects: &'a dyn TurnEffectPort,
     request: ProviderRequest,
     total_tool_calls: usize,
 }
@@ -106,10 +333,19 @@ pub async fn run_turn(
         request.cancellation.clone(),
         CancellationPolicy::SuppressWhenCancelled,
     );
+    let TurnPorts {
+        provider,
+        tools,
+        catalog,
+        effects,
+    } = ports;
     let mut turn = TurnContext {
         runtime,
         guard,
-        ports,
+        provider,
+        tools,
+        catalog,
+        effects,
         request,
         total_tool_calls: 0,
     };
@@ -170,10 +406,48 @@ fn finish_turn(
     match turn
         .guard
         .finish_turn_with_effect_after_await(turn.runtime, domain, || {
-            turn.ports.effects.emit(TurnEvent::Finished { reason })
+            turn.effects.emit(TurnEvent::Finished { reason })
         })? {
         LeaseEffect::Applied(()) => Ok(TurnRunOutcome::Completed),
         LeaseEffect::Suppressed(_) => Ok(TurnRunOutcome::Suppressed),
+    }
+}
+
+fn execute_provider(
+    provider: TurnProvider<'_>,
+    request: ProviderRequest,
+    sink: crate::ports::ProviderEventSink,
+) -> Result<
+    (
+        crate::ports::PortFuture<'_, RetryTerminal>,
+        Option<tokio::sync::mpsc::Receiver<RetryEvent>>,
+    ),
+    RuntimeError,
+> {
+    match provider {
+        TurnProvider::Direct(port) => Ok((
+            Box::pin(async move {
+                port.stream(request, sink).await?;
+                Ok(RetryTerminal::Success)
+            }),
+            None,
+        )),
+        TurnProvider::Retrying {
+            route,
+            source,
+            fallback,
+            executor,
+        } => {
+            let retry_events = executor.begin_retry_step()?;
+            Ok((
+                Box::pin(async move {
+                    executor
+                        .execute(route, source, fallback, request, sink)
+                        .await
+                }),
+                retry_events,
+            ))
+        }
     }
 }
 
@@ -182,44 +456,138 @@ async fn run_provider_step(
     state: &mut ProviderStepState,
 ) -> Result<Flow, RuntimeError> {
     turn.request.validate_bytes()?;
-    let (sink, mut receiver) = provider_event_channel(1, &turn.request.cancellation)?;
-    let future = turn.ports.provider.stream(turn.request.clone(), sink);
+    let (sink, mut output) = provider_event_channel(1, &turn.request.cancellation)?;
+    let (future, mut retry_events) =
+        execute_provider(turn.provider.clone(), turn.request.clone(), sink)?;
     tokio::pin!(future);
-    let mut provider_done = false;
-    let mut channel_done = false;
-    while !provider_done || !channel_done {
+    let terminal = loop {
         tokio::select! {
-            result = &mut future, if !provider_done => {
-                provider_done = true;
-                if turn.is_suppressed() {
-                    receiver.cancel();
-                    return Ok(Flow::Suppressed);
+            biased;
+            event = receive_retry(&mut retry_events), if retry_events.is_some() => {
+                if let Some(event) = event && apply_retry(turn, event)? == Flow::Suppressed {
+                    return suppress_provider(turn, &mut output);
                 }
-                result?;
             }
-            result = receiver.receive(), if !channel_done => {
+            result = &mut future => break result,
+            result = output.receive() => {
+                if drain_ready_retries(turn, &mut retry_events)? == Flow::Suppressed {
+                    return suppress_provider(turn, &mut output);
+                }
                 if turn.is_suppressed() {
-                    receiver.cancel();
-                    return Ok(Flow::Suppressed);
+                    return suppress_provider(turn, &mut output);
                 }
                 match result? {
                     Some(event) => {
                         if handle_event(turn, state, event).await? == Flow::Suppressed {
-                            receiver.cancel();
-                            turn.request.cancellation.cancel();
-                            return Ok(Flow::Suppressed);
+                            return suppress_provider(turn, &mut output);
                         }
                     }
-                    None => channel_done = true,
+                    None => return Err(protocol("provider stream closed before executor")),
                 }
             }
         }
+    };
+    close_retry_step(&turn.provider)?;
+    if turn.is_suppressed() || drain_retries(turn, &mut retry_events).await? == Flow::Suppressed {
+        return suppress_provider(turn, &mut output);
     }
-    state.accumulator.terminal_stop()?;
-    if state.stop.is_none() {
-        return Err(protocol("provider stream closed without terminal"));
+    handle_terminal(terminal?, turn, state, &mut output).await
+}
+
+fn drain_ready_retries(
+    turn: &mut TurnContext<'_>,
+    receiver: &mut Option<tokio::sync::mpsc::Receiver<RetryEvent>>,
+) -> Result<Flow, RuntimeError> {
+    let Some(receiver) = receiver.as_mut() else {
+        return Ok(Flow::Continue);
+    };
+    loop {
+        match receiver.try_recv() {
+            Ok(event) => {
+                if apply_retry(turn, event)? == Flow::Suppressed {
+                    return Ok(Flow::Suppressed);
+                }
+            }
+            Err(
+                tokio::sync::mpsc::error::TryRecvError::Empty
+                | tokio::sync::mpsc::error::TryRecvError::Disconnected,
+            ) => {
+                return Ok(Flow::Continue);
+            }
+        }
+    }
+}
+
+async fn receive_retry(
+    receiver: &mut Option<tokio::sync::mpsc::Receiver<RetryEvent>>,
+) -> Option<RetryEvent> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => None,
+    }
+}
+
+fn apply_retry(turn: &mut TurnContext<'_>, event: RetryEvent) -> Result<Flow, RuntimeError> {
+    match turn
+        .guard
+        .apply_after_await(turn.runtime, || turn.effects.emit(TurnEvent::Retry(event)))
+    {
+        LeaseEffect::Applied(result) => result.map(|()| Flow::Continue),
+        LeaseEffect::Suppressed(_) => Ok(Flow::Suppressed),
+    }
+}
+
+async fn drain_retries(
+    turn: &mut TurnContext<'_>,
+    receiver: &mut Option<tokio::sync::mpsc::Receiver<RetryEvent>>,
+) -> Result<Flow, RuntimeError> {
+    while let Some(event) = receive_retry(receiver).await {
+        if apply_retry(turn, event)? == Flow::Suppressed {
+            return Ok(Flow::Suppressed);
+        }
     }
     Ok(Flow::Continue)
+}
+
+fn close_retry_step(provider: &TurnProvider<'_>) -> Result<(), RuntimeError> {
+    if let TurnProvider::Retrying { executor, .. } = provider {
+        executor.end_retry_step()?;
+    }
+    Ok(())
+}
+
+fn suppress_provider(
+    turn: &TurnContext<'_>,
+    output: &mut crate::ports::ProviderEventReceiver,
+) -> Result<Flow, RuntimeError> {
+    output.cancel();
+    turn.request.cancellation.cancel();
+    close_retry_step(&turn.provider)?;
+    Ok(Flow::Suppressed)
+}
+
+async fn handle_terminal(
+    terminal: RetryTerminal,
+    turn: &mut TurnContext<'_>,
+    state: &mut ProviderStepState,
+    output: &mut crate::ports::ProviderEventReceiver,
+) -> Result<Flow, RuntimeError> {
+    if let RetryTerminal::Failure(failure) = terminal {
+        return Err(RuntimeError::AdapterFailure {
+            code: "provider_terminal_error",
+            context: failure.reason,
+        });
+    }
+    while let Some(event) = output.receive().await? {
+        if handle_event(turn, state, event).await? == Flow::Suppressed {
+            return suppress_provider(turn, output);
+        }
+    }
+    state.accumulator.terminal_stop()?;
+    state.stop.map_or_else(
+        || Err(protocol("provider stream closed without terminal")),
+        |_| Ok(Flow::Continue),
+    )
 }
 
 async fn handle_event(
@@ -270,8 +638,8 @@ impl TurnContext<'_> {
     ) -> Result<Flow, RuntimeError> {
         let projection = super::TurnProjection::new(kind, value);
         match self.guard.apply_after_await(self.runtime, || {
-            self.ports.effects.persist_projection(projection.clone())?;
-            self.ports.effects.emit(TurnEvent::StreamDelta(projection))
+            self.effects.persist_projection(projection.clone())?;
+            self.effects.emit(TurnEvent::StreamDelta(projection))
         }) {
             LeaseEffect::Applied(result) => result.map(|()| Flow::Continue),
             LeaseEffect::Suppressed(_) => Ok(Flow::Suppressed),
@@ -308,7 +676,6 @@ async fn execute_call(
         return Err(protocol("provider tool call name missing"));
     };
     let definition = turn
-        .ports
         .catalog
         .get(name.as_str())
         .ok_or_else(|| protocol("provider tool definition missing"))?;
@@ -319,7 +686,7 @@ async fn execute_call(
         cancellation: turn.request.cancellation.clone(),
         deadline: definition.timeout,
     };
-    let outcome = turn.ports.tools.execute(execution).await;
+    let outcome = turn.tools.execute(execution).await;
     if turn.is_suppressed() {
         return Ok(Flow::Suppressed);
     }
@@ -335,10 +702,8 @@ async fn execute_call(
         .try_reserve(1)
         .map_err(|_| limit(TURN_TOOL_CALLS_MAX.name))?;
     match turn.guard.apply_after_await(turn.runtime, || {
-        turn.ports.effects.append_tool_result(result.clone())?;
-        turn.ports
-            .effects
-            .emit(TurnEvent::ToolResult(result.clone()))
+        turn.effects.append_tool_result(result.clone())?;
+        turn.effects.emit(TurnEvent::ToolResult(result.clone()))
     }) {
         LeaseEffect::Applied(effect) => effect?,
         LeaseEffect::Suppressed(_) => return Ok(Flow::Suppressed),

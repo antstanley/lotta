@@ -411,7 +411,29 @@ pub struct ProviderErrorContext {
     pub code: ProviderName,
     /// Bounded safe diagnostic context; credentials and secret metadata are forbidden.
     pub context: ProviderEventText,
+    /// Optional provider-directed retry timing preserved by normalization.
+    pub retry_after: Option<crate::retry::RetryAfter>,
 }
+
+impl ProviderErrorContext {
+    /// Creates scrubbed adapter context with no provider-directed delay.
+    #[must_use]
+    pub const fn new(code: ProviderName, context: ProviderEventText) -> Self {
+        Self {
+            code,
+            context,
+            retry_after: None,
+        }
+    }
+
+    /// Preserves a normalized retry-after value supplied by an adapter mapper.
+    #[must_use]
+    pub const fn with_retry_after(mut self, retry_after: crate::retry::RetryAfter) -> Self {
+        self.retry_after = Some(retry_after);
+        self
+    }
+}
+
 /// Stable provider failure taxonomy; vendor error types never cross this boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderError {
@@ -440,6 +462,44 @@ pub enum ProviderError {
     /// Failure cannot be assigned another stable kind.
     Unknown(ProviderErrorContext),
 }
+
+impl ProviderError {
+    /// Converts adapter-facing error kinds into canonical retry categories.
+    #[must_use]
+    pub fn into_failure(self) -> crate::retry::ProviderFailure {
+        use crate::retry::{ProviderFailure, ProviderFailureKind};
+        let (kind, context) = match self {
+            Self::Authentication(value) | Self::Authorization(value) => {
+                (ProviderFailureKind::Auth, value)
+            }
+            Self::InvalidRequest(value) => (ProviderFailureKind::Invalid, value),
+            Self::RateLimit(value) | Self::Overloaded(value) => (ProviderFailureKind::Busy, value),
+            Self::Timeout(value) | Self::Unavailable(value) => {
+                (ProviderFailureKind::Transient, value)
+            }
+            Self::Protocol(value) => (ProviderFailureKind::Schema, value),
+            Self::Quota(value)
+            | Self::ContextOverflow(value)
+            | Self::Cancelled(value)
+            | Self::Unknown(value) => (ProviderFailureKind::Terminal, value),
+        };
+        let failure = ProviderFailure::new(
+            kind,
+            format!("{}: {}", context.code.as_str(), context.context.as_str()),
+        );
+        match context.retry_after {
+            Some(value) => failure.with_retry_after(value),
+            None => failure,
+        }
+    }
+}
+
+impl From<ProviderError> for crate::retry::ProviderFailure {
+    fn from(value: ProviderError) -> Self {
+        value.into_failure()
+    }
+}
+
 /// Stable provider tool-call identifier shared by start, deltas, and end.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ToolCallId(ProviderName);
@@ -808,7 +868,8 @@ fn cancelled() -> RuntimeError {
 ///
 /// Implementations own no channel half beyond `stream`, must normalize vendor events before
 /// sending, await bounded backpressure through `ProviderEventSink::send`, and stop after a terminal
-/// event or cancellation. The request and sink share one private cancellation token.
+/// event or cancellation. The request and sink share one private cancellation token. An adapter
+/// performs exactly one transport attempt; retry and fallback belong exclusively to the runtime.
 pub trait ProviderPort: Send + Sync {
     /// Streams one normalized request into the opaque bounded event sink.
     ///

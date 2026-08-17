@@ -30,6 +30,8 @@ pub mod queue;
 pub mod queue_snapshot;
 /// Bounded listener-owned runtime registry.
 pub mod registry;
+/// Runtime-owned deterministic provider retry and fallback.
+pub mod retry;
 /// Explicit task-local per-turn context.
 pub mod scope_context;
 /// Lease-guarded provider and local-tool turn loop.
@@ -43,13 +45,14 @@ pub use lifecycle::{LifecycleOwner, LifecycleProjection};
 pub use queue::{ConversationQueue, PumpDirective, PumpMutation};
 pub use queue_snapshot::{QueueMutation, QueueMutationEvent, QueueSnapshot};
 pub use registry::{ListenerRuntime, ResidencyUpdate, RuntimeHandle, RuntimeKey, RuntimeResidency};
+pub use retry::{RetryExecutor, RetryTerminal};
 pub use scope_context::{
     ScopeContextInput, ScopeContextSnapshot, WorkspaceSandbox, scope_operation, spawn_scoped,
     try_current,
 };
 pub use turn::{
-    ProjectionKind, ToolResultRecord, TurnEffectPort, TurnEvent, TurnPorts, TurnProjection,
-    TurnRunOutcome, TurnToolCatalog, run_turn,
+    ConfiguredFallback, ProjectionKind, ProviderTurnExecutorPort, ToolResultRecord, TurnEffectPort,
+    TurnEvent, TurnPorts, TurnProjection, TurnProvider, TurnRunOutcome, TurnToolCatalog, run_turn,
 };
 pub use worktree_watcher::{WORKTREE_WATCHER_IDLE_STOP_MS, WorktreeWatcher};
 

@@ -225,6 +225,7 @@ async fn run_provider_contract() {
                 contracts::ProviderContractScenario::TerminalError => {
                     let text = ProviderEventText::new("prefix".into()).expect("text");
                     let context = ProviderErrorContext {
+                        retry_after: None,
                         code: ProviderName::new("normalized".into()).expect("code"),
                         context: ProviderEventText::new("safe".into()).expect("context"),
                     };

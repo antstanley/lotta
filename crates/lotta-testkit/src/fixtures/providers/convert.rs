@@ -423,6 +423,7 @@ fn provider_error(
     context: &str,
 ) -> Result<ProviderError, ProviderFixtureError> {
     let context = ProviderErrorContext {
+        retry_after: None,
         code: ProviderName::new(code.to_owned())?,
         context: ProviderEventText::new(context.to_owned())?,
     };

@@ -19,6 +19,7 @@ pub(super) enum ProviderScript {
     Events(Vec<ProviderEvent>),
     Error(RuntimeError),
     CancelBefore(Vec<ProviderEvent>, CancellationToken),
+    CancelAfterFirst(Vec<ProviderEvent>, CancellationToken),
 }
 
 pub(super) struct ScriptedProvider {
@@ -52,6 +53,17 @@ impl ProviderPort for ScriptedProvider {
                 Some(ProviderScript::CancelBefore(script, token)) => {
                     token.cancel();
                     send_script(script, events).await
+                }
+                Some(ProviderScript::CancelAfterFirst(script, token)) => {
+                    let mut script = script.into_iter();
+                    if let Some(event) = script.next() {
+                        events.send(event).await?;
+                    }
+                    token.cancel();
+                    for event in script {
+                        events.send(event).await?;
+                    }
+                    Ok(())
                 }
                 Some(ProviderScript::Error(error)) => Err(error),
                 None => Err(RuntimeError::InvalidData {

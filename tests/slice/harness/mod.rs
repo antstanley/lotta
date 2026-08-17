@@ -451,7 +451,7 @@ impl TurnEffectPort for Effects<'_> {
                     error: None,
                 }
             }
-            TurnEvent::ToolResult(_) => return Ok(()),
+            TurnEvent::Retry(_) | TurnEvent::ToolResult(_) => return Ok(()),
         };
         self.sink
             .emit(self.scope, wire)

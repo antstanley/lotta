@@ -441,6 +441,7 @@ pub(super) fn normalize_source(source: &SourceEvent) -> ProviderEvent {
         SourceEvent::Stop => stop(),
         SourceEvent::Error => ProviderEvent::Error {
             error: ProviderError::Unknown(ProviderErrorContext {
+                retry_after: None,
                 code: name("source_error"),
                 context: event_text("safe"),
             }),
@@ -552,6 +553,7 @@ pub(crate) fn provider_event_variants() {
     let call_id = call("call");
     let metadata = ProviderMetadata::classified(Vec::<ProviderMetadataInput>::new()).unwrap();
     let context = ProviderErrorContext {
+        retry_after: None,
         code: name("code"),
         context: event_text("context"),
     };
@@ -587,6 +589,7 @@ pub(crate) fn provider_event_variants() {
 pub(crate) fn provider_error_variants() {
     fn context() -> ProviderErrorContext {
         ProviderErrorContext {
+            retry_after: None,
             code: name("stable"),
             context: event_text("scrubbed"),
         }
