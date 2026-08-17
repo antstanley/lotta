@@ -41,7 +41,7 @@
   "tool_choice": "auto",
   "image_policy": "drop",
   "context_tokens_max": 8192,
-  "output_tokens_max": 256,
+  "output_tokens_max": 8192,
   "reasoning": {
     "enabled": true,
     "effort": "medium",

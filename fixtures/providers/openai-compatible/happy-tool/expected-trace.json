@@ -1,16 +1,7 @@
 [
   {
     "type": "TextDelta",
-    "text": "SANITIZED_FIXTURE_TEXT"
-  },
-  {
-    "type": "ProviderMetadata",
-    "entries": [
-      {
-        "key": "fixture_request_id",
-        "value": "SANITIZED_FIXTURE_ID"
-      }
-    ]
+    "text": "SANITIZED_FIXTURE_TEXT_é☃𝄞"
   },
   {
     "type": "ToolCallStart",
@@ -30,6 +21,23 @@
   {
     "type": "ToolCallEnd",
     "call_id": "fixture-call"
+  },
+  {
+    "type": "ProviderMetadata",
+    "entries": [
+      {
+        "key": "id",
+        "value": "fixture-chat"
+      },
+      {
+        "key": "system_fingerprint",
+        "value": "openai-synthetic"
+      },
+      {
+        "key": "model",
+        "value": "fixture-model"
+      }
+    ]
   },
   {
     "type": "Usage",

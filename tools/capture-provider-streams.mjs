@@ -92,6 +92,38 @@ const REGION_NAMES = Object.freeze({
   "bun.lock": [],
 });
 
+// Task 49 Batch B: the seven cases a native adapter replays end to end. Their raw bytes, expected
+// request, baseline events and expected trace are independently derived from the pinned source
+// behavior. Every other case stays on its Task 12 shape.
+const NATIVE = Object.freeze([
+  "openai-compatible/happy-tool", "openai-compatible/authorization",
+  "openai-compatible/protocol-error", "openai-compatible/retry-after",
+  "anthropic/reasoning-redacted", "anthropic/authentication", "anthropic/quota",
+]);
+// Non-2xx statuses captured independently from the vendor error type/code that yields the kind.
+const NATIVE_STATUS = Object.freeze({
+  "openai-compatible/authorization": 403, "openai-compatible/protocol-error": 406,
+  "openai-compatible/retry-after": 429, "anthropic/authentication": 401,
+  "anthropic/quota": 402,
+});
+// Vendor `error.type` strings the pinned adapters normalize into the recorded kinds.
+const NATIVE_ERROR_TYPE = Object.freeze({
+  "openai-compatible/authorization": "insufficient_permissions",
+  "openai-compatible/protocol-error": "invalid_response_error",
+  "openai-compatible/retry-after": "rate_limit_error",
+  "anthropic/authentication": "authentication_error", "anthropic/quota": "billing_error",
+});
+const RETRY_AFTER_SECONDS = 2;
+const ANTHROPIC_VERSION = "2023-06-01";
+const ANTHROPIC_BETA =
+  "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14";
+// `native/anthropic.rs` REDACTED_REASONING_MARKER: the opaque block never yields vendor bytes.
+const REDACTED_REASONING_MARKER = "<redacted-reasoning>";
+// Two- three- and four-byte sequences so replay chunk boundaries fall inside UTF-8 sequences.
+const MULTIBYTE = "_é☃𝄞";
+const TOOL_SCHEMA = Object.freeze({ type: "object",
+  properties: { a: { type: "integer" } }, required: ["a"] });
+
 const CASES = Object.freeze([
   ["openai-compatible", "happy-tool", ["request_mapping", "event_order",
     "tool_call_assembly", "usage"], null, "stop", "sse"],
@@ -103,20 +135,20 @@ const CASES = Object.freeze([
   ["llama-cpp", "context-overflow", ["context_overflow", "errors"],
     "context_overflow", "error", "sse"],
   ["openai-compatible", "retry-after", ["retry_after", "errors"],
-    "rate_limit", "error", "sse"],
+    "rate_limit", "error", "json"],
   ["ollama", "image-drop", ["image_policy", "request_mapping"], null,
     "stop", "ndjson"],
   ["ollama", "image-strict", ["image_policy", "request_mapping"],
     "invalid_request", "error", "ndjson"],
   ["anthropic", "authentication", ["errors"], "authentication", "error",
-    "anthropic_sse"],
+    "json"],
   ["openai-compatible", "authorization", ["errors"], "authorization",
-    "error", "sse"],
+    "error", "json"],
   ["lm-studio", "invalid-request", ["errors"], "invalid_request", "error", "sse"],
-  ["anthropic", "quota", ["errors"], "quota", "error", "anthropic_sse"],
+  ["anthropic", "quota", ["errors"], "quota", "error", "json"],
   ["llama-cpp", "overloaded", ["errors"], "overloaded", "error", "sse"],
   ["ollama", "unavailable", ["errors"], "unavailable", "error", "ndjson"],
-  ["openai-compatible", "protocol-error", ["errors"], "protocol", "error", "sse"],
+  ["openai-compatible", "protocol-error", ["errors"], "protocol", "error", "json"],
   ["lm-studio", "unknown-error", ["errors"], "unknown", "error", "sse"],
 ]);
 const ERROR_MAP = Object.freeze([
@@ -236,12 +268,48 @@ function requestFor(dialect, name) {
       description: "SANITIZED_FIXTURE_TOOL", input_schema: { type: "object",
         properties: { a: { type: "integer" } }, required: ["a"] } }],
     tool_choice: "auto", image_policy: name === "image-strict" ? "strict" : "drop",
-    context_tokens_max: 8192, output_tokens_max: 256,
+    context_tokens_max: 8192,
+    output_tokens_max: name === "reasoning-redacted" ? 8192 : 256,
     reasoning: { enabled: name === "reasoning-redacted", effort: "medium", tier: null },
     deadline_ms: 1000,
   };
 }
+function isNative(dialect, name) {
+  return NATIVE.includes(`${dialect}/${name}`);
+}
+function sanitizedContext(name) {
+  return `SANITIZED_FIXTURE_${name.toUpperCase().replaceAll("-", "_")}`;
+}
+// Pinned medium budget is clamped to preserve 1024 visible output tokens within max_tokens.
+const THINKING_BUDGET_TOKENS = 7168;
+// Header names the adapter sets from transport or credential state; only presence is asserted.
+const PRESENCE_ONLY_HEADERS = Object.freeze(["content-length", "credential", "host"]);
+function nativeExpectedRequest(dialect, name) {
+  const system = "SANITIZED_FIXTURE_SYSTEM", user = "SANITIZED_FIXTURE_USER";
+  const description = "SANITIZED_FIXTURE_TOOL";
+  if (dialect === "anthropic") {
+    return { method: "POST", endpoint: "/v1/messages",
+      headers: { accept: "text/event-stream", "anthropic-beta": ANTHROPIC_BETA,
+        "anthropic-version": ANTHROPIC_VERSION, "content-type": "application/json" },
+      presence_only_headers: PRESENCE_ONLY_HEADERS,
+      body: { model: "fixture-model",
+        messages: [{ role: "user", content: user }],
+        max_tokens: name === "reasoning-redacted" ? 8192 : 256, stream: true,
+        thinking: name === "reasoning-redacted" ?
+          { type: "enabled", budget_tokens: THINKING_BUDGET_TOKENS } : { type: "disabled" },
+        system, tools: [{ name: "fixture_tool", description, input_schema: TOOL_SCHEMA }] } };
+  }
+  return { method: "POST", endpoint: "/v1/chat/completions",
+    headers: { accept: "text/event-stream", "content-type": "application/json" },
+    presence_only_headers: PRESENCE_ONLY_HEADERS,
+    body: { model: "fixture-model",
+      messages: [{ role: "system", content: system }, { role: "user", content: user }],
+      stream: true, stream_options: { include_usage: true }, max_tokens: 256,
+      tools: [{ type: "function", function: { name: "fixture_tool", description,
+        parameters: TOOL_SCHEMA } }], tool_choice: "auto" } };
+}
 function expectedRequest(dialect, name) {
+  if (isNative(dialect, name)) return nativeExpectedRequest(dialect, name);
   if (name === "image-strict") return { outcome: "preflight_error",
     error_kind: "invalid_request", reason: "SANITIZED_FIXTURE_UNSUPPORTED_IMAGE_STRICT" };
   const message = { role: "user", content: "SANITIZED_FIXTURE_USER" };
@@ -273,37 +341,60 @@ function provenance(symbol, boundary = "pinned_pi_ai_test_boundary") {
 function rawEvent(type, fields = {}, symbol = "streamFromEvents", boundary) {
   return { type, ...fields, provenance: provenance(symbol, boundary) };
 }
-function rawError(kind, name) {
-  return rawEvent("error", { kind, code: `fixture_${kind}`,
-    context: `SANITIZED_FIXTURE_${name.toUpperCase().replaceAll("-", "_")}` },
-  "normalizeLocalProviderError", "pinned_error_normalization_boundary");
+function rawError(kind, name, retryAfterMs) {
+  const fields = { kind, code: `fixture_${kind}`, context: sanitizedContext(name) };
+  if (retryAfterMs !== undefined) {
+    fields.retry_after = { type: "milliseconds", value: retryAfterMs };
+  }
+  return rawEvent("error", fields,
+    "normalizeLocalProviderError", "pinned_error_normalization_boundary");
 }
-function baselineFor(dialect, name, errorKind) {
-  if (name === "happy-tool") return [rawEvent("text_delta", { text: "SANITIZED_FIXTURE_TEXT" }),
-    rawEvent("metadata", {
-      entries: [{ key: "fixture_request_id", value: "SANITIZED_FIXTURE_ID" }],
-    }),
+// The adapter reads `retry-after` off the real response, so the trace must carry the same delay.
+function retryAfterMsFor(dialect, name, errorKind) {
+  return isNative(dialect, name) && errorKind === "rate_limit" ?
+    RETRY_AFTER_SECONDS * 1000 : undefined;
+}
+// Order matches `native/openai_compatible.rs`: the finishing choice closes its tool calls before
+// that chunk's usage block, the trailing usage-only chunk reports the final snapshot, and the
+// terminal `[DONE]` record drives stop. One usage event per usage-bearing raw chunk.
+function nativeToolBaseline() {
+  return [rawEvent("text_delta", { text: `SANITIZED_FIXTURE_TEXT${MULTIBYTE}` }),
     rawEvent("toolcall_start", { call_id: "fixture-call", name: "fixture_tool" }),
     rawEvent("toolcall_arguments_delta", { call_id: "fixture-call", arguments: "{\"a\":" }),
     rawEvent("toolcall_arguments_delta", { call_id: "fixture-call", arguments: "1}" }),
-    rawEvent("toolcall_end", { call_id: "fixture-call" }), usage(5, 2), usage(5, 4),
+    rawEvent("toolcall_end", { call_id: "fixture-call" }),
+    rawEvent("metadata", { entries: [
+      { key: "id", value: "fixture-chat" },
+      { key: "system_fingerprint", value: "openai-synthetic" },
+      { key: "model", value: "fixture-model" },
+    ] }), usage(5, 2), usage(5, 4),
     rawEvent("done", { reason: "tool_use" })];
-  if (name === "reasoning-redacted") return [
-    rawEvent("thinking_delta", { text: "SANITIZED_FIXTURE_REASONING" }),
-    rawEvent("redacted_reasoning", { marker: "<redacted-fixture>" }, "assistantMessage",
+}
+// `native/anthropic.rs` reports reasoning tokens only from provider usage; the raw stream's
+// `message_delta` carries none, so the derivable count is zero.
+function nativeReasoningBaseline() {
+  return [rawEvent("thinking_delta", { text: `SANITIZED_FIXTURE_REASONING${MULTIBYTE}` }),
+    rawEvent("redacted_reasoning", { marker: REDACTED_REASONING_MARKER }, "assistantMessage",
       "pinned_reasoning_replay_boundary"),
-    rawEvent("text_delta", { text: "SANITIZED_FIXTURE_TEXT" }),
-    usage(4, 2), rawEvent("done", { reason: "end_turn" })];
+    rawEvent("text_delta", { text: `SANITIZED_FIXTURE_TEXT${MULTIBYTE}` }),
+    usage(4, 2, 0, 0), rawEvent("metadata", { entries: [
+      { key: "id", value: "fixture-message" },
+      { key: "model", value: "fixture-model" },
+    ] }), rawEvent("done", { reason: "end_turn" })];
+}
+function baselineFor(dialect, name, errorKind) {
+  if (name === "happy-tool") return nativeToolBaseline();
+  if (name === "reasoning-redacted") return nativeReasoningBaseline();
   if (name === "cancelled") return [rawEvent("text_delta", { text: "SANITIZED_FIXTURE_TEXT" }),
     rawEvent("cancelled", { code: "fixture_cancelled", context: "SANITIZED_FIXTURE_CANCELLED" }),
     rawEvent("late_text_delta", { text: "SANITIZED_FIXTURE_LATE" })];
   if (!errorKind) return [rawEvent("text_delta", { text: "SANITIZED_FIXTURE_TEXT" }), usage(3, 2),
     rawEvent("done", { reason: "end_turn" })];
-  return [rawError(errorKind, name)];
+  return [rawError(errorKind, name, retryAfterMsFor(dialect, name, errorKind))];
 }
-function usage(input, output) {
+function usage(input, output, cached = 0, reasoning = 0) {
   return rawEvent("usage", { input_tokens: input, output_tokens: output,
-    cached_input_tokens: 0, reasoning_tokens: 0 }, "createUsageStatisticsChunk");
+    cached_input_tokens: cached, reasoning_tokens: reasoning }, "createUsageStatisticsChunk");
 }
 function normalizeBaseline(events) {
   const output = [], tools = new Map(); let terminal = false;
@@ -337,8 +428,10 @@ function normalizeBaseline(events) {
     }
     else if (type === "cancelled") { output.push({ type: "Error", kind: "cancelled",
       code: source.code, context: source.context }); terminal = true; }
-    else if (type === "error") { output.push({ type: "Error", kind: source.kind,
-      code: source.code, context: source.context }); terminal = true; }
+    else if (type === "error") { const event = { type: "Error", kind: source.kind,
+      code: source.code, context: source.context };
+    if (source.retry_after) event.retry_after = source.retry_after;
+    output.push(event); terminal = true; }
     else fail(`unknown baseline event: ${type}`);
   }
   return output;
@@ -403,7 +496,69 @@ function ollamaRaw(name, errorKind) {
     `${JSON.stringify({ model: "fixture-model", message: { role: "assistant", content: "" },
       done: true, done_reason: "stop", prompt_eval_count: 3, eval_count: 2 })}\n`;
 }
+// A non-2xx capture is the vendor's plain JSON body; its status and headers are indexed metadata
+// the loopback replays, so the adapter takes its real response-status path.
+function nativeErrorBody(dialect, name, errorKind) {
+  const error = { type: NATIVE_ERROR_TYPE[`${dialect}/${name}`], code: `fixture_${errorKind}`,
+    message: sanitizedContext(name) };
+  return `${JSON.stringify(dialect === "anthropic" ? { type: "error", error } : { error })}\n`;
+}
+// Blank-line terminated records, a trailing usage-only chunk, and the terminal `[DONE]` record.
+function nativeOpenAiStream() {
+  const model = "fixture-model", id = "fixture-chat", object = "chat.completion.chunk";
+  const records = [
+    { id, object, model, system_fingerprint: "openai-synthetic",
+      choices: [{ index: 0, delta: { content: `SANITIZED_FIXTURE_TEXT${MULTIBYTE}`,
+        tool_calls: [{ index: 0, id: "fixture-call", type: "function",
+          function: { name: "fixture_tool", arguments: "{\"a\":" } }] },
+      finish_reason: null }] },
+    { id, object, model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0,
+      function: { arguments: "1}" } }] }, finish_reason: "tool_calls" }],
+    usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 } },
+    { id, object, model, choices: [],
+      usage: { prompt_tokens: 5, completion_tokens: 4, total_tokens: 9 } },
+  ];
+  return `${records.map((record) => `data: ${JSON.stringify(record)}\n\n`).join("")}` +
+    "data: [DONE]\n\n";
+}
+function nativeAnthropicStream() {
+  const text = `SANITIZED_FIXTURE_TEXT${MULTIBYTE}`;
+  const events = [
+    ["message_start", { type: "message_start", message: { id: "fixture-message", type: "message",
+      role: "assistant", model: "fixture-model", content: [],
+      usage: { input_tokens: 4, output_tokens: 0 } } }],
+    ["content_block_start", { type: "content_block_start", index: 0,
+      content_block: { type: "thinking", thinking: "" } }],
+    ["content_block_delta", { type: "content_block_delta", index: 0,
+      delta: { type: "thinking_delta", thinking: `SANITIZED_FIXTURE_REASONING${MULTIBYTE}` } }],
+    ["content_block_start", { type: "content_block_start", index: 1,
+      content_block: { type: "redacted_thinking", data: "SANITIZED_FIXTURE_REDACTED" } }],
+    ["content_block_start", { type: "content_block_start", index: 2,
+      content_block: { type: "text", text: "" } }],
+    ["content_block_delta", { type: "content_block_delta", index: 2,
+      delta: { type: "text_delta", text } }],
+    ["message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" },
+      usage: { output_tokens: 2 } }], ["message_stop", { type: "message_stop" }]];
+  return events.map(([event, data]) =>
+    `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join("");
+}
+function nativeRaw(dialect, name, errorKind) {
+  if (errorKind) return nativeErrorBody(dialect, name, errorKind);
+  return dialect === "anthropic" ? nativeAnthropicStream() : nativeOpenAiStream();
+}
+function responseFor(dialect, name, errorKind) {
+  if (!isNative(dialect, name)) return null;
+  if (!errorKind) {
+    return { status: 200, headers: [{ name: "content-type", value: "text/event-stream" }] };
+  }
+  const headers = [{ name: "content-type", value: "application/json" }];
+  if (errorKind === "rate_limit") {
+    headers.push({ name: "retry-after", value: String(RETRY_AFTER_SECONDS) });
+  }
+  return { status: NATIVE_STATUS[`${dialect}/${name}`], headers };
+}
 function rawFor(dialect, name, errorKind) {
+  if (isNative(dialect, name)) return nativeRaw(dialect, name, errorKind);
   if (dialect === "anthropic") return anthropicRaw(name, errorKind);
   if (dialect === "ollama") return ollamaRaw(name, errorKind);
   return openAIRaw(dialect, name, errorKind);
@@ -425,7 +580,7 @@ function buildCorpus(regions) {
     records.push({ id: root, dialect, name, paths, raw_format: rawFormat,
       dimensions, reasoning: name === "reasoning-redacted" ?
         { visible: true, redacted: true } : { visible: false, redacted: false },
-      terminal_kind: terminalKind });
+      terminal_kind: terminalKind, response: responseFor(dialect, name, errorKind) });
   }
   const inventory = [...files].map(([path, bytes]) => ({ path,
     kind: path.endsWith(".jsonl") ? "jsonl" : path.endsWith(".json") ? "json" : "raw",

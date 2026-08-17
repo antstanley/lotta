@@ -3,6 +3,10 @@
     "type": "Error",
     "kind": "rate_limit",
     "code": "fixture_rate_limit",
-    "context": "SANITIZED_FIXTURE_RETRY_AFTER"
+    "context": "SANITIZED_FIXTURE_RETRY_AFTER",
+    "retry_after": {
+      "type": "milliseconds",
+      "value": 2000
+    }
   }
 ]

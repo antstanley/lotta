@@ -8,3 +8,6 @@
 
 /// Stable model identity, settings, resolution, catalog, and update services.
 pub mod model;
+
+/// Native HTTP provider adapters.
+pub mod native;

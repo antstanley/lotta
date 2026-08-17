@@ -169,7 +169,16 @@
         "visible": false,
         "redacted": false
       },
-      "terminal_kind": "stop"
+      "terminal_kind": "stop",
+      "response": {
+        "status": 200,
+        "headers": [
+          {
+            "name": "content-type",
+            "value": "text/event-stream"
+          }
+        ]
+      }
     },
     {
       "id": "anthropic/reasoning-redacted",
@@ -191,7 +200,16 @@
         "visible": true,
         "redacted": true
       },
-      "terminal_kind": "stop"
+      "terminal_kind": "stop",
+      "response": {
+        "status": 200,
+        "headers": [
+          {
+            "name": "content-type",
+            "value": "text/event-stream"
+          }
+        ]
+      }
     },
     {
       "id": "ollama/cancelled",
@@ -213,7 +231,8 @@
         "visible": false,
         "redacted": false
       },
-      "terminal_kind": "error"
+      "terminal_kind": "error",
+      "response": null
     },
     {
       "id": "lm-studio/timeout",
@@ -235,7 +254,8 @@
         "visible": false,
         "redacted": false
       },
-      "terminal_kind": "error"
+      "terminal_kind": "error",
+      "response": null
     },
     {
       "id": "llama-cpp/context-overflow",
@@ -257,7 +277,8 @@
         "visible": false,
         "redacted": false
       },
-      "terminal_kind": "error"
+      "terminal_kind": "error",
+      "response": null
     },
     {
       "id": "openai-compatible/retry-after",
@@ -270,7 +291,7 @@
         "openai-compatible/retry-after/baseline-events.jsonl",
         "openai-compatible/retry-after/expected-trace.json"
       ],
-      "raw_format": "sse",
+      "raw_format": "json",
       "dimensions": [
         "retry_after",
         "errors"
@@ -279,7 +300,20 @@
         "visible": false,
         "redacted": false
       },
-      "terminal_kind": "error"
+      "terminal_kind": "error",
+      "response": {
+        "status": 429,
+        "headers": [
+          {
+            "name": "content-type",
+            "value": "application/json"
+          },
+          {
+            "name": "retry-after",
+            "value": "2"
+          }
+        ]
+      }
     },
     {
       "id": "ollama/image-drop",
@@ -301,7 +335,8 @@
         "visible": false,
         "redacted": false
       },
-      "terminal_kind": "stop"
+      "terminal_kind": "stop",
+      "response": null
     },
     {
       "id": "ollama/image-strict",
@@ -323,7 +358,8 @@
         "visible": false,
         "redacted": false
       },
-      "terminal_kind": "error"
+      "terminal_kind": "error",
+      "response": null
     },
     {
       "id": "anthropic/authentication",
@@ -336,7 +372,7 @@
         "anthropic/authentication/baseline-events.jsonl",
         "anthropic/authentication/expected-trace.json"
       ],
-      "raw_format": "anthropic_sse",
+      "raw_format": "json",
       "dimensions": [
         "errors"
       ],
@@ -344,7 +380,16 @@
         "visible": false,
         "redacted": false
       },
-      "terminal_kind": "error"
+      "terminal_kind": "error",
+      "response": {
+        "status": 401,
+        "headers": [
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ]
+      }
     },
     {
       "id": "openai-compatible/authorization",
@@ -357,7 +402,7 @@
         "openai-compatible/authorization/baseline-events.jsonl",
         "openai-compatible/authorization/expected-trace.json"
       ],
-      "raw_format": "sse",
+      "raw_format": "json",
       "dimensions": [
         "errors"
       ],
@@ -365,7 +410,16 @@
         "visible": false,
         "redacted": false
       },
-      "terminal_kind": "error"
+      "terminal_kind": "error",
+      "response": {
+        "status": 403,
+        "headers": [
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ]
+      }
     },
     {
       "id": "lm-studio/invalid-request",
@@ -386,7 +440,8 @@
         "visible": false,
         "redacted": false
       },
-      "terminal_kind": "error"
+      "terminal_kind": "error",
+      "response": null
     },
     {
       "id": "anthropic/quota",
@@ -399,7 +454,7 @@
         "anthropic/quota/baseline-events.jsonl",
         "anthropic/quota/expected-trace.json"
       ],
-      "raw_format": "anthropic_sse",
+      "raw_format": "json",
       "dimensions": [
         "errors"
       ],
@@ -407,7 +462,16 @@
         "visible": false,
         "redacted": false
       },
-      "terminal_kind": "error"
+      "terminal_kind": "error",
+      "response": {
+        "status": 402,
+        "headers": [
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ]
+      }
     },
     {
       "id": "llama-cpp/overloaded",
@@ -428,7 +492,8 @@
         "visible": false,
         "redacted": false
       },
-      "terminal_kind": "error"
+      "terminal_kind": "error",
+      "response": null
     },
     {
       "id": "ollama/unavailable",
@@ -449,7 +514,8 @@
         "visible": false,
         "redacted": false
       },
-      "terminal_kind": "error"
+      "terminal_kind": "error",
+      "response": null
     },
     {
       "id": "openai-compatible/protocol-error",
@@ -462,7 +528,7 @@
         "openai-compatible/protocol-error/baseline-events.jsonl",
         "openai-compatible/protocol-error/expected-trace.json"
       ],
-      "raw_format": "sse",
+      "raw_format": "json",
       "dimensions": [
         "errors"
       ],
@@ -470,7 +536,16 @@
         "visible": false,
         "redacted": false
       },
-      "terminal_kind": "error"
+      "terminal_kind": "error",
+      "response": {
+        "status": 406,
+        "headers": [
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ]
+      }
     },
     {
       "id": "lm-studio/unknown-error",
@@ -491,7 +566,8 @@
         "visible": false,
         "redacted": false
       },
-      "terminal_kind": "error"
+      "terminal_kind": "error",
+      "response": null
     }
   ],
   "error_kind_to_case": [
@@ -554,8 +630,8 @@
     {
       "path": "anthropic/authentication/expected-request.json",
       "kind": "json",
-      "bytes": 755,
-      "sha256": "db45f757956289265ce4a4886a3e446f8378a42bf06d15a908c0c6afb737fc8c"
+      "bytes": 996,
+      "sha256": "554f6d292752a76f3bbf92648eec85c0f058f5b946f73ac86d15ab886243542b"
     },
     {
       "path": "anthropic/authentication/expected-trace.json",
@@ -566,8 +642,8 @@
     {
       "path": "anthropic/authentication/raw-stream.txt",
       "kind": "raw",
-      "bytes": 115,
-      "sha256": "29d59fb3e890ae96b17282bc85960532ca6f98aa8468b6fcd65e547d75fa092e"
+      "bytes": 134,
+      "sha256": "a2b364e4cce1e003b8648a1753430ba6a86be16750015e0db37915e8610607b5"
     },
     {
       "path": "anthropic/authentication/request.json",
@@ -584,8 +660,8 @@
     {
       "path": "anthropic/quota/expected-request.json",
       "kind": "json",
-      "bytes": 755,
-      "sha256": "db45f757956289265ce4a4886a3e446f8378a42bf06d15a908c0c6afb737fc8c"
+      "bytes": 996,
+      "sha256": "554f6d292752a76f3bbf92648eec85c0f058f5b946f73ac86d15ab886243542b"
     },
     {
       "path": "anthropic/quota/expected-trace.json",
@@ -596,8 +672,8 @@
     {
       "path": "anthropic/quota/raw-stream.txt",
       "kind": "raw",
-      "bytes": 97,
-      "sha256": "e43a749a7b4ba8a61c777cdf23bd8de2cd83cac506b80081815668860c9382e4"
+      "bytes": 109,
+      "sha256": "b1034bd07ed55084a5b20e14bdc9df455c22d38b065cc22132998fba4a07ff5a"
     },
     {
       "path": "anthropic/quota/request.json",
@@ -608,32 +684,32 @@
     {
       "path": "anthropic/reasoning-redacted/baseline-events.jsonl",
       "kind": "jsonl",
-      "bytes": 1086,
-      "sha256": "e212578976412129f058cda4b0b2eba7d151e909007336bc9d730ce42403b67f"
+      "bytes": 1371,
+      "sha256": "39719ee90ee0e5264fcac852763ca3a5b3b3c5226890039dd0735ee463ff0397"
     },
     {
       "path": "anthropic/reasoning-redacted/expected-request.json",
       "kind": "json",
-      "bytes": 782,
-      "sha256": "f4380ed9cd79c6903bde42b2f0cfddb044e886d15788dde0bc06435b2c74bbf7"
+      "bytes": 1025,
+      "sha256": "70e97ac4317582e21349159cd71f63fd02b22df9f52680e71ce1067867612e7d"
     },
     {
       "path": "anthropic/reasoning-redacted/expected-trace.json",
       "kind": "json",
-      "bytes": 419,
-      "sha256": "ca27755d9911e0bc94d58d512c2a00bc888a3aebd202ac1a6347c2f2ac563fe2"
+      "bytes": 651,
+      "sha256": "8791cbb77483ba0f9a3f07f46117e203e6d02227f531612888557d51ee2d2a69"
     },
     {
       "path": "anthropic/reasoning-redacted/raw-stream.txt",
       "kind": "raw",
-      "bytes": 1057,
-      "sha256": "9771f39fce818903215c2ad16c8258011a714fb7d652c584712eb276b5ea3ff2"
+      "bytes": 1078,
+      "sha256": "dc1921ad866daefc0395aa4199224a0bc709d88ee937cc12605f4fd8207a277b"
     },
     {
       "path": "anthropic/reasoning-redacted/request.json",
       "kind": "json",
-      "bytes": 957,
-      "sha256": "a9e20af3936d37efbe4c31c64c2e95ef08dced226e3a1ee9372a0394806aca71"
+      "bytes": 958,
+      "sha256": "3d46e65f14ec741f8d75458f946aa88d6a0a83375e1276b7d4e057a8d2d2a725"
     },
     {
       "path": "llama-cpp/context-overflow/baseline-events.jsonl",
@@ -914,8 +990,8 @@
     {
       "path": "openai-compatible/authorization/expected-request.json",
       "kind": "json",
-      "bytes": 897,
-      "sha256": "cede6440f6dacc62cf8e42f12b644c17d445f9e396e57f113bb21f85c64f454a"
+      "bytes": 1036,
+      "sha256": "926f17e87de0d51eb2d6fb0bcfa48acc7114924b2effe8491864010b3f5277af"
     },
     {
       "path": "openai-compatible/authorization/expected-trace.json",
@@ -926,8 +1002,8 @@
     {
       "path": "openai-compatible/authorization/raw-stream.txt",
       "kind": "raw",
-      "bytes": 128,
-      "sha256": "4b37324700878bcaa8d678036dcc853b55e79563eeb2b5f9572e416502e17365"
+      "bytes": 121,
+      "sha256": "929758416d982e244e7aaeddeabf4520c9d1137918be23d2d0e5b7b1d1e77670"
     },
     {
       "path": "openai-compatible/authorization/request.json",
@@ -938,26 +1014,26 @@
     {
       "path": "openai-compatible/happy-tool/baseline-events.jsonl",
       "kind": "jsonl",
-      "bytes": 2047,
-      "sha256": "d98c520fb87e09891e5bde21742ad78c32cf00a040b43d521c1589b1e0e9bc63"
+      "bytes": 2129,
+      "sha256": "b9f7ecd60902b8fa3f357c093d7fa185c9754f781c7db8be306d0a7d9994a7d0"
     },
     {
       "path": "openai-compatible/happy-tool/expected-request.json",
       "kind": "json",
-      "bytes": 897,
-      "sha256": "cede6440f6dacc62cf8e42f12b644c17d445f9e396e57f113bb21f85c64f454a"
+      "bytes": 1036,
+      "sha256": "926f17e87de0d51eb2d6fb0bcfa48acc7114924b2effe8491864010b3f5277af"
     },
     {
       "path": "openai-compatible/happy-tool/expected-trace.json",
       "kind": "json",
-      "bytes": 927,
-      "sha256": "38ed478fcd72f55ad690d4f238061f8cace4956a537dfb8f1f90587c575b8135"
+      "bytes": 1077,
+      "sha256": "b84ea1daf9ea05d3947ca7b7f61b63bcb8476e046fb3b5027eb621f4a5076046"
     },
     {
       "path": "openai-compatible/happy-tool/raw-stream.txt",
       "kind": "raw",
-      "bytes": 624,
-      "sha256": "d9fb03f75ca145d13221333af74899e1f973922babbca389a745e6f05ac2634e"
+      "bytes": 801,
+      "sha256": "14400092e24539e8bf69df558b368f41b40046fe4a0d17625b7b08ffe42d41c1"
     },
     {
       "path": "openai-compatible/happy-tool/request.json",
@@ -974,8 +1050,8 @@
     {
       "path": "openai-compatible/protocol-error/expected-request.json",
       "kind": "json",
-      "bytes": 897,
-      "sha256": "cede6440f6dacc62cf8e42f12b644c17d445f9e396e57f113bb21f85c64f454a"
+      "bytes": 1036,
+      "sha256": "926f17e87de0d51eb2d6fb0bcfa48acc7114924b2effe8491864010b3f5277af"
     },
     {
       "path": "openai-compatible/protocol-error/expected-trace.json",
@@ -986,8 +1062,8 @@
     {
       "path": "openai-compatible/protocol-error/raw-stream.txt",
       "kind": "raw",
-      "bytes": 119,
-      "sha256": "ebf1015cafa8d16056067769932ebfa27d099a13e33431e3c4047688595b2dd5"
+      "bytes": 115,
+      "sha256": "5c67a9bacf9825d8695d393b4fda3cce3f7addf67f555fd2f7ca1c63ccb726c5"
     },
     {
       "path": "openai-compatible/protocol-error/request.json",
@@ -998,26 +1074,26 @@
     {
       "path": "openai-compatible/retry-after/baseline-events.jsonl",
       "kind": "jsonl",
-      "bytes": 279,
-      "sha256": "0a6d5023267c8cd90ad2a91d73074639ff476816e020254c682c7c5829adefd8"
+      "bytes": 330,
+      "sha256": "280c0e53fb3702ab588835eed277ac1d1a2f4928fd44fb82604732d14d31581e"
     },
     {
       "path": "openai-compatible/retry-after/expected-request.json",
       "kind": "json",
-      "bytes": 897,
-      "sha256": "cede6440f6dacc62cf8e42f12b644c17d445f9e396e57f113bb21f85c64f454a"
+      "bytes": 1036,
+      "sha256": "926f17e87de0d51eb2d6fb0bcfa48acc7114924b2effe8491864010b3f5277af"
     },
     {
       "path": "openai-compatible/retry-after/expected-trace.json",
       "kind": "json",
-      "bytes": 140,
-      "sha256": "12dbef4b796f08bad848e8cbe7815fe75584127bd222e0ed6a98c0eb0a701b38"
+      "bytes": 218,
+      "sha256": "36a5938147f503f8add795a1730c3dd0fd45200bfc9e7921df2b7a8ab72a9e03"
     },
     {
       "path": "openai-compatible/retry-after/raw-stream.txt",
       "kind": "raw",
-      "bytes": 142,
-      "sha256": "da7f5ebdc5c0a8ebfa66f1de8603fa12588a2ea4c56d0f8ca6621f988b19b0ee"
+      "bytes": 108,
+      "sha256": "d0cc7393f85f8504758d4e17031c5c74298ad9e5af6581da9b61e800a8514510"
     },
     {
       "path": "openai-compatible/retry-after/request.json",

@@ -11,9 +11,9 @@ pub use replay::{
     replay_provider,
 };
 pub use types::{
-    Dialect, Dimension, ErrorKindCase, InventoryEntry, InventoryKind, ProviderCase,
-    ProviderCaseRecord, ProviderErrorKind, ProviderIndex, RawFormat, ReasoningFlags, SourceRegion,
-    TerminalKind,
+    Dialect, Dimension, ErrorKindCase, HeaderFixture, InventoryEntry, InventoryKind, ProviderCase,
+    ProviderCaseRecord, ProviderErrorKind, ProviderIndex, RESPONSE_HEADERS_MAX, RawFormat,
+    ReasoningFlags, ResponseFixture, SourceRegion, TerminalKind,
 };
 
 #[cfg(test)]

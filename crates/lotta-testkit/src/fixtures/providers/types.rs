@@ -12,6 +12,12 @@ pub(super) const INVENTORY_COUNT: usize = 80;
 pub(super) const ERROR_KIND_COUNT: usize = 12;
 pub(super) const TRACE_EVENTS_MAX: usize = 64;
 pub(super) const REPLAY_CHANNEL_EVENTS_MAX: usize = 8;
+/// Maximum captured response headers replayed for one case.
+pub const RESPONSE_HEADERS_MAX: usize = 8;
+/// Lowest captured response status the corpus accepts.
+pub(super) const RESPONSE_STATUS_MIN: u16 = 200;
+/// Highest captured response status the corpus accepts.
+pub(super) const RESPONSE_STATUS_MAX: u16 = 599;
 pub(super) const SOURCE_COMMIT: &str = "300f923f16cc8eee50656d7da732902c1dea2b65";
 pub(super) const PI_AI_VERSION: &str = "0.82.1";
 pub(super) const FILES: [&str; 5] = [
@@ -155,6 +161,31 @@ pub enum RawFormat {
     AnthropicSse,
     /// Ollama NDJSON.
     Ndjson,
+    /// Plain vendor JSON body delivered with an explicit non-2xx [`ResponseFixture`].
+    Json,
+}
+/// One exact response header replayed verbatim by a loopback transport.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct HeaderFixture {
+    /// Lowercase header name.
+    pub name: String,
+    /// Exact header value.
+    pub value: String,
+}
+/// Explicit HTTP response metadata a loopback transport replays with `raw-stream.txt`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct ResponseFixture {
+    /// Exact response status code.
+    pub status: u16,
+    /// Exact response headers in captured order.
+    pub headers: BoundedVec<HeaderFixture, RESPONSE_HEADERS_MAX>,
+}
+impl ResponseFixture {
+    /// Reports whether the captured status is a success status.
+    #[must_use]
+    pub const fn is_success(&self) -> bool {
+        self.status >= 200 && self.status < 300
+    }
 }
 /// Successful or failed terminal kind.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -203,6 +234,9 @@ pub struct ProviderCaseRecord {
     pub reasoning: ReasoningFlags,
     /// Expected terminal kind.
     pub terminal_kind: TerminalKind,
+    /// Explicit response status and headers for cases replayed over a real transport.
+    #[serde(default)]
+    pub response: Option<ResponseFixture>,
 }
 /// One indexed corpus file.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -394,6 +428,8 @@ pub(super) enum BaselineEventRecord {
         kind: ProviderErrorKind,
         code: String,
         context: String,
+        #[serde(default)]
+        retry_after: Option<RetryAfterFixture>,
         provenance: Provenance,
     },
     Cancelled {
@@ -446,7 +482,17 @@ pub(super) enum FixtureEventRecord {
         kind: ProviderErrorKind,
         code: String,
         context: String,
+        /// Absent unless the capture preserved a provider-directed retry delay.
+        #[serde(default)]
+        retry_after: Option<RetryAfterFixture>,
     },
+}
+/// Provider-directed retry timing preserved by error normalization.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(super) enum RetryAfterFixture {
+    Milliseconds { value: u64 },
+    DateMilliseconds { value: u64 },
 }
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]

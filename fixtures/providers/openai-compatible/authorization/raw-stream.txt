@@ -1,2 +1,1 @@
-status: 500
-data: {"error":{"type":"authorization","code":"fixture_authorization","message":"SANITIZED_FIXTURE_authorization"}}
+{"error":{"type":"insufficient_permissions","code":"fixture_authorization","message":"SANITIZED_FIXTURE_AUTHORIZATION"}}

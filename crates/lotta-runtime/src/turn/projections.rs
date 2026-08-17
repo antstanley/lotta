@@ -1,6 +1,10 @@
 use super::test_support::*;
 use super::*;
-use crate::ports::{ProviderEvent, ProviderUsage, StopReason};
+use crate::boundary::ProviderName;
+use crate::ports::{
+    ProviderEvent, ProviderMetadata, ProviderMetadataInput, ProviderUsage, StopReason,
+};
+use lotta_domain::BoundedJsonValue;
 use serde::Deserialize;
 
 async fn run_projection(script: Vec<ProviderEvent>) -> RecordingEffects {
@@ -71,6 +75,13 @@ async fn redacted_delta_exact_projection_and_event() {
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+struct FixtureMetadataEntry {
+    key: String,
+    value: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 enum FixtureEvent {
     ThinkingDelta {
         text: String,
@@ -80,6 +91,9 @@ enum FixtureEvent {
     },
     TextDelta {
         text: String,
+    },
+    Metadata {
+        entries: Vec<FixtureMetadataEntry>,
     },
     Usage {
         input_tokens: u64,
@@ -111,6 +125,16 @@ async fn anthropic_reasoning_fixture_exact_replay() {
             FixtureEvent::TextDelta { text: value } => {
                 ProviderEvent::TextDelta { text: text(&value) }
             }
+            FixtureEvent::Metadata { entries } => {
+                let metadata = ProviderMetadata::classified(entries.into_iter().map(|entry| {
+                    ProviderMetadataInput::Persist {
+                        key: ProviderName::new(entry.key).unwrap(),
+                        value: BoundedJsonValue::new(entry.value).unwrap(),
+                    }
+                }))
+                .unwrap();
+                ProviderEvent::ProviderMetadata { metadata }
+            }
             FixtureEvent::Usage {
                 input_tokens,
                 output_tokens,
@@ -136,13 +160,13 @@ async fn anthropic_reasoning_fixture_exact_replay() {
     let expected = vec![
         TurnProjection::new(
             ProjectionKind::Reasoning,
-            text("SANITIZED_FIXTURE_REASONING"),
+            text("SANITIZED_FIXTURE_REASONING_é☃𝄞"),
         ),
         TurnProjection::new(
             ProjectionKind::RedactedReasoning,
-            text("<redacted-fixture>"),
+            text("<redacted-reasoning>"),
         ),
-        TurnProjection::new(ProjectionKind::Text, text("SANITIZED_FIXTURE_TEXT")),
+        TurnProjection::new(ProjectionKind::Text, text("SANITIZED_FIXTURE_TEXT_é☃𝄞")),
     ];
     assert_eq!(*effects.projections.lock().unwrap(), expected);
     let mut expected_events: Vec<_> = expected.into_iter().map(TurnEvent::StreamDelta).collect();

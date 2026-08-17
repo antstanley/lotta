@@ -1,15 +1,15 @@
 [
   {
     "type": "ReasoningDelta",
-    "text": "SANITIZED_FIXTURE_REASONING"
+    "text": "SANITIZED_FIXTURE_REASONING_é☃𝄞"
   },
   {
     "type": "RedactedReasoning",
-    "marker": "<redacted-fixture>"
+    "marker": "<redacted-reasoning>"
   },
   {
     "type": "TextDelta",
-    "text": "SANITIZED_FIXTURE_TEXT"
+    "text": "SANITIZED_FIXTURE_TEXT_é☃𝄞"
   },
   {
     "type": "Usage",
@@ -17,6 +17,19 @@
     "output_tokens": 2,
     "cached_input_tokens": 0,
     "reasoning_tokens": 0
+  },
+  {
+    "type": "ProviderMetadata",
+    "entries": [
+      {
+        "key": "id",
+        "value": "fixture-message"
+      },
+      {
+        "key": "model",
+        "value": "fixture-model"
+      }
+    ]
   },
   {
     "type": "Stop",

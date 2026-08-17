@@ -1,3 +1,1 @@
-status: 429
-header: retry-after=2
-data: {"error":{"type":"rate_limit","code":"fixture_rate_limit","message":"SANITIZED_FIXTURE_retry-after"}}
+{"error":{"type":"rate_limit_error","code":"fixture_rate_limit","message":"SANITIZED_FIXTURE_RETRY_AFTER"}}

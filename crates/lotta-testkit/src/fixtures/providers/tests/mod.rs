@@ -129,16 +129,26 @@ fn tool_assembly_and_usage_are_semantic() {
         .find(|case| case.record.name == "happy-tool")
         .expect("tool");
     let events = case.expected_trace.as_slice();
-    assert!(matches!(events[2], ProviderEvent::ToolCallStart { .. }));
+    assert!(matches!(events[1], ProviderEvent::ToolCallStart { .. }));
     assert!(matches!(
-        events[4],
+        events[2],
         ProviderEvent::ToolCallArgumentsDelta { .. }
     ));
     assert!(matches!(
         events[3],
         ProviderEvent::ToolCallArgumentsDelta { .. }
     ));
-    assert!(matches!(events[5], ProviderEvent::ToolCallEnd { .. }));
+    // The finishing choice closes its tool calls before that chunk's usage block.
+    assert!(matches!(events[4], ProviderEvent::ToolCallEnd { .. }));
+    let usage: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::Usage { usage } => Some(*usage),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(usage.len(), 2);
+    assert!(usage[1].is_monotonic_after(usage[0]));
     assert!(matches!(
         events.last(),
         Some(ProviderEvent::Stop {
@@ -358,13 +368,28 @@ fn dimension_context_semantics() {
 }
 #[test]
 fn dimension_retry_after_semantics() {
+    let case = cases()
+        .into_iter()
+        .find(|c| c.record.name == "retry-after")
+        .unwrap();
+    let response = case.record.response.as_ref().expect("response metadata");
+    assert_eq!(response.status, 429);
     assert!(
-        cases()
+        response
+            .headers
+            .as_slice()
             .iter()
-            .find(|c| c.record.name == "retry-after")
-            .unwrap()
-            .raw_stream
-            .contains("retry-after=2")
+            .any(|header| header.name == "retry-after" && header.value == "2")
+    );
+    let ProviderEvent::Error {
+        error: lotta_runtime::ports::ProviderError::RateLimit(context),
+    } = &case.expected_trace.as_slice()[0]
+    else {
+        panic!("retry-after fixture is a terminal rate-limit error");
+    };
+    assert_eq!(
+        context.retry_after,
+        Some(lotta_runtime::retry::RetryAfter::Milliseconds(2_000))
     );
 }
 #[test]
@@ -420,18 +445,33 @@ fn expected_request_preserves_message_order() {
         }
     }
 }
+/// Native continuation captures carry classified, secret-free metadata where raw bytes supply it.
 #[test]
 fn provider_metadata_is_classified() {
-    let c = cases()
-        .into_iter()
-        .find(|c| c.record.name == "happy-tool")
-        .unwrap();
-    assert!(
-        c.expected_trace
-            .as_slice()
-            .iter()
-            .any(|e| matches!(e, ProviderEvent::ProviderMetadata { .. }))
-    );
+    for case in cases() {
+        let expected = matches!(
+            case.record.id.as_str(),
+            "openai-compatible/happy-tool" | "anthropic/reasoning-redacted"
+        );
+        assert_eq!(
+            case.expected_trace
+                .as_slice()
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::ProviderMetadata { .. })),
+            expected,
+            "{}",
+            case.record.id
+        );
+    }
+    let record: super::types::FixtureEventRecord = serde_json::from_str(
+        r#"{"type":"ProviderMetadata","entries":[{"key":"fixture_request_id","value":"x"}]}"#,
+    )
+    .expect("metadata record");
+    let converted = super::convert::convert_trace(&[record]).expect("metadata conversion");
+    assert!(matches!(
+        converted.as_slice()[0],
+        ProviderEvent::ProviderMetadata { .. }
+    ));
 }
 #[test]
 fn raw_all_have_dialect_structure() {
@@ -444,6 +484,11 @@ fn raw_all_have_dialect_structure() {
             ),
             RawFormat::AnthropicSse => assert!(c.raw_stream.contains("event: ")),
             RawFormat::Sse => assert!(c.raw_stream.contains("data: ")),
+            RawFormat::Json => {
+                let body = serde_json::from_str::<serde_json::Value>(&c.raw_stream);
+                assert!(body.expect("json body").is_object());
+                assert!(!c.record.response.as_ref().expect("response").is_success());
+            }
         }
     }
 }

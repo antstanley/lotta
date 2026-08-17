@@ -1,2 +1,1 @@
-event: error
-data: {"type":"error","error":{"type":"authentication","message":"SANITIZED_FIXTURE_authentication"}}
+{"type":"error","error":{"type":"authentication_error","code":"fixture_authentication","message":"SANITIZED_FIXTURE_AUTHENTICATION"}}

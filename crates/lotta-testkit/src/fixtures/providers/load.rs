@@ -5,8 +5,8 @@ use super::convert::{convert_request, convert_trace, normalize_baseline, validat
 use super::types::{
     BaselineEventRecord, CASE_COUNT, Dialect, Dimension, ERROR_KIND_COUNT, FILES,
     FixtureEventRecord, INVENTORY_COUNT, InventoryEntry, PI_AI_VERSION, ProviderCase,
-    ProviderCaseRecord, ProviderErrorKind, ProviderIndex, RawFormat, RequestFixture, SOURCE_COMMIT,
-    TRACE_EVENTS_MAX,
+    ProviderCaseRecord, ProviderErrorKind, ProviderIndex, RESPONSE_STATUS_MAX, RESPONSE_STATUS_MIN,
+    RawFormat, RequestFixture, SOURCE_COMMIT, TRACE_EVENTS_MAX,
 };
 use crate::TestkitError;
 use crate::fixtures::{FixtureLoader, sha256};
@@ -170,6 +170,34 @@ fn validate_record(record: &ProviderCaseRecord) -> Result<(), ProviderFixtureErr
             return Err(ProviderFixtureError::Semantic("case path"));
         }
     }
+    validate_response(record)
+}
+/// A plain JSON capture carries no framing, so its status and headers must be indexed and
+/// non-2xx; every recorded response must otherwise stay a well-formed replayable response.
+fn validate_response(record: &ProviderCaseRecord) -> Result<(), ProviderFixtureError> {
+    let Some(response) = &record.response else {
+        return if record.raw_format == RawFormat::Json {
+            Err(ProviderFixtureError::Semantic("json capture response"))
+        } else {
+            Ok(())
+        };
+    };
+    if response.status < RESPONSE_STATUS_MIN || response.status > RESPONSE_STATUS_MAX {
+        return Err(ProviderFixtureError::Semantic("response status"));
+    }
+    if record.raw_format == RawFormat::Json && response.is_success() {
+        return Err(ProviderFixtureError::Semantic("json capture status"));
+    }
+    let mut names = BTreeSet::new();
+    for header in response.headers.as_slice() {
+        let lowercase = header.name.bytes().all(|byte| !byte.is_ascii_uppercase());
+        if header.name.is_empty() || !lowercase || !names.insert(header.name.as_str()) {
+            return Err(ProviderFixtureError::Semantic("response header"));
+        }
+        if header.value.is_empty() || header.value.bytes().any(|byte| byte < b' ') {
+            return Err(ProviderFixtureError::Semantic("response header value"));
+        }
+    }
     Ok(())
 }
 fn parse_jsonl(
@@ -191,6 +219,13 @@ pub(super) fn validate_raw(format: RawFormat, text: &str) -> Result<(), Provider
         return Err(ProviderFixtureError::Semantic("raw sanitization marker"));
     }
     match format {
+        RawFormat::Json => {
+            let value: BoundedJsonValue = serde_json::from_str(text)
+                .map_err(|_| ProviderFixtureError::Semantic("JSON body"))?;
+            if !value.as_value().is_object() {
+                return Err(ProviderFixtureError::Semantic("JSON body object"));
+            }
+        }
         RawFormat::Ndjson => {
             for line in text.lines() {
                 serde_json::from_str::<BoundedJsonValue>(line)

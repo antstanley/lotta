@@ -1,2 +1,1 @@
-event: error
-data: {"type":"error","error":{"type":"quota","message":"SANITIZED_FIXTURE_quota"}}
+{"type":"error","error":{"type":"billing_error","code":"fixture_quota","message":"SANITIZED_FIXTURE_QUOTA"}}

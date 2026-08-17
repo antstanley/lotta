@@ -3,8 +3,8 @@
 use super::ProviderFixtureError;
 use super::types::{
     BaselineEventRecord, ContentFixture, FixtureEventRecord, ImagePolicyFixture, MessageFixture,
-    MetadataEntryFixture, ProviderErrorKind, RequestFixture, RoleFixture, StopReasonFixture,
-    TRACE_EVENTS_MAX, ToolChoiceFixture, ToolFixture,
+    MetadataEntryFixture, ProviderErrorKind, RequestFixture, RetryAfterFixture, RoleFixture,
+    StopReasonFixture, TRACE_EVENTS_MAX, ToolChoiceFixture, ToolFixture,
 };
 use lotta_domain::{BoundedJsonValue, BoundedVec};
 use lotta_runtime::boundary::{
@@ -17,6 +17,7 @@ use lotta_runtime::ports::{
     ProviderToolDefinition, ProviderTools, ProviderUsage, ReasoningControls, StopReason,
     TokenLimit, ToolCallAccumulator, ToolCallId,
 };
+use lotta_runtime::retry::RetryAfter;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -261,10 +262,11 @@ fn normalize_terminal_event(
             kind,
             code,
             context,
+            retry_after,
             ..
-        } => terminal_error(*kind, code, context, terminal),
+        } => terminal_error(*kind, code, context, *retry_after, terminal),
         BaselineEventRecord::Cancelled { code, context, .. } => {
-            terminal_error(ProviderErrorKind::Cancelled, code, context, terminal)
+            terminal_error(ProviderErrorKind::Cancelled, code, context, None, terminal)
         }
         _ => unreachable!(),
     }
@@ -312,11 +314,12 @@ fn terminal_error(
     kind: ProviderErrorKind,
     code: &str,
     context: &str,
+    retry_after: Option<RetryAfterFixture>,
     terminal: &mut bool,
 ) -> Result<ProviderEvent, ProviderFixtureError> {
     *terminal = true;
     Ok(ProviderEvent::Error {
-        error: provider_error(kind, code, context)?,
+        error: provider_error(kind, code, context, retry_after)?,
     })
 }
 fn classified_entries(
@@ -400,8 +403,9 @@ fn convert_event(value: &FixtureEventRecord) -> Result<ProviderEvent, ProviderFi
             kind,
             code,
             context,
+            retry_after,
         } => ProviderEvent::Error {
-            error: provider_error(*kind, code, context)?,
+            error: provider_error(*kind, code, context, *retry_after)?,
         },
     })
 }
@@ -421,9 +425,13 @@ fn provider_error(
     kind: ProviderErrorKind,
     code: &str,
     context: &str,
+    retry_after: Option<RetryAfterFixture>,
 ) -> Result<ProviderError, ProviderFixtureError> {
     let context = ProviderErrorContext {
-        retry_after: None,
+        retry_after: retry_after.map(|value| match value {
+            RetryAfterFixture::Milliseconds { value } => RetryAfter::Milliseconds(value),
+            RetryAfterFixture::DateMilliseconds { value } => RetryAfter::DateMilliseconds(value),
+        }),
         code: ProviderName::new(code.to_owned())?,
         context: ProviderEventText::new(context.to_owned())?,
     };

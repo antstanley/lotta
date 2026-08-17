@@ -5,7 +5,7 @@ event: content_block_start
 data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"SANITIZED_FIXTURE_REASONING"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"SANITIZED_FIXTURE_REASONING_é☃𝄞"}}
 
 event: content_block_start
 data: {"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"SANITIZED_FIXTURE_REDACTED"}}
@@ -14,10 +14,11 @@ event: content_block_start
 data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"SANITIZED_FIXTURE_TEXT"}}
+data: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"SANITIZED_FIXTURE_TEXT_é☃𝄞"}}
 
 event: message_delta
 data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}
 
 event: message_stop
 data: {"type":"message_stop"}
+

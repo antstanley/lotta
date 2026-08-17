@@ -2,19 +2,31 @@
   "method": "POST",
   "endpoint": "/v1/messages",
   "headers": {
-    "anthropic-version": "SANITIZED_FIXTURE_VERSION"
+    "accept": "text/event-stream",
+    "anthropic-beta": "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
+    "anthropic-version": "2023-06-01",
+    "content-type": "application/json"
   },
+  "presence_only_headers": [
+    "content-length",
+    "credential",
+    "host"
+  ],
   "body": {
     "model": "fixture-model",
-    "system": "SANITIZED_FIXTURE_SYSTEM",
     "messages": [
       {
         "role": "user",
         "content": "SANITIZED_FIXTURE_USER"
       }
     ],
-    "max_tokens": 256,
+    "max_tokens": 8192,
     "stream": true,
+    "thinking": {
+      "type": "enabled",
+      "budget_tokens": 7168
+    },
+    "system": "SANITIZED_FIXTURE_SYSTEM",
     "tools": [
       {
         "name": "fixture_tool",
@@ -31,10 +43,6 @@
           ]
         }
       }
-    ],
-    "thinking": {
-      "type": "enabled",
-      "budget_tokens": 128
-    }
+    ]
   }
 }

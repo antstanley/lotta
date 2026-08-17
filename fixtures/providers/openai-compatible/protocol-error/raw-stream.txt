@@ -1,2 +1,1 @@
-status: 500
-data: {"error":{"type":"protocol","code":"fixture_protocol","message":"SANITIZED_FIXTURE_protocol-error"}}
+{"error":{"type":"invalid_response_error","code":"fixture_protocol","message":"SANITIZED_FIXTURE_PROTOCOL_ERROR"}}

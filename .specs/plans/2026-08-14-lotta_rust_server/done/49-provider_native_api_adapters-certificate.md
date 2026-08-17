@@ -1,7 +1,7 @@
 # Done Certificate — Task 49: Native OpenAI-compatible and Anthropic adapters
 
 **Task:** [49-provider_native_api_adapters.md](49-provider_native_api_adapters.md) · **Plan:** [plan.md](../plan.md)
-**State:** Authored 2026-08-14 — unverified
+**State:** Verified 2026-08-17 — DONE
 
 > Verification protocol for Task 49. A validating agent discharges it: collect each
 > obligation's evidence, run its checks, set the Status, then derive the Conclusion by the
@@ -24,43 +24,45 @@ obligation names (a file location, a named test result, or an execution trace) �
 - **O1 — Both adapters replay their `fixtures/providers/` corpus and produce the expected normalized trace event for event**
   - *Claim:* Every captured stream for the two dialects yields the recorded expected trace under the Task 12 comparator.
   - *Evidence to collect:* Run `cargo nextest run -p lotta-providers -E 'test(native::replay)'` — expect one passing case per fixture in the two dialect directories, with the first divergence reported on failure.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED — all seven indexed native fixtures (four OpenAI-compatible, three Anthropic) replay event-for-event through public adapters and real loopback HTTP/SSE; corpus inventory remains 16 cases/80 files and deterministic generator checks pass twice.
 
 - **O2 — Vendor errors map to the twelve `ProviderError` kinds and no vendor type crosses the port**
   - *Claim:* Each error fixture maps to its expected kind, and the adapter's public signature exposes no vendor error type.
   - *Evidence to collect:* Run `cargo nextest run -p lotta-providers -E 'test(native::error_mapping)'` — expect one case per error fixture. Grep the adapter's public API for `reqwest::Error` — expect zero, per `architecture-principles.md` §Rust baseline.
   - *Checks:* Resolve the error constructed on an HTTP 429 — confirm it is `ProviderError::RateLimit`, and on 402/quota exhaustion `ProviderError::Quota`; the two are distinct kinds in `06-model-providers.md` §Normalized provider port.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED — both public adapters exercise all twelve normalized kinds over loopback HTTP/stream paths, including distinct 402 quota and 429 rate-limit plus seconds/milliseconds/date retry-after; no public signature exposes a vendor error.
 
 - **O3 — Reasoning and redacted-reasoning events survive translation where the vendor emits them**
   - *Claim:* The reasoning fixtures produce `ReasoningDelta` and `RedactedReasoning` events rather than being folded into text.
   - *Evidence to collect:* Run `cargo nextest run -p lotta-providers -E 'test(native::reasoning)'` — expect both cases, asserting the event kind rather than only the text content.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED — public streams preserve OpenAI reasoning precedence and Anthropic thinking/redacted data, retain safe continuation metadata, and never expose secret Anthropic signatures as visible reasoning or empty metadata.
 
 - **O4 — The strict/drop image policy is applied and `PROVIDER_REQUEST_BYTES_MAX`/`PROVIDER_RESPONSE_EVENT_BYTES_MAX` are enforced**
   - *Claim:* Under strict policy an unsupported image fails the request; under drop policy it is elided; both byte bounds reject above the limit.
   - *Evidence to collect:* Run `cargo nextest run -p lotta-providers -E 'test(native::image_policy) + test(native::byte_bounds)'` — expect the two policy cases and below/at/above cases for both bounds from `06-model-providers.md` §Limits.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED — public strict/drop/supported-image cases verify no-request rejection and exact vendor wire bodies for both adapters; request and response-event below/at/above limits pass with at accepted and above rejected.
 
 - **O5 — Meets the repo definition of done (tests, lint/format, named-constant limits — see plan.md baseline)**
   - *Claim:* The repo-wide gates named in the plan's definition-of-done baseline pass for this change.
   - *Evidence to collect:* Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo nextest run --workspace --all-features`, and `cargo deny check` — expect exit code 0 from each. Read every constant this task introduces and confirm it is a `const` whose name puts units last (`development-guidelines.md` §Naming), and that each function the task added stays within 70 lines and 100 columns.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED — workspace 1,593/1,593, fmt, strict all-target/all-feature Clippy, docs, deny, generator checks, named constants, and source-shape gates pass.
 
 - **O6 — Reviewable: a reviewer runs `cargo nextest run -p lotta-providers -E 'test(native::)'` and sees every OpenAI-compatible and Anthropic fixture replay to its expected trace with correct error kinds and image policy**
   - *Claim:* Both native adapters pass the fixture corpus.
   - *Evidence to collect:* Run the filter and confirm zero failures and a replay case count equal to the number of fixtures in the two dialect directories.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED — broad `native::` selector passes 40/40, including replay 7/7, both public Task09 contracts, lifecycle, errors, reasoning, image, byte bounds, SSE, and security.
 
 ## Regression check
 
 For each unit this task changes, the validator traces one downstream caller:
 
-- `crates/lotta-testkit/src/contract/` provider suite (Task 09) must pass for these adapters as well as the fake; confirm both invocations pass : ☐ (PRESERVED / REGRESSION)
+- `crates/lotta-testkit/src/contract/` provider suite (Task 09) must pass for these adapters as well as the fake; confirm both invocations pass : ☒ PRESERVED — real OpenAI-compatible and Anthropic adapters each run all Success, TerminalError, ReceiverClosed, and Cancelled scenarios over TCP loopback through `ProviderPort`; the fake suite and workspace remain green.
 
 ## Residue
 
 OpenAI Codex/ChatGPT OAuth stays on the compatibility host until its OAuth and request dialect pass fixtures (`06-model-providers.md` §Provider classes); it is Task 51's scope.
+
+The Task 07 provider message port cannot yet represent prior assistant tool-call/thinking blocks for a subsequent vendor request. That upstream multi-turn history extension remains Task 55 scope and is not absorbed here.
 
 ## Conclusion
 
@@ -71,6 +73,6 @@ check found a REGRESSION; **PARTIAL** if every obligation is SATISFIED except on
 more UNVERIFIED and no regression; **DONE** only if every obligation is SATISFIED and
 the regression check is PRESERVED.
 
-VERDICT: ☐ (DONE | PARTIAL | NOT_DONE)
-CONFIDENCE: ☐ (high | medium | low)
-SUMMARY: ☐
+VERDICT: ☒ DONE
+CONFIDENCE: ☒ high
+SUMMARY: Native OpenAI-compatible and Anthropic adapters now map pinned requests and bounded streams, preserve reasoning and safe continuation metadata, normalize all twelve errors, enforce image and byte policies, and pass deterministic public-adapter fixture and contract suites.
