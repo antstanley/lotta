@@ -76,8 +76,10 @@ impl OpenAiCompatible {
         max_tokens_field: MaxTokensField,
         supports_images: bool,
     ) -> Result<Self, RuntimeError> {
-        if !shared::is_secure_endpoint(endpoint) {
-            return Err(invalid("provider endpoint requires HTTPS"));
+        if !shared::endpoint_allowed(endpoint, !credential.is_empty()) {
+            return Err(invalid(
+                "provider endpoint requires HTTPS or an uncredentialed LAN URL",
+            ));
         }
         let endpoint = shared::endpoint(endpoint, CHAT_COMPLETIONS_PATH);
         let credential = if credential.is_empty() {

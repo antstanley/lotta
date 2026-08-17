@@ -1,2 +1,1 @@
-status: 500
-data: {"error":{"type":"unknown","code":"fixture_unknown","message":"SANITIZED_FIXTURE_unknown-error"}}
+{"error":{"type":"unknown","code":"fixture_unknown","message":"SANITIZED_FIXTURE_UNKNOWN_ERROR"}}

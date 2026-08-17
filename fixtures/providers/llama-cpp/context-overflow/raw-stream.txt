@@ -1,2 +1,1 @@
-status: 500
-data: {"error":{"type":"context_overflow","code":"fixture_context_overflow","message":"SANITIZED_FIXTURE_context-overflow"}}
+{"error":{"type":"context_overflow","code":"fixture_context_overflow","message":"SANITIZED_FIXTURE_CONTEXT_OVERFLOW"}}

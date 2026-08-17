@@ -1,6 +1,14 @@
 {
   "method": "POST",
   "endpoint": "/api/chat",
+  "headers": {
+    "accept": "*/*",
+    "content-type": "application/json"
+  },
+  "presence_only_headers": [
+    "content-length",
+    "host"
+  ],
   "body": {
     "model": "fixture-model",
     "messages": [
@@ -10,11 +18,11 @@
       },
       {
         "role": "user",
-        "content": "SANITIZED_FIXTURE_USER",
-        "images": []
+        "content": "SANITIZED_FIXTURE_USER"
       }
     ],
     "stream": true,
+    "think": false,
     "tools": [
       {
         "type": "function",

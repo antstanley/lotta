@@ -1,2 +1,1 @@
-status: 500
-data: {"error":{"type":"overloaded","code":"fixture_overloaded","message":"SANITIZED_FIXTURE_overloaded"}}
+{"error":{"type":"overloaded","code":"fixture_overloaded","message":"SANITIZED_FIXTURE_OVERLOADED"}}

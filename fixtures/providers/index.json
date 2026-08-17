@@ -232,7 +232,15 @@
         "redacted": false
       },
       "terminal_kind": "error",
-      "response": null
+      "response": {
+        "status": 499,
+        "headers": [
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ]
+      }
     },
     {
       "id": "lm-studio/timeout",
@@ -255,7 +263,15 @@
         "redacted": false
       },
       "terminal_kind": "error",
-      "response": null
+      "response": {
+        "status": 504,
+        "headers": [
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ]
+      }
     },
     {
       "id": "llama-cpp/context-overflow",
@@ -278,7 +294,15 @@
         "redacted": false
       },
       "terminal_kind": "error",
-      "response": null
+      "response": {
+        "status": 400,
+        "headers": [
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ]
+      }
     },
     {
       "id": "openai-compatible/retry-after",
@@ -336,7 +360,15 @@
         "redacted": false
       },
       "terminal_kind": "stop",
-      "response": null
+      "response": {
+        "status": 200,
+        "headers": [
+          {
+            "name": "content-type",
+            "value": "application/x-ndjson"
+          }
+        ]
+      }
     },
     {
       "id": "ollama/image-strict",
@@ -441,7 +473,15 @@
         "redacted": false
       },
       "terminal_kind": "error",
-      "response": null
+      "response": {
+        "status": 400,
+        "headers": [
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ]
+      }
     },
     {
       "id": "anthropic/quota",
@@ -493,7 +533,15 @@
         "redacted": false
       },
       "terminal_kind": "error",
-      "response": null
+      "response": {
+        "status": 503,
+        "headers": [
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ]
+      }
     },
     {
       "id": "ollama/unavailable",
@@ -515,7 +563,15 @@
         "redacted": false
       },
       "terminal_kind": "error",
-      "response": null
+      "response": {
+        "status": 503,
+        "headers": [
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ]
+      }
     },
     {
       "id": "openai-compatible/protocol-error",
@@ -567,7 +623,15 @@
         "redacted": false
       },
       "terminal_kind": "error",
-      "response": null
+      "response": {
+        "status": 418,
+        "headers": [
+          {
+            "name": "content-type",
+            "value": "application/json"
+          }
+        ]
+      }
     }
   ],
   "error_kind_to_case": [
@@ -720,8 +784,8 @@
     {
       "path": "llama-cpp/context-overflow/expected-request.json",
       "kind": "json",
-      "bytes": 889,
-      "sha256": "bbfa7cc044e459e753f45f64a3023765db2a467d6ec5c01a272690ba762e61da"
+      "bytes": 1050,
+      "sha256": "737b79d5bd8436688987c3700c7b2f15ec3f23a5156f4c5fd535f2a89659a053"
     },
     {
       "path": "llama-cpp/context-overflow/expected-trace.json",
@@ -732,8 +796,8 @@
     {
       "path": "llama-cpp/context-overflow/raw-stream.txt",
       "kind": "raw",
-      "bytes": 137,
-      "sha256": "e8704fa22adbb27c7fbae03ae0a2e3518667e23464cc02fd214783125a1b30b2"
+      "bytes": 119,
+      "sha256": "3037b582e97f88a911a4a78201e4ff159626fd708102d393a8c57b3649e22a1d"
     },
     {
       "path": "llama-cpp/context-overflow/request.json",
@@ -750,8 +814,8 @@
     {
       "path": "llama-cpp/overloaded/expected-request.json",
       "kind": "json",
-      "bytes": 889,
-      "sha256": "bbfa7cc044e459e753f45f64a3023765db2a467d6ec5c01a272690ba762e61da"
+      "bytes": 1050,
+      "sha256": "737b79d5bd8436688987c3700c7b2f15ec3f23a5156f4c5fd535f2a89659a053"
     },
     {
       "path": "llama-cpp/overloaded/expected-trace.json",
@@ -762,8 +826,8 @@
     {
       "path": "llama-cpp/overloaded/raw-stream.txt",
       "kind": "raw",
-      "bytes": 119,
-      "sha256": "edb8fcb8ecd57b7a45b9f100bf04acec930a28d22b848852cb7866a3e07683f3"
+      "bytes": 101,
+      "sha256": "7bb9508f69adb3dcf0b04b6f304833909dd3dff79cae843491effe761481e127"
     },
     {
       "path": "llama-cpp/overloaded/request.json",
@@ -780,8 +844,8 @@
     {
       "path": "lm-studio/invalid-request/expected-request.json",
       "kind": "json",
-      "bytes": 889,
-      "sha256": "782e501a683268bc255eab0caed91c67cd2e8fdc1a829f88880aef446d3490fd"
+      "bytes": 1050,
+      "sha256": "12a0c59d868c0225e8ce098e7bdafc65ded2835feee18bb5b854939a1e98f840"
     },
     {
       "path": "lm-studio/invalid-request/expected-trace.json",
@@ -792,8 +856,8 @@
     {
       "path": "lm-studio/invalid-request/raw-stream.txt",
       "kind": "raw",
-      "bytes": 134,
-      "sha256": "6d0de3a4ff6a42b8fbe0457a329e2d24f99f5066032765a7848f98159de8cc8e"
+      "bytes": 116,
+      "sha256": "3681527541bc6329abc8557a0902d0914e41e17671f348f6ecb1bd831febc78a"
     },
     {
       "path": "lm-studio/invalid-request/request.json",
@@ -810,8 +874,8 @@
     {
       "path": "lm-studio/timeout/expected-request.json",
       "kind": "json",
-      "bytes": 889,
-      "sha256": "782e501a683268bc255eab0caed91c67cd2e8fdc1a829f88880aef446d3490fd"
+      "bytes": 1050,
+      "sha256": "12a0c59d868c0225e8ce098e7bdafc65ded2835feee18bb5b854939a1e98f840"
     },
     {
       "path": "lm-studio/timeout/expected-trace.json",
@@ -822,8 +886,8 @@
     {
       "path": "lm-studio/timeout/raw-stream.txt",
       "kind": "raw",
-      "bytes": 110,
-      "sha256": "4fb94770a601d1b602b78f8fdb9151edf4a876d80b895ed16e1c886a8f34d1df"
+      "bytes": 92,
+      "sha256": "a9108d8e479c737db699ef09491606766605c372f77bd0266976b5d077972cd1"
     },
     {
       "path": "lm-studio/timeout/request.json",
@@ -840,8 +904,8 @@
     {
       "path": "lm-studio/unknown-error/expected-request.json",
       "kind": "json",
-      "bytes": 889,
-      "sha256": "782e501a683268bc255eab0caed91c67cd2e8fdc1a829f88880aef446d3490fd"
+      "bytes": 1050,
+      "sha256": "12a0c59d868c0225e8ce098e7bdafc65ded2835feee18bb5b854939a1e98f840"
     },
     {
       "path": "lm-studio/unknown-error/expected-trace.json",
@@ -852,8 +916,8 @@
     {
       "path": "lm-studio/unknown-error/raw-stream.txt",
       "kind": "raw",
-      "bytes": 116,
-      "sha256": "d716d2855260cc8160bd7a4e16198cdd68244eff4acbc0c0095b36801d764d8b"
+      "bytes": 98,
+      "sha256": "76d05ff47873b2fef845cd48d224db21e51b2f068deb646f6da682a66d9a930b"
     },
     {
       "path": "lm-studio/unknown-error/request.json",
@@ -864,26 +928,26 @@
     {
       "path": "ollama/cancelled/baseline-events.jsonl",
       "kind": "jsonl",
-      "bytes": 657,
-      "sha256": "25b2ffe89fe32b212e5b6795bd2aebedf1b1eccbad7358f71ad2b9161df48ac9"
+      "bytes": 486,
+      "sha256": "b829ebfd1fd0f3f3d54d47508128e2e3289585e0a01184187fa232465e8fe599"
     },
     {
       "path": "ollama/cancelled/expected-request.json",
       "kind": "json",
-      "bytes": 809,
-      "sha256": "6b82053be3d13fa3c8284f646ffb7a7729026d239519a6a3bce10564a2e641e8"
+      "bytes": 976,
+      "sha256": "d0ecfb2849ac9ef0385f75b31d0ac0af64eb0962376ab08089bb601bda090fc9"
     },
     {
       "path": "ollama/cancelled/expected-trace.json",
       "kind": "json",
-      "bytes": 207,
-      "sha256": "49e6c88dfccb0b96cf18385808ed466eefe3f0306794af52e60f6ea1e2cc77f5"
+      "bytes": 136,
+      "sha256": "be5400f14af0bd12e803ada9b520f78f01847f8befd1ad9d22edcc070ca40c3e"
     },
     {
       "path": "ollama/cancelled/raw-stream.txt",
       "kind": "raw",
-      "bytes": 71,
-      "sha256": "75faa03923d4d2d18fb9493e2d7971c3c6a8b20a81cf25656d151f52b069408e"
+      "bytes": 98,
+      "sha256": "f65a5957e046f530bdceb341a2c0034025b2f118c5de381c5315242d481390c0"
     },
     {
       "path": "ollama/cancelled/request.json",
@@ -894,20 +958,20 @@
     {
       "path": "ollama/image-drop/baseline-events.jsonl",
       "kind": "jsonl",
-      "bytes": 653,
-      "sha256": "7d403f8f6d0cecb46013729d339e65483d2c380df026418b4a428033f2e990c0"
+      "bytes": 1298,
+      "sha256": "c147ad77948e20b4953d6f4da343c03de3d1a91ed7a9ee7ebf7c4a09ca3200c3"
     },
     {
       "path": "ollama/image-drop/expected-request.json",
       "kind": "json",
-      "bytes": 831,
-      "sha256": "9f975b68568a7e27ed863530ec40a611e9f41c781297918a90bfab88c4abaf9f"
+      "bytes": 976,
+      "sha256": "d0ecfb2849ac9ef0385f75b31d0ac0af64eb0962376ab08089bb601bda090fc9"
     },
     {
       "path": "ollama/image-drop/expected-trace.json",
       "kind": "json",
-      "bytes": 261,
-      "sha256": "6852bfbc9a7308d587eeae9284ea98c71ae2de2f1d8bb30f281cf147399d3e8d"
+      "bytes": 518,
+      "sha256": "b29536267b85b453c375ae471e42d59ec98182cfcf96af79f91e1860e339c12d"
     },
     {
       "path": "ollama/image-drop/raw-stream.txt",
@@ -960,8 +1024,8 @@
     {
       "path": "ollama/unavailable/expected-request.json",
       "kind": "json",
-      "bytes": 809,
-      "sha256": "6b82053be3d13fa3c8284f646ffb7a7729026d239519a6a3bce10564a2e641e8"
+      "bytes": 976,
+      "sha256": "d0ecfb2849ac9ef0385f75b31d0ac0af64eb0962376ab08089bb601bda090fc9"
     },
     {
       "path": "ollama/unavailable/expected-trace.json",
@@ -972,8 +1036,8 @@
     {
       "path": "ollama/unavailable/raw-stream.txt",
       "kind": "raw",
-      "bytes": 75,
-      "sha256": "df08f682824c73954aafe218d96c93c5eb524bfc66c719e06eba84f0a2dd74f9"
+      "bytes": 104,
+      "sha256": "4f543b505e1768bd7e2184e084244a189b4f04220f73df4bf949854682081d68"
     },
     {
       "path": "ollama/unavailable/request.json",

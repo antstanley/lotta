@@ -9,5 +9,8 @@
 /// Stable model identity, settings, resolution, catalog, and update services.
 pub mod model;
 
+/// Local endpoint adapters and native model discovery.
+pub mod local;
+
 /// Native HTTP provider adapters.
 pub mod native;

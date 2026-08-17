@@ -4,6 +4,20 @@
     "text": "SANITIZED_FIXTURE_TEXT"
   },
   {
+    "type": "ToolCallStart",
+    "call_id": "call-0",
+    "name": "fixture_tool"
+  },
+  {
+    "type": "ToolCallArgumentsDelta",
+    "call_id": "call-0",
+    "bytes_base64": "eyJhIjoxfQ=="
+  },
+  {
+    "type": "ToolCallEnd",
+    "call_id": "call-0"
+  },
+  {
     "type": "Usage",
     "input_tokens": 3,
     "output_tokens": 2,
@@ -12,6 +26,6 @@
   },
   {
     "type": "Stop",
-    "reason": "end_turn"
+    "reason": "tool_use"
   }
 ]

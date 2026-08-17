@@ -1,2 +1,1 @@
-status: 500
-data: {"error":{"type":"invalid_request","code":"fixture_invalid_request","message":"SANITIZED_FIXTURE_invalid-request"}}
+{"error":{"type":"invalid_request","code":"fixture_invalid_request","message":"SANITIZED_FIXTURE_INVALID_REQUEST"}}

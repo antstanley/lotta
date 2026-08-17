@@ -72,7 +72,7 @@ impl Anthropic {
         credential: &str,
         supports_images: bool,
     ) -> Result<Self, RuntimeError> {
-        if !shared::is_secure_endpoint(endpoint) {
+        if !shared::endpoint_allowed(endpoint, !credential.is_empty()) {
             return Err(invalid("provider endpoint requires HTTPS"));
         }
         let endpoint = shared::endpoint(endpoint, MESSAGES_PATH);

@@ -22,20 +22,20 @@ const REQUEST_BYTES_MAX: usize = 64 * 1024 * 1024;
 const READ_BUFFER_BYTES: usize = 256 * 1024;
 
 /// One complete request an adapter put on the wire.
-pub(super) struct RecordedRequest {
+pub(crate) struct RecordedRequest {
     /// Request method token.
-    pub(super) method: String,
+    pub(crate) method: String,
     /// Request target, including the adapter-composed path.
-    pub(super) target: String,
+    pub(crate) target: String,
     /// Lowercased header names paired with their exact values, in arrival order.
-    pub(super) headers: Vec<(String, String)>,
+    pub(crate) headers: Vec<(String, String)>,
     /// Exact request body bytes.
-    pub(super) body: Vec<u8>,
+    pub(crate) body: Vec<u8>,
 }
 
 /// A bound loopback listener serving exactly one recorded exchange.
 #[derive(Clone)]
-pub(super) enum ResponseScript {
+pub(crate) enum ResponseScript {
     Complete(Vec<u8>),
     WaitForNotify {
         prefix: Vec<u8>,
@@ -44,14 +44,14 @@ pub(super) enum ResponseScript {
     Truncate(Vec<u8>),
 }
 
-pub(super) struct Loopback {
+pub(crate) struct Loopback {
     base: reqwest::Url,
     server: JoinHandle<RecordedRequest>,
 }
 
 impl Loopback {
     /// Binds a loopback port and serves this case's captured response to the first connection.
-    pub(super) async fn start(case: &ProviderCase) -> Self {
+    pub(crate) async fn start(case: &ProviderCase) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("loopback listener");
@@ -60,35 +60,48 @@ impl Loopback {
         let response = response_bytes(case);
         Self {
             base,
-            server: tokio::spawn(serve_once(listener, ResponseScript::Complete(response))),
+            server: tokio::spawn(async move {
+                serve_once(&listener, ResponseScript::Complete(response)).await
+            }),
         }
     }
 
-    pub(super) async fn scripted(script: ResponseScript) -> Self {
+    pub(crate) async fn scripted(script: ResponseScript) -> Self {
+        Self::sequence([script]).await
+    }
+
+    pub(crate) async fn sequence(scripts: impl IntoIterator<Item = ResponseScript>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("loopback listener");
         let address = listener.local_addr().expect("loopback address");
         let base = reqwest::Url::parse(&format!("http://{address}/v1")).expect("loopback base");
+        let scripts = scripts.into_iter().collect::<Vec<_>>();
         Self {
             base,
-            server: tokio::spawn(serve_once(listener, script)),
+            server: tokio::spawn(async move {
+                let mut last = None;
+                for script in scripts {
+                    last = Some(serve_once(&listener, script).await);
+                }
+                last.expect("at least one loopback response")
+            }),
         }
     }
 
     /// Aborts a server when a preflight adapter rejection correctly sends no request.
-    pub(super) fn assert_no_request(self) {
+    pub(crate) fn assert_no_request(self) {
         assert!(!self.server.is_finished(), "unexpected provider request");
         self.server.abort();
     }
 
     /// Borrows the base URL the adapter must be constructed against.
-    pub(super) const fn base(&self) -> &reqwest::Url {
+    pub(crate) const fn base(&self) -> &reqwest::Url {
         &self.base
     }
 
     /// Awaits the served exchange and returns the request the adapter sent.
-    pub(super) async fn recorded(self) -> RecordedRequest {
+    pub(crate) async fn recorded(self) -> RecordedRequest {
         self.server.await.expect("loopback server")
     }
 }
@@ -149,7 +162,7 @@ pub(super) fn has_multibyte(body: &str) -> bool {
 }
 
 /// Accepts one connection, records the request, writes the response, and closes.
-async fn serve_once(listener: TcpListener, response: ResponseScript) -> RecordedRequest {
+async fn serve_once(listener: &TcpListener, response: ResponseScript) -> RecordedRequest {
     let (mut socket, _) = listener.accept().await.expect("loopback accept");
     let raw = read_request(&mut socket).await;
     match response {

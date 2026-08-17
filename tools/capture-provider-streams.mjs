@@ -100,11 +100,23 @@ const NATIVE = Object.freeze([
   "openai-compatible/protocol-error", "openai-compatible/retry-after",
   "anthropic/reasoning-redacted", "anthropic/authentication", "anthropic/quota",
 ]);
+// Task 50 Batch B: every local case is a transport capture. Ollama Cloud deliberately replays the
+// Ollama image-drop capture through its own adapter because Cloud uses the identical /api/chat
+// dialect; the separate local::replay test is the fourth adapter proof.
+const LOCAL = Object.freeze([
+  "ollama/cancelled", "ollama/image-drop", "ollama/image-strict", "ollama/unavailable",
+  "lm-studio/timeout", "lm-studio/invalid-request", "lm-studio/unknown-error",
+  "llama-cpp/context-overflow", "llama-cpp/overloaded",
+]);
+const TRANSPORT = Object.freeze([...NATIVE, ...LOCAL]);
 // Non-2xx statuses captured independently from the vendor error type/code that yields the kind.
 const NATIVE_STATUS = Object.freeze({
   "openai-compatible/authorization": 403, "openai-compatible/protocol-error": 406,
   "openai-compatible/retry-after": 429, "anthropic/authentication": 401,
-  "anthropic/quota": 402,
+  "anthropic/quota": 402, "ollama/cancelled": 499, "ollama/unavailable": 503,
+  "lm-studio/timeout": 504,
+  "lm-studio/invalid-request": 400, "lm-studio/unknown-error": 418,
+  "llama-cpp/context-overflow": 400, "llama-cpp/overloaded": 503,
 });
 // Vendor `error.type` strings the pinned adapters normalize into the recorded kinds.
 const NATIVE_ERROR_TYPE = Object.freeze({
@@ -112,6 +124,10 @@ const NATIVE_ERROR_TYPE = Object.freeze({
   "openai-compatible/protocol-error": "invalid_response_error",
   "openai-compatible/retry-after": "rate_limit_error",
   "anthropic/authentication": "authentication_error", "anthropic/quota": "billing_error",
+  "ollama/cancelled": "cancelled", "ollama/unavailable": "unavailable",
+  "lm-studio/timeout": "timeout", "lm-studio/invalid-request": "invalid_request",
+  "lm-studio/unknown-error": "unknown", "llama-cpp/context-overflow": "context_overflow",
+  "llama-cpp/overloaded": "overloaded",
 });
 const RETRY_AFTER_SECONDS = 2;
 const ANTHROPIC_VERSION = "2023-06-01";
@@ -277,6 +293,9 @@ function requestFor(dialect, name) {
 function isNative(dialect, name) {
   return NATIVE.includes(`${dialect}/${name}`);
 }
+function isTransport(dialect, name) {
+  return TRANSPORT.includes(`${dialect}/${name}`);
+}
 function sanitizedContext(name) {
   return `SANITIZED_FIXTURE_${name.toUpperCase().replaceAll("-", "_")}`;
 }
@@ -323,13 +342,17 @@ function expectedRequest(dialect, name) {
         description: "SANITIZED_FIXTURE_TOOL", input_schema: tool.function.parameters }],
       thinking: name === "reasoning-redacted" ? { type: "enabled", budget_tokens: 128 } :
         { type: "disabled" } } };
-  if (dialect === "ollama") return { method: "POST", endpoint: "/api/chat", body: {
+  if (dialect === "ollama") return { method: "POST", endpoint: "/api/chat",
+    headers: { accept: "*/*", "content-type": "application/json" },
+    presence_only_headers: ["content-length", "host"], body: {
     model: "fixture-model", messages: [{ role: "system", content: "SANITIZED_FIXTURE_SYSTEM" },
-      { ...message, images: name === "image-drop" ? [] : undefined }], stream: true,
+      message], stream: true, think: false,
     tools: [tool], options: { num_ctx: 8192, num_predict: 256 } } };
   const marker = dialect === "lm-studio" ? "lm-studio" :
     dialect === "llama-cpp" ? "llama.cpp" : "openai-compatible";
-  return { method: "POST", endpoint: "/v1/chat/completions", compatibility: marker, body: {
+  return { method: "POST", endpoint: "/v1/chat/completions", compatibility: marker,
+    headers: { accept: "text/event-stream", "content-type": "application/json" },
+    presence_only_headers: ["content-length", "host"], body: {
     model: "fixture-model", messages: [{ role: "system", content: "SANITIZED_FIXTURE_SYSTEM" },
       message], tools: [tool], tool_choice: "auto", max_tokens: 256, stream: true,
     stream_options: { include_usage: true } } };
@@ -351,7 +374,7 @@ function rawError(kind, name, retryAfterMs) {
 }
 // The adapter reads `retry-after` off the real response, so the trace must carry the same delay.
 function retryAfterMsFor(dialect, name, errorKind) {
-  return isNative(dialect, name) && errorKind === "rate_limit" ?
+  return isTransport(dialect, name) && errorKind === "rate_limit" ?
     RETRY_AFTER_SECONDS * 1000 : undefined;
 }
 // Order matches `native/openai_compatible.rs`: the finishing choice closes its tool calls before
@@ -385,9 +408,14 @@ function nativeReasoningBaseline() {
 function baselineFor(dialect, name, errorKind) {
   if (name === "happy-tool") return nativeToolBaseline();
   if (name === "reasoning-redacted") return nativeReasoningBaseline();
-  if (name === "cancelled") return [rawEvent("text_delta", { text: "SANITIZED_FIXTURE_TEXT" }),
-    rawEvent("cancelled", { code: "fixture_cancelled", context: "SANITIZED_FIXTURE_CANCELLED" }),
+  if (name === "cancelled") return [rawError("cancelled", name),
     rawEvent("late_text_delta", { text: "SANITIZED_FIXTURE_LATE" })];
+  if (!errorKind && dialect === "ollama") return [
+    rawEvent("text_delta", { text: "SANITIZED_FIXTURE_TEXT" }),
+    rawEvent("toolcall_start", { call_id: "call-0", name: "fixture_tool" }),
+    rawEvent("toolcall_arguments_delta", { call_id: "call-0", arguments: "{\"a\":1}" }),
+    rawEvent("toolcall_end", { call_id: "call-0" }), usage(3, 2),
+    rawEvent("done", { reason: "tool_use" })];
   if (!errorKind) return [rawEvent("text_delta", { text: "SANITIZED_FIXTURE_TEXT" }), usage(3, 2),
     rawEvent("done", { reason: "end_turn" })];
   return [rawError(errorKind, name, retryAfterMsFor(dialect, name, errorKind))];
@@ -499,8 +527,8 @@ function ollamaRaw(name, errorKind) {
 // A non-2xx capture is the vendor's plain JSON body; its status and headers are indexed metadata
 // the loopback replays, so the adapter takes its real response-status path.
 function nativeErrorBody(dialect, name, errorKind) {
-  const error = { type: NATIVE_ERROR_TYPE[`${dialect}/${name}`], code: `fixture_${errorKind}`,
-    message: sanitizedContext(name) };
+  const error = { type: NATIVE_ERROR_TYPE[`${dialect}/${name}`] ?? errorKind,
+    code: `fixture_${errorKind}`, message: sanitizedContext(name) };
   return `${JSON.stringify(dialect === "anthropic" ? { type: "error", error } : { error })}\n`;
 }
 // Blank-line terminated records, a trailing usage-only chunk, and the terminal `[DONE]` record.
@@ -543,13 +571,16 @@ function nativeAnthropicStream() {
     `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join("");
 }
 function nativeRaw(dialect, name, errorKind) {
+  if (name === "cancelled") return `${JSON.stringify({ error: { type: "cancelled",
+    code: "fixture_cancelled", message: "SANITIZED_FIXTURE_CANCELLED" } })}\n`;
   if (errorKind) return nativeErrorBody(dialect, name, errorKind);
   return dialect === "anthropic" ? nativeAnthropicStream() : nativeOpenAiStream();
 }
 function responseFor(dialect, name, errorKind) {
-  if (!isNative(dialect, name)) return null;
+  if (!isTransport(dialect, name) || name === "image-strict") return null;
   if (!errorKind) {
-    return { status: 200, headers: [{ name: "content-type", value: "text/event-stream" }] };
+    return { status: 200, headers: [{ name: "content-type",
+      value: dialect === "ollama" ? "application/x-ndjson" : "text/event-stream" }] };
   }
   const headers = [{ name: "content-type", value: "application/json" }];
   if (errorKind === "rate_limit") {
@@ -558,6 +589,13 @@ function responseFor(dialect, name, errorKind) {
   return { status: NATIVE_STATUS[`${dialect}/${name}`], headers };
 }
 function rawFor(dialect, name, errorKind) {
+  if (LOCAL.includes(`${dialect}/${name}`)) {
+    if (name === "image-strict") return ollamaRaw(name, errorKind);
+    if (errorKind) {
+      const body = nativeErrorBody(dialect, name, errorKind);
+      return body;
+    }
+  }
   if (isNative(dialect, name)) return nativeRaw(dialect, name, errorKind);
   if (dialect === "anthropic") return anthropicRaw(name, errorKind);
   if (dialect === "ollama") return ollamaRaw(name, errorKind);
@@ -693,7 +731,13 @@ function selfTest() {
   let rejected = false; try { sanitize("fixture", unsafe); } catch { rejected = true; }
   if (!rejected) fail("sanitization self-test");
   const corpus = buildCorpus([{ path: "fixture", symbol: "fixture", sha256: sha("fixture") }]);
-  if (corpus.files.size !== 80) fail("corpus bound self-test");
+  if (corpus.files.size !== CASES.length * 5) fail("corpus inventory self-test");
+  if (TRANSPORT.length !== 16 || LOCAL.length !== 9) fail("transport inventory self-test");
+  for (const record of corpus.index.cases) {
+    if (record.name !== "image-strict" && record.response === null) {
+      fail(`missing response metadata self-test: ${record.id}`);
+    }
+  }
 }
 function parseArgs(argv) {
   let explicit, check = false, self = false;

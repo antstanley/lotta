@@ -14,16 +14,33 @@ pub(crate) fn model_id(handle: &str) -> Result<&str, ()> {
 
 pub(crate) const ERROR_BODY_BYTES_MAX: usize = 1024 * 1024;
 
-pub(crate) fn is_secure_endpoint(endpoint: &reqwest::Url) -> bool {
+pub(crate) fn endpoint_allowed(endpoint: &reqwest::Url, has_credential: bool) -> bool {
     endpoint.scheme() == "https"
         || (endpoint.scheme() == "http"
-            && endpoint.host_str().is_some_and(|host| {
-                let host = host.trim_start_matches('[').trim_end_matches(']');
-                host.eq_ignore_ascii_case("localhost")
-                    || host
-                        .parse::<IpAddr>()
-                        .is_ok_and(|address| address.is_loopback())
-            }))
+            && endpoint
+                .host_str()
+                .is_some_and(|host| local_or_lan(host) && (!has_credential || is_loopback(host))))
+}
+
+fn is_loopback(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn local_or_lan(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>().is_ok_and(|address| match address {
+        IpAddr::V4(value) => value.is_loopback() || value.is_private() || value.is_link_local(),
+        IpAddr::V6(value) => {
+            value.is_loopback() || value.is_unique_local() || value.is_unicast_link_local()
+        }
+    })
 }
 
 pub(crate) fn endpoint(base: &reqwest::Url, path: &str) -> reqwest::Url {

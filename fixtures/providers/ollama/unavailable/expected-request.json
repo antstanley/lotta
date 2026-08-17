@@ -1,6 +1,14 @@
 {
   "method": "POST",
   "endpoint": "/api/chat",
+  "headers": {
+    "accept": "*/*",
+    "content-type": "application/json"
+  },
+  "presence_only_headers": [
+    "content-length",
+    "host"
+  ],
   "body": {
     "model": "fixture-model",
     "messages": [
@@ -14,6 +22,7 @@
       }
     ],
     "stream": true,
+    "think": false,
     "tools": [
       {
         "type": "function",

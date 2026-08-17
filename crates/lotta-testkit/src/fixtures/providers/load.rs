@@ -241,7 +241,10 @@ pub(super) fn validate_raw(format: RawFormat, text: &str) -> Result<(), Provider
                 }
                 data += 1;
             }
-            if data == 0 || (format == RawFormat::AnthropicSse && !text.starts_with("event: ")) {
+            if data == 0 {
+                serde_json::from_str::<BoundedJsonValue>(text)
+                    .map_err(|_| ProviderFixtureError::Semantic("SSE or plain error body"))?;
+            } else if format == RawFormat::AnthropicSse && !text.starts_with("event: ") {
                 return Err(ProviderFixtureError::Semantic("SSE framing"));
             }
         }

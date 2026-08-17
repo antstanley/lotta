@@ -1,1 +1,1 @@
-{"error":{"type":"cancelled","message":"SANITIZED_FIXTURE_cancelled"}}
+{"error":{"type":"cancelled","code":"fixture_cancelled","message":"SANITIZED_FIXTURE_CANCELLED"}}

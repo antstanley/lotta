@@ -2,6 +2,14 @@
   "method": "POST",
   "endpoint": "/v1/chat/completions",
   "compatibility": "llama.cpp",
+  "headers": {
+    "accept": "text/event-stream",
+    "content-type": "application/json"
+  },
+  "presence_only_headers": [
+    "content-length",
+    "host"
+  ],
   "body": {
     "model": "fixture-model",
     "messages": [

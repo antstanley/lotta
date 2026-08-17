@@ -163,8 +163,8 @@ fn cancellation_suppresses_late_baseline_event() {
         .iter()
         .find(|case| case.record.name == "cancelled")
         .expect("cancel");
-    assert_eq!(case.baseline_event_count, 3);
-    assert_eq!(case.expected_trace.len(), 2);
+    assert_eq!(case.baseline_event_count, 2);
+    assert_eq!(case.expected_trace.len(), 1);
     assert!(matches!(
         case.expected_trace.as_slice().last(),
         Some(ProviderEvent::Error { .. })
@@ -196,7 +196,16 @@ fn each_dialect_has_distinct_wire_semantics() {
         match dialect {
             Dialect::Ollama => assert!(!case.raw_stream.contains("data: ")),
             Dialect::Anthropic => assert!(case.raw_stream.starts_with("event: ")),
-            _ => assert!(case.raw_stream.contains("data: ")),
+            _ => assert!(
+                case.raw_stream.contains("data: ")
+                    || (!case
+                        .record
+                        .response
+                        .as_ref()
+                        .expect("response")
+                        .is_success()
+                        && serde_json::from_str::<serde_json::Value>(&case.raw_stream).is_ok())
+            ),
         }
     }
 }
@@ -483,7 +492,11 @@ fn raw_all_have_dialect_structure() {
                     .all(|l| serde_json::from_str::<serde_json::Value>(l).is_ok())
             ),
             RawFormat::AnthropicSse => assert!(c.raw_stream.contains("event: ")),
-            RawFormat::Sse => assert!(c.raw_stream.contains("data: ")),
+            RawFormat::Sse => assert!(
+                c.raw_stream.contains("data: ")
+                    || (!c.record.response.as_ref().expect("response").is_success()
+                        && serde_json::from_str::<serde_json::Value>(&c.raw_stream).is_ok())
+            ),
             RawFormat::Json => {
                 let body = serde_json::from_str::<serde_json::Value>(&c.raw_stream);
                 assert!(body.expect("json body").is_object());

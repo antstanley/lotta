@@ -1,2 +1,1 @@
-status: 500
-data: {"error":{"type":"timeout","code":"fixture_timeout","message":"SANITIZED_FIXTURE_timeout"}}
+{"error":{"type":"timeout","code":"fixture_timeout","message":"SANITIZED_FIXTURE_TIMEOUT"}}

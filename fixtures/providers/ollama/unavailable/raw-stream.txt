@@ -1,1 +1,1 @@
-{"error":{"type":"unavailable","message":"SANITIZED_FIXTURE_unavailable"}}
+{"error":{"type":"unavailable","code":"fixture_unavailable","message":"SANITIZED_FIXTURE_UNAVAILABLE"}}
