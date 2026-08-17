@@ -117,7 +117,7 @@ async fn no_op_creates_no_commit() {
 }
 
 async fn invoke(bundle: &MemoryToolBundle, model: &str, input: serde_json::Value) {
-    use crate::{AllowAllPermissions, AllowAllSandbox, NoopHooks, PipelineError, PipelineRequest};
+    use crate::{AllowAllPermissions, AllowAllSandbox, PipelineError, PipelineRequest};
     use crate::{OutcomeSink, SecretResolver, TraceEvent, TraceSink};
     struct NoTrace;
     impl TraceSink for NoTrace {
@@ -159,7 +159,7 @@ async fn invoke(bundle: &MemoryToolBundle, model: &str, input: serde_json::Value
         model_name: model,
         input: BoundedJsonValue::new(input).expect("input"),
         cancellation: tokio_util::sync::CancellationToken::new(),
-        hooks: &NoopHooks,
+        hook_runtime: &lotta_runtime::hooks::NoopHookRuntime,
         permissions: &AllowAllPermissions,
         sandbox: &AllowAllSandbox,
         secrets: &Secrets,

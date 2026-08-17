@@ -27,8 +27,6 @@ const PATH_NOTICE: &str = "/fake/full-output.txt";
 struct State {
     trace: Vec<TraceEvent>,
     effects: Vec<&'static str>,
-    posts: Vec<PostHookStatus>,
-    pre_calls: usize,
     executed: usize,
     persisted: Vec<ToolOutcome>,
     emitted: Vec<ToolOutcome>,
@@ -123,25 +121,6 @@ impl ToolExecutor for Executor {
         Box::pin(future::ready(result))
     }
 }
-struct Hooks(
-    Arc<Mutex<State>>,
-    Option<Result<PreHookResult, OwnerFailure>>,
-    Option<OwnerFailure>,
-);
-impl PipelineHooks for Hooks {
-    fn pre(&self, _: &ValidatedToolInput) -> Result<PreHookResult, OwnerFailure> {
-        self.0.lock().unwrap().pre_calls += 1;
-        match &self.1 {
-            None | Some(Ok(PreHookResult::Allow)) => Ok(PreHookResult::Allow),
-            Some(Ok(PreHookResult::Replace(value))) => Ok(PreHookResult::Replace(value.clone())),
-            Some(Err(error)) => Err(error.clone()),
-        }
-    }
-    fn post(&self, status: PostHookStatus) -> Result<(), OwnerFailure> {
-        self.0.lock().unwrap().posts.push(status);
-        self.2.clone().map_or(Ok(()), Err)
-    }
-}
 
 fn definition(owner: ToolExecutionOwner) -> Arc<ToolDefinition> {
     let schema = serde_json::from_str::<ToolInputSchema>(
@@ -185,12 +164,12 @@ fn input(value: Value) -> BoundedJsonValue {
     BoundedJsonValue::new(value).unwrap()
 }
 
-async fn run_with_snapshot(
+async fn run_with_snapshot_and_hooks(
     state: Arc<Mutex<State>>,
-    hooks: &Hooks,
     snapshot: Arc<RegistrySnapshot>,
     value: Value,
     overflow: &dyn crate::clamp::OverflowWriter,
+    hooks: &dyn lotta_runtime::hooks::HookRuntime,
 ) -> Result<ToolOutcome, PipelineError> {
     let trace = Trace(Arc::clone(&state));
     let persistence = Sink(Arc::clone(&state), "persist");
@@ -204,7 +183,7 @@ async fn run_with_snapshot(
         model_name: "Read",
         input: input(value),
         cancellation: CancellationToken::new(),
-        hooks,
+        hook_runtime: hooks,
         permissions: &crate::permissions::AllowAllPermissions,
         sandbox: &crate::sandbox::AllowAllSandbox,
         secrets: &secrets,
@@ -216,15 +195,30 @@ async fn run_with_snapshot(
     .await
 }
 
+async fn run_with_snapshot(
+    state: Arc<Mutex<State>>,
+    snapshot: Arc<RegistrySnapshot>,
+    value: Value,
+    overflow: &dyn crate::clamp::OverflowWriter,
+) -> Result<ToolOutcome, PipelineError> {
+    run_with_snapshot_and_hooks(
+        state,
+        snapshot,
+        value,
+        overflow,
+        &lotta_runtime::hooks::NoopHookRuntime,
+    )
+    .await
+}
+
 async fn run(
     state: Arc<Mutex<State>>,
-    hooks: &Hooks,
     action: Action,
     value: Value,
     overflow: &dyn crate::clamp::OverflowWriter,
 ) -> Result<ToolOutcome, PipelineError> {
     let registry = registry(Arc::clone(&state), action);
-    run_with_snapshot(state, hooks, registry.snapshot().unwrap(), value, overflow).await
+    run_with_snapshot(state, registry.snapshot().unwrap(), value, overflow).await
 }
 
 fn assert_no_sentinel(value: &impl fmt::Debug) {
@@ -232,19 +226,48 @@ fn assert_no_sentinel(value: &impl fmt::Debug) {
     assert!(!debug.contains(ALPHA) && !debug.contains(BETA), "{debug}");
 }
 
+struct AttributedHookFailure;
+impl lotta_runtime::hooks::HookRuntime for AttributedHookFailure {
+    fn fire(
+        &self,
+        _: lotta_runtime::hooks::HookPayload,
+        _: CancellationToken,
+    ) -> lotta_runtime::hooks::HookFuture<'_> {
+        Box::pin(future::ready(Err(lotta_runtime::hooks::HookFailure {
+            owner: lotta_runtime::hooks::HookOwner::new("certificate-owner".into()).unwrap(),
+            hook_id: lotta_runtime::hooks::HookId::new("certificate-hook".into()).unwrap(),
+            code: "certificate_failure",
+        })))
+    }
+}
+
+pub(super) async fn owner_attribution_case() {
+    let state = Arc::new(Mutex::new(State::default()));
+    let overflow = Overflow(Arc::new(Mutex::new(None)));
+    let registry = registry(Arc::clone(&state), Action::Success("unreachable".into()));
+    let error = run_with_snapshot_and_hooks(
+        Arc::clone(&state),
+        registry.snapshot().unwrap(),
+        serde_json::json!({"command":"read"}),
+        &overflow,
+        &AttributedHookFailure,
+    )
+    .await
+    .unwrap_err();
+    let PipelineError::Hook(failure) = error else {
+        panic!("expected typed hook failure")
+    };
+    assert_eq!(failure.owner.as_str(), "certificate-owner");
+    assert_eq!(failure.hook_id.as_str(), "certificate-hook");
+    assert_eq!(failure.code, "certificate_failure");
+    assert_eq!(state.lock().unwrap().executed, 0);
+}
+
 pub(super) async fn stage_order_case() {
     let state = Arc::new(Mutex::new(State::default()));
-    let hooks = Hooks(
-        Arc::clone(&state),
-        Some(Ok(PreHookResult::Replace(input(
-            serde_json::json!({"command":"replacement-valid"}),
-        )))),
-        None,
-    );
     let overflow = Overflow(Arc::new(Mutex::new(None)));
     run(
         Arc::clone(&state),
-        &hooks,
         Action::Success("ok".into()),
         serde_json::json!({"command":"read"}),
         &overflow,
@@ -273,13 +296,11 @@ pub(super) async fn stage_order_case() {
     );
     assert_eq!(&state.trace[2..], expected.map(TraceEvent::Stage));
     assert_eq!(state.effects, ["persist", "emit"]);
-    assert_eq!(state.pre_calls, 1);
     assert_eq!(state.executed, 1);
     assert_eq!(
         state.executor_input,
-        Some(serde_json::json!({"command":"replacement-valid"}))
+        Some(serde_json::json!({"command":"read"}))
     );
-    assert_eq!(state.posts, [PostHookStatus::Completed]);
 }
 
 static PIPELINE_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -302,13 +323,11 @@ fn footer_path(content: &str) -> &Path {
 
 pub(super) async fn secret_substitution_case() {
     let state = Arc::new(Mutex::new(State::default()));
-    let hooks = Hooks(Arc::clone(&state), None, None);
     let root = pipeline_overflow_root();
     let overflow = crate::clamp::FileOverflowWriter::new(root.clone()).unwrap();
     let raw = format!("API_TOKEN={ALPHA} SECOND={BETA} {}", "é".repeat(31_000));
     let result = run(
         Arc::clone(&state),
-        &hooks,
         Action::Success(raw.clone()),
         serde_json::json!({"command":COMMAND,"$KEY_ONLY":"ignored"}),
         &overflow,
@@ -336,7 +355,6 @@ pub(super) async fn secret_substitution_case() {
         }
     );
     assert_eq!(state.resolved, ["API_TOKEN", "SECOND"]);
-    assert_eq!(state.posts, [PostHookStatus::Completed]);
     assert_eq!(state.persisted, state.emitted);
     assert_eq!(state.persisted.as_slice(), std::slice::from_ref(&result));
     assert_no_sentinel(&state.trace);
@@ -510,81 +528,8 @@ fn provider_request_secret_delivery() {
     assert_eq!(state.lock().unwrap().resolved, ["API_TOKEN"]);
 }
 
-pub(super) async fn owner_attribution_case() {
-    for owner in [
-        ExtensionOwner::hook("hook-id".into()).unwrap(),
-        ExtensionOwner::extension_mod("mod-id".into()).unwrap(),
-    ] {
-        assert_owner_failure(owner.clone(), false).await;
-        assert_owner_failure(owner, true).await;
-    }
-}
-
-async fn assert_owner_failure(owner: ExtensionOwner, post: bool) {
-    let state = Arc::new(Mutex::new(State::default()));
-    let failure = OwnerFailure {
-        owner: owner.clone(),
-        code: "blocked",
-    };
-    let hooks = if post {
-        Hooks(Arc::clone(&state), None, Some(failure.clone()))
-    } else {
-        Hooks(Arc::clone(&state), Some(Err(failure.clone())), None)
-    };
-    let overflow = Overflow(Arc::new(Mutex::new(None)));
-    let registry = registry(Arc::clone(&state), Action::Success("ok".into()));
-    let before = registry.snapshot().unwrap();
-    let error = run_with_snapshot(
-        Arc::clone(&state),
-        &hooks,
-        Arc::clone(&before),
-        serde_json::json!({"command":"read"}),
-        &overflow,
-    )
-    .await
-    .unwrap_err();
-    let after = registry.snapshot().unwrap();
-    assert_eq!(error, PipelineError::Owner(failure.clone()));
-    assert_eq!(failure.owner.kind(), owner.kind());
-    assert_eq!(failure.owner.id(), owner.id());
-    assert_eq!(failure.code, "blocked");
-    assert!(Arc::ptr_eq(&before, &after));
-    assert_eq!(
-        before.by_model("Read").unwrap().model_name,
-        after.by_model("Read").unwrap().model_name
-    );
-    let state = state.lock().unwrap();
-    let expected_last = if post {
-        PipelineStage::PostHook
-    } else {
-        PipelineStage::PreHook
-    };
-    assert_eq!(state.trace.last(), Some(&TraceEvent::Stage(expected_last)));
-    assert_eq!(state.pre_calls, 1);
-    assert_eq!(state.executed, usize::from(post));
-    assert!(state.effects.is_empty());
-    assert_eq!(state.posts.len(), usize::from(post));
-}
-
-#[test]
-fn owner_identity_rejects_bounded_invalid_values_without_disclosure() {
-    let overbound = "owner-payload-sentinel".repeat(20);
-    for value in [
-        overbound.clone(),
-        String::new(),
-        "nul-payload-sentinel\0".into(),
-    ] {
-        let error = OwnerId::new(value.clone()).unwrap_err();
-        assert_eq!(error, PipelineError::OwnerIdentity);
-        let debug = format!("{error:?}");
-        assert!(value.is_empty() || !debug.contains(&value));
-        assert!(!debug.contains("sentinel") && !debug.contains("payload"));
-    }
-}
-
 fn assert_executor_failure(state: &State, error: &PipelineError) {
     assert_eq!(state.executed, 1);
-    assert_eq!(state.posts, [PostHookStatus::Failed]);
     assert!(state.effects.is_empty());
     assert_eq!(
         state.trace.last(),
@@ -605,11 +550,9 @@ fn assert_executor_failure(state: &State, error: &PipelineError) {
 async fn invalid_inputs_and_executor_failures_stop_effects() {
     for value in [serde_json::json!({}), serde_json::json!({"command": 1})] {
         let state = Arc::new(Mutex::new(State::default()));
-        let hooks = Hooks(Arc::clone(&state), None, None);
         let overflow = Overflow(Arc::new(Mutex::new(None)));
         let error = run(
             Arc::clone(&state),
-            &hooks,
             Action::Success("x".into()),
             value,
             &overflow,
@@ -625,50 +568,11 @@ async fn invalid_inputs_and_executor_failures_stop_effects() {
                 TraceEvent::Preflight(PreflightEvent::SchemaValidation),
             ]
         );
-        assert_eq!(state.pre_calls, 0);
         assert_eq!(state.executed, 0);
-        assert!(state.posts.is_empty() && state.effects.is_empty());
+        assert!(state.effects.is_empty());
     }
 
-    let state = Arc::new(Mutex::new(State::default()));
-    let hooks = Hooks(
-        Arc::clone(&state),
-        Some(Ok(PreHookResult::Replace(input(
-            serde_json::json!({"command":1}),
-        )))),
-        None,
-    );
     let overflow = Overflow(Arc::new(Mutex::new(None)));
-    let error = run(
-        Arc::clone(&state),
-        &hooks,
-        Action::Success("x".into()),
-        serde_json::json!({"command":"valid"}),
-        &overflow,
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error, PipelineError::SchemaValidation);
-    {
-        let state_guard = state.lock().unwrap();
-        assert_eq!(
-            state_guard.trace,
-            [
-                TraceEvent::Preflight(PreflightEvent::NameResolution),
-                TraceEvent::Preflight(PreflightEvent::SchemaValidation),
-                TraceEvent::Stage(PipelineStage::PreHook),
-            ]
-        );
-        assert!(
-            !state_guard
-                .trace
-                .contains(&TraceEvent::Stage(PipelineStage::Permission))
-        );
-        assert!(state_guard.effects.is_empty() && state_guard.posts.is_empty());
-        assert_eq!(state_guard.pre_calls, 1);
-        assert_eq!(state_guard.executed, 0);
-    }
-
     for (action, expected) in [
         (Action::Error, PipelineError::Executor),
         (
@@ -677,10 +581,8 @@ async fn invalid_inputs_and_executor_failures_stop_effects() {
         ),
     ] {
         let state = Arc::new(Mutex::new(State::default()));
-        let hooks = Hooks(Arc::clone(&state), None, None);
         let error = run(
             Arc::clone(&state),
-            &hooks,
             action,
             serde_json::json!({"command":"x"}),
             &overflow,
@@ -695,7 +597,6 @@ async fn invalid_inputs_and_executor_failures_stop_effects() {
 #[tokio::test]
 async fn sandbox_stage_follows_permission_for_effect_recheck_ownership() {
     let state = Arc::new(Mutex::new(State::default()));
-    let hooks = Hooks(Arc::clone(&state), None, None);
     let overflow = Overflow(Arc::new(Mutex::new(None)));
     let trace = Trace(Arc::clone(&state));
     let persistence = Sink(Arc::clone(&state), "persist");
@@ -710,7 +611,7 @@ async fn sandbox_stage_follows_permission_for_effect_recheck_ownership() {
         model_name: "Read",
         input: input(serde_json::json!({"command":"valid"})),
         cancellation: CancellationToken::new(),
-        hooks: &hooks,
+        hook_runtime: &lotta_runtime::hooks::NoopHookRuntime,
         permissions: &FixedPermissions(PermissionDecision::Allow),
         sandbox: &crate::sandbox::AllowAllSandbox,
         secrets: &secrets,
@@ -751,7 +652,6 @@ async fn permission_deny_and_ask_stop_later_effects() {
         (PermissionDecision::Ask, PipelineError::ApprovalRequired),
     ] {
         let state = Arc::new(Mutex::new(State::default()));
-        let hooks = Hooks(Arc::clone(&state), None, None);
         let overflow = Overflow(Arc::new(Mutex::new(None)));
         let trace = Trace(Arc::clone(&state));
         let persistence = Sink(Arc::clone(&state), "persist");
@@ -767,7 +667,7 @@ async fn permission_deny_and_ask_stop_later_effects() {
             model_name: "Read",
             input: input(serde_json::json!({"command":"valid"})),
             cancellation: CancellationToken::new(),
-            hooks: &hooks,
+            hook_runtime: &lotta_runtime::hooks::NoopHookRuntime,
             permissions: &gate,
             sandbox: &crate::sandbox::AllowAllSandbox,
             secrets: &secrets,
@@ -780,12 +680,14 @@ async fn permission_deny_and_ask_stop_later_effects() {
         .unwrap_err();
         assert_eq!(error, expected);
         let state = state.lock().unwrap();
-        assert_eq!(
-            state.trace.last(),
-            Some(&TraceEvent::Stage(PipelineStage::Permission))
-        );
+        let expected_last = if decision == PermissionDecision::Ask {
+            PipelineStage::PermissionHook
+        } else {
+            PipelineStage::Permission
+        };
+        assert_eq!(state.trace.last(), Some(&TraceEvent::Stage(expected_last)));
         assert_eq!(state.executed, 0);
-        assert!(state.effects.is_empty() && state.posts.is_empty() && state.resolved.is_empty());
+        assert!(state.effects.is_empty() && state.resolved.is_empty());
     }
 }
 
@@ -793,7 +695,6 @@ async fn permission_deny_and_ask_stop_later_effects() {
 async fn failure_code_and_message_are_scrubbed() {
     let message = || ToolOutcomeMessage::new(format!("failure {ALPHA}")).unwrap();
     let state = Arc::new(Mutex::new(State::default()));
-    let hooks = Hooks(Arc::clone(&state), None, None);
     let overflow = Overflow(Arc::new(Mutex::new(None)));
     let failure = ToolOutcome::ToolDefinedError {
         code: ToolOutcomeCode::new(format!("code-{ALPHA}-{BETA}")).unwrap(),
@@ -801,7 +702,6 @@ async fn failure_code_and_message_are_scrubbed() {
     };
     let result = run(
         Arc::clone(&state),
-        &hooks,
         Action::Failure(failure),
         serde_json::json!({"command":"$API_TOKEN$SECOND"}),
         &overflow,
@@ -809,7 +709,6 @@ async fn failure_code_and_message_are_scrubbed() {
     .await
     .unwrap();
     let pipeline_state = state.lock().unwrap();
-    assert_eq!(pipeline_state.posts, [PostHookStatus::Failed]);
     assert_eq!(pipeline_state.persisted, pipeline_state.emitted);
     assert_eq!(
         pipeline_state.persisted.as_slice(),

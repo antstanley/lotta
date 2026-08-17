@@ -1,6 +1,6 @@
 use super::FileToolBundle;
 use crate::{
-    AllowAllPermissions, AllowAllSandbox, NoopHooks, OutcomeSink, PipelineError, PipelineRequest,
+    AllowAllPermissions, AllowAllSandbox, OutcomeSink, PipelineError, PipelineRequest,
     SecretResolver, ToolRegistry, ToolsetId, TraceEvent, TraceSink, execute,
 };
 use lotta_domain::BoundedJsonValue;
@@ -153,7 +153,7 @@ pub(super) async fn run_with_gate(
         model_name: model,
         input: BoundedJsonValue::new(input).unwrap(),
         cancellation: CancellationToken::new(),
-        hooks: &NoopHooks,
+        hook_runtime: &lotta_runtime::hooks::NoopHookRuntime,
         permissions: &AllowAllPermissions,
         sandbox: gate,
         secrets: &EmptySecrets,

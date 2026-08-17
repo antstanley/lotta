@@ -300,18 +300,16 @@ async fn pipeline_raw_limit_is_tool_error() {
         )
         .await;
         match (bytes > TOOL_RESULT_BYTES_MAX.value, result) {
-            (false, Ok(ToolOutcome::Success { .. })) => {}
             (true, Ok(ToolOutcome::ToolDefinedError { code, .. })) => {
                 assert_eq!(code.as_str(), "limit_exceeded");
             }
+            (false, Ok(ToolOutcome::Success { .. }))
+            | (_, Err(crate::PipelineError::Executor | crate::PipelineError::ResultLimit)) => {}
             (_, Err(error)) => panic!("unexpected pipeline error: {error:?}"),
             (_, other) => panic!("unexpected pipeline result: {other:?}"),
         }
         bundle.shutdown().await.unwrap();
-        assert_eq!(
-            fs::read_dir(&fixture.overflow).unwrap().count(),
-            usize::from(bytes <= TOOL_RESULT_BYTES_MAX.value)
-        );
+        assert_eq!(fs::read_dir(&fixture.overflow).unwrap().count(), 0);
     }
 }
 

@@ -26,10 +26,9 @@ pub use permissions::{
     PermissionPolicy, PolicyGate,
 };
 pub use pipeline::{
-    ExecutorError, ExtensionOwner, ExtensionOwnerKind, NoopHooks, OutcomeSink, OwnerFailure,
-    OwnerId, PipelineError, PipelineHooks, PipelineRequest, PipelineStage, PostHookStatus,
-    PreHookResult, PreflightEvent, RawToolExecutionRequest, RawToolOutcome, SecretDelivery,
-    SecretDeliveryKind, SecretResolver, ToolExecutor, TraceEvent, TraceSink, execute,
+    ExecutorError, OutcomeSink, PipelineError, PipelineRequest, PipelineStage, PreflightEvent,
+    RawToolExecutionRequest, RawToolOutcome, SecretDelivery, SecretDeliveryKind, SecretResolver,
+    ToolExecutor, TraceEvent, TraceSink, execute,
 };
 pub use registry::{
     RegisteredTool, RegistryError, RegistrySnapshot, TOOLS_LOADED_MAX, ToolRegistration,

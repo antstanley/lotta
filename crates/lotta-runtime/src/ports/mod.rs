@@ -2,6 +2,7 @@
 
 mod ids;
 mod memfs;
+mod model;
 mod process;
 #[path = "provider.rs"]
 mod provider_contract;
@@ -16,6 +17,7 @@ pub use memfs::{
     MemFsCommitAuthor, MemFsHistoryEntry, MemFsMutation, MemFsPort, MemFsStatus,
     MemFsTransactionResult, MemFsTreeEntry,
 };
+pub use model::{ModelCapabilityPort, ModelCapabilityRequest, ModelCapabilityResponse};
 pub use process::{
     ChildProcessPort, InteractiveSandboxPort, PROCESS_TIMEOUT_DISABLED, ProcessEvent, ProcessInput,
     ProcessOutcome, ProcessRequest, ProcessSession, ProcessSessionFuture, ProcessSessionParts,
@@ -329,6 +331,7 @@ mod tests {
         fn conversation(_: Arc<dyn ConversationStore>) {}
         fn transcript(_: Arc<dyn TranscriptStore>) {}
         fn memfs(_: Arc<dyn MemFsPort>) {}
+        fn model(_: Arc<dyn ModelCapabilityPort>) {}
         fn sandbox(_: Arc<dyn SandboxPort>) {}
         fn child(_: Arc<dyn ChildProcessPort>) {}
         fn provider(_: Arc<dyn ProviderPort>) {}
@@ -338,6 +341,7 @@ mod tests {
             conversation,
             transcript,
             memfs,
+            model,
             sandbox,
             child,
             provider,

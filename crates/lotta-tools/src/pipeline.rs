@@ -12,7 +12,7 @@ use crate::{
 };
 use lotta_domain::BoundedJsonValue;
 use lotta_runtime::{
-    bounds::TOOL_NAME_BYTES_MAX,
+    hooks::{HookEvent, HookFailure, HookLifecycle, HookOutcome, HookPayload, HookRuntime},
     ports::{
         ModelFacingToolName, ToolCallId, ToolDefinition, ToolExecutionOwner, ToolOutcome,
         ToolOutcomeCode, ToolOutcomeMessage, ToolResultText, ToolTimeout, ValidatedToolInput,
@@ -31,6 +31,8 @@ const SECRET_VALUE_BYTES_MAX: usize = 256 * 1024;
 pub enum PipelineStage {
     /// Pre-tool hook.
     PreHook,
+    /// Permission-request hook at the policy gate.
+    PermissionHook,
     /// Permission gate.
     Permission,
     /// Sandbox gate.
@@ -185,126 +187,6 @@ pub trait ToolExecutor: Send + Sync {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutorError;
 
-/// Extension owner category.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ExtensionOwnerKind {
-    /// Hook owner.
-    Hook,
-    /// Mod owner.
-    Mod,
-}
-
-/// Validated bounded owner identifier.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OwnerId(String);
-impl OwnerId {
-    /// Validates a nonempty, NUL-free identifier.
-    ///
-    /// # Errors
-    /// Returns [`PipelineError::OwnerIdentity`] for invalid input.
-    pub fn new(value: String) -> Result<Self, PipelineError> {
-        if value.is_empty() || value.len() > TOOL_NAME_BYTES_MAX.value || value.contains('\0') {
-            return Err(PipelineError::OwnerIdentity);
-        }
-        Ok(Self(value))
-    }
-    /// Borrows the owner identifier.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// Bounded hook/mod owner identity.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExtensionOwner {
-    kind: ExtensionOwnerKind,
-    id: OwnerId,
-}
-impl ExtensionOwner {
-    /// Constructs a hook owner.
-    ///
-    /// # Errors
-    /// Returns [`PipelineError::OwnerIdentity`] for invalid identifiers.
-    pub fn hook(id: String) -> Result<Self, PipelineError> {
-        Ok(Self {
-            kind: ExtensionOwnerKind::Hook,
-            id: OwnerId::new(id)?,
-        })
-    }
-    /// Constructs a mod owner.
-    ///
-    /// # Errors
-    /// Returns [`PipelineError::OwnerIdentity`] for invalid identifiers.
-    pub fn extension_mod(id: String) -> Result<Self, PipelineError> {
-        Ok(Self {
-            kind: ExtensionOwnerKind::Mod,
-            id: OwnerId::new(id)?,
-        })
-    }
-    /// Returns the owner category.
-    #[must_use]
-    pub const fn kind(&self) -> ExtensionOwnerKind {
-        self.kind
-    }
-    /// Returns the bounded identifier.
-    #[must_use]
-    pub const fn id(&self) -> &OwnerId {
-        &self.id
-    }
-}
-
-/// Pre-hook decision.
-pub enum PreHookResult {
-    /// Continue with current input.
-    Allow,
-    /// Replace input, requiring both admission and schema revalidation.
-    Replace(BoundedJsonValue),
-}
-
-/// Minimal synchronous hook seam.
-pub trait PipelineHooks: Send + Sync {
-    /// Runs before policy.
-    ///
-    /// # Errors
-    /// Returns bounded owner attribution on hook failure.
-    fn pre(&self, input: &ValidatedToolInput) -> Result<PreHookResult, OwnerFailure>;
-    /// Observes non-sensitive executor status without output or secrets.
-    ///
-    /// # Errors
-    /// Returns bounded owner attribution on hook failure.
-    fn post(&self, status: PostHookStatus) -> Result<(), OwnerFailure>;
-}
-
-/// Non-sensitive post-hook status.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PostHookStatus {
-    /// Executor produced an admitted result.
-    Completed,
-    /// Executor or raw-result admission failed.
-    Failed,
-}
-
-/// Fixed owner-attributed hook failure.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OwnerFailure {
-    /// Failing bounded owner.
-    pub owner: ExtensionOwner,
-    /// Fixed machine code.
-    pub code: &'static str,
-}
-
-/// No-op hook implementation.
-pub struct NoopHooks;
-impl PipelineHooks for NoopHooks {
-    fn pre(&self, _: &ValidatedToolInput) -> Result<PreHookResult, OwnerFailure> {
-        Ok(PreHookResult::Allow)
-    }
-    fn post(&self, _: PostHookStatus) -> Result<(), OwnerFailure> {
-        Ok(())
-    }
-}
-
 /// Typed fixed pipeline failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PipelineError {
@@ -314,8 +196,8 @@ pub enum PipelineError {
     InputLimit,
     /// Input failed the declared JSON Schema.
     SchemaValidation,
-    /// Hook or mod failed with bounded attribution.
-    Owner(OwnerFailure),
+    /// Hook failed with stable owner and hook attribution.
+    Hook(HookFailure),
     /// Permission policy denied the invocation or rejected unsafe input.
     PermissionDenied,
     /// Permission policy requires interactive approval.
@@ -336,8 +218,8 @@ pub enum PipelineError {
     Emit,
     /// Executor infrastructure failed.
     Executor,
-    /// Extension owner identity was invalid.
-    OwnerIdentity,
+    /// A typed hook blocked the action.
+    HookBlocked,
 }
 
 /// Owning pipeline request and its explicit effect seams.
@@ -352,8 +234,8 @@ pub struct PipelineRequest<'a> {
     pub input: BoundedJsonValue,
     /// Cancellation token.
     pub cancellation: CancellationToken,
-    /// Hook seam.
-    pub hooks: &'a dyn PipelineHooks,
+    /// Typed asynchronous hook capability.
+    pub hook_runtime: &'a dyn HookRuntime,
     /// Permission gate.
     pub permissions: &'a dyn PermissionGate,
     /// Sandbox gate.
@@ -381,7 +263,7 @@ pub async fn execute(request: PipelineRequest<'_>) -> Result<ToolOutcome, Pipeli
         model_name,
         input,
         cancellation,
-        hooks,
+        hook_runtime,
         permissions,
         sandbox,
         secrets,
@@ -395,7 +277,7 @@ pub async fn execute(request: PipelineRequest<'_>) -> Result<ToolOutcome, Pipeli
         registry,
         model_name,
         cancellation,
-        hooks,
+        hook_runtime,
         permissions,
         sandbox,
         secrets,
@@ -405,6 +287,7 @@ pub async fn execute(request: PipelineRequest<'_>) -> Result<ToolOutcome, Pipeli
         emit,
     };
     let (tool, input) = prepare(&services, input)?;
+    let input = fire_pre_tool(&services, &tool, input).await?;
     let (raw, delivery) = execute_stages(&services, &tool, input).await?;
     finalize(&services, &tool.definition, raw, &delivery)
 }
@@ -414,7 +297,7 @@ struct PipelineServices<'a> {
     registry: Arc<RegistrySnapshot>,
     model_name: &'a str,
     cancellation: CancellationToken,
-    hooks: &'a dyn PipelineHooks,
+    hook_runtime: &'a dyn HookRuntime,
     permissions: &'a dyn PermissionGate,
     sandbox: &'a dyn SandboxGate,
     secrets: &'a dyn SecretResolver,
@@ -439,15 +322,45 @@ fn prepare(
     request
         .trace
         .record(TraceEvent::Preflight(PreflightEvent::SchemaValidation));
-    let mut input = validate_input(value, &tool.definition)?;
+    let input = validate_input(value, &tool.definition)?;
+    Ok((tool, input))
+}
+
+async fn fire_pre_tool(
+    request: &PipelineServices<'_>,
+    tool: &crate::registry::RegisteredTool,
+    input: ValidatedToolInput,
+) -> Result<ValidatedToolInput, PipelineError> {
     request
         .trace
         .record(TraceEvent::Stage(PipelineStage::PreHook));
-    let decision = request.hooks.pre(&input).map_err(PipelineError::Owner)?;
-    if let PreHookResult::Replace(value) = decision {
-        input = validate_input(value, &tool.definition)?;
+    let payload = tool_payload(
+        HookEvent::PreToolUse,
+        request,
+        tool,
+        Some(&input),
+        None,
+        None,
+    )?;
+    match HookLifecycle::new(request.hook_runtime)
+        .pre_tool_use(payload, request.cancellation.child_token())
+        .await
+        .map_err(PipelineError::Hook)?
+    {
+        HookOutcome::Allow => Ok(input),
+        HookOutcome::Block(_) => Err(PipelineError::HookBlocked),
+        HookOutcome::Modify(payload) => {
+            let value = payload
+                .value()
+                .get("tool_input")
+                .cloned()
+                .ok_or(PipelineError::SchemaValidation)?;
+            validate_input(
+                BoundedJsonValue::new(value).map_err(|_| PipelineError::InputLimit)?,
+                &tool.definition,
+            )
+        }
     }
-    Ok((tool, input))
 }
 
 async fn execute_stages(
@@ -455,20 +368,13 @@ async fn execute_stages(
     tool: &crate::registry::RegisteredTool,
     input: ValidatedToolInput,
 ) -> Result<(RawToolOutcome, SecretDelivery), PipelineError> {
-    request
-        .trace
-        .record(TraceEvent::Stage(PipelineStage::Permission));
-    match request
-        .permissions
-        .check(PermissionInvocation::from_definition(
-            &tool.definition,
-            &input,
-        ))
-        .map_err(|_| PipelineError::PermissionDenied)?
-    {
+    match permission_decision(request, tool, &input)? {
         PermissionDecision::Allow => {}
         PermissionDecision::Deny => return Err(PipelineError::PermissionDenied),
-        PermissionDecision::Ask => return Err(PipelineError::ApprovalRequired),
+        PermissionDecision::Ask => {
+            fire_permission_hook(request, tool, &input).await?;
+            return Err(PipelineError::ApprovalRequired);
+        }
     }
     request
         .trace
@@ -481,7 +387,12 @@ async fn execute_stages(
         })
         .map_err(|_| PipelineError::Sandbox)?;
     if sandbox == SandboxDecision::Deny {
-        return sandbox_denied(request, tool);
+        let (raw, delivery) = sandbox_denied(tool)?;
+        request
+            .trace
+            .record(TraceEvent::Stage(PipelineStage::PostHook));
+        fire_post_failure(request, tool, &input, "sandbox denied").await?;
+        return Ok((raw, delivery));
     }
     request
         .trace
@@ -494,6 +405,7 @@ async fn execute_stages(
     request
         .trace
         .record(TraceEvent::Stage(PipelineStage::Executor));
+    let hook_input = input.clone();
     let raw = tool
         .executor
         .execute(RawToolExecutionRequest {
@@ -506,20 +418,195 @@ async fn execute_stages(
             secrets: delivery.clone(),
         })
         .await
-        .map_err(|_| PipelineError::Executor)
-        .and_then(|value| admit_raw(value, &tool.definition));
+        .map_err(|_| PipelineError::Executor);
     request
         .trace
         .record(TraceEvent::Stage(PipelineStage::PostHook));
-    let status = post_hook_status(&raw);
-    request.hooks.post(status).map_err(PipelineError::Owner)?;
-    Ok((raw?, delivery))
+    match raw {
+        Ok(RawToolOutcome::Success(output)) => {
+            if output.len() > lotta_runtime::hooks::HOOK_PAYLOAD_BYTES_MAX / 2 {
+                fire_post_failure(request, tool, &hook_input, "result limit").await?;
+                return Err(PipelineError::ResultLimit);
+            }
+            let raw = fire_post_success(request, tool, &hook_input, output).await?;
+            Ok((raw, delivery))
+        }
+        Ok(RawToolOutcome::Failure(failure)) => {
+            let failure = match admit_raw(RawToolOutcome::Failure(failure), &tool.definition) {
+                Ok(RawToolOutcome::Failure(failure)) => failure,
+                Ok(RawToolOutcome::Success(_)) => unreachable!("failure admission changed variant"),
+                Err(error) => {
+                    fire_post_failure(request, tool, &hook_input, failure_code(&error)).await?;
+                    return Err(error);
+                }
+            };
+            fire_post_failure(request, tool, &hook_input, "tool failure").await?;
+            Ok((RawToolOutcome::Failure(failure), delivery))
+        }
+        Err(error) => {
+            fire_post_failure(request, tool, &hook_input, failure_code(&error)).await?;
+            Err(error)
+        }
+    }
 }
 
-fn post_hook_status(raw: &Result<RawToolOutcome, PipelineError>) -> PostHookStatus {
+async fn fire_post_success(
+    request: &PipelineServices<'_>,
+    tool: &crate::registry::RegisteredTool,
+    _input: &ValidatedToolInput,
+    output: String,
+) -> Result<RawToolOutcome, PipelineError> {
+    let result = raw_json(&RawToolOutcome::Success(output.clone()));
+    let value = serde_json::json!({
+        "event_type": HookEvent::PostToolUse,
+        "working_directory": "",
+        "tool_name": tool.model_name.as_str(),
+        "tool_call_id": request.tool_call_id.as_str(),
+        "tool_result": result,
+    });
+    let payload = HookPayload::new(HookEvent::PostToolUse, value)
+        .map_err(|_| hook_boundary_error("payload"))?;
+    match HookLifecycle::new(request.hook_runtime)
+        .post_tool_use(payload, request.cancellation.child_token())
+        .await
+        .map_err(PipelineError::Hook)?
+    {
+        HookOutcome::Allow => admit_raw(RawToolOutcome::Success(output), &tool.definition),
+        HookOutcome::Block(_) => Err(PipelineError::HookBlocked),
+        HookOutcome::Modify(payload) => {
+            let result = payload
+                .value()
+                .get("tool_result")
+                .ok_or(PipelineError::ResultLimit)?;
+            if result.get("status").and_then(Value::as_str) != Some("success") {
+                return Err(PipelineError::ResultLimit);
+            }
+            let output = result
+                .get("output")
+                .and_then(Value::as_str)
+                .ok_or(PipelineError::ResultLimit)?
+                .to_owned();
+            admit_raw(RawToolOutcome::Success(output), &tool.definition)
+        }
+    }
+}
+
+fn failure_code(error: &PipelineError) -> &'static str {
+    match error {
+        PipelineError::ResultLimit => "result limit",
+        _ => "executor failure",
+    }
+}
+
+async fn fire_post_failure(
+    request: &PipelineServices<'_>,
+    tool: &crate::registry::RegisteredTool,
+    _input: &ValidatedToolInput,
+    error: &'static str,
+) -> Result<(), PipelineError> {
+    let value = serde_json::json!({
+        "event_type": HookEvent::PostToolUseFailure,
+        "working_directory": "",
+        "tool_name": tool.model_name.as_str(),
+        "tool_call_id": request.tool_call_id.as_str(),
+        "error_message": error,
+    });
+    let payload = HookPayload::new(HookEvent::PostToolUseFailure, value)
+        .map_err(|_| hook_boundary_error("payload"))?;
+    match HookLifecycle::new(request.hook_runtime)
+        .post_tool_use_failure(payload, request.cancellation.child_token())
+        .await
+        .map_err(PipelineError::Hook)?
+    {
+        HookOutcome::Allow => Ok(()),
+        HookOutcome::Block(_) => Err(PipelineError::HookBlocked),
+        HookOutcome::Modify(_) => Err(hook_boundary_error("illegal_modification")),
+    }
+}
+
+async fn fire_permission_hook(
+    request: &PipelineServices<'_>,
+    tool: &crate::registry::RegisteredTool,
+    input: &ValidatedToolInput,
+) -> Result<(), PipelineError> {
+    request
+        .trace
+        .record(TraceEvent::Stage(PipelineStage::PermissionHook));
+    let payload = tool_payload(
+        HookEvent::PermissionRequest,
+        request,
+        tool,
+        Some(input),
+        None,
+        None,
+    )?;
+    let outcome = HookLifecycle::new(request.hook_runtime)
+        .permission_request(payload, request.cancellation.child_token())
+        .await
+        .map_err(PipelineError::Hook)?;
+    if matches!(outcome, HookOutcome::Block(_)) {
+        Err(PipelineError::HookBlocked)
+    } else {
+        Ok(())
+    }
+}
+
+fn permission_decision(
+    request: &PipelineServices<'_>,
+    tool: &crate::registry::RegisteredTool,
+    input: &ValidatedToolInput,
+) -> Result<PermissionDecision, PipelineError> {
+    request
+        .trace
+        .record(TraceEvent::Stage(PipelineStage::Permission));
+    request
+        .permissions
+        .check(PermissionInvocation::from_definition(
+            &tool.definition,
+            input,
+        ))
+        .map_err(|_| PipelineError::PermissionDenied)
+}
+
+fn tool_payload(
+    event: HookEvent,
+    request: &PipelineServices<'_>,
+    tool: &crate::registry::RegisteredTool,
+    input: Option<&ValidatedToolInput>,
+    result: Option<serde_json::Value>,
+    error: Option<&str>,
+) -> Result<HookPayload, PipelineError> {
+    let mut value = serde_json::json!({
+        "event_type": serde_json::to_value(event).map_err(|_| PipelineError::Executor)?,
+        "working_directory": "",
+        "tool_name": tool.model_name.as_str(),
+        "tool_call_id": request.tool_call_id.as_str(),
+    });
+    if let Some(input) = input {
+        value["tool_input"] = input.as_value().clone();
+    }
+    if let Some(result) = result {
+        value["tool_result"] = result;
+    }
+    if let Some(error) = error {
+        value["error_message"] = Value::String(error.into());
+    }
+    HookPayload::new(event, value).map_err(|_| hook_boundary_error("payload"))
+}
+
+fn hook_boundary_error(code: &'static str) -> PipelineError {
+    PipelineError::Hook(HookFailure {
+        owner: lotta_runtime::hooks::HookOwner::new("runtime".into()).expect("constant owner"),
+        hook_id: lotta_runtime::hooks::HookId::new("tool-pipeline".into())
+            .expect("constant hook id"),
+        code,
+    })
+}
+
+fn raw_json(raw: &RawToolOutcome) -> serde_json::Value {
     match raw {
-        Ok(RawToolOutcome::Success(_)) => PostHookStatus::Completed,
-        Ok(RawToolOutcome::Failure(_)) | Err(_) => PostHookStatus::Failed,
+        RawToolOutcome::Success(output) => serde_json::json!({"status":"success","output":output}),
+        RawToolOutcome::Failure(_) => serde_json::json!({"status":"error"}),
     }
 }
 
@@ -586,20 +673,12 @@ fn admit_raw(
 }
 
 fn sandbox_denied(
-    request: &PipelineServices<'_>,
     tool: &crate::registry::RegisteredTool,
 ) -> Result<(RawToolOutcome, SecretDelivery), PipelineError> {
     let raw = RawToolOutcome::Failure(ToolOutcome::SandboxDenied {
         message: ToolOutcomeMessage::new("workspace sandbox denied".into())
             .map_err(|_| PipelineError::Sandbox)?,
     });
-    request
-        .trace
-        .record(TraceEvent::Stage(PipelineStage::PostHook));
-    request
-        .hooks
-        .post(PostHookStatus::Failed)
-        .map_err(PipelineError::Owner)?;
     let delivery = SecretDelivery {
         kind: if tool.definition.execution_owner == ToolExecutionOwner::Rust {
             SecretDeliveryKind::ChildEnvironment

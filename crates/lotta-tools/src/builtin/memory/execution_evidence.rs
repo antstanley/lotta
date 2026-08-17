@@ -138,7 +138,7 @@ impl Drop for Root {
 }
 
 async fn invoke(bundle: &MemoryToolBundle, input: serde_json::Value) -> ToolOutcome {
-    use crate::{AllowAllPermissions, AllowAllSandbox, NoopHooks, PipelineError, PipelineRequest};
+    use crate::{AllowAllPermissions, AllowAllSandbox, PipelineError, PipelineRequest};
     use crate::{OutcomeSink, SecretResolver, TraceEvent, TraceSink};
     struct NoTrace;
     impl TraceSink for NoTrace {
@@ -175,7 +175,7 @@ async fn invoke(bundle: &MemoryToolBundle, input: serde_json::Value) -> ToolOutc
         model_name: "memory",
         input: BoundedJsonValue::new(input).expect("input"),
         cancellation: CancellationToken::new(),
-        hooks: &NoopHooks,
+        hook_runtime: &lotta_runtime::hooks::NoopHookRuntime,
         permissions: &AllowAllPermissions,
         sandbox: &AllowAllSandbox,
         secrets: &Secrets,

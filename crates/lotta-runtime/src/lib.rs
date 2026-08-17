@@ -14,6 +14,8 @@ pub mod admission;
 pub mod boundary;
 /// Immutable Task 06 runtime resource bounds exported for inward-dependent adapters.
 pub mod bounds;
+/// Dependency-neutral hook wire types and firing capability.
+pub mod hooks;
 /// Lease-guarded post-await effects.
 pub mod lease;
 /// Runtime lifecycle ownership and projections.

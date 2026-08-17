@@ -5,8 +5,8 @@ use crate::{
         PermissionDecision, PermissionGate, PermissionInvocation, matcher::PermissionError,
     },
     pipeline::{
-        OutcomeSink, PipelineError, PipelineHooks, PipelineRequest, PipelineStage, PostHookStatus,
-        PreHookResult, RawToolExecutionRequest, RawToolOutcome, SecretResolver, ToolExecutor,
+        OutcomeSink, PipelineError, PipelineRequest, PipelineStage, RawToolExecutionRequest,
+        RawToolOutcome, SecretResolver, ToolExecutor,
         TraceEvent, TraceSink, execute,
     },
     registry::{ToolRegistration, ToolRegistry},
@@ -340,7 +340,7 @@ mod workspace {
                 )
                 .unwrap(),
                 cancellation: CancellationToken::new(),
-                hooks: &RecordingHooks::default(),
+                hook_runtime: &lotta_runtime::hooks::NoopHookRuntime,
                 permissions: &crate::AllowAllPermissions,
                 sandbox: &gate,
                 secrets: &Counters::default(),
@@ -494,7 +494,6 @@ mod outcome_kind {
         let counter = Arc::new(AtomicUsize::new(0));
         let registry = tool_registry(Arc::clone(&counter));
         let trace = RecordingTrace::default();
-        let hooks = RecordingHooks::default();
         let counters = Counters::default();
         let persistence = RecordingSink::default();
         let emit = RecordingSink::default();
@@ -506,7 +505,7 @@ mod outcome_kind {
             model_name: "Read",
             input: BoundedJsonValue::new(serde_json::json!({"file_path":"/outside"})).unwrap(),
             cancellation: CancellationToken::new(),
-            hooks: &hooks,
+            hook_runtime: &lotta_runtime::hooks::NoopHookRuntime,
             permissions: &CountingPermission(&counters, PermissionDecision::Allow),
             sandbox: &CountingSandbox(&counters, Ok(SandboxDecision::Deny)),
             secrets: &counters,
@@ -532,10 +531,6 @@ mod outcome_kind {
                 TraceEvent::Stage(PipelineStage::Persist),
                 TraceEvent::Stage(PipelineStage::Emit),
             ]
-        );
-        assert_eq!(
-            hooks.posts.lock().unwrap().as_slice(),
-            &[PostHookStatus::Failed]
         );
         assert_eq!(counter.load(Ordering::Relaxed), 0);
         assert_eq!(counters.secret.load(Ordering::Relaxed), 0);
@@ -564,7 +559,7 @@ mod outcome_kind {
             model_name: "Read",
             input: valid_input(),
             cancellation: CancellationToken::new(),
-            hooks: &RecordingHooks::default(),
+            hook_runtime: &lotta_runtime::hooks::NoopHookRuntime,
             permissions: &CountingPermission(&counters, PermissionDecision::Deny),
             sandbox: &CountingSandbox(&counters, Ok(SandboxDecision::Allow)),
             secrets: &counters,
@@ -594,7 +589,7 @@ mod outcome_kind {
             model_name: "Read",
             input: valid_input(),
             cancellation: CancellationToken::new(),
-            hooks: &RecordingHooks::default(),
+            hook_runtime: &lotta_runtime::hooks::NoopHookRuntime,
             permissions: &CountingPermission(&counters, PermissionDecision::Allow),
             sandbox: &CountingSandbox(&counters, Err(SandboxError)),
             secrets: &counters,
@@ -837,20 +832,6 @@ struct RecordingTrace(Mutex<Vec<TraceEvent>>);
 impl TraceSink for RecordingTrace {
     fn record(&self, event: TraceEvent) {
         self.0.lock().unwrap().push(event);
-    }
-}
-
-#[derive(Default)]
-struct RecordingHooks {
-    posts: Mutex<Vec<PostHookStatus>>,
-}
-impl PipelineHooks for RecordingHooks {
-    fn pre(&self, _: &ValidatedToolInput) -> Result<PreHookResult, crate::pipeline::OwnerFailure> {
-        Ok(PreHookResult::Allow)
-    }
-    fn post(&self, status: PostHookStatus) -> Result<(), crate::pipeline::OwnerFailure> {
-        self.posts.lock().unwrap().push(status);
-        Ok(())
     }
 }
 

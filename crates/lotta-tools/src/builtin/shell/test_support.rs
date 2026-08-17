@@ -1,7 +1,7 @@
 use super::{ShellSandbox, ShellToolBundle};
 use crate::clamp::OverflowWriter;
 use crate::{
-    AllowAllPermissions, AllowAllSandbox, NoopHooks, OutcomeSink, PipelineError, PipelineRequest,
+    AllowAllPermissions, AllowAllSandbox, OutcomeSink, PipelineError, PipelineRequest,
     SecretResolver, ToolRegistry, ToolsetId, TraceEvent, TraceSink, execute,
 };
 use lotta_domain::{AgentId, BoundedJsonValue, ConversationId, RuntimeScope};
@@ -195,7 +195,7 @@ pub(super) async fn execute_bundle_with_overflow(
         model_name: model,
         input: BoundedJsonValue::new(input).unwrap(),
         cancellation,
-        hooks: &NoopHooks,
+        hook_runtime: &lotta_runtime::hooks::NoopHookRuntime,
         permissions: &AllowAllPermissions,
         sandbox: &AllowAllSandbox,
         secrets: &EmptySecrets,

@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    AllowAllPermissions, AllowAllSandbox, NoopHooks, OutcomeSink, PipelineError, PipelineRequest,
+    AllowAllPermissions, AllowAllSandbox, OutcomeSink, PipelineError, PipelineRequest,
     RawToolExecutionRequest, RegistrySnapshot, SecretResolver, ToolRegistry, ToolsetId, TraceEvent,
     TraceSink, execute,
 };
@@ -645,7 +645,7 @@ async fn pipeline(
         model_name: name,
         input: BoundedJsonValue::new(serde_json::json!({"tool_call_id":"call-1"})).unwrap(),
         cancellation,
-        hooks: &NoopHooks,
+        hook_runtime: &lotta_runtime::hooks::NoopHookRuntime,
         permissions: &AllowAllPermissions,
         sandbox: &AllowAllSandbox,
         secrets: &NoSecrets,

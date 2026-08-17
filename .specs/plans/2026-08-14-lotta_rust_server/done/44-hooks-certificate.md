@@ -1,7 +1,7 @@
 # Done Certificate — Task 44: Hook events, command and prompt executors, and owner attribution
 
 **Task:** [44-hooks.md](44-hooks.md) · **Plan:** [plan.md](../plan.md)
-**State:** Authored 2026-08-14 — unverified
+**State:** Verified 2026-08-16 — DONE
 
 > Verification protocol for Task 44. A validating agent discharges it: collect each
 > obligation's evidence, run its checks, set the Status, then derive the Conclusion by the
@@ -25,38 +25,38 @@ obligation names (a file location, a named test result, or an execution trace) �
   - *Claim:* The event enum has eleven variants and each has a firing test at the correct pipeline position.
   - *Evidence to collect:* Run `cargo nextest run -p lotta-extensions -E 'test(hooks::events)'` — expect eleven firing cases. Compare the names against `../letta-code/src/hooks/types.ts`.
   - *Checks:* Resolve the pre-tool and post-tool firing points against the Task 33 pipeline stage log — confirm pre-tool fires before the permission gate and post-tool after the executor, matching `05-tools-and-extensions.md` §Execution pipeline.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED — 11/11 cases fire through the production lifecycle operation hosts or actual Task33 tool pipeline, with pre/permission/post/failure traces at their documented boundaries.
 
 - **O2 — Prompt hooks are supported for exactly the seven permitted events, and registering a prompt hook for notification, pre-compact, or a session event is rejected**
   - *Claim:* The seven permitted events accept a prompt hook; the four command-only events reject one.
   - *Evidence to collect:* Run `cargo nextest run -p lotta-extensions -E 'test(hooks::prompt_subset)'` — expect seven acceptance cases and four rejection cases.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED — seven registered prompt-event cases invoke the model once and all four command-only event registrations reject before any model call.
 
 - **O3 — Command hooks run as sandboxed child processes under `COMMAND_HOOK_TIMEOUT_MS_DEFAULT`, and prompt hooks under `PROMPT_HOOK_TIMEOUT_MS_DEFAULT`**
   - *Claim:* The two timeouts are distinct named constants with the §Limits defaults, and a command hook cannot read outside the sandbox root.
   - *Evidence to collect:* Run `cargo nextest run -p lotta-extensions -E 'test(hooks::timeouts) + test(hooks::command_is_sandboxed)'` — expect the two timeout cases (60,000 and 30,000) and the confinement case.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED — six timeout cases prove server-owned 60,000/30,000 ms caps, local prompt enforcement, cancellation, malformed/overbound responses, and real command process-group cleanup; four real OsSandbox cases prove confinement.
 
 - **O4 — Block, modify, and allow outcomes work, a failure is attributed to its owning hook, and `HOOKS_PER_EVENT_MAX` rejects at the limit**
   - *Claim:* Each outcome changes the pipeline as documented, a failing hook's error names its owner, and the 65th hook on an event is rejected.
   - *Evidence to collect:* Run `cargo nextest run -p lotta-extensions -E 'test(hooks::outcomes) + test(hooks::bounds)'` — expect three outcome cases, an attribution case naming the owner, and below/at/above cases for `HOOKS_PER_EVENT_MAX`.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED — 9/9 real Task33 outcome/parser cases prove allow, block, ordered pre/post modification, failure-once semantics, pinned JSON parsing, and exact owner/HookId attribution; 3/3 registry cases prove 63/64/65 and concurrent atomic ownership.
 
 - **O5 — Meets the repo definition of done (tests, lint/format, named-constant limits — see plan.md baseline)**
   - *Claim:* The repo-wide gates named in the plan's definition-of-done baseline pass for this change.
   - *Evidence to collect:* Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo nextest run --workspace --all-features`, and `cargo deny check` — expect exit code 0 from each. Read every constant this task introduces and confirm it is a `const` whose name puts units last (`development-guidelines.md` §Naming), and that each function the task added stays within 70 lines and 100 columns.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED — workspace tests 1,389/1,389, all-target tests, build, fmt, strict all-target/all-feature Clippy, private Rustdoc, deny, pinned-source, and source-shape gates pass.
 
 - **O6 — Reviewable: a reviewer runs `cargo nextest run -p lotta-extensions -E 'test(hooks::)'` and sees eleven events, the seven-event prompt subset with four rejections, both timeouts, sandboxed command hooks, and owner attribution pass**
   - *Claim:* The hooks module passes with the full event set.
   - *Evidence to collect:* Run the filter and confirm zero failures and eleven `events` cases.
-  - *Status:* ☐ unverified
+  - *Status:* ☒ SATISFIED — clean reviewer ran all 44 hook cases and found no remaining event, timeout, confinement, outcome, ownership, pipeline, bound, lifecycle, source-shape, or regression defect.
 
 ## Regression check
 
 For each unit this task changes, the validator traces one downstream caller:
 
-- `crates/lotta-tools/src/pipeline.rs` (Task 33) gains real hook stages; confirm `pipeline::stage_order` and `pipeline::owner_attribution` still pass : ☐ (PRESERVED / REGRESSION)
+- `crates/lotta-tools/src/pipeline.rs` (Task 33) gains real hook stages; confirm `pipeline::stage_order` and `pipeline::owner_attribution` still pass : ☒ PRESERVED — both exact selectors pass with the sole typed runtime and owner/HookId propagation.
 
 ## Residue
 
@@ -71,6 +71,6 @@ check found a REGRESSION; **PARTIAL** if every obligation is SATISFIED except on
 more UNVERIFIED and no regression; **DONE** only if every obligation is SATISFIED and
 the regression check is PRESERVED.
 
-VERDICT: ☐ (DONE | PARTIAL | NOT_DONE)
-CONFIDENCE: ☐ (high | medium | low)
-SUMMARY: ☐
+VERDICT: ☒ DONE
+CONFIDENCE: ☒ high
+SUMMARY: Eleven exact hook events now fire through one attributed runtime at real lifecycle and Task33 boundaries, with atomic load-order registration, event-specific outcomes, locally enforced prompt deadlines, and process-group-confined command execution.

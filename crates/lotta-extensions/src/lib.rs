@@ -11,6 +11,8 @@
     clippy::struct_field_names
 )]
 
+/// Typed hook registry and command/model executors.
+pub mod hooks;
 /// Bounded Model Context Protocol client and adapters.
 pub mod mcp;
 /// Shared bounded local-pipe contract for extension sidecars.
