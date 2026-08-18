@@ -533,11 +533,17 @@ async fn handle_text(
         let failure_frame = frame.clone();
         let turn_cancellation = cancellation.child_token();
         turns.spawn(async move {
-            if controller
-                .submit_turn(command, deferred, turn_cancellation, sink)
-                .await
-                .is_err()
-            {
+            let result = if controller.is_control_continuation(&deferred) {
+                state
+                    .runtime_service
+                    .continue_input(deferred.scope, deferred.continuation, sink)
+                    .await
+            } else {
+                controller
+                    .submit_turn(command, deferred, turn_cancellation, sink)
+                    .await
+            };
+            if result.is_err() {
                 let _ = dispatch_typed_failure(&state, connection_id, &failure_frame);
             }
         });

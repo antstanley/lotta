@@ -1,4 +1,7 @@
 use crate::{ListenerRuntime, QueueMutation, QueueMutationEvent, RuntimeError, RuntimeHandle};
+mod control;
+pub use control::admit_control_snapshot;
+
 use lotta_domain::{
     InputDisposition, QueueDropReason, QueueItem, QueueItemKind, TurnLease, TurnStateKind,
 };
@@ -60,6 +63,21 @@ impl AdmissionOutcome {
 }
 
 impl ListenerRuntime {
+    /// Retains an item already admitted by an active admission queue.
+    ///
+    /// This preserves the canonical queue's ordering and bounds without recording
+    /// admission history a second time or classifying the item as a new start.
+    ///
+    /// # Errors
+    /// Returns an error for stale handles, duplicate queue IDs, or revision exhaustion.
+    pub fn enqueue_retained(
+        &mut self,
+        handle: &RuntimeHandle,
+        item: QueueItem,
+    ) -> Result<QueueMutation, RuntimeError> {
+        self.current_entry_mut(handle)?.queue.enqueue(item)
+    }
+
     /// Atomically admits against one entry's history, lifecycle, and queue.
     ///
     /// # Errors

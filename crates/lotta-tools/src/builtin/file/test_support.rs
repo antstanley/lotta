@@ -146,6 +146,7 @@ pub(super) async fn run_with_gate(
     };
     let records = Arc::new(Records::default());
     let result = execute(PipelineRequest {
+        approval_grant: lotta_runtime::ports::ToolApprovalGrant::None,
         tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
             lotta_runtime::boundary::ProviderName::new("pipeline-call".to_owned()).unwrap(),
         ),

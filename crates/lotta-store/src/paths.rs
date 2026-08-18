@@ -102,6 +102,11 @@ impl StorePaths {
     pub fn indexes(&self) -> PathBuf {
         self.root.join("indexes")
     }
+    /// Returns the canonical runtime state directory location.
+    #[must_use]
+    pub fn runtime(&self) -> PathBuf {
+        self.root.join("runtime")
+    }
     /// Returns the provider authentication file location.
     #[must_use]
     pub fn provider_auth(&self) -> PathBuf {

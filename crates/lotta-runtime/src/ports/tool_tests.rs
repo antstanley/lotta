@@ -196,6 +196,10 @@ pub(crate) fn input_output_deadline_boundaries() {
     )
     .unwrap();
     let request = ToolExecutionRequest {
+        tool_call_id: ToolCallId::from_name(
+            crate::boundary::ProviderName::new("call".into()).unwrap(),
+        ),
+        approval_grant: ToolApprovalGrant::None,
         definition: definition(),
         input,
         cancellation: CancellationToken::new(),

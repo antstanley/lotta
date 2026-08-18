@@ -25,7 +25,7 @@ pub use setup::{
 };
 pub use setup_run::{TurnSetup, run_turn_with_setup};
 pub use stop_reason::{ProviderFailureDetail, TurnStopReason, TurnStopRecord};
-pub use tool_calls::TurnToolCatalog;
+pub use tool_calls::{ToolSnapshotHandle, TurnToolCatalog};
 pub use turn_loop::{
     ApprovalPort, ApprovalResolution, CONTEXT_OVERFLOW_COMPACTIONS_MAX, CompactionPort,
     CompactionProgress, ConfiguredFallback, ControllerToolPort, ProviderStartPort,

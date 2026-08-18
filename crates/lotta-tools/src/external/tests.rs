@@ -638,6 +638,7 @@ async fn pipeline(
     let trace = RecordingTrace(Mutex::new(Vec::new()));
     let sink = Sink;
     let result = execute(PipelineRequest {
+        approval_grant: lotta_runtime::ports::ToolApprovalGrant::None,
         tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
             lotta_runtime::boundary::ProviderName::new("pipeline-call".to_owned()).unwrap(),
         ),

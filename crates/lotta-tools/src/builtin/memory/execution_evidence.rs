@@ -168,6 +168,7 @@ async fn invoke(bundle: &MemoryToolBundle, input: serde_json::Value) -> ToolOutc
         .update(crate::toolset::ToolsetId::None, &[registration], None)
         .expect("snapshot");
     crate::execute(PipelineRequest {
+        approval_grant: lotta_runtime::ports::ToolApprovalGrant::None,
         tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
             lotta_runtime::boundary::ProviderName::new("pipeline-call".to_owned()).unwrap(),
         ),

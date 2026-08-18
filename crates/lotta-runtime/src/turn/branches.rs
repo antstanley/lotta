@@ -41,15 +41,23 @@ struct CapturingApproval {
 }
 
 impl ApprovalPort for CapturingApproval {
+    fn store_request(&self, request: ControlRequest) -> Result<(), crate::RuntimeError> {
+        self.requests.lock().unwrap().push(request);
+        Ok(())
+    }
     fn await_resolution(
         &self,
-        request: ControlRequest,
+        _: ControlRequest,
         _: tokio_util::sync::CancellationToken,
-        _: ToolTimeout,
     ) -> PortFuture<'_, ApprovalResolution> {
-        self.requests.lock().unwrap().push(request);
         let resolution = self.resolution.clone();
         Box::pin(async move { Ok(resolution) })
+    }
+    fn mark_allowed(&self, _: &ControlRequest, _: &ToolOutcome) -> Result<(), crate::RuntimeError> {
+        Ok(())
+    }
+    fn mark_interrupted(&self, _: &ControlRequest) -> Result<(), crate::RuntimeError> {
+        Ok(())
     }
 }
 
@@ -152,18 +160,56 @@ struct Approval {
     calls: AtomicUsize,
 }
 impl ApprovalPort for Approval {
-    fn await_resolution(
-        &self,
-        request: ControlRequest,
-        _: tokio_util::sync::CancellationToken,
-        _: ToolTimeout,
-    ) -> PortFuture<'_, ApprovalResolution> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+    fn store_request(&self, request: ControlRequest) -> Result<(), crate::RuntimeError> {
         assert_eq!(request.call_id, id("call"));
         self.requests.lock().unwrap().push(request);
+        Ok(())
+    }
+    fn await_resolution(
+        &self,
+        _: ControlRequest,
+        _: tokio_util::sync::CancellationToken,
+    ) -> PortFuture<'_, ApprovalResolution> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         let resolution = self.resolution.lock().unwrap().take().unwrap();
         Box::pin(async move { resolution })
     }
+    fn mark_allowed(&self, _: &ControlRequest, _: &ToolOutcome) -> Result<(), crate::RuntimeError> {
+        Ok(())
+    }
+    fn mark_interrupted(&self, _: &ControlRequest) -> Result<(), crate::RuntimeError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn aborted_approval_uses_user_cancellation_terminal() {
+    let tool = CaptureTool {
+        calls: AtomicUsize::new(0),
+        inputs: Mutex::new(Vec::new()),
+    };
+    let approval = Approval {
+        resolution: Mutex::new(Some(Err(crate::RuntimeError::Cancelled {
+            context: "approval abort".into(),
+        }))),
+        requests: Mutex::new(Vec::new()),
+        calls: AtomicUsize::new(0),
+    };
+    let effects = RecordingEffects::default();
+    assert_eq!(
+        run_approval(&tool, &approval, &effects).await.unwrap(),
+        TurnRunOutcome::Completed
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+    let stops = effects.stops.lock().unwrap();
+    assert_eq!(stops.len(), 1);
+    assert_eq!(stops[0].reason, TurnStopReason::UserCancellation);
+    assert!(matches!(
+        effects.events.lock().unwrap().last(),
+        Some(TurnEvent::Failed {
+            reason: TurnStopReason::UserCancellation
+        })
+    ));
 }
 
 #[tokio::test]

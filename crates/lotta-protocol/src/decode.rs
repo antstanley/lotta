@@ -161,10 +161,12 @@ fn validate_create_message(payload: &Map<String, Value>) -> Option<String> {
 }
 
 fn validate_approval(payload: &Map<String, Value>) -> Option<String> {
-    let valid = payload.get("request_id").is_some_and(Value::is_string)
-        && payload
-            .get("error")
-            .map_or_else(|| valid_decision(payload.get("decision")), Value::is_string);
+    let valid = payload.get("kind").and_then(Value::as_str) == Some("approval_response")
+        && payload.get("request_id").is_some_and(Value::is_string)
+        && match payload.get("error") {
+            Some(error) => error.is_string(),
+            None => payload.get("decision").is_some_and(valid_decision_value),
+        };
     (!valid).then(|| {
         concat!(
             "Protocol violation: input.kind=approval_response requires ",
@@ -174,8 +176,8 @@ fn validate_approval(payload: &Map<String, Value>) -> Option<String> {
     })
 }
 
-fn valid_decision(value: Option<&Value>) -> bool {
-    let Some(value) = value.and_then(Value::as_object) else {
+fn valid_decision_value(value: &Value) -> bool {
+    let Some(value) = value.as_object() else {
         return false;
     };
     match value.get("behavior").and_then(Value::as_str) {
@@ -183,7 +185,7 @@ fn valid_decision(value: Option<&Value>) -> bool {
             optional_string(value, "message")
                 && value
                     .get("updated_input")
-                    .is_none_or(|v| v.is_null() || v.is_object())
+                    .is_none_or(|candidate| candidate.is_null() || candidate.is_object())
                 && optional_string_array(value, "selected_permission_suggestion_ids")
         }
         Some("deny") => value.get("message").is_some_and(Value::is_string),

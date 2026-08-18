@@ -2,10 +2,28 @@ use crate::RuntimeError;
 use crate::bounds::PROVIDER_TOOLS_MAX;
 use crate::ports::{ModelFacingToolName, ToolDefinition};
 use std::collections::BTreeMap;
+/// Opaque per-turn handle for an executor-bearing tool snapshot.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ToolSnapshotHandle(u64);
+
+impl ToolSnapshotHandle {
+    /// Creates an opaque snapshot handle owned by setup ports.
+    #[must_use]
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+
+    /// Returns the opaque identifier to its owning adapter.
+    #[must_use]
+    pub const fn id(self) -> u64 {
+        self.0
+    }
+}
 
 /// Bounded model-name catalog for tools eligible during one turn.
 pub struct TurnToolCatalog {
     definitions: BTreeMap<ModelFacingToolName, ToolDefinition>,
+    snapshot: Option<ToolSnapshotHandle>,
 }
 
 impl TurnToolCatalog {
@@ -32,7 +50,21 @@ impl TurnToolCatalog {
         }
         Ok(Self {
             definitions: indexed,
+            snapshot: None,
         })
+    }
+
+    /// Attaches the opaque executor snapshot retained by setup.
+    #[must_use]
+    pub fn with_snapshot(mut self, snapshot: ToolSnapshotHandle) -> Self {
+        self.snapshot = Some(snapshot);
+        self
+    }
+
+    /// Returns the opaque executor snapshot handle, when production attached one.
+    #[must_use]
+    pub const fn snapshot(&self) -> Option<ToolSnapshotHandle> {
+        self.snapshot
     }
 
     pub(crate) fn get(&self, name: &str) -> Option<&ToolDefinition> {

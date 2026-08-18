@@ -81,6 +81,7 @@ impl PipelineCertificate {
         input: Value,
     ) -> Result<ToolOutcome, PipelineError> {
         execute(PipelineRequest {
+            approval_grant: lotta_runtime::ports::ToolApprovalGrant::None,
             tool_call_id: ToolCallId::from_name(
                 lotta_runtime::boundary::ProviderName::new("hook-certificate-call".into()).unwrap(),
             ),

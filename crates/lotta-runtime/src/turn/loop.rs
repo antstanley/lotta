@@ -7,8 +7,8 @@ use crate::bounds::{PROVIDER_MESSAGES_MAX, TURN_STEPS_MAX, TURN_TOOL_CALLS_MAX};
 use crate::ports::{
     ParallelSafety, ProviderEvent, ProviderMessage, ProviderMessages, ProviderPort,
     ProviderRequest, StopReason, ToolApprovalPolicy, ToolCallAccumulator, ToolCallId,
-    ToolExecutionOwner, ToolExecutionRequest, ToolOutcome, ToolOutcomeMessage, ToolPort,
-    ValidatedToolInput, provider_event_channel,
+    ToolExecutionOwner, ToolExecutionRequest, ToolOutcome, ToolPort, ValidatedToolInput,
+    provider_event_channel,
 };
 use crate::retry::{
     Clock, EventSink, FallbackRoute, ProviderRoute, RETRY_EVENT_CHANNEL_CAPACITY, RetryEvent,
@@ -136,13 +136,31 @@ pub enum ApprovalResolution {
 
 /// Approval backend for one exact persisted request and lease.
 pub trait ApprovalPort: Send + Sync {
-    /// Waits for a matching resolution, cancellation, or deadline.
+    /// Durably stores the exact request before any visible effect is emitted.
+    ///
+    /// # Errors
+    /// Returns a journal conflict, capacity, or persistence failure.
+    fn store_request(&self, request: ControlRequest) -> Result<(), RuntimeError>;
+    /// Waits for a matching resolution, cancellation, or the approval deadline.
     fn await_resolution(
         &self,
         request: ControlRequest,
         cancellation: tokio_util::sync::CancellationToken,
-        deadline: crate::ports::ToolTimeout,
     ) -> crate::ports::PortFuture<'_, ApprovalResolution>;
+    /// Finalizes one successfully executed allow claim exactly once.
+    ///
+    /// # Errors
+    /// Returns a durable state conflict or persistence failure.
+    fn mark_allowed(
+        &self,
+        request: &ControlRequest,
+        outcome: &ToolOutcome,
+    ) -> Result<(), RuntimeError>;
+    /// Marks an executing claim interrupted when execution or persistence is uncertain.
+    ///
+    /// # Errors
+    /// Returns a durable state conflict or persistence failure.
+    fn mark_interrupted(&self, request: &ControlRequest) -> Result<(), RuntimeError>;
 }
 
 /// External execution backend for controller, MCP, sidecar, and channel owners.
@@ -648,7 +666,12 @@ async fn run_loop(turn: &mut TurnContext<'_, '_>) -> Result<TurnRunOutcome, Runt
     for step_index in 0..TURN_STEPS_MAX.value {
         let remaining = TURN_TOOL_CALLS_MAX.value - turn.total_tool_calls;
         let mut state = ProviderStepState::new(remaining)?;
-        match run_provider_step(turn, &mut state).await? {
+        let step = match run_provider_step(turn, &mut state).await {
+            Ok(step) => step,
+            Err(RuntimeError::Cancelled { .. }) => return cancelled_outcome(turn),
+            Err(error) => return Err(error),
+        };
+        match step {
             Flow::Suppressed => {
                 if turn.request.cancellation.is_cancelled() {
                     return cancel_turn(turn).map(|flow| match flow {
@@ -679,6 +702,13 @@ async fn run_loop(turn: &mut TurnContext<'_, '_>) -> Result<TurnRunOutcome, Runt
         return finish_turn(turn, reason);
     }
     Err(limit(TURN_STEPS_MAX.name))
+}
+
+fn cancelled_outcome(turn: &mut TurnContext<'_, '_>) -> Result<TurnRunOutcome, RuntimeError> {
+    cancel_turn(turn).map(|flow| match flow {
+        Flow::Failed => TurnRunOutcome::Completed,
+        Flow::Suppressed | Flow::Continue => TurnRunOutcome::Suppressed,
+    })
 }
 
 fn continue_after_tools(
@@ -1261,87 +1291,150 @@ async fn execute_branch(
     definition: &crate::ports::ToolDefinition,
     mut input: ValidatedToolInput,
 ) -> Result<ToolOutcome, RuntimeError> {
-    if definition.approval_policy == ToolApprovalPolicy::Always {
-        let request = ControlRequest {
-            request_id: NonEmptyString::new(format!(
-                "approval-{}-{}",
-                turn.lease_generation,
-                call_id.as_str()
-            ))
-            .map_err(|_| protocol("approval request id"))?,
-            call_id: call_id.clone(),
-            lease_generation: turn.lease_generation,
-            tool_name: NonEmptyString::new(definition.model_name.as_str().to_owned())
-                .map_err(|_| protocol("approval tool name"))?,
-            input: input.clone(),
-            schema: definition.input_schema.clone(),
+    let executing_approval = if definition.approval_policy == ToolApprovalPolicy::Always {
+        let Some((request, approved_input)) =
+            approve_branch(turn, call_id, definition, input).await?
+        else {
+            return denied("Tool execution denied by user.");
         };
-        match turn.guard.apply_after_await(turn.runtime, || {
-            turn.effects.persist_control_request(&request)?;
-            turn.effects
-                .emit(TurnEvent::ControlRequest(request.clone()))
-        }) {
-            LeaseEffect::Applied(effect) => effect?,
-            LeaseEffect::Suppressed(_) => return Err(cancelled("approval suppressed")),
-        }
-        let approval = turn
-            .approvals
-            .ok_or_else(|| unavailable("approval backend"))?;
-        match approval
-            .await_resolution(
-                request,
-                turn.request.cancellation.clone(),
-                definition.timeout,
-            )
-            .await?
-        {
-            ApprovalResolution::Deny => return denied("Tool execution denied by user."),
-            ApprovalResolution::Allow(Some(edited)) => {
-                input = ValidatedToolInput::new(edited)?;
-            }
-            ApprovalResolution::Allow(None) => {}
-        }
-    }
-    let execution = ToolExecutionRequest {
+        input = approved_input;
+        Some(request)
+    } else {
+        None
+    };
+    let execution = approved_execution_request(
+        call_id,
+        definition,
+        input,
+        turn,
+        executing_approval.as_ref(),
+    );
+    let outcome = dispatch_tool_execution(turn, call_id, definition, execution).await;
+    finalize_approved_execution(turn, outcome, executing_approval)
+}
+
+fn approved_execution_request(
+    call_id: &ToolCallId,
+    definition: &crate::ports::ToolDefinition,
+    input: ValidatedToolInput,
+    turn: &TurnContext<'_, '_>,
+    approval: Option<&ControlRequest>,
+) -> ToolExecutionRequest {
+    let approval_grant = approval.map_or(crate::ports::ToolApprovalGrant::None, |_| {
+        crate::ports::ToolApprovalGrant::granted(call_id.clone(), definition)
+    });
+    ToolExecutionRequest {
+        tool_call_id: call_id.clone(),
+        approval_grant,
         definition: definition.clone(),
         input,
         cancellation: turn.request.cancellation.clone(),
         deadline: definition.timeout,
-    };
-    match definition.execution_owner {
-        ToolExecutionOwner::Rust => turn.tools.execute(execution).await,
-        ToolExecutionOwner::Mcp
-        | ToolExecutionOwner::Controller
-        | ToolExecutionOwner::ModSidecar
-        | ToolExecutionOwner::ChannelGateway => {
-            let record = ControllerToolRequestRecord {
-                scope: turn.scope.clone(),
-                run_id: turn.run_id.clone(),
-                lease_generation: turn.lease_generation,
-                call_id: call_id.clone(),
-                tool_name: NonEmptyString::new(definition.model_name.as_str().to_owned())
-                    .map_err(|_| protocol("controller tool name"))?,
-                input: execution.input.clone(),
-            };
-            match turn.guard.apply_after_await(turn.runtime, || {
-                turn.effects.persist_controller_request(record.clone())
-            }) {
-                LeaseEffect::Applied(effect) => effect?,
-                LeaseEffect::Suppressed(_) => {
-                    return Err(cancelled("controller request suppressed"));
-                }
-            }
-            turn.controller_tools
-                .ok_or_else(|| unavailable("external tool backend"))?
-                .execute_external(record, execution)
-                .await
-        }
     }
+}
+
+async fn dispatch_tool_execution(
+    turn: &mut TurnContext<'_, '_>,
+    call_id: &ToolCallId,
+    definition: &crate::ports::ToolDefinition,
+    execution: ToolExecutionRequest,
+) -> Result<ToolOutcome, RuntimeError> {
+    if definition.execution_owner == ToolExecutionOwner::Rust {
+        return turn.tools.execute(execution).await;
+    }
+    let record = ControllerToolRequestRecord {
+        scope: turn.scope.clone(),
+        run_id: turn.run_id.clone(),
+        lease_generation: turn.lease_generation,
+        call_id: call_id.clone(),
+        tool_name: NonEmptyString::new(definition.model_name.as_str().to_owned())
+            .map_err(|_| protocol("controller tool name"))?,
+        input: execution.input.clone(),
+    };
+    match turn.guard.apply_after_await(turn.runtime, || {
+        turn.effects.persist_controller_request(record.clone())
+    }) {
+        LeaseEffect::Applied(effect) => effect?,
+        LeaseEffect::Suppressed(_) => return Err(cancelled("controller request suppressed")),
+    }
+    turn.controller_tools
+        .ok_or_else(|| unavailable("external tool backend"))?
+        .execute_external(record, execution)
+        .await
+}
+
+fn finalize_approved_execution(
+    turn: &TurnContext<'_, '_>,
+    outcome: Result<ToolOutcome, RuntimeError>,
+    approval: Option<ControlRequest>,
+) -> Result<ToolOutcome, RuntimeError> {
+    match (outcome, approval) {
+        (Ok(outcome), Some(request)) => {
+            let port = turn
+                .approvals
+                .ok_or_else(|| unavailable("approval backend"))?;
+            if let Err(error) = port.mark_allowed(&request, &outcome) {
+                let _ = port.mark_interrupted(&request);
+                return Err(error);
+            }
+            Ok(outcome)
+        }
+        (Err(error), Some(request)) => {
+            if let Some(port) = turn.approvals {
+                let _ = port.mark_interrupted(&request);
+            }
+            Err(error)
+        }
+        (outcome, None) => outcome,
+    }
+}
+
+async fn approve_branch(
+    turn: &mut TurnContext<'_, '_>,
+    call_id: &ToolCallId,
+    definition: &crate::ports::ToolDefinition,
+    input: ValidatedToolInput,
+) -> Result<Option<(ControlRequest, ValidatedToolInput)>, RuntimeError> {
+    let request = ControlRequest {
+        request_id: NonEmptyString::new(format!(
+            "approval-{}-{}",
+            turn.lease_generation,
+            call_id.as_str()
+        ))
+        .map_err(|_| protocol("approval request id"))?,
+        call_id: call_id.clone(),
+        lease_generation: turn.lease_generation,
+        tool_name: NonEmptyString::new(definition.model_name.as_str().to_owned())
+            .map_err(|_| protocol("approval tool name"))?,
+        input: input.clone(),
+        schema: definition.input_schema.clone(),
+    };
+    let approval = turn
+        .approvals
+        .ok_or_else(|| unavailable("approval backend"))?;
+    approval.store_request(request.clone())?;
+    match turn.guard.apply_after_await(turn.runtime, || {
+        turn.effects.persist_control_request(&request)?;
+        turn.effects
+            .emit(TurnEvent::ControlRequest(request.clone()))
+    }) {
+        LeaseEffect::Applied(effect) => effect?,
+        LeaseEffect::Suppressed(_) => return Err(cancelled("approval suppressed")),
+    }
+    let resolution = approval
+        .await_resolution(request.clone(), turn.request.cancellation.clone())
+        .await?;
+    let approved_input = match resolution {
+        ApprovalResolution::Deny => return Ok(None),
+        ApprovalResolution::Allow(Some(edited)) => ValidatedToolInput::new(edited)?,
+        ApprovalResolution::Allow(None) => input,
+    };
+    Ok(Some((request, approved_input)))
 }
 
 fn denied(message: &str) -> Result<ToolOutcome, RuntimeError> {
     Ok(ToolOutcome::UserDenied {
-        message: ToolOutcomeMessage::new(message.to_owned())?,
+        message: crate::ports::ToolOutcomeMessage::new(message.to_owned())?,
     })
 }
 

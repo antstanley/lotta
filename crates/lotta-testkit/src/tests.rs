@@ -164,7 +164,9 @@ async fn run_child_process_contract() {
 
 fn provider_events() -> Vec<ProviderEvent> {
     let text = |value: &str| ProviderEventText::new(value.into()).expect("event text");
-    let call_id = ToolCallId::from_name(ProviderName::new("call-1".into()).expect("call ID"));
+    let call_id = ToolCallId::from_name(
+        lotta_runtime::boundary::ProviderName::new("call-1".into()).expect("call ID"),
+    );
     let metadata = ProviderMetadata::classified([ProviderMetadataInput::Persist {
         key: ProviderName::new("cursor".into()).expect("key"),
         value: lotta_domain::BoundedJsonValue::new(json!("next")).expect("metadata"),
@@ -294,6 +296,10 @@ pub(crate) fn tool_request() -> ToolExecutionRequest {
         SecretRedactionSpec::new(fields, SecretRedactionPolicy::Redact).expect("redaction"),
     );
     ToolExecutionRequest {
+        tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
+            lotta_runtime::boundary::ProviderName::new("contract-call".into()).expect("call name"),
+        ),
+        approval_grant: lotta_runtime::ports::ToolApprovalGrant::None,
         definition,
         input: ValidatedToolInput::new(
             lotta_domain::BoundedJsonValue::new(json!({"secret":"recognizable-secret"}))

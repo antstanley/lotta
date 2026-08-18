@@ -6,7 +6,7 @@ pub(crate) fn backend_root(path: &Path) -> Result<&Path, StoreError> {
     while let Some(candidate) = current {
         if matches!(
             candidate.file_name().and_then(|value| value.to_str()),
-            Some("agents" | "conversations" | "memfs" | "providers" | "indexes")
+            Some("agents" | "conversations" | "memfs" | "providers" | "indexes" | "runtime")
         ) {
             return candidate.parent().ok_or_else(|| invalid(path));
         }

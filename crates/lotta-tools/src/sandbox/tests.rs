@@ -330,6 +330,7 @@ mod workspace {
             let gate = WorkspaceSandboxGate::new(&fixture.policy, &fixture.own);
             let sink = RecordingSink::default();
             let outcome = execute(PipelineRequest {
+                approval_grant: lotta_runtime::ports::ToolApprovalGrant::None,
         tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
             lotta_runtime::boundary::ProviderName::new("pipeline-call".to_owned()).unwrap(),
         ),
@@ -498,6 +499,7 @@ mod outcome_kind {
         let persistence = RecordingSink::default();
         let emit = RecordingSink::default();
         let outcome = execute(PipelineRequest {
+            approval_grant: lotta_runtime::ports::ToolApprovalGrant::None,
         tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
             lotta_runtime::boundary::ProviderName::new("pipeline-call".to_owned()).unwrap(),
         ),
@@ -552,6 +554,7 @@ mod outcome_kind {
         let counters = Counters::default();
         let sink = RecordingSink::default();
         let result = execute(PipelineRequest {
+            approval_grant: lotta_runtime::ports::ToolApprovalGrant::None,
         tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
             lotta_runtime::boundary::ProviderName::new("pipeline-call".to_owned()).unwrap(),
         ),
@@ -582,6 +585,7 @@ mod outcome_kind {
         let counters = Counters::default();
         let sink = RecordingSink::default();
         let result = execute(PipelineRequest {
+            approval_grant: lotta_runtime::ports::ToolApprovalGrant::None,
         tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
             lotta_runtime::boundary::ProviderName::new("pipeline-call".to_owned()).unwrap(),
         ),

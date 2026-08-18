@@ -80,6 +80,15 @@ pub trait RuntimeEventSink: Send + Sync {
 
 /// Object-safe canonical turn submission port.
 pub trait TurnController: Send + Sync {
+    /// Returns whether this command is a control continuation rather than a new turn.
+    fn is_control_continuation(&self, deferred: &super::router::DeferredInput) -> bool {
+        deferred
+            .continuation
+            .as_ref()
+            .and_then(|value| value.as_value().get("kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some("approval_response")
+    }
     /// Submits one admitted canonical user message to the production turn pipeline.
     fn submit_turn(
         &self,

@@ -9,6 +9,8 @@
 
 mod adapter;
 mod agent;
+/// Atomic bounded runtime approval journal.
+pub mod approval;
 /// Durable bounded atomic file replacement.
 pub mod atomic;
 mod confinement;

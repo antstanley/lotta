@@ -112,13 +112,18 @@ impl LeaseGuard {
         if let Err(reason) = self.check_owner(registry) {
             return Ok(LeaseEffect::Suppressed(reason));
         }
-        let value = effect()?;
         let owner =
             registry
                 .lifecycle_mut(&self.handle)
                 .map_err(|_| crate::RuntimeError::NotFound {
                     context: "checked cancelled turn runtime".into(),
                 })?;
+        owner
+            .request_cancellation(&self.lease)
+            .map_err(|_| crate::RuntimeError::Conflict {
+                context: "checked cancellation request lease".into(),
+            })?;
+        let value = effect()?;
         owner
             .finish_turn(&self.lease, stop_reason)
             .map_err(|_| crate::RuntimeError::Conflict {

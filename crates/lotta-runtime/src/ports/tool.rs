@@ -1,4 +1,5 @@
 use super::PortFuture;
+use super::ToolCallId;
 use crate::RuntimeError;
 use crate::bounds::{
     EXTERNAL_TOOL_CALL_TIMEOUT_MS, TOOL_DESCRIPTION_BYTES_MAX, TOOL_INPUT_BYTES_MAX,
@@ -473,12 +474,52 @@ impl fmt::Debug for ValidatedToolInput {
     }
 }
 
+/// Internal proof that one exact tool call received interactive approval.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ToolApprovalGrant {
+    /// No interactive approval was granted for this execution.
+    #[default]
+    None,
+    /// Approval was granted for this exact call identity and definition.
+    Granted {
+        /// Provider-generated call identity.
+        tool_call_id: ToolCallId,
+        /// Stable internal tool identity approved by the manager.
+        internal_name: InternalToolName,
+    },
+}
+
+impl ToolApprovalGrant {
+    /// Mints a grant after the approval manager has claimed execution.
+    #[must_use]
+    pub(crate) fn granted(tool_call_id: ToolCallId, definition: &ToolDefinition) -> Self {
+        Self::Granted {
+            tool_call_id,
+            internal_name: definition.internal_name.clone(),
+        }
+    }
+
+    /// Returns whether this grant names the exact current call and definition.
+    #[must_use]
+    pub fn matches(&self, tool_call_id: &ToolCallId, definition: &ToolDefinition) -> bool {
+        matches!(
+            self,
+            Self::Granted { tool_call_id: granted_call, internal_name }
+                if granted_call == tool_call_id && internal_name == &definition.internal_name
+        )
+    }
+}
+
 /// Owning execution request passed across the tool port.
 ///
 /// The definition identifies and attributes external execution. Input is schema-validated before
 /// construction, cancellation is explicit and terminal, and the adapter must enforce the deadline.
 #[derive(Clone)]
 pub struct ToolExecutionRequest {
+    /// Genuine provider invocation identity.
+    pub tool_call_id: ToolCallId,
+    /// Internal exact-call approval proof, or no approval.
+    pub approval_grant: ToolApprovalGrant,
     /// Full definition needed by external owners.
     pub definition: ToolDefinition,
     /// Validated bounded tool input.
@@ -492,6 +533,8 @@ impl fmt::Debug for ToolExecutionRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ToolExecutionRequest")
+            .field("tool_call_id", &self.tool_call_id)
+            .field("approval_grant", &self.approval_grant)
             .field("definition", &self.definition)
             .field("input", &"[REDACTED]")
             .field("cancelled", &self.cancellation.is_cancelled())

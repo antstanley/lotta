@@ -38,9 +38,9 @@ pub use store::{AgentStore, ConversationStore};
 pub use tool::{
     InternalToolName, ModelFacingToolName, ParallelCertificationId, ParallelSafety,
     PermissionAction, SecretFieldPath, SecretRedactionPolicy, SecretRedactionSpec,
-    ToolApprovalPolicy, ToolDefinition, ToolDescriptionAsset, ToolExecutionOwner,
-    ToolExecutionRequest, ToolInputSchema, ToolOutcome, ToolOutcomeCode, ToolOutcomeMessage,
-    ToolOutputLimit, ToolPort, ToolResultText, ToolTimeout, ValidatedToolInput,
+    ToolApprovalGrant, ToolApprovalPolicy, ToolDefinition, ToolDescriptionAsset,
+    ToolExecutionOwner, ToolExecutionRequest, ToolInputSchema, ToolOutcome, ToolOutcomeCode,
+    ToolOutcomeMessage, ToolOutputLimit, ToolPort, ToolResultText, ToolTimeout, ValidatedToolInput,
 };
 pub use transcript::{TranscriptItem, TranscriptStore};
 

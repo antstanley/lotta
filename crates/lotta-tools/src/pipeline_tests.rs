@@ -176,6 +176,7 @@ async fn run_with_snapshot_and_hooks(
     let emit = Sink(Arc::clone(&state), "emit");
     let secrets = Secrets(Arc::clone(&state));
     execute(PipelineRequest {
+        approval_grant: lotta_runtime::ports::ToolApprovalGrant::None,
         tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
             lotta_runtime::boundary::ProviderName::new("pipeline-call".to_owned()).unwrap(),
         ),
@@ -604,6 +605,7 @@ async fn sandbox_stage_follows_permission_for_effect_recheck_ownership() {
     let secrets = Secrets(Arc::clone(&state));
     let registry = registry(Arc::clone(&state), Action::Success("x".into()));
     execute(PipelineRequest {
+        approval_grant: lotta_runtime::ports::ToolApprovalGrant::None,
         tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
             lotta_runtime::boundary::ProviderName::new("pipeline-call".to_owned()).unwrap(),
         ),
@@ -660,6 +662,7 @@ async fn permission_deny_and_ask_stop_later_effects() {
         let registry = registry(Arc::clone(&state), Action::Success("x".into()));
         let gate = FixedPermissions(decision);
         let error = execute(PipelineRequest {
+            approval_grant: lotta_runtime::ports::ToolApprovalGrant::None,
             tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
                 lotta_runtime::boundary::ProviderName::new("pipeline-call".to_owned()).unwrap(),
             ),

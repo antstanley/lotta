@@ -10,6 +10,8 @@
 
 /// Serialized per-runtime input admission.
 pub mod admission;
+/// Durable approval ownership and recovery.
+pub mod approval;
 /// Validated, bounded values shared by runtime ports.
 pub mod boundary;
 /// Immutable Task 06 runtime resource bounds exported for inward-dependent adapters.
@@ -39,7 +41,12 @@ pub mod turn;
 /// Worktree watcher lifetime state.
 pub mod worktree_watcher;
 
-pub use admission::{AdmissionOutcome, AdmissionRequest, AdmissionRoute};
+pub use admission::{AdmissionOutcome, AdmissionRequest, AdmissionRoute, admit_control_snapshot};
+pub use approval::{
+    APPROVAL_WAIT_MS_MAX, ApprovalJournal, ApprovalManager, ApprovalRecovery, ApprovalRequest,
+    ApprovalResolution, ApprovalResolutionInput, ApprovalState, EditedInputValidator,
+    PENDING_APPROVALS_PER_RUNTIME_MAX, RecoveryAction,
+};
 pub use lease::{CancellationPolicy, LeaseEffect, LeaseGuard, SuppressionReason};
 pub use lifecycle::{LifecycleOwner, LifecycleProjection};
 pub use queue::{ConversationQueue, PumpDirective, PumpMutation};
@@ -52,8 +59,9 @@ pub use scope_context::{
 };
 pub use turn::{
     CompactionPort, CompactionProgress, ConfiguredFallback, ProjectionKind,
-    ProviderTurnExecutorPort, RequestRefreshPort, ToolResultRecord, TurnEffectPort, TurnEvent,
-    TurnPorts, TurnProjection, TurnProvider, TurnRunOutcome, TurnToolCatalog, run_turn,
+    ProviderTurnExecutorPort, RequestRefreshPort, ToolResultRecord, ToolSnapshotHandle,
+    TurnEffectPort, TurnEvent, TurnPorts, TurnProjection, TurnProvider, TurnRunOutcome,
+    TurnToolCatalog, run_turn,
 };
 pub use worktree_watcher::{WORKTREE_WATCHER_IDLE_STOP_MS, WorktreeWatcher};
 

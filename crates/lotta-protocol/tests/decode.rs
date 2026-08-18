@@ -92,6 +92,124 @@ mod decode {
     }
 
     #[test]
+    fn accepted_approval_responses_match_typescript() {
+        let accepted = [
+            json!({"kind":"approval_response","request_id":"","error":"failed"}),
+            json!({
+                "kind": "approval_response",
+                "request_id": "r",
+                "error": "failed",
+                "decision": {"behavior":"deny","message":"no"}
+            }),
+            json!({
+                "kind": "approval_response",
+                "request_id": "r",
+                "decision": {"behavior":"allow"}
+            }),
+            json!({
+                "kind": "approval_response",
+                "request_id": "r",
+                "decision": {
+                    "behavior": "allow",
+                    "message": "ok",
+                    "updated_input": null,
+                    "selected_permission_suggestion_ids": ["one"]
+                }
+            }),
+            json!({
+                "kind": "approval_response",
+                "request_id": "r",
+                "decision": {"behavior":"allow","updated_input":{}}
+            }),
+            json!({
+                "kind": "approval_response",
+                "request_id": "r",
+                "decision": {"behavior":"deny","message":"no"}
+            }),
+            json!({
+                "kind": "approval_response",
+                "request_id": "r",
+                "decision": {"behavior":"allow","extra":true}
+            }),
+            json!({
+                "kind": "approval_response",
+                "request_id": "r",
+                "decision": {"behavior":"deny","message":"no","extra":true}
+            }),
+            json!({
+                "kind": "approval_response",
+                "request_id": "r",
+                "error": "failed",
+                "extra": true
+            }),
+            json!({
+                "kind": "approval_response",
+                "request_id": "r",
+                "comment": "old",
+                "decision": {"behavior":"allow"}
+            }),
+            json!({
+                "kind": "approval_response",
+                "request_id": "r",
+                "updated_input": {},
+                "decision": {"behavior":"allow"}
+            }),
+        ];
+        assert_approval_payloads_accepted(accepted);
+    }
+
+    #[test]
+    fn rejected_approval_responses_match_typescript() {
+        let rejected = [
+            json!({"kind":"approval_response","request_id":"r"}),
+            json!({"kind":"approval_response","request_id":1,"error":"failed"}),
+            json!({"kind":"approval_response","request_id":"r","error":1}),
+            json!({
+                "kind": "approval_response",
+                "request_id": "r",
+                "decision": {"behavior":"deny"}
+            }),
+            json!({
+                "kind": "approval_response",
+                "request_id": "r",
+                "decision": {"behavior":"allow","message":1}
+            }),
+            json!({
+                "kind": "approval_response",
+                "request_id": "r",
+                "decision": {"behavior":"allow","updated_input":[]}
+            }),
+            json!({
+                "kind": "approval_response",
+                "request_id": "r",
+                "decision": {
+                    "behavior": "allow",
+                    "selected_permission_suggestion_ids": [1]
+                }
+            }),
+        ];
+        for payload in rejected {
+            assert_eq!(
+                decode_text(&input(&payload)).outcome,
+                DecodeOutcome::RecoverableInput,
+                "expected rejected: {payload}"
+            );
+        }
+    }
+
+    fn assert_approval_payloads_accepted(payloads: impl IntoIterator<Item = serde_json::Value>) {
+        for payload in payloads {
+            assert!(
+                matches!(
+                    decode_text(&input(&payload)).outcome,
+                    DecodeOutcome::Accepted(_)
+                ),
+                "expected accepted: {payload}"
+            );
+        }
+    }
+
+    #[test]
     fn invalid_runtime_and_request_id_drop_silently() {
         let invalid_runtime = r#"{"type":"input","runtime":{"agent_id":"","conversation_id":"c"},"payload":{"kind":"create_message","messages":[]}}"#;
         assert_eq!(
