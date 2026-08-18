@@ -8,10 +8,16 @@
 
 use std::{io::Write, sync::Arc};
 
-use lotta_app_server::{config::parse_cli, listener::start_listener};
+use lotta_app_server::{
+    config::parse_cli, listener::start_listener_with_runtime_service_and_controller,
+};
 use lotta_domain::{Clock, DomainError, Timestamp};
+use production_components::ProductionComponents;
 
 mod cli;
+mod production_components;
+/// Concrete production turn-setup composition used by application controllers.
+pub mod production_setup;
 
 struct SystemClock;
 
@@ -47,7 +53,15 @@ async fn run() -> Result<(), cli::CliError> {
 async fn run_server(arguments: Vec<String>) -> Result<(), cli::CliError> {
     let args = parse_cli(arguments)?;
     let prepared = args.prepare()?;
-    let mut handle = start_listener(prepared, Arc::new(SystemClock)).await?;
+    let clock: Arc<dyn Clock + Send + Sync> = Arc::new(SystemClock);
+    let components = ProductionComponents::from_server(&prepared, Arc::clone(&clock))?;
+    let mut handle = start_listener_with_runtime_service_and_controller(
+        prepared,
+        clock,
+        components.runtime_service(),
+        components.turn_controller(),
+    )
+    .await?;
     println!("Base URL: {}", handle.base_url());
     println!("WebSocket URL: {}", handle.websocket_url());
     if let Some(url) = handle.openai_url() {

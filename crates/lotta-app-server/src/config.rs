@@ -32,6 +32,10 @@ pub struct ServerArgs {
     pub ws_audience: Option<String>,
     /// Signed bearer clock skew.
     pub ws_max_clock_skew_seconds: Option<u32>,
+    /// Local production storage root.
+    pub storage_dir: Option<PathBuf>,
+    /// Local production workspace root.
+    pub workspace_dir: Option<PathBuf>,
 }
 
 /// Validated listener configuration that contains no plaintext token file value.
@@ -47,6 +51,10 @@ pub struct PreparedServer {
     pub(crate) openai_api: bool,
     /// Prepared authentication policy.
     pub(crate) auth: AuthPolicy,
+    /// Canonical local production storage root.
+    pub storage_dir: PathBuf,
+    /// Canonical local production workspace root.
+    pub workspace_dir: PathBuf,
 }
 
 /// Parses the exact Task-14 command-line surface.
@@ -102,6 +110,8 @@ fn parse_flag(
         "--ws-issuer" => set_string(values, index, &mut args.ws_issuer),
         "--ws-audience" => set_string(values, index, &mut args.ws_audience),
         "--ws-max-clock-skew-seconds" => set_skew(values, index, args),
+        "--storage-dir" => set_path(values, index, &mut args.storage_dir),
+        "--workspace-dir" => set_path(values, index, &mut args.workspace_dir),
         _ => Err(AppServerError::Config("unknown server argument")),
     }
 }
@@ -193,6 +203,11 @@ impl ServerArgs {
             url.path().to_owned()
         };
         let auth = AuthPolicy::prepare(&self)?;
+        let storage_dir = prepare_directory(self.storage_dir.unwrap_or_else(default_storage_dir))?;
+        let workspace_dir = prepare_directory(
+            self.workspace_dir
+                .unwrap_or_else(|| storage_dir.join("workspace")),
+        )?;
         if !is_loopback_host(&host) && auth.is_none() {
             return Err(AppServerError::Config(
                 "non-loopback listeners require websocket authentication",
@@ -204,8 +219,29 @@ impl ServerArgs {
             websocket_path,
             openai_api: self.openai_api,
             auth,
+            storage_dir,
+            workspace_dir,
         })
     }
+}
+
+fn default_storage_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("lotta-production-{}", std::process::id()))
+}
+
+fn prepare_directory(path: PathBuf) -> Result<PathBuf, AppServerError> {
+    if !path.is_absolute() {
+        return Err(AppServerError::Config("server paths must be absolute"));
+    }
+    std::fs::create_dir_all(&path)
+        .map_err(|_| AppServerError::Config("server path cannot be created"))?;
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|_| AppServerError::Config("server path cannot be inspected"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(AppServerError::Config("server path must be a directory"));
+    }
+    std::fs::canonicalize(path)
+        .map_err(|_| AppServerError::Config("server path cannot be canonicalized"))
 }
 
 fn parse_listen_url(value: Option<&str>) -> Result<Url, AppServerError> {

@@ -222,6 +222,49 @@ impl ListenerRuntime {
         self.current_entry_mut(handle)?.queue.drop_stale(id)
     }
 
+    /// Restores one previously removed item to an exact runtime's queue front.
+    ///
+    /// # Errors
+    /// Returns an error for a missing/stale handle or queue mutation failure.
+    pub fn requeue_front(
+        &mut self,
+        handle: &RuntimeHandle,
+        item: lotta_domain::QueueItem,
+    ) -> Result<QueueMutation, RuntimeError> {
+        self.current_entry_mut(handle)?.queue.requeue_front(item)
+    }
+
+    /// Returns an exact runtime's FIFO queue head without mutation.
+    #[must_use]
+    pub fn peek_queue(&self, handle: &RuntimeHandle) -> Option<&lotta_domain::QueueItem> {
+        self.current_entry(handle)
+            .and_then(|entry| entry.queue.peek())
+    }
+
+    /// Pumps exactly one item from an exact runtime's queue using its live lifecycle state.
+    ///
+    /// # Errors
+    /// Returns an error for a missing/stale handle or queue mutation failure.
+    pub fn pump_one_queue(
+        &mut self,
+        handle: &RuntimeHandle,
+    ) -> Result<Option<lotta_domain::QueueItem>, RuntimeError> {
+        let entry = self.current_entry_mut(handle)?;
+        let state = entry.owner.projection().state();
+        entry.queue.pump_one(state)
+    }
+
+    /// Infallibly restores the exact item most recently removed by [`Self::pump_one_queue`].
+    ///
+    /// # Panics
+    /// Panics if the caller does not provide the same live runtime generation used to pump.
+    pub fn rollback_pump_one(&mut self, handle: &RuntimeHandle, item: lotta_domain::QueueItem) {
+        let entry = self
+            .current_entry_mut(handle)
+            .expect("pump rollback requires the same live runtime generation");
+        entry.queue.rollback_pump_one(item);
+    }
+
     /// Pumps an exact runtime's queue using its live lifecycle state.
     ///
     /// # Errors

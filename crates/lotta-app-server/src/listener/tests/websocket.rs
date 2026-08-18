@@ -180,6 +180,7 @@ async fn typed_runtime_failures_are_unstamped_and_sent_to_origin() {
         limits: super::SocketLimits::default(),
         runtime_router: router,
         runtime_service: Arc::new(crate::ws::UnsupportedRuntimeCommandService),
+        turn_controller: Arc::new(crate::ws::UnsupportedRuntimeCommandService),
         observer: Arc::new(crate::observer::InertRuntimeBroadcastObserver),
         next_observation: std::sync::atomic::AtomicU64::new(1),
         outbound: Arc::new(Mutex::new(HashMap::from([(origin, sender)]))),

@@ -9,16 +9,21 @@ publish.workspace = true
 lotta-app-server = { version = "0.1.0", path = "crates/lotta-app-server" }
 lotta-domain = { version = "0.1.0", path = "crates/lotta-domain" }
 lotta-store = { version = "0.1.0", path = "crates/lotta-store" }
+lotta-runtime = { version = "0.1.0", path = "crates/lotta-runtime" }
+lotta-memfs = { version = "0.1.0", path = "crates/lotta-memfs" }
+lotta-providers = { version = "0.1.0", path = "crates/lotta-providers" }
+lotta-tools = { version = "0.1.0", path = "crates/lotta-tools" }
+lotta-extensions = { version = "0.1.0", path = "crates/lotta-extensions" }
 chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tokio-util.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-lotta-runtime = { version = "0.1.0", path = "crates/lotta-runtime" }
 lotta-testkit = { version = "0.1.0", path = "crates/lotta-testkit" }
-lotta-memfs = { version = "0.1.0", path = "crates/lotta-memfs" }
-lotta-providers = { version = "0.1.0", path = "crates/lotta-providers" }
-lotta-extensions = { version = "0.1.0", path = "crates/lotta-extensions" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

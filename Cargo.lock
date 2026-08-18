@@ -913,6 +913,7 @@ dependencies = [
  "lotta-runtime",
  "lotta-store",
  "lotta-testkit",
+ "lotta-tools",
  "reqwest",
  "serde",
  "serde_json",

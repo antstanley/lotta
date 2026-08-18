@@ -143,6 +143,8 @@ pub struct RouteOutput {
 pub struct DeferredInput {
     /// Runtime scope for continuation.
     pub scope: RuntimeScope,
+    /// Accepted disposition controlling whether a new turn starts.
+    pub disposition: InputDisposition,
     /// Opaque bounded continuation state.
     pub continuation: Option<BoundedJsonValue>,
 }
@@ -232,6 +234,7 @@ impl RuntimeRouter {
             output,
             deferred: DeferredInput {
                 scope: command.runtime.clone(),
+                disposition: admission.disposition,
                 continuation: admission.continuation,
             },
         })

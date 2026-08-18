@@ -1,6 +1,7 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use lotta_domain::{BoundedJsonValue, BoundedVec, InputDisposition, NonEmptyString, RuntimeScope};
+use tokio_util::sync::CancellationToken;
 
 use super::{
     command::{
@@ -77,6 +78,18 @@ pub trait RuntimeEventSink: Send + Sync {
     ) -> Result<(), crate::error::AppServerError>;
 }
 
+/// Object-safe canonical turn submission port.
+pub trait TurnController: Send + Sync {
+    /// Submits one admitted canonical user message to the production turn pipeline.
+    fn submit_turn(
+        &self,
+        command: InputCommand,
+        deferred: super::router::DeferredInput,
+        cancellation: CancellationToken,
+        sink: Arc<dyn RuntimeEventSink>,
+    ) -> ServiceFuture<'_, ()>;
+}
+
 /// Injectable application seam for the five Runtime-group commands.
 pub trait RuntimeCommandService: Send + Sync {
     /// Resolves or creates a runtime.
@@ -104,6 +117,44 @@ pub trait RuntimeCommandService: Send + Sync {
 
 /// Documented inert service used by the compatibility listener entry point.
 pub struct UnsupportedRuntimeCommandService;
+
+impl TurnController for UnsupportedRuntimeCommandService {
+    fn submit_turn(
+        &self,
+        _: InputCommand,
+        _: super::router::DeferredInput,
+        _: CancellationToken,
+        _: Arc<dyn RuntimeEventSink>,
+    ) -> ServiceFuture<'_, ()> {
+        unsupported()
+    }
+}
+
+/// Adapter preserving the canonical service continuation for compatibility listeners.
+pub struct ServiceBackedTurnController {
+    service: Arc<dyn RuntimeCommandService>,
+}
+
+impl ServiceBackedTurnController {
+    /// Creates an adapter over the listener's runtime service.
+    #[must_use]
+    pub fn new(service: Arc<dyn RuntimeCommandService>) -> Self {
+        Self { service }
+    }
+}
+
+impl TurnController for ServiceBackedTurnController {
+    fn submit_turn(
+        &self,
+        _: InputCommand,
+        deferred: super::router::DeferredInput,
+        _: CancellationToken,
+        sink: Arc<dyn RuntimeEventSink>,
+    ) -> ServiceFuture<'_, ()> {
+        self.service
+            .continue_input(deferred.scope, deferred.continuation, sink)
+    }
+}
 
 fn unsupported<'a, T>() -> ServiceFuture<'a, T> {
     Box::pin(async { Err(crate::error::AppServerError::Unavailable) })

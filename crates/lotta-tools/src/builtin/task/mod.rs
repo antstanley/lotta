@@ -573,6 +573,14 @@ pub fn registrations(port: Arc<TaskLifecyclePort>) -> Result<Vec<ToolRegistratio
             .map_err(|()| TaskError::Invalid)?,
         );
     }
+    output.push(common::registration(
+        "Task",
+        r#"{"type":"object","properties":{"description":{"type":"string"},"prompt":{"type":"string"}},"required":["description","prompt"],"additionalProperties":true}"#,
+        "Start a bounded subagent task.",
+        ToolApprovalPolicy::Never,
+        "task",
+        executor,
+    ).map_err(|()| TaskError::Invalid)?);
     Ok(output)
 }
 

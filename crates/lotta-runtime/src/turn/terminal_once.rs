@@ -107,6 +107,7 @@ async fn retry_executor_composes_with_task19_and_finishes_once() {
             fallback: None,
             executor: std::sync::Arc::new(executor),
         },
+        provider_start: None,
         tools: &tool,
         catalog: &catalog(&[]),
         effects: &effects,

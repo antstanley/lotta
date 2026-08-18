@@ -47,6 +47,14 @@ pub enum AppServerError {
     /// Internal processing failed without exposing detail.
     #[error("internal server error")]
     Internal,
+    /// A primary operation failed and its mandatory cleanup also failed.
+    #[error("{primary}; cleanup also failed: {cleanup}")]
+    CleanupAttached {
+        /// Primary operation failure preserved for classification.
+        primary: Box<Self>,
+        /// Cleanup failure attached without replacing the primary failure.
+        cleanup: Box<Self>,
+    },
     /// No route exists for the requested path.
     #[error("not found")]
     NotFound,
@@ -73,6 +81,7 @@ impl AppServerError {
             Self::PayloadTooLarge => "payload_too_large",
             Self::Unavailable => "service_unavailable",
             Self::Internal => "internal_error",
+            Self::CleanupAttached { primary, .. } => primary.code(),
             Self::NotFound => "not_found",
             Self::MethodNotAllowed => "method_not_allowed",
             Self::Task => "listener_task_failed",
@@ -89,6 +98,7 @@ impl AppServerError {
             Self::Config(_) | Self::SecretFile { .. } | Self::Malformed => StatusCode::BAD_REQUEST,
             Self::Listener | Self::Task | Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::CleanupAttached { primary, .. } => primary.status(),
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
         }
@@ -102,6 +112,7 @@ impl AppServerError {
             Self::PayloadTooLarge => "payload too large",
             Self::Listener | Self::Task | Self::Unavailable => "service unavailable",
             Self::Internal => "internal server error",
+            Self::CleanupAttached { primary, .. } => primary.external_message(),
             Self::NotFound => "not found",
             Self::MethodNotAllowed => "method not allowed",
         }

@@ -40,4 +40,9 @@ impl TurnToolCatalog {
             .iter()
             .find_map(|(candidate, definition)| (candidate.as_str() == name).then_some(definition))
     }
+
+    /// Returns definitions in stable model-name order for provider request composition.
+    pub fn definitions(&self) -> impl Iterator<Item = &ToolDefinition> {
+        self.definitions.values()
+    }
 }

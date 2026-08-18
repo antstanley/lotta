@@ -33,7 +33,7 @@ impl RegisteredHookRuntime {
         }
     }
     /// Fires using an already captured immutable snapshot.
-    pub async fn fire_snapshot(
+    pub async fn fire_registry_snapshot(
         &self,
         snapshot: Arc<HookRegistrySnapshot>,
         mut payload: HookPayload,
@@ -91,7 +91,8 @@ impl HookRuntime for RegisteredHookRuntime {
                 hook_id: events::HookId::new("registry".into()).expect("constant hook id"),
                 code: "hook_registry",
             })?;
-            self.fire_snapshot(snapshot, payload, cancellation).await
+            self.fire_registry_snapshot(snapshot, payload, cancellation)
+                .await
         })
     }
 }

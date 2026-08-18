@@ -23,8 +23,8 @@ pub use router::{
     route_command,
 };
 pub use service::{
-    RuntimeCommandService, RuntimeEventSink, UnsupportedRuntimeCommandService,
-    WS_RUNTIME_ROUTE_EVENTS_MAX,
+    RuntimeCommandService, RuntimeEventSink, ServiceBackedTurnController, TurnController,
+    UnsupportedRuntimeCommandService, WS_RUNTIME_ROUTE_EVENTS_MAX,
 };
 
 #[cfg(test)]

@@ -59,6 +59,12 @@ impl ConversationQueue {
         self.items.iter()
     }
 
+    /// Returns the FIFO head without mutating the queue.
+    #[must_use]
+    pub fn peek(&self) -> Option<&QueueItem> {
+        self.items.front()
+    }
+
     /// Produces a drop event and snapshot without retaining an input.
     pub(crate) fn reject(
         &mut self,
@@ -138,6 +144,47 @@ impl ConversationQueue {
             revision,
             QueueMutationEvent::Dropped(item, QueueDropReason::StaleGeneration),
         )))
+    }
+
+    /// Restores a previously removed item to the FIFO front.
+    ///
+    /// This rollback operation preserves the hard bound and rejects duplicate IDs.
+    ///
+    /// # Errors
+    /// Returns a stable error when the queue is full, the ID is duplicated, or revision is exhausted.
+    pub fn requeue_front(&mut self, item: QueueItem) -> Result<QueueMutation, RuntimeError> {
+        if self.items.len() >= QUEUE_ITEMS_HARD_MAX.value {
+            return Err(RuntimeError::LimitExceeded {
+                context: QUEUE_ITEMS_HARD_MAX.name.into(),
+            });
+        }
+        self.validate_unique(&item)?;
+        let revision = self.next_revision()?;
+        self.items.push_front(item.clone());
+        Ok(self.finish(revision, QueueMutationEvent::Enqueued(item)))
+    }
+
+    /// Infallibly restores the exact item just removed by [`Self::pump_one`].
+    ///
+    /// Callers must invoke this before any intervening queue mutation.
+    pub(crate) fn rollback_pump_one(&mut self, item: QueueItem) {
+        debug_assert!(self.items.len() < QUEUE_ITEMS_HARD_MAX.value);
+        debug_assert!(self.position(&item.id).is_none());
+        self.items.push_front(item);
+    }
+
+    /// Selects exactly one eligible FIFO item from an idle lifecycle snapshot.
+    ///
+    /// # Errors
+    /// Returns a stable error when snapshot revision is exhausted.
+    pub fn pump_one(&mut self, state: TurnStateKind) -> Result<Option<QueueItem>, RuntimeError> {
+        if state != TurnStateKind::Idle || self.items.is_empty() {
+            return Ok(None);
+        }
+        let revision = self.next_revision()?;
+        let item = self.items.pop_front().ok_or_else(queue_invariant)?;
+        self.revision = revision;
+        Ok(Some(item))
     }
 
     /// Selects one eligible FIFO batch only from an idle lifecycle snapshot.

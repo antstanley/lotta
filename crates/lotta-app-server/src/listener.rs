@@ -19,7 +19,11 @@ use axum::{
     routing::get,
 };
 use lotta_domain::Clock;
-use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
+use tokio::{
+    net::TcpListener,
+    sync::mpsc,
+    task::{JoinHandle, JoinSet},
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -30,7 +34,8 @@ use crate::{
     heartbeat::Heartbeat,
     ws::{
         EventDeliveryBatch, RandomEventIdGenerator, RouterEventSink, RuntimeCommandService,
-        RuntimeRouter, UnsupportedRuntimeCommandService, lock_router, route_command,
+        RuntimeRouter, ServiceBackedTurnController, TurnController,
+        UnsupportedRuntimeCommandService, lock_router, route_command,
     },
 };
 
@@ -74,6 +79,7 @@ struct ListenerState {
     limits: SocketLimits,
     runtime_router: Arc<std::sync::Mutex<RuntimeRouter>>,
     runtime_service: Arc<dyn RuntimeCommandService>,
+    turn_controller: Arc<dyn TurnController>,
     observer: Arc<dyn crate::observer::RuntimeBroadcastObserver>,
     next_observation: AtomicU64,
     outbound: Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
@@ -145,10 +151,31 @@ pub async fn start_listener_with_runtime_service(
     clock: Arc<dyn Clock + Send + Sync>,
     runtime_service: Arc<dyn RuntimeCommandService>,
 ) -> Result<ListenerHandle, AppServerError> {
-    start_listener_with_runtime_service_and_observer(
+    let turn_controller = Arc::new(ServiceBackedTurnController::new(runtime_service.clone()));
+    start_listener_with_runtime_service_and_controller(
         prepared,
         clock,
         runtime_service,
+        turn_controller,
+    )
+    .await
+}
+
+/// Binds a listener with a Runtime service and production turn controller.
+///
+/// # Errors
+/// Returns a stable listener error when startup fails.
+pub async fn start_listener_with_runtime_service_and_controller(
+    prepared: PreparedServer,
+    clock: Arc<dyn Clock + Send + Sync>,
+    runtime_service: Arc<dyn RuntimeCommandService>,
+    turn_controller: Arc<dyn TurnController>,
+) -> Result<ListenerHandle, AppServerError> {
+    start_listener_with_runtime_service_controller_and_observer(
+        prepared,
+        clock,
+        runtime_service,
+        turn_controller,
         Arc::new(crate::observer::InertRuntimeBroadcastObserver),
     )
     .await
@@ -164,11 +191,29 @@ pub async fn start_listener_with_runtime_service_and_observer(
     runtime_service: Arc<dyn RuntimeCommandService>,
     observer: Arc<dyn crate::observer::RuntimeBroadcastObserver>,
 ) -> Result<ListenerHandle, AppServerError> {
+    start_listener_with_runtime_service_controller_and_observer(
+        prepared,
+        clock,
+        runtime_service.clone(),
+        Arc::new(ServiceBackedTurnController::new(runtime_service)),
+        observer,
+    )
+    .await
+}
+
+async fn start_listener_with_runtime_service_controller_and_observer(
+    prepared: PreparedServer,
+    clock: Arc<dyn Clock + Send + Sync>,
+    runtime_service: Arc<dyn RuntimeCommandService>,
+    turn_controller: Arc<dyn TurnController>,
+    observer: Arc<dyn crate::observer::RuntimeBroadcastObserver>,
+) -> Result<ListenerHandle, AppServerError> {
     start_listener_with_limits(
         prepared,
         clock,
         SocketLimits::default(),
         runtime_service,
+        turn_controller,
         observer,
     )
     .await
@@ -190,6 +235,7 @@ async fn start_listener_for_test(
         clock,
         limits,
         Arc::new(UnsupportedRuntimeCommandService),
+        Arc::new(UnsupportedRuntimeCommandService),
         Arc::new(crate::observer::InertRuntimeBroadcastObserver),
     )
     .await
@@ -200,6 +246,7 @@ async fn start_listener_with_limits(
     clock: Arc<dyn Clock + Send + Sync>,
     limits: SocketLimits,
     runtime_service: Arc<dyn RuntimeCommandService>,
+    turn_controller: Arc<dyn TurnController>,
     observer: Arc<dyn crate::observer::RuntimeBroadcastObserver>,
 ) -> Result<ListenerHandle, AppServerError> {
     if !is_loopback_host(&prepared.host) && prepared.auth.is_none() {
@@ -224,6 +271,7 @@ async fn start_listener_with_limits(
         limits,
         runtime_router: Arc::new(std::sync::Mutex::new(runtime_router)),
         runtime_service,
+        turn_controller,
         observer,
         next_observation: AtomicU64::new(1),
         outbound: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -307,6 +355,8 @@ async fn serve_socket(mut socket: WebSocket, state: Arc<ListenerState>) {
         return;
     };
     let mut heartbeat = Heartbeat::new(state.clock.as_ref());
+    let connection_cancellation = state.shutdown.child_token();
+    let mut turns = JoinSet::new();
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(
         state.limits.ping_interval_ms,
     ));
@@ -338,6 +388,8 @@ async fn serve_socket(mut socket: WebSocket, state: Arc<ListenerState>) {
                     &mut heartbeat,
                     &state,
                     connection_id,
+                    &connection_cancellation,
+                    &mut turns,
                 ).await;
                 if !keep_open {
                     break;
@@ -345,6 +397,8 @@ async fn serve_socket(mut socket: WebSocket, state: Arc<ListenerState>) {
             }
         }
     }
+    connection_cancellation.cancel();
+    while turns.join_next().await.is_some() {}
     close_connection(&state, connection_id);
 }
 
@@ -396,6 +450,8 @@ async fn handle_incoming(
     heartbeat: &mut Heartbeat,
     state: &Arc<ListenerState>,
     connection_id: crate::ws::ConnectionId,
+    cancellation: &CancellationToken,
+    turns: &mut JoinSet<()>,
 ) -> bool {
     match incoming {
         Some(Ok(Message::Pong(_))) => {
@@ -403,7 +459,9 @@ async fn handle_incoming(
             true
         }
         Some(Ok(Message::Ping(payload))) => socket.send(Message::Pong(payload)).await.is_ok(),
-        Some(Ok(Message::Text(text))) => handle_text(&text, state, connection_id).await,
+        Some(Ok(Message::Text(text))) => {
+            handle_text(&text, state, connection_id, cancellation, turns).await
+        }
         Some(Ok(Message::Binary(_))) => {
             send_close(socket, close_code::UNSUPPORTED, "binary unsupported").await;
             false
@@ -438,6 +496,8 @@ async fn handle_text(
     text: &str,
     state: &Arc<ListenerState>,
     connection_id: crate::ws::ConnectionId,
+    cancellation: &CancellationToken,
+    turns: &mut JoinSet<()>,
 ) -> bool {
     let frame = match crate::framing::decode_text(text) {
         Ok(frame) => frame,
@@ -461,16 +521,26 @@ async fn handle_text(
     if dispatch_output(state, connection_id, &output).is_err() {
         return false;
     }
-    if let Some(deferred) = deferred {
+    if let Some(deferred) = deferred
+        && deferred.disposition == lotta_domain::InputDisposition::Started
+    {
         let sink = event_sink(state);
-        if state
-            .runtime_service
-            .continue_input(deferred.scope, deferred.continuation, sink)
-            .await
-            .is_err()
-        {
-            return false;
-        }
+        let Ok(command) = serde_json::from_value(frame.value.clone()) else {
+            return dispatch_typed_failure(state, connection_id, &frame).is_ok();
+        };
+        let controller = state.turn_controller.clone();
+        let state = state.clone();
+        let failure_frame = frame.clone();
+        let turn_cancellation = cancellation.child_token();
+        turns.spawn(async move {
+            if controller
+                .submit_turn(command, deferred, turn_cancellation, sink)
+                .await
+                .is_err()
+            {
+                let _ = dispatch_typed_failure(&state, connection_id, &failure_frame);
+            }
+        });
     }
     true
 }

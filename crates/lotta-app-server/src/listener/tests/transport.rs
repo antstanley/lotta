@@ -41,6 +41,7 @@ fn router() -> axum::Router {
             Arc::new(crate::ws::RandomEventIdGenerator),
         ))),
         runtime_service: Arc::new(crate::ws::UnsupportedRuntimeCommandService),
+        turn_controller: Arc::new(crate::ws::UnsupportedRuntimeCommandService),
         observer: Arc::new(crate::observer::InertRuntimeBroadcastObserver),
         next_observation: std::sync::atomic::AtomicU64::new(1),
         outbound: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),

@@ -114,6 +114,17 @@ impl InteractiveSandboxPort for OsSandbox {
     }
 }
 
+impl lotta_runtime::ports::ChildProcessPort for OsSandbox {
+    fn run(
+        &self,
+        request: ProcessRequest,
+        events: Sender<ProcessEvent>,
+        cancellation: CancellationToken,
+    ) -> PortFuture<'_, ProcessOutcome> {
+        <Self as SandboxPort>::execute(self, request, events, cancellation)
+    }
+}
+
 impl SandboxPort for OsSandbox {
     fn execute(
         &self,

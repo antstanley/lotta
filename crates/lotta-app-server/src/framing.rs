@@ -10,7 +10,7 @@ use crate::{
 };
 
 /// Successfully bounded protocol input and downstream decode effects.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct DecodedFrame {
     /// Valid top-level request correlation.
     pub request_id: Option<String>,

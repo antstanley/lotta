@@ -248,7 +248,7 @@ pub fn registrations(port: Arc<PlanningPort>) -> Result<Vec<ToolRegistration>, P
     )
     .map_err(|()| PlanningError)?;
     let todos = common::registration(
-        "TodoWrite",
+        "write_todos",
         include_str!("assets/schemas/TodoWrite.json"),
         include_str!("assets/descriptions/TodoWrite.md"),
         ToolApprovalPolicy::Never,

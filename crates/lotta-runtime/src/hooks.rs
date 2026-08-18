@@ -240,6 +240,17 @@ pub type HookFuture<'a> = Pin<Box<dyn Future<Output = HookFireResult> + Send + '
 pub trait HookRuntime: Send + Sync {
     /// Fires one typed event in registry order.
     fn fire(&self, payload: HookPayload, cancellation: CancellationToken) -> HookFuture<'_>;
+    /// Fires one typed event against a caller-captured immutable registry snapshot.
+    ///
+    /// Runtimes without snapshot support retain their normal dispatch behavior.
+    fn fire_snapshot(
+        &self,
+        _snapshot_id: u64,
+        payload: HookPayload,
+        cancellation: CancellationToken,
+    ) -> HookFuture<'_> {
+        self.fire(payload, cancellation)
+    }
 }
 
 macro_rules! lifecycle_method {
@@ -296,14 +307,24 @@ impl<'a> HookLifecycle<'a> {
 
 /// Sole production operation boundary for non-tool lifecycle events.
 pub struct HookLifecycleHost<'a> {
-    lifecycle: HookLifecycle<'a>,
+    runtime: &'a dyn HookRuntime,
+    snapshot_id: Option<u64>,
 }
 impl<'a> HookLifecycleHost<'a> {
     /// Creates an operation boundary over the configured hook runtime.
     #[must_use]
     pub const fn new(runtime: &'a dyn HookRuntime) -> Self {
         Self {
-            lifecycle: HookLifecycle::new(runtime),
+            runtime,
+            snapshot_id: None,
+        }
+    }
+    /// Creates an operation boundary pinned to one caller-captured snapshot identity.
+    #[must_use]
+    pub const fn with_snapshot(runtime: &'a dyn HookRuntime, snapshot_id: u64) -> Self {
+        Self {
+            runtime,
+            snapshot_id: Some(snapshot_id),
         }
     }
     /// Fires before accepting a user prompt operation.
@@ -433,7 +454,17 @@ impl<'a> HookLifecycleHost<'a> {
         payload: HookPayload,
         cancellation: CancellationToken,
     ) -> Result<(), LifecycleError<E>> {
-        match self.lifecycle.fire(event, payload, cancellation).await {
+        if payload.event() != event {
+            return Err(LifecycleError::Hook(boundary_failure("event_mismatch")));
+        }
+        let fired = if let Some(snapshot_id) = self.snapshot_id {
+            self.runtime
+                .fire_snapshot(snapshot_id, payload, cancellation)
+                .await
+        } else {
+            self.runtime.fire(payload, cancellation).await
+        };
+        match fired {
             Ok(HookOutcome::Allow) => Ok(()),
             Ok(HookOutcome::Block(_)) => Err(LifecycleError::Blocked),
             Ok(HookOutcome::Modify(_)) => Err(LifecycleError::Hook(boundary_failure(

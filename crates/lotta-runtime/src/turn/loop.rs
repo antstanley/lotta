@@ -56,25 +56,41 @@ impl ProviderStepState {
 }
 
 /// Borrowed ports used by one turn run.
-pub struct TurnPorts<'a> {
+pub struct TurnPorts<'ports, 'catalog> {
     /// Runtime retry composition over the normalized provider boundary.
-    pub provider: TurnProvider<'a>,
+    pub provider: TurnProvider<'ports>,
+    /// Optional callbacks fired around the provider's first poll.
+    pub provider_start: Option<&'catalog dyn ProviderStartPort>,
     /// Local tool execution boundary.
-    pub tools: &'a dyn ToolPort,
+    pub tools: &'ports dyn ToolPort,
     /// Tools admitted for this turn.
-    pub catalog: &'a TurnToolCatalog,
+    pub catalog: &'catalog TurnToolCatalog,
     /// Owner-local projection and event effects.
-    pub effects: &'a dyn TurnEffectPort,
+    pub effects: &'ports dyn TurnEffectPort,
 }
 
-impl<'a> TurnPorts<'a> {
+/// Provider lifecycle callbacks straddling the stream future's first poll.
+pub trait ProviderStartPort: Send + Sync {
+    /// Runs immediately before the provider stream future is first polled.
+    ///
+    /// # Errors
+    /// Returns a typed failure that occurs after durable input admission.
+    fn provider_start(&self) -> crate::ports::PortFuture<'_, ()>;
+    /// Runs after the first poll only when the provider remains pending.
+    ///
+    /// # Errors
+    /// Returns a typed failure that occurs after durable input admission.
+    fn provider_waiting(&self) -> crate::ports::PortFuture<'_, ()>;
+}
+
+impl<'ports, 'catalog> TurnPorts<'ports, 'catalog> {
     /// Groups production ports with an explicitly unconfigured fallback.
     #[must_use]
     pub fn new(
-        provider: &'a dyn ProviderPort,
-        tools: &'a dyn ToolPort,
-        catalog: &'a TurnToolCatalog,
-        effects: &'a dyn TurnEffectPort,
+        provider: &'ports dyn ProviderPort,
+        tools: &'ports dyn ToolPort,
+        catalog: &'catalog TurnToolCatalog,
+        effects: &'ports dyn TurnEffectPort,
     ) -> Self {
         Self::configured(
             ProviderRoute::new("native", "configured"),
@@ -90,11 +106,11 @@ impl<'a> TurnPorts<'a> {
     #[must_use]
     pub fn configured(
         route: ProviderRoute,
-        provider: &'a dyn ProviderPort,
-        fallback: Option<ConfiguredFallback<'a>>,
-        tools: &'a dyn ToolPort,
-        catalog: &'a TurnToolCatalog,
-        effects: &'a dyn TurnEffectPort,
+        provider: &'ports dyn ProviderPort,
+        fallback: Option<ConfiguredFallback<'ports>>,
+        tools: &'ports dyn ToolPort,
+        catalog: &'catalog TurnToolCatalog,
+        effects: &'ports dyn TurnEffectPort,
     ) -> Self {
         let fallback_port = fallback.as_ref().map(|value| value.provider);
         let fallback_route = fallback.map(|value| value.route);
@@ -110,22 +126,31 @@ impl<'a> TurnPorts<'a> {
                     fallback: fallback_route,
                 }),
             },
+            provider_start: None,
             tools,
             catalog,
             effects,
         }
     }
 
+    /// Installs a callback for the first provider stream admission boundary.
+    #[must_use]
+    pub fn with_provider_start(mut self, callback: &'catalog dyn ProviderStartPort) -> Self {
+        self.provider_start = Some(callback);
+        self
+    }
+
     /// Explicit single-attempt compatibility composition for tests and legacy callers.
     #[must_use]
     pub const fn direct(
-        provider: &'a dyn ProviderPort,
-        tools: &'a dyn ToolPort,
-        catalog: &'a TurnToolCatalog,
-        effects: &'a dyn TurnEffectPort,
+        provider: &'ports dyn ProviderPort,
+        tools: &'ports dyn ToolPort,
+        catalog: &'catalog TurnToolCatalog,
+        effects: &'ports dyn TurnEffectPort,
     ) -> Self {
         Self {
             provider: TurnProvider::Direct(provider),
+            provider_start: None,
             tools,
             catalog,
             effects,
@@ -305,13 +330,14 @@ impl ProviderTurnExecutorPort for ProductionRetryExecutor {
     }
 }
 
-struct TurnContext<'a> {
-    runtime: &'a mut ListenerRuntime,
+struct TurnContext<'ports, 'catalog> {
+    runtime: &'ports mut ListenerRuntime,
     guard: LeaseGuard,
-    provider: TurnProvider<'a>,
-    tools: &'a dyn ToolPort,
-    catalog: &'a TurnToolCatalog,
-    effects: &'a dyn TurnEffectPort,
+    provider: TurnProvider<'ports>,
+    provider_start: Option<&'catalog dyn ProviderStartPort>,
+    tools: &'ports dyn ToolPort,
+    catalog: &'catalog TurnToolCatalog,
+    effects: &'ports dyn TurnEffectPort,
     request: ProviderRequest,
     total_tool_calls: usize,
 }
@@ -325,7 +351,7 @@ pub async fn run_turn(
     handle: RuntimeHandle,
     lease: TurnLease,
     request: ProviderRequest,
-    ports: TurnPorts<'_>,
+    ports: TurnPorts<'_, '_>,
 ) -> Result<TurnRunOutcome, RuntimeError> {
     let guard = LeaseGuard::new(
         handle,
@@ -335,6 +361,7 @@ pub async fn run_turn(
     );
     let TurnPorts {
         provider,
+        provider_start,
         tools,
         catalog,
         effects,
@@ -343,6 +370,7 @@ pub async fn run_turn(
         runtime,
         guard,
         provider,
+        provider_start,
         tools,
         catalog,
         effects,
@@ -352,7 +380,7 @@ pub async fn run_turn(
     run_loop(&mut turn).await
 }
 
-async fn run_loop(turn: &mut TurnContext<'_>) -> Result<TurnRunOutcome, RuntimeError> {
+async fn run_loop(turn: &mut TurnContext<'_, '_>) -> Result<TurnRunOutcome, RuntimeError> {
     if turn.is_suppressed() {
         turn.request.cancellation.cancel();
         return Ok(TurnRunOutcome::Suppressed);
@@ -384,7 +412,7 @@ async fn run_loop(turn: &mut TurnContext<'_>) -> Result<TurnRunOutcome, RuntimeE
 }
 
 fn continue_after_tools(
-    turn: &mut TurnContext<'_>,
+    turn: &mut TurnContext<'_, '_>,
     completed: &[ToolResultRecord],
     step_index: usize,
 ) -> Result<(), RuntimeError> {
@@ -399,7 +427,7 @@ fn continue_after_tools(
 }
 
 fn finish_turn(
-    turn: &mut TurnContext<'_>,
+    turn: &mut TurnContext<'_, '_>,
     reason: StopReason,
 ) -> Result<TurnRunOutcome, RuntimeError> {
     let domain = domain_stop(reason)?;
@@ -452,37 +480,57 @@ fn execute_provider(
 }
 
 async fn run_provider_step(
-    turn: &mut TurnContext<'_>,
+    turn: &mut TurnContext<'_, '_>,
     state: &mut ProviderStepState,
 ) -> Result<Flow, RuntimeError> {
     turn.request.validate_bytes()?;
     let (sink, mut output) = provider_event_channel(1, &turn.request.cancellation)?;
     let (future, mut retry_events) =
         execute_provider(turn.provider.clone(), turn.request.clone(), sink)?;
+    let callback = turn.provider_start.take();
+    if let Some(callback) = callback {
+        callback.provider_start().await?;
+    }
     tokio::pin!(future);
-    let terminal = loop {
-        tokio::select! {
-            biased;
-            event = receive_retry(&mut retry_events), if retry_events.is_some() => {
-                if let Some(event) = event && apply_retry(turn, event)? == Flow::Suppressed {
-                    return suppress_provider(turn, &mut output);
-                }
-            }
-            result = &mut future => break result,
-            result = output.receive() => {
-                if drain_ready_retries(turn, &mut retry_events)? == Flow::Suppressed {
-                    return suppress_provider(turn, &mut output);
-                }
-                if turn.is_suppressed() {
-                    return suppress_provider(turn, &mut output);
-                }
-                match result? {
-                    Some(event) => {
-                        if handle_event(turn, state, event).await? == Flow::Suppressed {
-                            return suppress_provider(turn, &mut output);
-                        }
+    let mut first_poll_pending = false;
+    let first = std::future::poll_fn(|context| match future.as_mut().poll(context) {
+        std::task::Poll::Ready(value) => std::task::Poll::Ready(Some(value)),
+        std::task::Poll::Pending => {
+            first_poll_pending = true;
+            std::task::Poll::Ready(None)
+        }
+    })
+    .await;
+    if first_poll_pending && let Some(callback) = callback {
+        callback.provider_waiting().await?;
+    }
+    let terminal = if let Some(result) = first {
+        result
+    } else {
+        loop {
+            tokio::select! {
+                biased;
+                event = receive_retry(&mut retry_events), if retry_events.is_some() => {
+                    if let Some(event) = event && apply_retry(turn, event)? == Flow::Suppressed {
+                        return suppress_provider(turn, &mut output);
                     }
-                    None => return Err(protocol("provider stream closed before executor")),
+                }
+                result = &mut future => break result,
+                result = output.receive() => {
+                    if drain_ready_retries(turn, &mut retry_events)? == Flow::Suppressed {
+                        return suppress_provider(turn, &mut output);
+                    }
+                    if turn.is_suppressed() {
+                        return suppress_provider(turn, &mut output);
+                    }
+                    match result? {
+                        Some(event) => {
+                            if handle_event(turn, state, event).await? == Flow::Suppressed {
+                                return suppress_provider(turn, &mut output);
+                            }
+                        }
+                        None => return Err(protocol("provider stream closed before executor")),
+                    }
                 }
             }
         }
@@ -495,7 +543,7 @@ async fn run_provider_step(
 }
 
 fn drain_ready_retries(
-    turn: &mut TurnContext<'_>,
+    turn: &mut TurnContext<'_, '_>,
     receiver: &mut Option<tokio::sync::mpsc::Receiver<RetryEvent>>,
 ) -> Result<Flow, RuntimeError> {
     let Some(receiver) = receiver.as_mut() else {
@@ -527,7 +575,7 @@ async fn receive_retry(
     }
 }
 
-fn apply_retry(turn: &mut TurnContext<'_>, event: RetryEvent) -> Result<Flow, RuntimeError> {
+fn apply_retry(turn: &mut TurnContext<'_, '_>, event: RetryEvent) -> Result<Flow, RuntimeError> {
     match turn
         .guard
         .apply_after_await(turn.runtime, || turn.effects.emit(TurnEvent::Retry(event)))
@@ -538,7 +586,7 @@ fn apply_retry(turn: &mut TurnContext<'_>, event: RetryEvent) -> Result<Flow, Ru
 }
 
 async fn drain_retries(
-    turn: &mut TurnContext<'_>,
+    turn: &mut TurnContext<'_, '_>,
     receiver: &mut Option<tokio::sync::mpsc::Receiver<RetryEvent>>,
 ) -> Result<Flow, RuntimeError> {
     while let Some(event) = receive_retry(receiver).await {
@@ -557,7 +605,7 @@ fn close_retry_step(provider: &TurnProvider<'_>) -> Result<(), RuntimeError> {
 }
 
 fn suppress_provider(
-    turn: &TurnContext<'_>,
+    turn: &TurnContext<'_, '_>,
     output: &mut crate::ports::ProviderEventReceiver,
 ) -> Result<Flow, RuntimeError> {
     output.cancel();
@@ -568,7 +616,7 @@ fn suppress_provider(
 
 async fn handle_terminal(
     terminal: RetryTerminal,
-    turn: &mut TurnContext<'_>,
+    turn: &mut TurnContext<'_, '_>,
     state: &mut ProviderStepState,
     output: &mut crate::ports::ProviderEventReceiver,
 ) -> Result<Flow, RuntimeError> {
@@ -591,7 +639,7 @@ async fn handle_terminal(
 }
 
 async fn handle_event(
-    turn: &mut TurnContext<'_>,
+    turn: &mut TurnContext<'_, '_>,
     state: &mut ProviderStepState,
     event: ProviderEvent,
 ) -> Result<Flow, RuntimeError> {
@@ -623,7 +671,7 @@ async fn handle_event(
     }
 }
 
-impl TurnContext<'_> {
+impl TurnContext<'_, '_> {
     fn is_suppressed(&self) -> bool {
         matches!(
             self.guard.apply_after_await(self.runtime, || ()),
@@ -648,7 +696,7 @@ impl TurnContext<'_> {
 }
 
 fn start_call(
-    turn: &mut TurnContext<'_>,
+    turn: &mut TurnContext<'_, '_>,
     state: &mut ProviderStepState,
     call_id: ToolCallId,
     name: crate::boundary::ProviderEventText,
@@ -666,7 +714,7 @@ fn start_call(
 }
 
 async fn execute_call(
-    turn: &mut TurnContext<'_>,
+    turn: &mut TurnContext<'_, '_>,
     state: &mut ProviderStepState,
     call_id: ToolCallId,
 ) -> Result<Flow, RuntimeError> {

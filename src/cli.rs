@@ -167,6 +167,8 @@ pub(crate) enum CliError {
     Store(#[from] lotta_store::StoreError),
     #[error(transparent)]
     Server(#[from] lotta_app_server::error::AppServerError),
+    #[error(transparent)]
+    Setup(#[from] lotta_runtime::turn::SetupError),
 }
 
 impl CliError {
@@ -175,6 +177,7 @@ impl CliError {
             Self::Config(_) => "config",
             Self::Store(error) => error.kind().code(),
             Self::Server(error) => error.code(),
+            Self::Setup(_) => "production_setup",
         }
     }
 }
