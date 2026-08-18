@@ -14,6 +14,13 @@ impl OAuthClock for Clock {
         self.0.load(Ordering::SeqCst)
     }
 }
+impl OAuthWallClock for Clock {
+    fn unix_epoch_millis(&self) -> Result<u64, OAuthError> {
+        self.now_seconds()
+            .checked_mul(1_000)
+            .ok_or(OAuthError::Provider)
+    }
+}
 
 #[derive(Default)]
 struct Random(AtomicU8);
@@ -70,6 +77,7 @@ fn setup() -> (OAuthManager, Arc<Clock>, Arc<Http>) {
     let http = Arc::new(Http::default());
     (
         OAuthManager::new(
+            clock.clone(),
             clock.clone(),
             Arc::new(Random::default()),
             http.clone(),
@@ -183,7 +191,10 @@ fn callback_success_is_one_use_and_at_ttl_expires() {
             },
         )
         .unwrap();
-    assert_eq!(credential.expires_at, OAUTH_STATE_TTL_SECONDS - 1 + 3600);
+    assert_eq!(
+        credential.expires_at,
+        (OAUTH_STATE_TTL_SECONDS - 1 + 3600) * 1_000
+    );
     assert_eq!(
         manager
             .callback(

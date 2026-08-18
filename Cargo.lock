@@ -1037,6 +1037,7 @@ dependencies = [
  "lotta-domain",
  "lotta-extensions",
  "lotta-runtime",
+ "lotta-store",
  "lotta-testkit",
  "reqwest",
  "serde",
@@ -1046,7 +1047,10 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tracing",
+ "tracing-subscriber",
  "url",
+ "uuid",
 ]
 
 [[package]]

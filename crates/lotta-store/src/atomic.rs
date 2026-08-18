@@ -48,6 +48,13 @@ pub trait AtomicObserver: Send + Sync {
     fn attempt(&self, _attempt: usize, _target: &Path) -> Result<(), StoreError> {
         Ok(())
     }
+    /// Called after the temporary file is created and before bytes are written.
+    ///
+    /// # Errors
+    /// May inspect the temporary file or inject a scrubbed typed failure.
+    fn temp_created(&self, _target: &Path, _temp: &Path) -> Result<(), StoreError> {
+        Ok(())
+    }
     /// Called immediately before the final revision comparison and rename.
     ///
     /// # Errors
@@ -223,8 +230,9 @@ fn write_precommit(
 ) -> Result<PathBuf, StoreError> {
     let parent = path.parent().ok_or_else(|| invalid_path(path))?;
     validate_existing(root, parent)?;
-    let (temp_path, mut temp) = create_temp(root, parent, path)?;
+    let (temp_path, mut temp) = create_temp(root, parent, path, mode)?;
     let result = (|| {
+        observer.temp_created(path, &temp_path)?;
         temp.write_all(bytes)
             .map_err(|error| StoreError::from_io(&temp_path, &error))?;
         apply_file_mode(&temp, path, mode)?;
@@ -443,7 +451,12 @@ pub(crate) fn validate_revision_length(
     }
 }
 
-fn create_temp(root: &Path, parent: &Path, target: &Path) -> Result<(PathBuf, File), StoreError> {
+fn create_temp(
+    root: &Path,
+    parent: &Path,
+    target: &Path,
+    mode: WriteMode,
+) -> Result<(PathBuf, File), StoreError> {
     for _ in 0..TEMP_CREATE_RETRIES_MAX {
         validate_existing(root, parent)?;
         let sequence = next_sequence(&TEMP_SEQUENCE, target)?;
@@ -451,7 +464,10 @@ fn create_temp(root: &Path, parent: &Path, target: &Path) -> Result<(PathBuf, Fi
             ".lotta-write-{}-{sequence}.tmp",
             std::process::id()
         ));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        configure_create_mode(&mut options, mode);
+        match options.open(&path) {
             Ok(file) => return Ok((path, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(StoreError::from_io(target, &error)),
@@ -504,6 +520,17 @@ fn logged_once<T>(operation: impl FnOnce() -> Result<T, StoreError>) -> Result<T
 fn invalid_path(path: &Path) -> StoreError {
     StoreError::new(StoreErrorKind::InvalidPath, path)
 }
+
+#[cfg(unix)]
+fn configure_create_mode(options: &mut OpenOptions, mode: WriteMode) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    if mode == WriteMode::ProviderAuth {
+        options.mode(0o600);
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_create_mode(_options: &mut OpenOptions, _mode: WriteMode) {}
 
 #[cfg(unix)]
 fn apply_directory_mode(path: &Path, mode: WriteMode) -> Result<(), StoreError> {

@@ -871,6 +871,19 @@ fn cancelled() -> RuntimeError {
 /// event or cancellation. The request and sink share one private cancellation token. An adapter
 /// performs exactly one transport attempt; retry and fallback belong exclusively to the runtime.
 pub trait ProviderPort: Send + Sync {
+    /// Registers a hosted custom adapter descriptor when this port supports the pi host.
+    ///
+    /// # Errors
+    /// Returns a normalized unsupported adapter failure for ordinary provider ports.
+    fn register_host_adapter(&self, _descriptor: serde_json::Value) -> PortFuture<'_, ()> {
+        Box::pin(async {
+            Err(RuntimeError::AdapterFailure {
+                code: "provider_host_registration_unsupported",
+                context: "provider host registration".into(),
+            })
+        })
+    }
+
     /// Streams one normalized request into the opaque bounded event sink.
     ///
     /// # Errors

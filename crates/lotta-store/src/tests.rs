@@ -650,6 +650,56 @@ mod errors {
         }
     }
 
+    #[cfg(unix)]
+    struct ProviderAuthBirthObserver(Arc<Mutex<bool>>);
+    #[cfg(unix)]
+    impl AtomicObserver for ProviderAuthBirthObserver {
+        fn temp_created(&self, target: &Path, temp: &Path) -> Result<(), StoreError> {
+            use std::os::unix::fs::PermissionsExt as _;
+            let temp_mode = std::fs::metadata(temp)
+                .map_err(|error| StoreError::from_io(temp, &error))?
+                .permissions()
+                .mode()
+                & 0o777;
+            let parent = target.parent().expect("provider parent");
+            let parent_mode = std::fs::metadata(parent)
+                .map_err(|error| StoreError::from_io(parent, &error))?
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(temp_mode, 0o600);
+            assert_eq!(parent_mode, 0o700);
+            assert_eq!(std::fs::metadata(temp).unwrap().len(), 0);
+            *self.0.lock().expect("birth observation") = true;
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_auth_temp_is_private_from_birth() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_owned, paths) = root("provider-auth-private-birth");
+        let observed = Arc::new(Mutex::new(false));
+        atomic_write_observed(
+            &paths.provider_auth(),
+            b"private provider credentials",
+            WriteMode::ProviderAuth,
+            &ProviderAuthBirthObserver(Arc::clone(&observed)),
+        )
+        .expect("provider auth atomic write");
+        assert!(*observed.lock().expect("birth observation"));
+        assert_eq!(
+            std::fs::metadata(paths.provider_auth())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
     struct PermissionObserver;
     impl AtomicObserver for PermissionObserver {
         fn attempt(&self, _attempt: usize, target: &Path) -> Result<(), StoreError> {

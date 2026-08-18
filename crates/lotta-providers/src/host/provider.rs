@@ -130,6 +130,15 @@ impl HostProvider {
 }
 
 impl ProviderPort for HostProvider {
+    fn register_host_adapter(&self, descriptor: Value) -> lotta_runtime::ports::PortFuture<'_, ()> {
+        Box::pin(async move {
+            self.register_adapter(descriptor)
+                .await
+                .map(|_| ())
+                .map_err(|error| host_error(&error))
+        })
+    }
+
     fn stream(
         &self,
         request: ProviderRequest,

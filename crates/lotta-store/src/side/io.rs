@@ -42,6 +42,14 @@ pub(crate) fn read(path: &Path) -> Result<OpaqueFile, StoreError> {
     read_inner(path, &SideReadNoopObserver)
 }
 
+/// Reads one bounded confined file with an optimistic revision token.
+///
+/// # Errors
+/// Returns typed path, limit, conflict, or filesystem failures.
+pub fn read_opaque(path: &Path) -> Result<OpaqueFile, StoreError> {
+    read(path)
+}
+
 #[cfg(test)]
 pub(crate) fn read_observed(
     path: &Path,
@@ -91,14 +99,30 @@ pub(crate) fn write_expected(
     bytes: &[u8],
     expected: &SideRevision,
 ) -> Result<(), StoreError> {
+    write_expected_mode(path, bytes, expected, WriteMode::Standard)
+}
+
+/// Replaces a bounded confined file when its revision remains current.
+///
+/// # Errors
+/// Returns typed path, limit, conflict, lock, or filesystem failures.
+pub fn write_opaque_expected(
+    path: &Path,
+    bytes: &[u8],
+    expected: &SideRevision,
+    mode: WriteMode,
+) -> Result<(), StoreError> {
+    write_expected_mode(path, bytes, expected, mode)
+}
+
+fn write_expected_mode(
+    path: &Path,
+    bytes: &[u8],
+    expected: &SideRevision,
+    mode: WriteMode,
+) -> Result<(), StoreError> {
     validate_payload(path, bytes)?;
-    atomic_write_with_expected_observed(
-        path,
-        bytes,
-        WriteMode::Standard,
-        &expected.0,
-        &SideNoopObserver,
-    )
+    atomic_write_with_expected_observed(path, bytes, mode, &expected.0, &SideNoopObserver)
 }
 
 struct SideNoopObserver;

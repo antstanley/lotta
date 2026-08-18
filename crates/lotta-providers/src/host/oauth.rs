@@ -68,7 +68,7 @@ macro_rules! secret_type {
                 validate_secret(&value)?;
                 Ok(Self(value))
             }
-            fn expose(&self) -> &str {
+            pub(crate) fn expose(&self) -> &str {
                 &self.0
             }
         }
@@ -98,8 +98,26 @@ pub struct OAuthCredential {
     pub refresh: RefreshToken,
     /// Optional identity token.
     pub id: Option<IdToken>,
-    /// Monotonic expiry instant in seconds.
+    /// Absolute Unix epoch expiry in milliseconds, compatible with baseline `auth.json`.
     pub expires_at: u64,
+}
+
+impl AccessToken {
+    pub(crate) fn into_inner(mut self) -> String {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl RefreshToken {
+    pub(crate) fn into_inner(mut self) -> String {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl IdToken {
+    pub(crate) fn into_inner(mut self) -> String {
+        std::mem::take(&mut self.0)
+    }
 }
 
 impl fmt::Debug for OAuthCredential {
@@ -166,10 +184,16 @@ pub enum OAuthError {
     TooSoon,
 }
 
-/// Monotonic clock seam.
+/// Monotonic clock seam used only for pending-flow TTL state.
 pub trait OAuthClock: Send + Sync {
     /// Seconds from an arbitrary non-decreasing origin.
     fn now_seconds(&self) -> u64;
+}
+
+/// Wall-clock seam used only to materialize baseline epoch expiries.
+pub trait OAuthWallClock: Send + Sync {
+    /// Milliseconds since the Unix epoch.
+    fn unix_epoch_millis(&self) -> Result<u64, OAuthError>;
 }
 
 /// Cryptographic random source seam.
@@ -381,6 +405,7 @@ enum Pending {
 pub struct OAuthManager {
     metadata: OAuthMetadata,
     clock: Arc<dyn OAuthClock>,
+    wall_clock: Arc<dyn OAuthWallClock>,
     random: Arc<dyn OAuthRandom>,
     http: Arc<dyn OAuthHttp>,
     browser: Arc<dyn OAuthBrowser>,
@@ -397,8 +422,9 @@ impl OAuthManager {
     /// Constructs a production manager with monotonic time, OS randomness, bounded TLS HTTP,
     /// and the caller-owned browser port.
     pub fn production(browser: Arc<dyn OAuthBrowser>) -> Result<Self, OAuthError> {
-        Self::new(
+        Self::new_with_wall_clock(
             Arc::new(MonotonicOAuthClock::default()),
+            Arc::new(SystemOAuthWallClock),
             Arc::new(OsOAuthRandom),
             Arc::new(ReqwestOAuthHttp::new()?),
             browser,
@@ -408,6 +434,18 @@ impl OAuthManager {
     /// Constructs a manager only from explicit side-effect ports.
     pub fn new(
         clock: Arc<dyn OAuthClock>,
+        wall_clock: Arc<dyn OAuthWallClock>,
+        random: Arc<dyn OAuthRandom>,
+        http: Arc<dyn OAuthHttp>,
+        browser: Arc<dyn OAuthBrowser>,
+    ) -> Result<Self, OAuthError> {
+        Self::new_with_wall_clock(clock, wall_clock, random, http, browser)
+    }
+
+    /// Constructs a manager with distinct monotonic and wall-clock time ports.
+    pub fn new_with_wall_clock(
+        clock: Arc<dyn OAuthClock>,
+        wall_clock: Arc<dyn OAuthWallClock>,
         random: Arc<dyn OAuthRandom>,
         http: Arc<dyn OAuthHttp>,
         browser: Arc<dyn OAuthBrowser>,
@@ -417,6 +455,7 @@ impl OAuthManager {
         Ok(Self {
             metadata,
             clock,
+            wall_clock,
             random,
             http,
             browser,
@@ -526,7 +565,7 @@ impl OAuthManager {
                 ("redirect_uri", callback.redirect_uri),
             ],
         )?;
-        credential(response, now)
+        credential(response, self.wall_clock.as_ref())
     }
 
     /// Starts the pinned `OpenAI` device-code flow.
@@ -672,7 +711,7 @@ impl OAuthManager {
         &self,
         flow_id: &str,
         response: OAuthHttpResponse,
-        now: u64,
+        _now: u64,
     ) -> Result<OAuthDevicePoll, OAuthError> {
         if (200..300).contains(&response.status) {
             let code = AuthorizationCode::new(
@@ -691,7 +730,7 @@ impl OAuthManager {
                     ("redirect_uri", OPENAI_DEVICE_REDIRECT),
                 ],
             )?;
-            return credential(exchanged, now).map(OAuthDevicePoll::Complete);
+            return credential(exchanged, self.wall_clock.as_ref()).map(OAuthDevicePoll::Complete);
         }
         let code = response.fields.get("error").map_or("", String::as_str);
         match code {
@@ -805,7 +844,10 @@ fn parse_callback<'a>(query: &'a [(&'a str, &'a str)]) -> Result<ParsedCallback<
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn credential(response: OAuthHttpResponse, now: u64) -> Result<OAuthCredential, OAuthError> {
+fn credential(
+    response: OAuthHttpResponse,
+    wall_clock: &dyn OAuthWallClock,
+) -> Result<OAuthCredential, OAuthError> {
     if !(200..300).contains(&response.status) {
         return Err(OAuthError::Provider);
     }
@@ -819,11 +861,16 @@ fn credential(response: OAuthHttpResponse, now: u64) -> Result<OAuthCredential, 
     let expires = response_field(&response, "expires_in")?
         .parse::<u64>()
         .map_err(|_| OAuthError::Provider)?;
+    let expires_millis = expires.checked_mul(1_000).ok_or(OAuthError::Provider)?;
+    let expires_at = wall_clock
+        .unix_epoch_millis()?
+        .checked_add(expires_millis)
+        .ok_or(OAuthError::Provider)?;
     Ok(OAuthCredential {
         access,
         refresh,
         id,
-        expires_at: now.checked_add(expires).ok_or(OAuthError::Provider)?,
+        expires_at,
     })
 }
 
@@ -959,6 +1006,18 @@ fn prune(pending: &mut HashMap<String, Pending>, now: u64) {
         Pending::Browser(v) => now < v.expires_at,
         Pending::Device(v) => now < v.expires_at,
     });
+}
+
+/// Production Unix epoch clock.
+pub struct SystemOAuthWallClock;
+impl OAuthWallClock for SystemOAuthWallClock {
+    fn unix_epoch_millis(&self) -> Result<u64, OAuthError> {
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| OAuthError::Provider)?
+            .as_millis();
+        u64::try_from(millis).map_err(|_| OAuthError::Provider)
+    }
 }
 
 mod production;

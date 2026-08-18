@@ -12,7 +12,7 @@ pub mod project;
 /// Global settings side store.
 pub mod settings;
 
-pub use io::{OpaqueFile, SideRevision};
+pub use io::{OpaqueFile, SideRevision, read_opaque, write_opaque_expected};
 pub use paths::{ChannelFile, ProjectFile, SidePaths};
 
 #[cfg(test)]

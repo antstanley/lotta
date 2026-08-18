@@ -6,6 +6,9 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+/// Baseline-compatible provider connections and credential persistence.
+pub mod connections;
+
 /// Stable model identity, settings, resolution, catalog, and update services.
 pub mod model;
 

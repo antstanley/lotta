@@ -122,7 +122,10 @@ impl LifecycleOwner {
     }
 
     /// Finishes a current active or cancelling turn.
-    pub(crate) fn finish_turn(
+    ///
+    /// # Errors
+    /// Returns a stable runtime error when the lease is stale or the transition is invalid.
+    pub fn finish_turn(
         &mut self,
         lease: &TurnLease,
         stop_reason: StopReason,

@@ -18,6 +18,13 @@ impl OAuthClock for Clock {
         self.0.load(Ordering::SeqCst)
     }
 }
+impl OAuthWallClock for Clock {
+    fn unix_epoch_millis(&self) -> Result<u64, OAuthError> {
+        self.now_seconds()
+            .checked_mul(1_000)
+            .ok_or(OAuthError::Provider)
+    }
+}
 
 #[derive(Default)]
 struct Random(AtomicU8);
@@ -118,6 +125,7 @@ fn manager() -> (Arc<OAuthManager>, Arc<Clock>, Arc<Http>) {
         Arc::new(
             OAuthManager::new(
                 clock.clone(),
+                clock.clone(),
                 Arc::new(Random::default()),
                 http.clone(),
                 Arc::new(Browser),
@@ -179,7 +187,7 @@ async fn real_host_pkce_flow() {
         )
         .await
         .unwrap();
-    assert_eq!(credential.expires_at, 3600);
+    assert_eq!(credential.expires_at, 3_600_000);
     assert!(
         client
             .oauth_callback(
