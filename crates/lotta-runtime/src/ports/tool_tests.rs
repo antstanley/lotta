@@ -123,10 +123,10 @@ pub(crate) fn outcome_user_denied() {
 }
 pub(crate) fn outcome_interrupted() {
     round_trip(
-        &ToolOutcome::Interrupted {
+        &ToolOutcome::Interruption {
             message: text("stop"),
         },
-        "interrupted",
+        "interruption",
     );
 }
 pub(crate) fn outcome_timeout() {

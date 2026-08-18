@@ -5,6 +5,7 @@
 
 use crate::{ListenerRuntime, RuntimeHandle};
 use lotta_domain::{StopReason, TurnLease};
+use std::marker::PhantomData;
 use tokio_util::sync::CancellationToken;
 
 /// Determines whether a cancelled token permits cleanup effects.
@@ -38,6 +39,25 @@ pub enum LeaseEffect<T> {
     Suppressed(SuppressionReason),
 }
 
+/// Unique capability minted by the exact current Active-to-Cancelling transition.
+pub struct CancellationClaim {
+    _private: PhantomData<()>,
+}
+
+/// Receipt returned after the canonical cancellation transaction releases the lease.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CancellationReceipt {
+    _private: PhantomData<()>,
+}
+
+impl CancellationReceipt {
+    const fn new() -> Self {
+        Self {
+            _private: PhantomData,
+        }
+    }
+}
+
 /// Capability captured before an await and checked against live registry state afterward.
 pub struct LeaseGuard {
     handle: RuntimeHandle,
@@ -61,6 +81,12 @@ impl LeaseGuard {
             cancellation,
             policy,
         }
+    }
+
+    /// Returns the exact captured runtime handle.
+    #[must_use]
+    pub const fn handle(&self) -> &RuntimeHandle {
+        &self.handle
     }
 
     /// Returns the exact captured turn lease for scoped adapter calls.
@@ -99,16 +125,50 @@ impl LeaseGuard {
         }
     }
 
-    /// Applies terminal cancellation cleanup when this exact owner is still current.
+    /// Atomically claims cancellation for the exact current Active owner.
+    ///
+    /// Already-cancelling, idle, missing, inactive, and stale owners mint no claim.
+    ///
+    /// # Errors
+    /// Returns a typed lifecycle ownership failure.
+    pub fn claim_cancellation(
+        &self,
+        registry: &mut ListenerRuntime,
+    ) -> Result<LeaseEffect<CancellationClaim>, crate::RuntimeError> {
+        if let Err(reason) = self.check_owner(registry) {
+            return Ok(LeaseEffect::Suppressed(reason));
+        }
+        let owner =
+            registry
+                .lifecycle_mut(&self.handle)
+                .map_err(|_| crate::RuntimeError::NotFound {
+                    context: "checked cancellation runtime".into(),
+                })?;
+        if owner.projection().state() != lotta_domain::TurnStateKind::Active {
+            return Ok(LeaseEffect::Suppressed(
+                SuppressionReason::CancellationDenied,
+            ));
+        }
+        owner.request_cancellation(&self.lease)?;
+        Ok(LeaseEffect::Applied(CancellationClaim {
+            _private: PhantomData,
+        }))
+    }
+
+    /// Persists and emits cancellation, then releases the exact cancelling owner.
+    ///
+    /// Only the holder of the unique transition claim may invoke this transaction. Effect failure
+    /// retains the Cancelling owner for recovery; release follows successful persistence/emission.
     ///
     /// # Errors
     /// Returns the durable effect failure or a lifecycle ownership invariant failure.
-    pub fn finish_cancelled_turn_with_effect_after_await<T>(
+    pub fn finish_cancelled_turn_with_effect_after_await(
         &self,
         registry: &mut ListenerRuntime,
+        _claim: CancellationClaim,
         stop_reason: StopReason,
-        effect: impl FnOnce() -> Result<T, crate::RuntimeError>,
-    ) -> Result<LeaseEffect<T>, crate::RuntimeError> {
+        effect: impl FnOnce() -> Result<(), crate::RuntimeError>,
+    ) -> Result<LeaseEffect<CancellationReceipt>, crate::RuntimeError> {
         if let Err(reason) = self.check_owner(registry) {
             return Ok(LeaseEffect::Suppressed(reason));
         }
@@ -118,18 +178,18 @@ impl LeaseGuard {
                 .map_err(|_| crate::RuntimeError::NotFound {
                     context: "checked cancelled turn runtime".into(),
                 })?;
-        owner
-            .request_cancellation(&self.lease)
-            .map_err(|_| crate::RuntimeError::Conflict {
-                context: "checked cancellation request lease".into(),
-            })?;
-        let value = effect()?;
+        if owner.projection().state() != lotta_domain::TurnStateKind::Cancelling {
+            return Ok(LeaseEffect::Suppressed(
+                SuppressionReason::CancellationDenied,
+            ));
+        }
+        effect()?;
         owner
             .finish_turn(&self.lease, stop_reason)
             .map_err(|_| crate::RuntimeError::Conflict {
                 context: "checked cancelled turn lease".into(),
             })?;
-        Ok(LeaseEffect::Applied(value))
+        Ok(LeaseEffect::Applied(CancellationReceipt::new()))
     }
 
     /// Checks once, applies a terminal effect, then releases the exact owner synchronously.

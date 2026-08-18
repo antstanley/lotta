@@ -50,6 +50,7 @@ pub(super) enum SessionStatus {
 }
 
 struct Session {
+    owner: Option<TurnOwner>,
     status: SessionStatus,
     output: VecDeque<u8>,
     aggregate_output_bytes: usize,
@@ -67,12 +68,19 @@ struct Session {
     ordinal: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct TurnOwner {
+    pub(super) scope: RuntimeScope,
+    pub(super) lease_generation: u64,
+}
+
 pub(super) struct ProcessManager {
     workspace_root: PathBuf,
     scope: RuntimeScope,
     sandbox: Arc<dyn ShellSandbox>,
     sessions: Arc<Mutex<BTreeMap<String, Session>>>,
     next_id: AtomicU64,
+    launch_owner: Mutex<Option<TurnOwner>>,
 }
 
 pub(super) struct LaunchOptions<'a> {
@@ -89,6 +97,7 @@ impl ProcessManager {
             sandbox,
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
             next_id: AtomicU64::new(1),
+            launch_owner: Mutex::new(None),
         }
     }
 
@@ -384,6 +393,11 @@ impl ProcessManager {
         guard.insert(
             id.to_owned(),
             Session {
+                owner: self
+                    .launch_owner
+                    .lock()
+                    .ok()
+                    .and_then(|owner| owner.clone()),
                 status: SessionStatus::Running,
                 output: VecDeque::new(),
                 aggregate_output_bytes: 0,
@@ -453,6 +467,26 @@ impl ProcessManager {
         Err(ManagerError::Infrastructure)
     }
 
+    pub(super) fn set_launch_owner(&self, owner: TurnOwner) -> Result<(), ManagerError> {
+        *self
+            .launch_owner
+            .lock()
+            .map_err(|_| ManagerError::Infrastructure)? = Some(owner);
+        Ok(())
+    }
+
+    pub(super) fn has_operations(&self) -> bool {
+        self.sessions.lock().is_ok_and(|guard| !guard.is_empty())
+    }
+
+    pub(super) fn has_owned_operations(&self, owner: &TurnOwner) -> bool {
+        self.sessions.lock().is_ok_and(|guard| {
+            guard
+                .values()
+                .any(|session| session.owner.as_ref() == Some(owner))
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn session_count(&self) -> usize {
         self.sessions.lock().map_or(0, |guard| guard.len())
@@ -478,6 +512,34 @@ impl ProcessManager {
         })
     }
 
+    pub(super) async fn shutdown_owner(&self, owner: &TurnOwner) -> Result<(), ManagerError> {
+        let joins = {
+            let mut guard = self
+                .sessions
+                .lock()
+                .map_err(|_| ManagerError::Infrastructure)?;
+            let ids = guard
+                .iter()
+                .filter(|(_, session)| session.owner.as_ref() == Some(owner))
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            let mut joins = Vec::new();
+            for id in ids {
+                if let Some(mut session) = guard.remove(&id) {
+                    session.cancellation.cancel();
+                    if let Some(join) = session.join.take() {
+                        joins.push(join);
+                    }
+                }
+            }
+            joins
+        };
+        for join in joins {
+            join.await.map_err(|_| ManagerError::Infrastructure)?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn shutdown(&self) -> Result<(), ManagerError> {
         let joins = {
             let mut guard = self
@@ -495,6 +557,10 @@ impl ProcessManager {
         for join in joins {
             join.await.map_err(|_| ManagerError::Infrastructure)?;
         }
+        self.sessions
+            .lock()
+            .map_err(|_| ManagerError::Infrastructure)?
+            .clear();
         Ok(())
     }
 

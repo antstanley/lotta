@@ -371,7 +371,7 @@ fn map_error(error: InteractionError) -> Result<RawToolOutcome, ExecutorError> {
     };
     let message = ToolOutcomeMessage::new(message.to_owned()).map_err(|_| ExecutorError)?;
     let outcome = match error {
-        InteractionError::Cancelled => ToolOutcome::Interrupted { message },
+        InteractionError::Cancelled => ToolOutcome::Interruption { message },
         InteractionError::Timeout => ToolOutcome::Timeout { message },
         _ => ToolOutcome::ToolDefinedError {
             code: lotta_runtime::ports::ToolOutcomeCode::new("interaction_error".to_owned())

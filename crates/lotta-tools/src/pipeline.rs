@@ -902,7 +902,7 @@ fn scrub_failure(
         ToolOutcome::UserDenied { message: value } => ToolOutcome::UserDenied {
             message: message(value)?,
         },
-        ToolOutcome::Interrupted { message: value } => ToolOutcome::Interrupted {
+        ToolOutcome::Interruption { message: value } => ToolOutcome::Interruption {
             message: message(value)?,
         },
         ToolOutcome::Timeout { message: value } => ToolOutcome::Timeout {

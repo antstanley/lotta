@@ -47,7 +47,10 @@ pub use approval::{
     ApprovalResolution, ApprovalResolutionInput, ApprovalState, EditedInputValidator,
     PENDING_APPROVALS_PER_RUNTIME_MAX, RecoveryAction,
 };
-pub use lease::{CancellationPolicy, LeaseEffect, LeaseGuard, SuppressionReason};
+pub use lease::{
+    CancellationClaim, CancellationPolicy, CancellationReceipt, LeaseEffect, LeaseGuard,
+    SuppressionReason,
+};
 pub use lifecycle::{LifecycleOwner, LifecycleProjection};
 pub use queue::{ConversationQueue, PumpDirective, PumpMutation};
 pub use queue_snapshot::{QueueMutation, QueueMutationEvent, QueueSnapshot};

@@ -422,7 +422,7 @@ async fn cancellation_is_distinct_and_removes_pending() {
     cancellation.cancel();
     assert!(matches!(
         task.await.unwrap(),
-        ToolOutcome::Interrupted { .. }
+        ToolOutcome::Interruption { .. }
     ));
     assert_eq!(manager.pending_calls().unwrap(), 0);
 }

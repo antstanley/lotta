@@ -258,7 +258,7 @@ fn tool_outcomes() -> Vec<Result<ToolOutcome, RuntimeError>> {
             content: ToolResultText::new("success".into(), limit).expect("result"),
         }),
         Ok(ToolOutcome::UserDenied { message: message() }),
-        Ok(ToolOutcome::Interrupted { message: message() }),
+        Ok(ToolOutcome::Interruption { message: message() }),
         Ok(ToolOutcome::Timeout { message: message() }),
         Ok(ToolOutcome::ValidationFailure { message: message() }),
         Ok(ToolOutcome::SandboxDenied { message: message() }),

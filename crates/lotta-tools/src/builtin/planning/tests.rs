@@ -58,7 +58,7 @@ fn registered_descriptions_are_exact_asset_bytes() {
         .unwrap();
     let todos = registrations
         .iter()
-        .find(|item| item.definition.internal_name.as_str() == "TodoWrite")
+        .find(|item| item.definition.internal_name.as_str() == "write_todos")
         .unwrap();
     assert_eq!(
         plan.definition.description.as_str().as_bytes(),
@@ -76,11 +76,11 @@ async fn todo_write_replaces_shared_state_and_bounds() {
     let registrations = registrations(Arc::clone(&port)).unwrap();
     let todo = registrations
         .iter()
-        .find(|item| item.definition.internal_name.as_str() == "TodoWrite")
+        .find(|item| item.definition.internal_name.as_str() == "write_todos")
         .unwrap();
     let registered = crate::registry::RegisteredTool {
         definition: todo.definition.clone(),
-        model_name: ModelFacingToolName::new("TodoWrite".into()).unwrap(),
+        model_name: ModelFacingToolName::new("write_todos".into()).unwrap(),
         executor: todo.executor.clone(),
     };
     execute(

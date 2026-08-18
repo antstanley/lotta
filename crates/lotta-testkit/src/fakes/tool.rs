@@ -269,7 +269,7 @@ fn observe(request: &ToolExecutionRequest) -> Result<ToolObservation, RuntimeErr
 }
 
 fn interrupted() -> Result<ToolOutcome, RuntimeError> {
-    Ok(ToolOutcome::Interrupted {
+    Ok(ToolOutcome::Interruption {
         message: ToolOutcomeMessage::new("cancelled".into())?,
     })
 }

@@ -1,5 +1,6 @@
 //! Minimal owner-local provider/tool turn loop.
 
+mod cancel;
 mod effects;
 mod projection;
 /// Production turn setup orchestration and admission boundary.
@@ -12,6 +13,9 @@ mod tool_calls;
 #[path = "turn/loop.rs"]
 mod turn_loop;
 
+pub use cancel::{
+    CancelStep, PostTurnPort, TurnChildOwner, UnfinishedCallTracker, UnfinishedToolCall,
+};
 pub use effects::{
     CompactionRequest, ControlRequest, ControllerToolRequestRecord, ToolResultRecord,
     TurnEffectPort, TurnEvent,
@@ -30,7 +34,7 @@ pub use turn_loop::{
     ApprovalPort, ApprovalResolution, CONTEXT_OVERFLOW_COMPACTIONS_MAX, CompactionPort,
     CompactionProgress, ConfiguredFallback, ControllerToolPort, ProviderStartPort,
     ProviderTurnExecutorPort, RequestRefreshPort, TurnPorts, TurnProvider, TurnRunOutcome,
-    run_turn,
+    run_turn, run_turn_observed,
 };
 
 #[cfg(test)]
@@ -39,6 +43,9 @@ mod bounds;
 #[cfg(test)]
 #[path = "turn/branches.rs"]
 mod branches;
+#[cfg(test)]
+#[path = "turn/cancel_tests.rs"]
+mod cancel_tests;
 #[cfg(test)]
 #[path = "turn/context_pressure.rs"]
 mod context_pressure;

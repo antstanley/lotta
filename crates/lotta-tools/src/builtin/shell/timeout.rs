@@ -94,7 +94,7 @@ async fn cancellation_outcome_differs() {
     cancellation.cancel();
     let (result, records, bundle) = run.await;
     let outcome = result.unwrap();
-    assert!(matches!(outcome, ToolOutcome::Interrupted { .. }));
+    assert!(matches!(outcome, ToolOutcome::Interruption { .. }));
     assert!(!matches!(outcome, ToolOutcome::Timeout { .. }));
     assert_complete(&records, &outcome);
     bundle.shutdown().await.unwrap();
@@ -137,7 +137,7 @@ async fn assert_bash_timeout_matrix() {
         )
         .await;
         if valid {
-            assert!(matches!(result.unwrap(), ToolOutcome::Interrupted { .. }));
+            assert!(matches!(result.unwrap(), ToolOutcome::Interruption { .. }));
             tokio::task::yield_now().await;
             assert_eq!(
                 sandbox.durations.lock().unwrap().as_slice(),

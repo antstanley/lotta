@@ -75,10 +75,65 @@ const DEFAULT_OUTPUT_TOKENS: u64 = 4_096;
 const TRANSCRIPT_MANIFEST_SCHEMA_VERSION: u8 = 2;
 const TRANSCRIPT_SESSION_SCHEMA_VERSION: u8 = 3;
 
+#[cfg(test)]
+type CancellationStageObserver = Arc<dyn Fn(lotta_runtime::turn::CancelStep) + Send + Sync>;
+#[cfg(test)]
+type CancellationOperationObserver = Arc<ProductionCancellationObserver>;
+#[cfg(not(test))]
+type CancellationOperationObserver = ();
+#[cfg(test)]
+static TEST_CANCELLATION_STAGE_OBSERVER: std::sync::OnceLock<
+    std::sync::Mutex<Option<CancellationStageObserver>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn test_cancellation_stage_observer() -> Option<CancellationStageObserver> {
+    TEST_CANCELLATION_STAGE_OBSERVER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("test cancellation stage observer")
+        .clone()
+}
+
 /// Owned production dependencies kept alive for the listener lifetime.
 pub struct ProductionComponents {
     runtime_service: Arc<ProductionRuntimeService>,
     turn_controller: Arc<ProductionTurnController>,
+    post_turn_queue: lotta_store::PostTurnQueue,
+    reflection: Arc<Mutex<Arc<dyn lotta_store::ReflectionJob>>>,
+    memory_push: Arc<Mutex<Arc<dyn lotta_store::MemoryPushJob>>>,
+}
+
+struct RegisteredReflection(Arc<Mutex<Arc<dyn lotta_store::ReflectionJob>>>);
+
+impl lotta_store::ReflectionJob for RegisteredReflection {
+    fn reflect(
+        &self,
+        job: &lotta_store::PostTurnJob,
+    ) -> Result<lotta_store::PostTurnExecution, lotta_store::StoreError> {
+        self.0
+            .lock()
+            .map_err(|_| {
+                lotta_store::StoreError::new(StoreErrorKind::StorageConflict, "reflection")
+            })?
+            .reflect(job)
+    }
+}
+
+struct RegisteredMemoryPush(Arc<Mutex<Arc<dyn lotta_store::MemoryPushJob>>>);
+
+impl lotta_store::MemoryPushJob for RegisteredMemoryPush {
+    fn push_memory(
+        &self,
+        job: &lotta_store::PostTurnJob,
+    ) -> Result<lotta_store::PostTurnExecution, lotta_store::StoreError> {
+        self.0
+            .lock()
+            .map_err(|_| {
+                lotta_store::StoreError::new(StoreErrorKind::StorageConflict, "memory-push")
+            })?
+            .push_memory(job)
+    }
 }
 
 impl ProductionComponents {
@@ -92,18 +147,30 @@ impl ProductionComponents {
         let store_paths = StorePaths::new(&root).map_err(adapter)?;
         let provider_runtime = production_provider_runtime(&store_paths, &root)?;
         let (models, default_model) = production_catalog(&provider_runtime)?;
+        let tool_sandbox: Arc<dyn lotta_tools::builtin::shell::ShellSandbox> =
+            Arc::new(OsSandbox::detect(workspace_policy(&root, &workspace)?));
+        let shell = Arc::new(
+            ShellToolBundle::new(
+                &workspace.canonicalize().map_err(adapter)?,
+                production_shell_scope()?,
+                Arc::clone(&tool_sandbox),
+            )
+            .map_err(|_| SetupError::Adapter("shell tool bundle".into()))?,
+        );
         let setup = Arc::new(ProductionSetupPorts::new(setup_config(
             &root,
             &workspace,
             models,
             default_model,
             provider_runtime.connections(),
+            shell.as_ref(),
         )?)?);
         let provider = Arc::new(provider_runtime);
         let tools = Arc::new(ProductionToolPort::new(
             setup.registry(),
             setup.hook_runtime(),
             root.join("artifacts"),
+            shell,
         )?);
         let approval_manager = Arc::new(lotta_runtime::ApprovalManager::new(
             LocalStore::new(store_paths.clone()).approval_journal(),
@@ -118,6 +185,16 @@ impl ProductionComponents {
             Arc::clone(&runtime_state),
             Arc::clone(&approval_manager),
         ));
+        let reflection: Arc<Mutex<Arc<dyn lotta_store::ReflectionJob>>> = Arc::new(Mutex::new(
+            Arc::new(crate::production_setup::UnavailableReflection),
+        ));
+        let memory_push: Arc<Mutex<Arc<dyn lotta_store::MemoryPushJob>>> = Arc::new(Mutex::new(
+            Arc::new(crate::production_setup::UnavailableMemoryPush),
+        ));
+        let reflection_port: Arc<dyn lotta_store::ReflectionJob> =
+            Arc::new(RegisteredReflection(Arc::clone(&reflection)));
+        let memory_port: Arc<dyn lotta_store::MemoryPushJob> =
+            Arc::new(RegisteredMemoryPush(Arc::clone(&memory_push)));
         let turn_controller = Arc::new(ProductionTurnController::new(
             Arc::clone(&setup),
             provider,
@@ -128,11 +205,65 @@ impl ProductionComponents {
             runtime_state,
             Arc::clone(&brokers),
             approval_manager,
+            reflection_port,
+            memory_port,
         ));
-        Ok(Self {
+        let post_turn_queue = lotta_store::PostTurnQueue::new(&LocalStore::new(store_paths));
+        let components = Self {
             runtime_service,
             turn_controller,
-        })
+            post_turn_queue,
+            reflection,
+            memory_push,
+        };
+        components.drain_post_turn()?;
+        Ok(components)
+    }
+
+    fn drain_post_turn(&self) -> Result<(), SetupError> {
+        let reflection = self
+            .reflection
+            .lock()
+            .map_err(|_| SetupError::Adapter("reflection capability lock".into()))?
+            .clone();
+        let memory_push = self
+            .memory_push
+            .lock()
+            .map_err(|_| SetupError::Adapter("memory capability lock".into()))?
+            .clone();
+        lotta_store::PostTurnJobRunner::new(
+            &self.post_turn_queue,
+            reflection.as_ref(),
+            memory_push.as_ref(),
+        )
+        .drain()
+        .map_err(adapter)
+    }
+
+    /// Registers the production reflection capability and drains pending jobs.
+    #[allow(dead_code, reason = "public production capability API")]
+    pub fn register_reflection(
+        &self,
+        capability: Arc<dyn lotta_store::ReflectionJob>,
+    ) -> Result<(), SetupError> {
+        *self
+            .reflection
+            .lock()
+            .map_err(|_| SetupError::Adapter("reflection capability lock".into()))? = capability;
+        self.drain_post_turn()
+    }
+
+    /// Registers the production memory-push capability and drains pending jobs.
+    #[allow(dead_code, reason = "public production capability API")]
+    pub fn register_memory_push(
+        &self,
+        capability: Arc<dyn lotta_store::MemoryPushJob>,
+    ) -> Result<(), SetupError> {
+        *self
+            .memory_push
+            .lock()
+            .map_err(|_| SetupError::Adapter("memory capability lock".into()))? = capability;
+        self.drain_post_turn()
     }
 
     /// Returns the concrete runtime command service.
@@ -153,19 +284,10 @@ fn production_builtins(
     workspace: &std::path::Path,
     workspace_policy: &WorkspacePolicy,
     skill_roots: &SkillRoots,
+    shell: &ShellToolBundle,
 ) -> Result<Vec<ToolRegistration>, SetupError> {
     let file = FileToolBundle::new(workspace, &root.join("artifacts"))
         .map_err(|_| SetupError::Adapter("file tool bundle".into()))?;
-    let shell = ShellToolBundle::new(
-        workspace,
-        RuntimeScope::new(
-            AgentId::accept("production-agent").map_err(adapter)?,
-            lotta_domain::ConversationId::accept("production-conversation").map_err(adapter)?,
-            None,
-        ),
-        Arc::new(OsSandbox::detect(workspace_policy.clone())),
-    )
-    .map_err(|_| SetupError::Adapter("shell tool bundle".into()))?;
     let discovered = SkillDiscovery::discover(skill_roots, SkillSources::ALL)
         .map_err(|_| SetupError::Adapter("skill discovery".into()))?;
     let skills: Arc<dyn lotta_tools::builtin::skill::RegisteredSkillPort> = Arc::new(
@@ -182,7 +304,7 @@ fn production_builtins(
             LanguageServerRegistry::new(workspace.to_path_buf(), [])
                 .map_err(|_| SetupError::Adapter("language server registry".into()))?,
         ),
-        &shell,
+        shell,
     )
     .map_err(|_| SetupError::Adapter("task40 tool bundle".into()))?;
     let agent = AgentId::accept("production-agent").map_err(adapter)?;
@@ -259,19 +381,36 @@ fn production_hostname() -> String {
         .unwrap_or_else(|| "localhost".into())
 }
 
+fn production_shell_scope() -> Result<RuntimeScope, SetupError> {
+    Ok(RuntimeScope::new(
+        AgentId::accept("production-agent").map_err(adapter)?,
+        lotta_domain::ConversationId::accept("production-conversation").map_err(adapter)?,
+        None,
+    ))
+}
+
+fn workspace_policy(root: &Path, workspace: &Path) -> Result<WorkspacePolicy, SetupError> {
+    WorkspacePolicy::new(&WorkspaceSandbox::new(
+        workspace.to_path_buf(),
+        root.to_path_buf(),
+    ))
+    .map_err(|_| SetupError::Adapter("workspace policy".into()))
+}
+
 fn setup_config(
     root: &std::path::Path,
     workspace: &std::path::Path,
     models: Vec<ModelDescriptor>,
     default_model: ModelHandle,
     connections: Vec<lotta_providers::connections::ConnectionSnapshot>,
+    shell: &ShellToolBundle,
 ) -> Result<ProductionSetupConfig, SetupError> {
     let sandbox = WorkspaceSandbox::new(workspace.to_path_buf(), root.to_path_buf());
     let workspace_policy = WorkspacePolicy::new(&sandbox)
         .map_err(|_| SetupError::Adapter("workspace policy".into()))?;
     let skill_roots = production_skill_roots(root, workspace);
     create_production_directories(root)?;
-    let builtins = production_builtins(root, workspace, &workspace_policy, &skill_roots)?;
+    let builtins = production_builtins(root, workspace, &workspace_policy, &skill_roots, shell)?;
     let registry = Arc::new(lotta_tools::ToolRegistry::new(builtins).map_err(adapter)?);
     let mod_registries = Arc::new(ModRegistries::new(Arc::clone(&registry)));
     let hook_registry = Arc::new(HookRegistry::new());
@@ -494,6 +633,33 @@ pub(crate) struct ActiveAdmission {
     pub(crate) history: lotta_domain::AdmissionHistory,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ProductionCancellationObserver {
+    pub(crate) claims: std::sync::atomic::AtomicU64,
+    pub(crate) terminal_persistences: std::sync::atomic::AtomicU64,
+    pub(crate) cancelled_events: std::sync::atomic::AtomicU64,
+    pub(crate) releases: std::sync::atomic::AtomicU64,
+    pub(crate) pumps: std::sync::atomic::AtomicU64,
+    pub(crate) order: std::sync::Mutex<Vec<&'static str>>,
+}
+
+#[cfg(test)]
+impl ProductionCancellationObserver {
+    pub(crate) fn record(&self, step: &'static str) {
+        let counter = match step {
+            "claim" => &self.claims,
+            "persist" => &self.terminal_persistences,
+            "cancelled" => &self.cancelled_events,
+            "release" => &self.releases,
+            "pump" => &self.pumps,
+            _ => return,
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.order.lock().expect("cancellation observer").push(step);
+    }
+}
+
 pub(crate) struct RuntimeServiceState {
     pub(crate) registry: ListenerRuntime,
     pub(crate) pending: HashMap<PendingAdmissionKey, PendingAdmission>,
@@ -503,6 +669,8 @@ pub(crate) struct RuntimeServiceState {
 pub(crate) struct ProductionRuntimeState {
     pub(crate) inner: tokio::sync::Mutex<RuntimeServiceState>,
     pub(crate) active: std::sync::Mutex<HashMap<RuntimeKey, ActiveAdmission>>,
+    #[cfg(test)]
+    pub(crate) cancellation_observer: std::sync::Mutex<Option<Arc<ProductionCancellationObserver>>>,
 }
 
 impl ProductionRuntimeState {
@@ -514,6 +682,8 @@ impl ProductionRuntimeState {
                 sequence: 1,
             }),
             active: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            cancellation_observer: std::sync::Mutex::new(None),
         }
     }
 
@@ -530,11 +700,32 @@ impl ProductionRuntimeState {
             .ok_or(AppServerError::Malformed)
     }
 
-    pub(crate) fn release_and_pump(
+    #[cfg(test)]
+    pub(crate) fn observe_cancellation(&self, observer: Arc<ProductionCancellationObserver>) {
+        *self
+            .cancellation_observer
+            .lock()
+            .expect("cancellation observer") = Some(observer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_cancellation(&self, step: &'static str) {
+        if let Some(observer) = self
+            .cancellation_observer
+            .lock()
+            .expect("cancellation observer")
+            .as_ref()
+        {
+            observer.record(step);
+        }
+    }
+
+    pub(crate) async fn release_and_pump(
         &self,
         scope: &RuntimeScope,
         pending: PendingAdmission,
         reason: &'static str,
+        lifecycle_already_released: bool,
     ) -> Result<Option<(QueueItem, BoundedJsonValue)>, AppServerError> {
         let key = RuntimeKey::from(scope);
         let active = self
@@ -546,17 +737,29 @@ impl ProductionRuntimeState {
         if active.handle != pending.handle || active.lease != pending.lease {
             return Err(AppServerError::Malformed);
         }
-        let mut state = self
-            .inner
-            .try_lock()
-            .map_err(|_| AppServerError::Internal)?;
+        let mut state = self.inner.lock().await;
         for item in active.queue.items().cloned() {
             let _mutation = state
                 .registry
                 .enqueue_retained(&pending.handle, item)
                 .map_err(runtime_service_error)?;
         }
-        release_and_pump_locked(&mut state, scope, pending, reason)
+        let pumped = release_and_pump_locked(
+            &mut state,
+            scope,
+            pending,
+            reason,
+            lifecycle_already_released,
+        )?;
+        #[cfg(test)]
+        if lifecycle_already_released {
+            self.record_cancellation("release");
+        }
+        #[cfg(test)]
+        if pumped.is_some() {
+            self.record_cancellation("pump");
+        }
+        Ok(pumped)
     }
 }
 
@@ -972,12 +1175,14 @@ fn release_and_pump_locked(
     scope: &RuntimeScope,
     pending: PendingAdmission,
     reason: &'static str,
+    lifecycle_already_released: bool,
 ) -> Result<Option<(QueueItem, BoundedJsonValue)>, AppServerError> {
     let current_key = (
         RuntimeKey::from(scope),
         pending.item.client_message_id.as_str().to_owned(),
     );
-    if let Err(error) = finish_released_turn(state, &pending, reason) {
+    if !lifecycle_already_released && let Err(error) = finish_released_turn(state, &pending, reason)
+    {
         return restore_failed_release(state, current_key, pending, error);
     }
     pending.cancellation.cancel();
@@ -1502,11 +1707,7 @@ impl RuntimeCommandService for ProductionRuntimeService {
                 return Ok(AbortOutcome { aborted: true });
             }
             let _ = self.ensure_runtime(&command.runtime)?;
-            let mut state = self
-                .state
-                .inner
-                .try_lock()
-                .map_err(|_| AppServerError::Internal)?;
+            let mut state = self.state.inner.lock().await;
             let pending_key = state
                 .pending
                 .keys()
@@ -1565,6 +1766,8 @@ pub(crate) struct ProductionProviderPort {
     native: NativeAdapterRegistry,
     host: Arc<dyn ConnectionAdapterFactory>,
     pinned_connection: Option<String>,
+    #[cfg(test)]
+    test_port: Option<Arc<dyn ProviderPort>>,
 }
 
 impl ProductionProviderPort {
@@ -1578,7 +1781,16 @@ impl ProductionProviderPort {
             native,
             host,
             pinned_connection: None,
+            #[cfg(test)]
+            test_port: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_test_port(mut self, port: Arc<dyn ProviderPort>) -> Self {
+        self.test_port = Some(port);
+        self.native = NativeAdapterRegistry::default();
+        self
     }
 
     pub(crate) fn connections(&self) -> Vec<lotta_providers::connections::ConnectionSnapshot> {
@@ -1609,6 +1821,10 @@ impl ProviderPort for ProductionProviderPort {
     }
 
     fn stream(&self, request: ProviderRequest, events: ProviderEventSink) -> PortFuture<'_, ()> {
+        #[cfg(test)]
+        if let Some(port) = self.test_port.as_ref() {
+            return port.stream(request, events);
+        }
         Box::pin(async move {
             let connection_id = self
                 .pinned_connection
@@ -1683,6 +1899,7 @@ async fn send_connection_error(
 pub(crate) struct ProductionToolPort {
     hook_runtime: Arc<dyn lotta_runtime::hooks::HookRuntime>,
     overflow: Arc<lotta_tools::clamp::FileOverflowWriter>,
+    shell: Arc<ShellToolBundle>,
 }
 
 impl ProductionToolPort {
@@ -1690,6 +1907,7 @@ impl ProductionToolPort {
         _registry: Arc<lotta_tools::ToolRegistry>,
         hook_runtime: Arc<dyn lotta_runtime::hooks::HookRuntime>,
         overflow_root: std::path::PathBuf,
+        shell: Arc<ShellToolBundle>,
     ) -> Result<Self, SetupError> {
         Ok(Self {
             hook_runtime,
@@ -1697,6 +1915,7 @@ impl ProductionToolPort {
                 lotta_tools::clamp::FileOverflowWriter::new(overflow_root)
                     .map_err(|error| SetupError::Adapter(format!("{error:?}")))?,
             ),
+            shell,
         })
     }
 }
@@ -1728,6 +1947,20 @@ pub(crate) struct ScopedProductionToolPort {
 }
 
 impl ProductionToolPort {
+    pub(crate) fn child_owner(
+        &self,
+        scope: &RuntimeScope,
+        lease_generation: u64,
+    ) -> Result<lotta_tools::builtin::shell::ShellCancellationOwner, lotta_runtime::RuntimeError>
+    {
+        self.shell
+            .cancellation_owner(scope.clone(), lease_generation)
+            .map_err(|_| lotta_runtime::RuntimeError::AdapterFailure {
+                code: "shell_child_owner",
+                context: "production shell process manager".into(),
+            })
+    }
+
     pub(crate) fn scoped(
         &self,
         snapshot: Arc<lotta_tools::RegistrySnapshot>,
@@ -1781,6 +2014,8 @@ pub(crate) struct ProductionEffects {
     actor: ProductionEffectActor,
     scope: RuntimeScope,
     sink: Arc<dyn RuntimeEventSink>,
+    #[cfg_attr(not(test), expect(dead_code, reason = "test diagnostic observer"))]
+    cancellation_observer: Option<CancellationOperationObserver>,
     pub(crate) turn_id: NonEmptyString,
     pub(crate) run_id: lotta_domain::RunId,
     pub(crate) input_id: NonEmptyString,
@@ -1964,10 +2199,27 @@ impl ProductionEffects {
             actor: ProductionEffectActor::new(store, scope.clone()),
             scope,
             sink,
+            cancellation_observer: None,
             turn_id,
             run_id,
             input_id,
             sequence: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_cancellation(
+        mut self,
+        observer: Arc<ProductionCancellationObserver>,
+    ) -> Self {
+        self.cancellation_observer = Some(observer);
+        self
+    }
+
+    #[cfg(test)]
+    fn record_cancellation(&self, step: &'static str) {
+        if let Some(observer) = &self.cancellation_observer {
+            observer.record(step);
         }
     }
 
@@ -2013,10 +2265,15 @@ impl TurnEffectPort for ProductionEffects {
             lotta_domain::LocalMessageRole::Assistant,
             serde_json::json!({"type": "turn_stop", "record": record}),
             format!("{}-stop", self.turn_id.as_str()),
-        )
+        )?;
+        #[cfg(test)]
+        self.record_cancellation("persist");
+        Ok(())
     }
 
     fn emit(&self, event: TurnEvent) -> EffectResult {
+        #[cfg(test)]
+        let cancelled = matches!(&event, TurnEvent::Cancelled);
         let wire = match event {
             TurnEvent::ControlRequest(request) => {
                 lotta_app_server::ws::RuntimeEvent::ControlRequest {
@@ -2052,6 +2309,12 @@ impl TurnEffectPort for ProductionEffects {
                     .map_err(effect_error)?,
                 error: None,
             },
+            TurnEvent::Cancelled => lotta_app_server::ws::RuntimeEvent::TurnFinished {
+                turn_id: self.turn_id.clone(),
+                run_id: Some(self.run_id.clone()),
+                stop_reason: NonEmptyString::new("cancelled").map_err(effect_error)?,
+                error: None,
+            },
             TurnEvent::Failed { reason } => lotta_app_server::ws::RuntimeEvent::TurnFinished {
                 turn_id: self.turn_id.clone(),
                 run_id: Some(self.run_id.clone()),
@@ -2074,7 +2337,12 @@ impl TurnEffectPort for ProductionEffects {
         };
         self.sink
             .emit(&self.scope, wire)
-            .map_err(|_| effect_error("runtime event sink"))
+            .map_err(|_| effect_error("runtime event sink"))?;
+        #[cfg(test)]
+        if cancelled {
+            self.record_cancellation("cancelled");
+        }
+        Ok(())
     }
 
     fn persist_compaction_request(
@@ -2217,7 +2485,7 @@ fn adapter(error: impl std::fmt::Display) -> SetupError {
 #[cfg(test)]
 mod production_tests {
     use super::*;
-    use lotta_app_server::ws::service::{RuntimeCommandService, RuntimeEventSink};
+    use lotta_app_server::ws::service::{RuntimeCommandService, RuntimeEventSink, TurnController};
     use lotta_domain::{ConversationId, DomainError, RunId, Timestamp};
 
     struct TestClock;
@@ -2230,17 +2498,14 @@ mod production_tests {
         }
     }
     #[derive(Default)]
-    struct Sink(Mutex<Vec<(RuntimeScope, String)>>);
+    struct Sink(Mutex<Vec<(RuntimeScope, lotta_app_server::ws::RuntimeEvent)>>);
     impl RuntimeEventSink for Sink {
         fn emit(
             &self,
             scope: &RuntimeScope,
             event: lotta_app_server::ws::RuntimeEvent,
         ) -> Result<(), AppServerError> {
-            self.0
-                .lock()
-                .unwrap()
-                .push((scope.clone(), event.discriminant().into()));
+            self.0.lock().unwrap().push((scope.clone(), event));
             Ok(())
         }
     }
@@ -2256,7 +2521,7 @@ mod production_tests {
             request_id: None,
             runtime: scope,
             payload: BoundedJsonValue::new(
-                serde_json::json!({"messages":[{"client_message_id":id,"content":"hello"}]}),
+                serde_json::json!({"messages":[{"client_message_id":id,"content":[{"type":"text","text":"hello"}]}]}),
             )
             .unwrap(),
         }
@@ -2288,9 +2553,19 @@ mod production_tests {
         let root = std::env::temp_dir().join(format!("lotta-task54-registry-{}", unique_test_id()));
         let workspace = root.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
+        for directory in ["artifacts", "skills", "bundled-skills"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
         let root = root.canonicalize().unwrap();
         let workspace = workspace.canonicalize().unwrap();
         let model = production_model("openai", "gpt-5.4", 128_000, true).unwrap();
+        let policy = workspace_policy(&root, &workspace).unwrap();
+        let shell = ShellToolBundle::new(
+            &workspace,
+            production_shell_scope().unwrap(),
+            Arc::new(OsSandbox::detect(policy)),
+        )
+        .unwrap();
         let config = setup_config(
             &root,
             &workspace,
@@ -2308,6 +2583,7 @@ mod production_tests {
                 is_connected: true,
                 revision: 1,
             }],
+            &shell,
         )
         .expect("exact production builder");
         let expected: std::collections::BTreeSet<_> = production_builtins(
@@ -2315,6 +2591,7 @@ mod production_tests {
             &workspace,
             &config.workspace_policy,
             &config.skill_roots,
+            &shell,
         )
         .unwrap()
         .into_iter()
@@ -2441,10 +2718,21 @@ mod production_tests {
         let workspace_policy = Arc::new(WorkspacePolicy::new(&sandbox).unwrap());
         std::fs::create_dir_all(root.join("artifacts")).unwrap();
         let artifacts = root.join("artifacts").canonicalize().unwrap();
+        let shell_sandbox: Arc<dyn lotta_tools::builtin::shell::ShellSandbox> =
+            Arc::new(OsSandbox::detect((*workspace_policy).clone()));
+        let shell = Arc::new(
+            ShellToolBundle::new(
+                &workspace.canonicalize().unwrap(),
+                scope("shell"),
+                shell_sandbox,
+            )
+            .unwrap(),
+        );
         let port = ProductionToolPort::new(
             Arc::new(registry),
             Arc::new(lotta_runtime::hooks::NoopHookRuntime),
             artifacts,
+            shell,
         )
         .unwrap()
         .scoped(Arc::clone(&snapshot), policy, workspace_policy, workspace);
@@ -2454,6 +2742,75 @@ mod production_tests {
             definition,
             counter,
             snapshot,
+        }
+    }
+
+    struct AcceptConnection;
+
+    impl lotta_providers::connections::ConnectionAdapter for AcceptConnection {
+        fn validate<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a lotta_providers::connections::ProviderAuth,
+            _: &'a std::collections::BTreeMap<String, String>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), ConnectionError>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct UnusedConnectionFactory;
+
+    impl ConnectionAdapterFactory for UnusedConnectionFactory {
+        fn build<'a>(
+            &'a self,
+            _: &'a str,
+            _: lotta_providers::host::protocol::HostAuth,
+            _: lotta_providers::host::protocol::HostOptions,
+        ) -> lotta_providers::connections::ConnectionAdapterFuture<'a> {
+            Box::pin(async { Err(ConnectionError::Unsupported) })
+        }
+    }
+
+    struct HeldProvider {
+        waiting: tokio::sync::Semaphore,
+        calls: std::sync::atomic::AtomicU64,
+    }
+
+    impl Default for HeldProvider {
+        fn default() -> Self {
+            Self {
+                waiting: tokio::sync::Semaphore::new(0),
+                calls: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl ProviderPort for HeldProvider {
+        fn stream(
+            &self,
+            request: ProviderRequest,
+            events: ProviderEventSink,
+        ) -> PortFuture<'_, ()> {
+            Box::pin(async move {
+                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                    return events
+                        .send(ProviderEvent::Stop {
+                            reason: lotta_runtime::ports::StopReason::EndTurn,
+                        })
+                        .await;
+                }
+                self.waiting.add_permits(1);
+                tokio::select! {
+                    () = request.cancellation.cancelled() => Err(lotta_runtime::RuntimeError::Cancelled {
+                        context: "production held provider".into(),
+                    }),
+                    result = events.send(ProviderEvent::Stop {
+                        reason: lotta_runtime::ports::StopReason::EndTurn,
+                    }) => result,
+                }
+            })
         }
     }
 
@@ -2472,6 +2829,305 @@ mod production_tests {
             Arc::new(ProductionRuntimeState::new()),
             approvals,
         )
+    }
+
+    async fn production_controller_fixture(
+        label: &str,
+        held: Arc<HeldProvider>,
+    ) -> (
+        std::path::PathBuf,
+        Arc<ProductionRuntimeService>,
+        Arc<ProductionTurnController>,
+    ) {
+        use lotta_domain::{Agent, Conversation};
+        use lotta_providers::connections::{
+            AuthMethod, ConnectProviderInput, ProviderAuth, ProviderSecret,
+        };
+
+        let root = std::env::temp_dir().join(format!("lotta-cancel-{label}-{}", unique_test_id()));
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        for directory in ["artifacts", "skills", "bundled-skills"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        let root = root.canonicalize().unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let paths = StorePaths::new(root.clone()).unwrap();
+        let scope = scope(label);
+        let agent: Agent = serde_json::from_value(serde_json::json!({
+            "id": scope.agent_id.as_str(), "name": scope.agent_id.as_str(),
+            "description": null, "system": "test", "tags": [],
+            "model": "openai/gpt-5.4", "model_settings": {}, "hidden": false,
+            "compaction_settings": null
+        }))
+        .unwrap();
+        let conversation: Conversation = serde_json::from_value(serde_json::json!({
+            "id": scope.conversation_id.as_str(), "agent_id": scope.agent_id.as_str(),
+            "archived": false, "created_at": "2026-08-18T00:00:00Z",
+            "updated_at": "2026-08-18T00:00:00Z", "last_message_at": null,
+            "summary": null, "in_context_message_ids": [], "model": null,
+            "model_settings": null, "context_window_limit": null, "hidden": false,
+            "tags": []
+        }))
+        .unwrap();
+        let store = LocalStore::new(paths.clone());
+        AgentStore::save(&store, &agent).await.unwrap();
+        ConversationStore::save(&store, &conversation)
+            .await
+            .unwrap();
+
+        let mut manager = ConnectionManager::load(ProviderAuthStore::new(paths.clone())).unwrap();
+        manager
+            .connect(
+                ConnectProviderInput {
+                    provider_id: "openai".into(),
+                    provider_name: "openai".into(),
+                    provider_type: "openai".into(),
+                    auth_method: AuthMethod::Api,
+                    auth: ProviderAuth::Api {
+                        key: ProviderSecret::new("test-key".into()).unwrap(),
+                        extras: Default::default(),
+                    },
+                    fields: Default::default(),
+                    expected_revision: 0,
+                    now: "2026-08-18T00:00:00Z".into(),
+                },
+                &AcceptConnection,
+            )
+            .await
+            .unwrap();
+        let policy = workspace_policy(&root, &workspace).unwrap();
+        let shell = Arc::new(
+            ShellToolBundle::new(
+                &workspace.canonicalize().unwrap(),
+                production_shell_scope().unwrap(),
+                Arc::new(OsSandbox::detect(policy.clone())),
+            )
+            .unwrap(),
+        );
+        let setup = Arc::new(
+            ProductionSetupPorts::new(
+                setup_config(
+                    &root,
+                    &workspace,
+                    vec![production_model("openai", "gpt-5.4", 128_000, true).unwrap()],
+                    ModelHandle::from_str("openai/gpt-5.4").unwrap(),
+                    manager.snapshots(),
+                    shell.as_ref(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let provider = Arc::new(
+            ProductionProviderPort::new(
+                manager,
+                NativeAdapterRegistry::default(),
+                Arc::new(UnusedConnectionFactory),
+            )
+            .with_test_port(held),
+        );
+        let tools = Arc::new(
+            ProductionToolPort::new(
+                setup.registry(),
+                setup.hook_runtime(),
+                root.join("artifacts"),
+                shell,
+            )
+            .unwrap(),
+        );
+        let approvals = Arc::new(lotta_runtime::ApprovalManager::new(
+            store.approval_journal(),
+            Arc::new(crate::production_setup::ProductionEditedInputValidator),
+        ));
+        let state = Arc::new(ProductionRuntimeState::new());
+        let service = Arc::new(ProductionRuntimeService::new(
+            paths,
+            Arc::new(TestClock),
+            setup.hook_runtime(),
+            Arc::clone(&state),
+            Arc::clone(&approvals),
+        ));
+        let controller = Arc::new(ProductionTurnController::new(
+            setup,
+            provider,
+            tools,
+            store,
+            Arc::new(TestClock),
+            workspace,
+            state,
+            Arc::new(ProductionTurnBrokers::new()),
+            approvals,
+            Arc::new(crate::production_setup::UnavailableReflection),
+            Arc::new(crate::production_setup::UnavailableMemoryPush),
+        ));
+        (root, service, controller)
+    }
+
+    #[tokio::test]
+    async fn production_three_concurrent_abort_paths_terminal_release_then_pump_once() {
+        use lotta_runtime::turn::CancelStep;
+        use std::sync::atomic::Ordering;
+
+        for repetition in 0..100 {
+            let label = format!("three-aborts-{repetition}");
+            let held = Arc::new(HeldProvider::default());
+            let (root, service, controller) =
+                production_controller_fixture(&label, Arc::clone(&held)).await;
+            let scope = scope(&label);
+            let observer = Arc::new(ProductionCancellationObserver::default());
+            service.state.observe_cancellation(Arc::clone(&observer));
+            let stage_observer: Arc<dyn Fn(CancelStep) + Send + Sync> = {
+                let observer = Arc::clone(&observer);
+                Arc::new(move |step| {
+                    if step == CancelStep::ClaimAndCancel {
+                        observer.record("claim");
+                    }
+                })
+            };
+            *TEST_CANCELLATION_STAGE_OBSERVER
+                .get_or_init(|| std::sync::Mutex::new(None))
+                .lock()
+                .unwrap() = Some(stage_observer);
+
+            let first_command = command(scope.clone(), "active");
+            let first = service
+                .admit_input(first_command.clone())
+                .await
+                .expect("start active input");
+            let deferred = lotta_app_server::ws::DeferredInput {
+                scope: scope.clone(),
+                disposition: first.disposition,
+                continuation: first.continuation,
+            };
+            let connection_cancellation = CancellationToken::new();
+            let sink = Arc::new(Sink::default());
+            let turn = {
+                let controller = Arc::clone(&controller);
+                let sink = Arc::clone(&sink);
+                let cancellation = connection_cancellation.clone();
+                tokio::spawn(async move {
+                    controller
+                        .submit_turn(first_command, deferred, cancellation, sink)
+                        .await
+                })
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), held.waiting.acquire())
+                .await
+                .expect("provider wait entered")
+                .expect("provider wait semaphore")
+                .forget();
+            assert_eq!(
+                service
+                    .admit_input(command(scope.clone(), "next"))
+                    .await
+                    .expect("queue next input")
+                    .disposition,
+                InputDisposition::Queued
+            );
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(4));
+            let abort = |request_id: &'static str| {
+                let service = Arc::clone(&service);
+                let scope = scope.clone();
+                let barrier = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    service
+                        .abort_message(AbortMessageCommand {
+                            request_id: Some(NonEmptyString::new(request_id).unwrap()),
+                            runtime: scope,
+                            run_id: None,
+                        })
+                        .await
+                })
+            };
+            let abort_a = abort("abort-a");
+            let abort_b = abort("abort-b");
+            let disconnect = {
+                let barrier = Arc::clone(&barrier);
+                let cancellation = connection_cancellation.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    cancellation.cancel();
+                })
+            };
+            barrier.wait().await;
+            let outcome_a = abort_a.await.unwrap().unwrap();
+            let outcome_b = abort_b.await.unwrap().unwrap();
+            disconnect.await.unwrap();
+            assert!(outcome_a.aborted && outcome_b.aborted);
+            let settled = tokio::time::timeout(std::time::Duration::from_secs(5), turn)
+                .await
+                .expect("turn settles")
+                .unwrap();
+            assert!(settled.is_ok() || matches!(settled, Err(AppServerError::Internal)));
+
+            let transcript_path = service
+                .store
+                .paths()
+                .conversation_dir(&scope.agent_id, &scope.conversation_id)
+                .unwrap()
+                .join("messages.jsonl");
+            let transcript = tokio::fs::read_to_string(transcript_path).await.unwrap();
+            let durable_terminal = transcript
+                .lines()
+                .filter(|line| line.contains("turn_stop") && line.contains("user_cancellation"))
+                .count();
+            let events = sink.0.lock().unwrap();
+            let cancelled = events
+                .iter()
+                .filter(|(_, event)| {
+                    matches!(
+                        event,
+                        lotta_app_server::ws::RuntimeEvent::TurnFinished { stop_reason, .. }
+                            if stop_reason.as_str() == "cancelled"
+                    )
+                })
+                .count();
+            let generic_finished = events
+                .iter()
+                .filter(|(_, event)| {
+                    matches!(
+                        event,
+                        lotta_app_server::ws::RuntimeEvent::TurnFinished { stop_reason, .. }
+                            if stop_reason.as_str() != "cancelled"
+                    )
+                })
+                .count();
+            let idle = events
+                .iter()
+                .filter(|(_, event)| {
+                    matches!(
+                        event,
+                        lotta_app_server::ws::RuntimeEvent::UpdateLoopStatus { loop_status }
+                            if loop_status.as_value()["status"] == "idle"
+                    )
+                })
+                .count();
+            drop(events);
+            assert_eq!(observer.claims.load(Ordering::SeqCst), 1);
+            assert_eq!(durable_terminal, 1);
+            assert_eq!(cancelled, 1);
+            assert_eq!(observer.releases.load(Ordering::SeqCst), 1);
+            assert_eq!(observer.pumps.load(Ordering::SeqCst), 1);
+            assert_eq!(generic_finished, 0);
+            assert_eq!(idle, 1, "only the pumped successor may complete idle");
+            assert_eq!(
+                observer.order.lock().unwrap().as_slice(),
+                &["claim", "persist", "cancelled", "release", "pump"]
+            );
+            assert_eq!(
+                observer.pumps.load(Ordering::SeqCst),
+                1,
+                "next input started exactly once"
+            );
+            *TEST_CANCELLATION_STAGE_OBSERVER
+                .get_or_init(|| std::sync::Mutex::new(None))
+                .lock()
+                .unwrap() = None;
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     fn approval_request(
@@ -2648,7 +3304,8 @@ mod production_tests {
         assert_eq!(second.disposition, InputDisposition::Queued);
         let pumped = service
             .state
-            .release_and_pump(&scope, pending, "completed")
+            .release_and_pump(&scope, pending, "completed", false)
+            .await
             .expect("release and pump")
             .expect("pumped item");
         assert_eq!(pumped.0.client_message_id.as_str(), "second");
@@ -2856,10 +3513,10 @@ mod production_tests {
                 reason: lotta_runtime::ports::StopReason::EndTurn,
             })
             .unwrap();
-        assert_eq!(
-            sink.0.lock().unwrap().as_slice(),
-            &[(scope, "turn_finished".into())]
-        );
+        let events = sink.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, scope);
+        assert_eq!(events[0].1.discriminant(), "turn_finished");
     }
     #[test]
     fn production_second_turn_includes_persisted_assistant_history() {

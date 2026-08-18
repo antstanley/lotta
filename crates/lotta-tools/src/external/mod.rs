@@ -57,7 +57,7 @@ impl ExternalCallFailure {
             };
         }
         if self == Self::Cancellation {
-            return lotta_runtime::ports::ToolOutcome::Interrupted {
+            return lotta_runtime::ports::ToolOutcome::Interruption {
                 message: bounded_message(self.message()),
             };
         }

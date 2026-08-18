@@ -196,20 +196,18 @@ async fn aborted_approval_uses_user_cancellation_terminal() {
         calls: AtomicUsize::new(0),
     };
     let effects = RecordingEffects::default();
-    assert_eq!(
+    assert!(matches!(
         run_approval(&tool, &approval, &effects).await.unwrap(),
-        TurnRunOutcome::Completed
-    );
+        TurnRunOutcome::Cancelled(_)
+    ));
     assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
     let stops = effects.stops.lock().unwrap();
     assert_eq!(stops.len(), 1);
     assert_eq!(stops[0].reason, TurnStopReason::UserCancellation);
-    assert!(matches!(
+    assert_eq!(
         effects.events.lock().unwrap().last(),
-        Some(TurnEvent::Failed {
-            reason: TurnStopReason::UserCancellation
-        })
-    ));
+        Some(&TurnEvent::Cancelled)
+    );
 }
 
 #[tokio::test]

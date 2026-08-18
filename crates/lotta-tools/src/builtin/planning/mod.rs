@@ -150,7 +150,7 @@ impl ToolExecutor for PlanningExecutor {
                     .map_err(|_| PlanningError)
                     .and_then(|input| port.replace_plan(input))
                     .map(|()| "{\"message\":\"Plan updated\"}".to_owned()),
-                "TodoWrite" => serde_json::from_value::<TodoWriteInput>(value)
+                "write_todos" => serde_json::from_value::<TodoWriteInput>(value)
                     .map_err(|_| PlanningError)
                     .and_then(|input| port.replace_todos(input.todos))
                     .map(|()| todo_message()),
@@ -167,7 +167,7 @@ fn interrupted() -> Result<RawToolOutcome, ExecutorError> {
     use lotta_runtime::ports::{ToolOutcome, ToolOutcomeMessage};
     let message = ToolOutcomeMessage::new("Planning tool interrupted.".to_owned())
         .map_err(|_| ExecutorError)?;
-    Ok(RawToolOutcome::Failure(ToolOutcome::Interrupted {
+    Ok(RawToolOutcome::Failure(ToolOutcome::Interruption {
         message,
     }))
 }

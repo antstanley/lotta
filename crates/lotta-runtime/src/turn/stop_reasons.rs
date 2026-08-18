@@ -80,6 +80,8 @@ async fn empty_response() {
         effects: &effects,
         compaction: None,
         request_refresh: None,
+        children: None,
+        post_turn: None,
     };
     run_turn(&mut runtime, handle, lease, request(), ports)
         .await

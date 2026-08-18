@@ -419,7 +419,7 @@ fn map_result(result: ToolResult) -> Result<RawToolOutcome, ExecutorError> {
         Err(ManagerError::Timeout) => Ok(RawToolOutcome::Failure(ToolOutcome::Timeout {
             message: message("Shell command timed out.")?,
         })),
-        Err(ManagerError::Interrupted) => Ok(RawToolOutcome::Failure(ToolOutcome::Interrupted {
+        Err(ManagerError::Interrupted) => Ok(RawToolOutcome::Failure(ToolOutcome::Interruption {
             message: message("Shell command interrupted.")?,
         })),
         Err(ManagerError::Spawn) => Ok(RawToolOutcome::Failure(ToolOutcome::SpawnFailure {

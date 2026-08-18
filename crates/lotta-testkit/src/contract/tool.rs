@@ -209,7 +209,7 @@ fn assert_outcome(scenario: ToolContractScenario, outcome: Result<ToolOutcome, R
     let expected = match scenario {
         ToolContractScenario::Success => "success",
         ToolContractScenario::UserDenied => "user_denied",
-        ToolContractScenario::Interrupted => "interrupted",
+        ToolContractScenario::Interrupted => "interruption",
         ToolContractScenario::Timeout => "timeout",
         ToolContractScenario::ValidationFailure => "validation_failure",
         ToolContractScenario::SandboxDenied => "sandbox_denied",
@@ -225,7 +225,7 @@ fn assert_outcome(scenario: ToolContractScenario, outcome: Result<ToolOutcome, R
             assert_eq!(message.as_str(), "message");
         }
         ToolOutcome::UserDenied { message }
-        | ToolOutcome::Interrupted { message }
+        | ToolOutcome::Interruption { message }
         | ToolOutcome::Timeout { message }
         | ToolOutcome::ValidationFailure { message }
         | ToolOutcome::SandboxDenied { message }
@@ -243,7 +243,7 @@ async fn assert_pending_cancellation<Adapter: ToolPort>(
     cancellation.cancel();
     assert!(matches!(
         case.port.execute(request.clone()).await,
-        Ok(ToolOutcome::Interrupted { .. })
+        Ok(ToolOutcome::Interruption { .. })
     ));
     assert_eq!(case.probe.snapshot().completed_calls, 1);
     request.cancellation = CancellationToken::new();

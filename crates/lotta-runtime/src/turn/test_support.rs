@@ -178,7 +178,7 @@ impl TurnEffectPort for RecordingEffects {
     }
 
     fn emit(&self, event: TurnEvent) -> Result<(), RuntimeError> {
-        if matches!(event, TurnEvent::Finished { .. }) {
+        if matches!(event, TurnEvent::Finished { .. } | TurnEvent::Cancelled) {
             if let Some(token) = &self.cancel_on_finished {
                 token.cancel();
             }

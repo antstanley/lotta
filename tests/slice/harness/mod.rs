@@ -460,6 +460,7 @@ impl TurnEffectPort for Effects<'_> {
             TurnEvent::ControlRequest(_)
             | TurnEvent::Retry(_)
             | TurnEvent::ToolResult(_)
+            | TurnEvent::Cancelled
             | TurnEvent::Failed { .. } => {
                 return Ok(());
             }

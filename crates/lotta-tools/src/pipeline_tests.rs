@@ -726,7 +726,7 @@ async fn failure_code_and_message_are_scrubbed() {
     drop(pipeline_state);
     let failures = [
         ToolOutcome::UserDenied { message: message() },
-        ToolOutcome::Interrupted { message: message() },
+        ToolOutcome::Interruption { message: message() },
         ToolOutcome::Timeout { message: message() },
         ToolOutcome::ValidationFailure { message: message() },
         ToolOutcome::SandboxDenied { message: message() },

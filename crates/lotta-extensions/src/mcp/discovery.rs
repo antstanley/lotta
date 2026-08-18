@@ -473,7 +473,7 @@ impl ToolExecutor for McpExecutor {
                     .map(RawToolOutcome::Success)
                     .map_err(|_| ExecutorError),
                 Ok(Err(McpError::Cancelled)) => {
-                    Ok(RawToolOutcome::Failure(ToolOutcome::Interrupted {
+                    Ok(RawToolOutcome::Failure(ToolOutcome::Interruption {
                         message: ToolOutcomeMessage::new("MCP tool call cancelled".into())
                             .map_err(|_| ExecutorError)?,
                     }))

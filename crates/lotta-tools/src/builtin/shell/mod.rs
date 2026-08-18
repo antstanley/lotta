@@ -52,6 +52,40 @@ impl ShellToolBundle {
         })
     }
 
+    /// Returns a cancellation owner for this bundle's exact process manager.
+    ///
+    /// # Errors
+    /// Returns a fixed bundle error if the shared owner registry is unavailable.
+    pub fn cancellation_owner(
+        &self,
+        scope: RuntimeScope,
+        lease_generation: u64,
+    ) -> Result<ShellCancellationOwner, ShellBundleError> {
+        let owner = manager::TurnOwner {
+            scope,
+            lease_generation,
+        };
+        self.manager
+            .set_launch_owner(owner.clone())
+            .map_err(|_| ShellBundleError)?;
+        Ok(ShellCancellationOwner {
+            manager: Arc::clone(&self.manager),
+            owner,
+        })
+    }
+
+    /// Returns whether the shared manager retains any operation records.
+    #[must_use]
+    pub fn has_operations(&self) -> bool {
+        self.manager.has_operations()
+    }
+
+    /// Returns a stable identity for the exact shared process manager.
+    #[must_use]
+    pub fn manager_id(&self) -> usize {
+        Arc::as_ptr(&self.manager) as usize
+    }
+
     /// Cancels and joins every owned background shell session.
     ///
     /// # Errors
@@ -64,6 +98,46 @@ impl ShellToolBundle {
     #[must_use]
     pub fn registrations(&self) -> &[ToolRegistration] {
         &self.registrations
+    }
+}
+
+/// Runtime cancellation adapter over the existing Task38 process manager.
+#[derive(Clone)]
+pub struct ShellCancellationOwner {
+    manager: Arc<manager::ProcessManager>,
+    owner: manager::TurnOwner,
+}
+
+impl ShellCancellationOwner {
+    /// Returns a stable identity for the exact shared process manager.
+    #[must_use]
+    pub fn manager_id(&self) -> usize {
+        Arc::as_ptr(&self.manager) as usize
+    }
+}
+
+impl lotta_runtime::turn::TurnChildOwner for ShellCancellationOwner {
+    fn has_operations(&self) -> bool {
+        self.manager.has_owned_operations(&self.owner)
+    }
+
+    fn terminate_and_reap(
+        &self,
+        kill_grace: std::time::Duration,
+    ) -> lotta_runtime::ports::PortFuture<'_, ()> {
+        Box::pin(async move {
+            if kill_grace != std::time::Duration::from_millis(SHELL_CHILD_KILL_GRACE_MS) {
+                return Err(lotta_runtime::RuntimeError::InvalidData {
+                    context: "shell child kill grace".into(),
+                });
+            }
+            self.manager.shutdown_owner(&self.owner).await.map_err(|_| {
+                lotta_runtime::RuntimeError::AdapterFailure {
+                    code: "shell_child_cleanup",
+                    context: "turn-scoped shell process manager".into(),
+                }
+            })
+        })
     }
 }
 

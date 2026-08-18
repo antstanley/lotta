@@ -21,6 +21,8 @@ mod lock;
 pub mod migration;
 /// Baseline-compatible local-backend paths and encoded keys.
 pub mod paths;
+/// Durable bounded post-turn job queue.
+pub mod post_turn;
 /// Bounded canonical JSON/JSONL query API.
 pub mod query;
 mod refresh;
@@ -41,8 +43,16 @@ pub use conversation::CONVERSATIONS_PER_AGENT_MAX;
 pub use error::{StoreError, StoreErrorKind};
 pub use lock::{LOTTA_STORAGE_LOCK_WAIT_MS, LottaStorageLock};
 pub use paths::{ConversationKey, LETTA_LOCAL_BACKEND_DIR, StorePaths};
+pub use post_turn::{
+    MemoryPushJob, POST_TURN_COMPLETED_JOBS_MAX, POST_TURN_JOB_ATTEMPTS_MAX,
+    POST_TURN_JOBS_BYTES_MAX, POST_TURN_JOBS_MAX, PostTurnClaim, PostTurnExecution, PostTurnJob,
+    PostTurnJobKey, PostTurnJobKind, PostTurnJobRunner, PostTurnJobState, PostTurnQueue,
+    ReflectionJob,
+};
 pub use side::{ChannelFile, OpaqueFile, ProjectFile, SidePaths, SideRevision};
 pub use transcript::{TRANSCRIPT_BYTES_MAX, TRANSCRIPT_LINE_BYTES_MAX};
 
+#[cfg(test)]
+mod post_turn_tests;
 #[cfg(test)]
 mod tests;

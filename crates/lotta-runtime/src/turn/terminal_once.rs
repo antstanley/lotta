@@ -115,6 +115,8 @@ async fn retry_executor_composes_with_task19_and_finishes_once() {
         effects: &effects,
         compaction: None,
         request_refresh: None,
+        children: None,
+        post_turn: None,
     };
     let outcome = run_turn(&mut runtime, handle, lease, request(), ports)
         .await
@@ -202,7 +204,7 @@ async fn cancelled_lease_suppresses_production_retry_event() {
     )
     .await
     .unwrap();
-    assert_eq!(outcome, TurnRunOutcome::Completed);
+    assert!(matches!(outcome, TurnRunOutcome::Cancelled(_)));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert!(
         effects
@@ -274,14 +276,20 @@ async fn cancellation_during_tool_execute_suppresses_all_later_effects() {
     )
     .await
     .unwrap();
-    assert_eq!(outcome, TurnRunOutcome::Completed);
+    assert!(matches!(outcome, TurnRunOutcome::Cancelled(_)));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-    assert!(effects.results.lock().unwrap().is_empty());
+    let results = effects.results.lock().unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(matches!(
+        results[0].outcome,
+        crate::ports::ToolOutcome::Interruption { .. }
+    ));
     assert_eq!(
         effects.events.lock().unwrap().as_slice(),
-        &[TurnEvent::Failed {
-            reason: super::TurnStopReason::UserCancellation,
-        }]
+        &[
+            TurnEvent::ToolResult(results[0].clone()),
+            TurnEvent::Cancelled,
+        ]
     );
     assert_eq!(
         runtime.lifecycle(&handle).unwrap().projection().state(),
@@ -348,12 +356,10 @@ async fn cancellation_before_terminal_helper_suppresses_without_release() {
     )
     .await
     .unwrap();
-    assert_eq!(outcome, TurnRunOutcome::Completed);
+    assert!(matches!(outcome, TurnRunOutcome::Cancelled(_)));
     assert_eq!(
         effects.events.lock().unwrap().as_slice(),
-        &[TurnEvent::Failed {
-            reason: super::TurnStopReason::UserCancellation,
-        }]
+        &[TurnEvent::Cancelled]
     );
     assert_eq!(
         runtime.lifecycle(&handle).unwrap().projection().state(),

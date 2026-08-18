@@ -45,6 +45,8 @@ pub enum TurnEvent {
         /// Provider-normalized successful stop reason.
         reason: StopReason,
     },
+    /// Sole canonical cancellation terminal event.
+    Cancelled,
     /// Sole unsuccessful typed terminal event.
     Failed {
         /// Stable persisted failure reason.

@@ -1,7 +1,9 @@
 use super::step::tool_message;
 use super::{
-    ControlRequest, ControllerToolRequestRecord, ProjectionKind, ProviderFailureDetail,
-    ToolResultRecord, TurnEffectPort, TurnEvent, TurnStopReason, TurnStopRecord, TurnToolCatalog,
+    ControlRequest, ControllerToolRequestRecord, PostTurnPort, ProjectionKind,
+    ProviderFailureDetail, ToolResultRecord, TurnChildOwner, TurnEffectPort, TurnEvent,
+    TurnStopReason, TurnStopRecord, TurnToolCatalog, UnfinishedToolCall,
+    cancel::{CancelContext, UnfinishedCallTracker, cancel_turn as settle_cancellation},
 };
 use crate::bounds::{PROVIDER_MESSAGES_MAX, TURN_STEPS_MAX, TURN_TOOL_CALLS_MAX};
 use crate::ports::{
@@ -15,7 +17,8 @@ use crate::retry::{
     RetryExecutor, RetryPolicy, RetryTerminal, Sleeper,
 };
 use crate::{
-    CancellationPolicy, LeaseEffect, LeaseGuard, ListenerRuntime, RuntimeError, RuntimeHandle,
+    CancellationPolicy, CancellationReceipt, LeaseEffect, LeaseGuard, ListenerRuntime,
+    RuntimeError, RuntimeHandle,
 };
 use lotta_domain::{BoundedJsonValue, NonEmptyString, RunId, TurnLease};
 use std::collections::BTreeMap;
@@ -23,8 +26,10 @@ use std::collections::BTreeMap;
 /// Outcome of an admitted turn loop.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TurnRunOutcome {
-    /// Terminal effect was emitted and the lifecycle released.
+    /// Non-cancellation terminal effect was emitted and the lifecycle released.
     Completed,
+    /// Canonical cancellation was persisted/emitted and the lifecycle released.
+    Cancelled(CancellationReceipt),
     /// A stale lease or cancellation suppressed all later effects.
     Suppressed,
 }
@@ -33,6 +38,7 @@ pub enum TurnRunOutcome {
 enum Flow {
     Continue,
     Failed,
+    Cancelled(CancellationReceipt),
     Suppressed,
 }
 
@@ -123,6 +129,10 @@ pub struct TurnPorts<'ports, 'catalog> {
     pub compaction: Option<&'ports dyn CompactionPort>,
     /// Optional request refresh/recompile/rebuild seam paired with compaction.
     pub request_refresh: Option<std::sync::Arc<dyn RequestRefreshPort>>,
+    /// Turn-local owner of shell, PTY, and background children.
+    pub children: Option<&'ports dyn TurnChildOwner>,
+    /// Post-terminal reflection and memory cleanup adapter.
+    pub post_turn: Option<&'ports dyn PostTurnPort>,
 }
 
 /// Resolution returned by the runtime approval backend.
@@ -206,6 +216,18 @@ impl<'ports, 'catalog> TurnPorts<'ports, 'catalog> {
         )
     }
 
+    /// Installs cancellation settlement ports owned by this exact turn.
+    #[must_use]
+    pub fn with_cancellation_ports(
+        mut self,
+        children: &'ports dyn TurnChildOwner,
+        post_turn: &'ports dyn PostTurnPort,
+    ) -> Self {
+        self.children = Some(children);
+        self.post_turn = Some(post_turn);
+        self
+    }
+
     /// Builds production retry composition from an immutable validated fallback option.
     #[must_use]
     pub fn configured(
@@ -244,6 +266,8 @@ impl<'ports, 'catalog> TurnPorts<'ports, 'catalog> {
             effects,
             compaction: None,
             request_refresh: None,
+            children: None,
+            post_turn: None,
         }
     }
 
@@ -328,6 +352,8 @@ impl<'ports, 'catalog> TurnPorts<'ports, 'catalog> {
             effects,
             compaction: None,
             request_refresh: None,
+            children: None,
+            post_turn: None,
         }
     }
 }
@@ -581,6 +607,10 @@ struct TurnContext<'ports, 'catalog> {
     run_id: RunId,
     input_id: NonEmptyString,
     scope: lotta_domain::RuntimeScope,
+    children: Option<&'ports dyn TurnChildOwner>,
+    post_turn: Option<&'ports dyn PostTurnPort>,
+    unfinished: UnfinishedCallTracker,
+    cancellation_stages: Option<std::sync::Arc<dyn Fn(super::CancelStep) + Send + Sync>>,
 }
 
 /// Runs one bounded provider turn and sequential local-tool continuations.
@@ -593,6 +623,18 @@ pub async fn run_turn(
     lease: TurnLease,
     request: ProviderRequest,
     ports: TurnPorts<'_, '_>,
+) -> Result<TurnRunOutcome, RuntimeError> {
+    run_turn_observed(runtime, handle, lease, request, ports, None).await
+}
+
+#[doc(hidden)]
+pub async fn run_turn_observed(
+    runtime: &mut ListenerRuntime,
+    handle: RuntimeHandle,
+    lease: TurnLease,
+    request: ProviderRequest,
+    ports: TurnPorts<'_, '_>,
+    cancellation_stages: Option<std::sync::Arc<dyn Fn(super::CancelStep) + Send + Sync>>,
 ) -> Result<TurnRunOutcome, RuntimeError> {
     let lease_generation = lease.generation();
     let scope = lotta_domain::RuntimeScope::new(
@@ -627,6 +669,8 @@ pub async fn run_turn(
         effects,
         compaction,
         request_refresh,
+        children,
+        post_turn,
     } = ports;
     let mut turn = TurnContext {
         runtime,
@@ -648,6 +692,10 @@ pub async fn run_turn(
         run_id,
         input_id,
         scope,
+        children,
+        post_turn,
+        unfinished: UnfinishedCallTracker::default(),
+        cancellation_stages,
     };
     run_loop(&mut turn).await
 }
@@ -655,9 +703,9 @@ pub async fn run_turn(
 async fn run_loop(turn: &mut TurnContext<'_, '_>) -> Result<TurnRunOutcome, RuntimeError> {
     if turn.is_suppressed() {
         if turn.request.cancellation.is_cancelled() {
-            return cancel_turn(turn).map(|flow| match flow {
-                Flow::Failed => TurnRunOutcome::Completed,
-                Flow::Suppressed | Flow::Continue => TurnRunOutcome::Suppressed,
+            return cancel_turn(turn).await.map(|flow| match flow {
+                Flow::Cancelled(receipt) => TurnRunOutcome::Cancelled(receipt),
+                Flow::Failed | Flow::Suppressed | Flow::Continue => TurnRunOutcome::Suppressed,
             });
         }
         turn.request.cancellation.cancel();
@@ -668,21 +716,24 @@ async fn run_loop(turn: &mut TurnContext<'_, '_>) -> Result<TurnRunOutcome, Runt
         let mut state = ProviderStepState::new(remaining)?;
         let step = match run_provider_step(turn, &mut state).await {
             Ok(step) => step,
-            Err(RuntimeError::Cancelled { .. }) => return cancelled_outcome(turn),
+            Err(RuntimeError::Cancelled { .. }) => return cancelled_outcome(turn).await,
             Err(error) => return Err(error),
         };
         match step {
             Flow::Suppressed => {
                 if turn.request.cancellation.is_cancelled() {
-                    return cancel_turn(turn).map(|flow| match flow {
-                        Flow::Failed => TurnRunOutcome::Completed,
-                        Flow::Suppressed | Flow::Continue => TurnRunOutcome::Suppressed,
+                    return cancel_turn(turn).await.map(|flow| match flow {
+                        Flow::Cancelled(receipt) => TurnRunOutcome::Cancelled(receipt),
+                        Flow::Failed | Flow::Suppressed | Flow::Continue => {
+                            TurnRunOutcome::Suppressed
+                        }
                     });
                 }
                 turn.request.cancellation.cancel();
                 return Ok(TurnRunOutcome::Suppressed);
             }
             Flow::Failed => return Ok(TurnRunOutcome::Completed),
+            Flow::Cancelled(receipt) => return Ok(TurnRunOutcome::Cancelled(receipt)),
             Flow::Continue => {}
         }
         if turn.is_suppressed() {
@@ -704,10 +755,10 @@ async fn run_loop(turn: &mut TurnContext<'_, '_>) -> Result<TurnRunOutcome, Runt
     Err(limit(TURN_STEPS_MAX.name))
 }
 
-fn cancelled_outcome(turn: &mut TurnContext<'_, '_>) -> Result<TurnRunOutcome, RuntimeError> {
-    cancel_turn(turn).map(|flow| match flow {
-        Flow::Failed => TurnRunOutcome::Completed,
-        Flow::Suppressed | Flow::Continue => TurnRunOutcome::Suppressed,
+async fn cancelled_outcome(turn: &mut TurnContext<'_, '_>) -> Result<TurnRunOutcome, RuntimeError> {
+    cancel_turn(turn).await.map(|flow| match flow {
+        Flow::Cancelled(receipt) => TurnRunOutcome::Cancelled(receipt),
+        Flow::Failed | Flow::Suppressed | Flow::Continue => TurnRunOutcome::Suppressed,
     })
 }
 
@@ -855,7 +906,7 @@ async fn run_provider_attempt(
                                 close_retry_step(&turn.provider)?;
                                 return Ok(ProviderStepResult::Flow(Flow::Failed));
                             }
-                            Flow::Continue => {}
+                            Flow::Continue | Flow::Cancelled(_) => {}
                         },
                         None => return Err(protocol("provider stream closed before executor")),
                     }
@@ -1108,7 +1159,7 @@ async fn handle_terminal(
                 output.cancel();
                 return Ok(Flow::Failed);
             }
-            Flow::Continue => {}
+            Flow::Continue | Flow::Cancelled(_) => {}
         }
     }
     state.accumulator.terminal_stop()?;
@@ -1118,24 +1169,33 @@ async fn handle_terminal(
     )
 }
 
-fn cancel_turn(turn: &mut TurnContext<'_, '_>) -> Result<Flow, RuntimeError> {
-    let reason = TurnStopReason::UserCancellation;
+async fn cancel_turn(turn: &mut TurnContext<'_, '_>) -> Result<Flow, RuntimeError> {
     let record = TurnStopRecord {
         turn_id: turn.turn_id.clone(),
         run_id: turn.run_id.clone(),
         input_id: turn.input_id.clone(),
-        reason,
+        reason: TurnStopReason::UserCancellation,
         provider_failure: None,
     };
-    match turn.guard.finish_cancelled_turn_with_effect_after_await(
-        turn.runtime,
-        failure_domain_stop(reason),
-        || {
-            turn.effects.persist_stop_reason(record)?;
-            turn.effects.emit(TurnEvent::Failed { reason })
-        },
-    )? {
-        LeaseEffect::Applied(()) => Ok(Flow::Failed),
+    let guard = LeaseGuard::new(
+        turn.guard.handle().clone(),
+        turn.guard.lease().clone(),
+        turn.request.cancellation.clone(),
+        CancellationPolicy::PermitDuringCancellationCleanup,
+    );
+    let mut context = CancelContext {
+        runtime: turn.runtime,
+        guard,
+        provider_cancellation: turn.request.cancellation.clone(),
+        unfinished: std::mem::take(&mut turn.unfinished),
+        effects: turn.effects,
+        children: turn.children,
+        post_turn: turn.post_turn,
+        record,
+        stages: turn.cancellation_stages.clone(),
+    };
+    match settle_cancellation(&mut context).await? {
+        LeaseEffect::Applied(receipt) => Ok(Flow::Cancelled(receipt)),
         LeaseEffect::Suppressed(_) => Ok(Flow::Suppressed),
     }
 }
@@ -1262,8 +1322,18 @@ async fn execute_call(
         .ok_or_else(|| protocol("provider tool definition missing"))?;
     require_sequential_tool(definition)?;
     let input = ValidatedToolInput::new(value)?;
-    let outcome = execute_branch(turn, &call_id, definition, input).await?;
+    let cancellation = turn.request.cancellation.child_token();
+    if !turn.unfinished.register(UnfinishedToolCall {
+        call_id: call_id.clone(),
+        cancellation: cancellation.clone(),
+    }) {
+        return Err(protocol("duplicate unfinished tool call"));
+    }
+    let outcome = execute_branch(turn, &call_id, definition, input, cancellation).await?;
     if turn.is_suppressed() {
+        return Ok(Flow::Suppressed);
+    }
+    if !turn.unfinished.mark_completed(&call_id) {
         return Ok(Flow::Suppressed);
     }
     let result = ToolResultRecord { call_id, outcome };
@@ -1274,14 +1344,21 @@ async fn execute_call(
         .completed
         .try_reserve(1)
         .map_err(|_| limit(TURN_TOOL_CALLS_MAX.name))?;
-    match turn.guard.apply_after_await(turn.runtime, || {
+    let effect = turn.guard.apply_after_await(turn.runtime, || {
         turn.effects.append_tool_result(result.clone())?;
         turn.effects.emit(TurnEvent::ToolResult(result.clone()))
-    }) {
-        LeaseEffect::Applied(effect) => effect?,
-        LeaseEffect::Suppressed(_) => return Ok(Flow::Suppressed),
+    });
+    match effect {
+        LeaseEffect::Applied(Ok(())) => state.completed.push(result),
+        LeaseEffect::Applied(Err(error)) => {
+            turn.unfinished.restore_pending(&result.call_id);
+            return Err(error);
+        }
+        LeaseEffect::Suppressed(_) => {
+            turn.unfinished.restore_pending(&result.call_id);
+            return Ok(Flow::Suppressed);
+        }
     }
-    state.completed.push(result);
     Ok(Flow::Continue)
 }
 
@@ -1290,6 +1367,7 @@ async fn execute_branch(
     call_id: &ToolCallId,
     definition: &crate::ports::ToolDefinition,
     mut input: ValidatedToolInput,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<ToolOutcome, RuntimeError> {
     let executing_approval = if definition.approval_policy == ToolApprovalPolicy::Always {
         let Some((request, approved_input)) =
@@ -1308,6 +1386,7 @@ async fn execute_branch(
         input,
         turn,
         executing_approval.as_ref(),
+        cancellation,
     );
     let outcome = dispatch_tool_execution(turn, call_id, definition, execution).await;
     finalize_approved_execution(turn, outcome, executing_approval)
@@ -1317,8 +1396,9 @@ fn approved_execution_request(
     call_id: &ToolCallId,
     definition: &crate::ports::ToolDefinition,
     input: ValidatedToolInput,
-    turn: &TurnContext<'_, '_>,
+    _turn: &TurnContext<'_, '_>,
     approval: Option<&ControlRequest>,
+    cancellation: tokio_util::sync::CancellationToken,
 ) -> ToolExecutionRequest {
     let approval_grant = approval.map_or(crate::ports::ToolApprovalGrant::None, |_| {
         crate::ports::ToolApprovalGrant::granted(call_id.clone(), definition)
@@ -1328,7 +1408,7 @@ fn approved_execution_request(
         approval_grant,
         definition: definition.clone(),
         input,
-        cancellation: turn.request.cancellation.clone(),
+        cancellation,
         deadline: definition.timeout,
     }
 }

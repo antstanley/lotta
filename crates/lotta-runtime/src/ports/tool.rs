@@ -619,7 +619,7 @@ pub enum ToolOutcome {
         message: ToolOutcomeMessage,
     },
     /// Explicit cancellation interrupted execution.
-    Interrupted {
+    Interruption {
         /// Bounded normalized explanation.
         message: ToolOutcomeMessage,
     },

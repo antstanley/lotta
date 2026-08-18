@@ -40,7 +40,8 @@ use lotta_runtime::turn::{
 };
 use lotta_runtime::{ListenerRuntime, RuntimeHandle};
 use lotta_store::{
-    LocalStore, LottaStorageLock, StoreErrorKind, StorePaths, WriteMode, atomic_write,
+    LocalStore, LottaStorageLock, MemoryPushJob, PostTurnExecution, PostTurnJob, PostTurnJobRunner,
+    PostTurnQueue, ReflectionJob, StoreError, StoreErrorKind, StorePaths, WriteMode, atomic_write,
 };
 use lotta_tools::{
     PermissionDecision, PermissionInvocation, PermissionPolicy, ToolRegistration, ToolRegistry,
@@ -202,6 +203,8 @@ impl ProductionSetupPorts {
         controller_tools: &dyn lotta_runtime::turn::ControllerToolPort,
         compaction: &dyn lotta_runtime::turn::CompactionPort,
         refresh: Arc<dyn lotta_runtime::turn::RequestRefreshPort>,
+        children: &dyn lotta_runtime::turn::TurnChildOwner,
+        post_turn: &dyn lotta_runtime::turn::PostTurnPort,
         provider: &crate::production_components::ProductionProviderPort,
         tools: &crate::production_components::ProductionToolPort,
         effects: &dyn lotta_runtime::turn::TurnEffectPort,
@@ -222,10 +225,24 @@ impl ProductionSetupPorts {
         let ports = TurnPorts::new(provider, &scoped_tools, &prepared.tools, effects)
             .with_approvals(approval)
             .with_controller_tools(controller_tools)
-            .with_context_ports(compaction, refresh);
+            .with_context_ports(compaction, refresh)
+            .with_cancellation_ports(children, post_turn);
         self.release_scope(prepared.scope);
         let fallbacks = configured_fallbacks(&prepared, provider, &fallback_providers)?;
         let ports = ports.with_fallbacks(fallbacks).with_provider_start(&status);
+        #[cfg(test)]
+        let observer = crate::production_components::test_cancellation_stage_observer();
+        #[cfg(test)]
+        let result = lotta_runtime::turn::run_turn_observed(
+            runtime,
+            handle,
+            lease,
+            prepared.request,
+            ports,
+            observer,
+        )
+        .await;
+        #[cfg(not(test))]
         let result =
             lotta_runtime::turn::run_turn(runtime, handle, lease, prepared.request, ports).await;
         match host
@@ -294,6 +311,12 @@ impl ProductionSetupPorts {
     #[must_use]
     pub fn hook_runtime(&self) -> Arc<dyn HookRuntime> {
         Arc::clone(&self.hook_runtime)
+    }
+
+    /// Returns the validated production workspace policy.
+    #[must_use]
+    pub fn workspace_policy(&self) -> &WorkspacePolicy {
+        &self.workspace_policy
     }
 
     /// Returns the shared canonical tool registry used by production execution.
@@ -2081,6 +2104,8 @@ pub struct ProductionTurnController {
     turn_sequence: AtomicU64,
     brokers: Arc<ProductionTurnBrokers>,
     approvals: Arc<lotta_runtime::ApprovalManager>,
+    reflection: Arc<dyn ReflectionJob>,
+    memory_push: Arc<dyn MemoryPushJob>,
 }
 
 impl ProductionTurnController {
@@ -2100,6 +2125,8 @@ impl ProductionTurnController {
         runtime_state: Arc<crate::production_components::ProductionRuntimeState>,
         brokers: Arc<ProductionTurnBrokers>,
         approvals: Arc<lotta_runtime::ApprovalManager>,
+        reflection: Arc<dyn ReflectionJob>,
+        memory_push: Arc<dyn MemoryPushJob>,
     ) -> Self {
         Self {
             setup,
@@ -2112,6 +2139,8 @@ impl ProductionTurnController {
             turn_sequence: AtomicU64::new(1),
             brokers,
             approvals,
+            reflection,
+            memory_push,
         }
     }
 
@@ -2208,6 +2237,18 @@ impl ProductionTurnController {
                 .map_err(|_| lotta_app_server::error::AppServerError::Malformed)?,
             Arc::clone(&self.clock),
         );
+        #[cfg(test)]
+        let effects = if let Some(observer) = self
+            .runtime_state
+            .cancellation_observer
+            .lock()
+            .expect("cancellation observer")
+            .clone()
+        {
+            effects.observe_cancellation(observer)
+        } else {
+            effects
+        };
         Ok((input, effects))
     }
 
@@ -2217,7 +2258,7 @@ impl ProductionTurnController {
         pending: &crate::production_components::PendingAdmission,
         cancellation: CancellationToken,
         sink: Arc<dyn lotta_app_server::ws::RuntimeEventSink>,
-    ) -> Result<(), lotta_app_server::error::AppServerError> {
+    ) -> Result<lotta_runtime::turn::TurnRunOutcome, lotta_app_server::error::AppServerError> {
         let text = canonical_user_text(command.payload.as_value())?;
         self.run_prompt_hook(command, &text, cancellation.clone())
             .await?;
@@ -2250,6 +2291,17 @@ impl ProductionTurnController {
         let refresh = self
             .request_refresh(command, &scope, &input, turn_cancellation)
             .await?;
+        let children = self
+            .tools
+            .child_owner(&scope, pending.lease.generation())
+            .map_err(app_server_error)?;
+        let post_turn = ProductionPostTurn::new(
+            self.store.clone(),
+            scope.clone(),
+            pending.lease.generation(),
+            Arc::clone(&self.reflection),
+            Arc::clone(&self.memory_push),
+        );
         let mut state = self.runtime_state.inner.lock().await;
         self.setup
             .run_production_turn(
@@ -2261,12 +2313,13 @@ impl ProductionTurnController {
                 &controller_tools,
                 &compaction,
                 refresh,
+                &children,
+                &post_turn,
                 self.provider.as_ref(),
                 self.tools.as_ref(),
                 &effects,
             )
             .await
-            .map(|_| ())
             .map_err(app_server_error)
     }
 
@@ -2357,14 +2410,15 @@ fn activate_submission(
         queue: lotta_runtime::ConversationQueue::default(),
         history: lotta_domain::AdmissionHistory::default(),
     };
-    if controller
-        .runtime_state
-        .active
-        .lock()
-        .map_err(|_| lotta_app_server::error::AppServerError::Internal)?
-        .insert(key, active)
-        .is_some()
-    {
+    let replaced = {
+        let mut active_state = controller
+            .runtime_state
+            .active
+            .lock()
+            .map_err(|_| lotta_app_server::error::AppServerError::Internal)?;
+        active_state.insert(key, active).is_some()
+    };
+    if replaced {
         return Err(lotta_app_server::error::AppServerError::Internal);
     }
     let watcher = active_cancellation.clone();
@@ -2395,28 +2449,43 @@ async fn submit_production_turn(
         let result = controller
             .run_admitted(&command, &pending, active_cancellation, Arc::clone(&sink))
             .await;
-        if primary.is_none() {
+        let cancelled = matches!(
+            result,
+            Ok(lotta_runtime::turn::TurnRunOutcome::Cancelled(_))
+        );
+        if cancelled {
+            primary = None;
+        } else if primary.is_none() {
             primary = result.err();
         }
-        let reason = if primary.is_none() {
+        let reason = if cancelled {
+            "user_cancellation"
+        } else if primary.is_none() {
             "completed"
         } else {
             "error"
         };
-        let pumped =
-            match controller
-                .runtime_state
-                .release_and_pump(&command.runtime, pending, reason)
-            {
-                Ok(pumped) => pumped,
-                Err(error) => return Err(attach_controller_error(primary, error)),
-            };
-        if let Err(error) = ProductionTurnController::emit_completion(&command, sink.as_ref()) {
+        let pumped = match controller
+            .runtime_state
+            .release_and_pump(&command.runtime, pending, reason, cancelled)
+            .await
+        {
+            Ok(pumped) => pumped,
+            Err(error) => return Err(attach_controller_error(primary, error)),
+        };
+        if !cancelled
+            && let Err(error) = ProductionTurnController::emit_completion(&command, sink.as_ref())
+        {
             primary = Some(attach_controller_error(primary, error));
         }
         let Some((item, continuation)) = pumped else {
             return primary.map_or(Ok(()), Err);
         };
+        if primary.as_ref().is_some_and(|error| {
+            matches!(error, lotta_app_server::error::AppServerError::Malformed)
+        }) {
+            primary = None;
+        }
         command = lotta_app_server::ws::command::InputCommand {
             request_id: None,
             runtime: command.runtime.clone(),
@@ -2446,6 +2515,67 @@ impl lotta_app_server::ws::TurnController for ProductionTurnController {
             cancellation,
             sink,
         ))
+    }
+}
+
+pub(crate) struct UnavailableReflection;
+
+impl ReflectionJob for UnavailableReflection {
+    fn reflect(&self, _: &PostTurnJob) -> Result<PostTurnExecution, StoreError> {
+        Ok(PostTurnExecution::Unavailable)
+    }
+}
+
+pub(crate) struct UnavailableMemoryPush;
+
+impl MemoryPushJob for UnavailableMemoryPush {
+    fn push_memory(&self, _: &PostTurnJob) -> Result<PostTurnExecution, StoreError> {
+        Ok(PostTurnExecution::Unavailable)
+    }
+}
+
+struct ProductionPostTurn {
+    queue: PostTurnQueue,
+    scope: lotta_domain::RuntimeScope,
+    lease_generation: u64,
+    reflection: Arc<dyn ReflectionJob>,
+    memory_push: Arc<dyn MemoryPushJob>,
+}
+
+impl ProductionPostTurn {
+    fn new(
+        store: LocalStore,
+        scope: lotta_domain::RuntimeScope,
+        lease_generation: u64,
+        reflection: Arc<dyn ReflectionJob>,
+        memory_push: Arc<dyn MemoryPushJob>,
+    ) -> Self {
+        Self {
+            queue: PostTurnQueue::new(&store),
+            scope,
+            lease_generation,
+            reflection,
+            memory_push,
+        }
+    }
+
+    fn enqueue_and_drain(&self) -> Result<(), RuntimeError> {
+        self.queue
+            .enqueue_turn(&self.scope, self.lease_generation)
+            .map_err(RuntimeError::from)?;
+        PostTurnJobRunner::new(
+            &self.queue,
+            self.reflection.as_ref(),
+            self.memory_push.as_ref(),
+        )
+        .drain()
+        .map_err(RuntimeError::from)
+    }
+}
+
+impl lotta_runtime::turn::PostTurnPort for ProductionPostTurn {
+    fn run(&self) -> lotta_runtime::ports::PortFuture<'_, ()> {
+        Box::pin(async move { self.enqueue_and_drain() })
     }
 }
 
@@ -2548,6 +2678,14 @@ fn canonical_user_text(
             .get("content")
             .and_then(serde_json::Value::as_str)
             .or_else(|| message.as_str())
+            .or_else(|| {
+                message
+                    .get("content")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|parts| parts.first())
+                    .and_then(|part| part.get("text"))
+                    .and_then(serde_json::Value::as_str)
+            })
             .ok_or(lotta_app_server::error::AppServerError::Malformed)?;
         if !text.is_empty() {
             text.push('\n');

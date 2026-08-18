@@ -137,6 +137,8 @@ async fn run_with_policy(
         effects: &effects,
         compaction: None,
         request_refresh: None,
+        children: None,
+        post_turn: None,
     };
     (
         run_turn(&mut runtime, handle, lease, request, ports).await,
@@ -225,14 +227,12 @@ async fn cancellation_during_delay_is_user_cancellation_and_never_resends() {
     let time = RecordedTime::cancelling();
     let request = request();
     let (outcome, effects) = run_with(&provider, &time, request).await;
-    assert_eq!(outcome.unwrap(), TurnRunOutcome::Completed);
+    assert!(matches!(outcome.unwrap(), TurnRunOutcome::Cancelled(_)));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert_eq!(time.delays(), [1_000]);
     assert_eq!(effects.stops.lock().unwrap().len(), 1);
     assert_eq!(
         effects.events.lock().unwrap().last(),
-        Some(&TurnEvent::Failed {
-            reason: super::TurnStopReason::UserCancellation,
-        })
+        Some(&TurnEvent::Cancelled)
     );
 }

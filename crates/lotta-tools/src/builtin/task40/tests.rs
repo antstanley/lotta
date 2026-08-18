@@ -118,7 +118,7 @@ async fn registry_aliases_share_state_and_every_nonblocking_tool_executes() {
 
     for (name, input) in [
         (
-            "TodoWrite",
+            "write_todos",
             json!({"todos":[{"content":"do","status":"pending","activeForm":"doing"}]}),
         ),
         (
