@@ -5,15 +5,16 @@ use serde_json::Value;
 use std::fmt;
 
 use super::oauth::{OAuthBegin, OAuthDeviceBegin, OAuthMetadata};
+use crate::limits::{PROVIDER_RESPONSE_EVENT_BYTES_MAX, PROVIDERS_MAX};
 
 /// Provider-host payload protocol version.
 pub const HOST_PROTOCOL_VERSION: u16 = 1;
 /// Maximum concurrent host requests.
 pub const HOST_PENDING_REQUESTS_MAX: usize = 64;
 /// Maximum provider descriptors in one catalog.
-pub const HOST_PROVIDERS_MAX: usize = 128;
+pub const HOST_PROVIDERS_MAX: usize = PROVIDERS_MAX;
 /// Maximum models in one complete catalog.
-pub const HOST_MODELS_MAX: usize = 10_000;
+pub const HOST_MODELS_MAX: usize = crate::limits::MODELS_PER_PROVIDER_MAX;
 /// Maximum bounded descriptor string bytes.
 pub const HOST_TEXT_BYTES_MAX: usize = 512;
 /// Maximum explicit credential bytes retained by one host provider.
@@ -21,7 +22,7 @@ pub const HOST_CREDENTIAL_BYTES_MAX: usize = 64 * 1024;
 /// Maximum normalized events accepted for one stream.
 pub const HOST_STREAM_EVENTS_MAX: usize = 4_096;
 /// Maximum bytes accepted in one encoded stream event.
-pub const HOST_EVENT_BYTES_MAX: usize = 4 * 1024 * 1024;
+pub const HOST_EVENT_BYTES_MAX: usize = PROVIDER_RESPONSE_EVENT_BYTES_MAX;
 /// Maximum fixture raw stream bytes accepted in test mode.
 pub const HOST_FIXTURE_BYTES_MAX: usize = 8 * 1024 * 1024;
 

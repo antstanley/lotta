@@ -129,6 +129,12 @@ bound!(
     "confined_path_component_limit_total"
 );
 bound!(
+    PROVIDER_IMAGE_BYTES_MAX,
+    20 * 1024 * 1024,
+    "provider_image_byte_limit",
+    "provider_image_byte_limit_total"
+);
+bound!(
     PROVIDER_REQUEST_BYTES_MAX,
     32 * 1024 * 1024,
     "provider_request_byte_limit",
@@ -187,7 +193,8 @@ bound!(
 pub const TURN_RESOURCE_BOUNDS: [ResourceBound; 2] = [TURN_TOOL_CALLS_MAX, TURN_STEPS_MAX];
 
 /// Task 07 provider bounds in stable declaration order.
-pub const PROVIDER_RESOURCE_BOUNDS: [ResourceBound; 7] = [
+pub const PROVIDER_RESOURCE_BOUNDS: [ResourceBound; 8] = [
+    PROVIDER_IMAGE_BYTES_MAX,
     PROVIDER_REQUEST_BYTES_MAX,
     PROVIDER_RESPONSE_EVENT_BYTES_MAX,
     TOOL_ARGUMENT_BYTES_MAX,
@@ -376,8 +383,14 @@ mod tests {
     }
 
     #[test]
-    fn exact_seven_provider_rows_do_not_drift() {
+    fn exact_eight_provider_rows_do_not_drift() {
         let expected = [
+            (
+                "PROVIDER_IMAGE_BYTES_MAX",
+                20 * 1024 * 1024,
+                "provider_image_byte_limit",
+                "provider_image_byte_limit_total",
+            ),
             (
                 "PROVIDER_REQUEST_BYTES_MAX",
                 32 * 1024 * 1024,

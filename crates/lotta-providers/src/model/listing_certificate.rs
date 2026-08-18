@@ -43,7 +43,13 @@ fn contains_no_credentials() {
 }
 #[test]
 fn below_limit_is_accepted() {
-    assert!(ModelCatalog::new([("openai".into(), (0..9_999).map(model).collect())]).is_ok());
+    assert!(
+        ModelCatalog::new([(
+            "openai".into(),
+            (0..MODELS_PER_PROVIDER_MAX - 1).map(model).collect()
+        )])
+        .is_ok()
+    );
 }
 #[test]
 fn at_limit_is_accepted() {

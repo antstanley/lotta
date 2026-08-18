@@ -148,6 +148,9 @@ impl OllamaCore {
         events: ProviderEventSink,
     ) -> Result<(), RuntimeError> {
         request.validate_bytes()?;
+        crate::context::ContextGuard
+            .check(&request, None)
+            .map_err(context_error)?;
         let body = map_request(&request, self.supports_images)?;
         let deadline = Instant::now() + request.deadline.get();
         let mut builder = self.client.post(self.endpoint.clone()).json(&body);
@@ -169,6 +172,18 @@ impl OllamaCore {
             return status_error(response, &request, deadline, &events).await;
         }
         consume(response, &request, deadline, &events).await
+    }
+}
+
+fn context_error(error: crate::context::ContextGuardError) -> RuntimeError {
+    match error {
+        crate::context::ContextGuardError::Window(_) => common::invalid("provider context window"),
+        crate::context::ContextGuardError::Overflow(decision) => match decision {
+            lotta_runtime::ports::ProviderContextDecision::CompactionRequired(detail)
+            | lotta_runtime::ports::ProviderContextDecision::ContextOverflow(detail) => {
+                RuntimeError::ContextOverflow { detail }
+            }
+        },
     }
 }
 
@@ -258,6 +273,9 @@ async fn consume(
             Ok(Some(Ok(value))) => value,
             Ok(None) => break,
         };
+        if crate::limits::validate_response_event_bytes(chunk.len()).is_err() {
+            return protocol(events).await;
+        }
         if buffer.len().saturating_add(chunk.len()) > NDJSON_LINE_BYTES_MAX {
             return protocol(events).await;
         }

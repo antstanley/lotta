@@ -17,7 +17,7 @@ pub use types::{
 };
 
 /// Maximum persisted provider connections from the provider specification.
-pub const PROVIDERS_MAX: usize = 128;
+pub use crate::limits::PROVIDERS_MAX;
 /// Maximum serialized provider authentication file size.
 pub const PROVIDER_AUTH_BYTES_MAX: usize = 8 * 1_024 * 1_024;
 /// Maximum provider identifier, name, method, and metadata string bytes.

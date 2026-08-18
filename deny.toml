@@ -5,7 +5,15 @@ yanked = "deny"
 [licenses]
 version = 2
 confidence-threshold = 0.8
-allow = ["Apache-2.0", "BSD-3-Clause", "MIT", "Unicode-3.0"]
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+]
 exceptions = [
     { allow = ["Apache-2.0 WITH LLVM-exception"], crate = "winx@0.36.4" },
 ]
@@ -15,8 +23,10 @@ multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
 skip = [
+    { crate = "getrandom@0.2.17", reason = "ring 0.17.14 transitive via workspace reqwest rustls" },
     { crate = "syn@2.0.119", reason = "Source audit uses Syn 2; Tokio macros use Syn 3" },
     { crate = "io-lifetimes@2.0.4", reason = "cap-primitives 4.0.2 transitive" },
+    { crate = "windows-sys@0.52.0", reason = "ring 0.17.14 transitive via workspace reqwest rustls" },
     { crate = "windows-sys@0.59.0", reason = "cap-primitives 4.0.2 transitive" },
     { crate = "windows-sys@0.60.2", reason = "cap-primitives 4.0.2 transitive" },
     { crate = "windows-targets@0.52.6", reason = "cap-primitives 4.0.2 transitive" },

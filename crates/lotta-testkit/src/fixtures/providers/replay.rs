@@ -100,9 +100,13 @@ pub async fn replay_provider(
     };
     let (producer_result, actual) = tokio::join!(producer, consumer);
     producer_result.map_err(|error| ProviderReplayError::Provider(Box::new(error)))?;
-    compare(case.expected_trace.as_slice(), &actual?)
+    compare_provider_traces(case.expected_trace.as_slice(), &actual?)
 }
-fn compare(
+/// Compares two already-normalized traces and reports their first divergence.
+///
+/// # Errors
+/// Returns the first differing or missing event.
+pub fn compare_provider_traces(
     expected: &[ProviderEvent],
     actual: &[ProviderEvent],
 ) -> Result<(), ProviderReplayError> {

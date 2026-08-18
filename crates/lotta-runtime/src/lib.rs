@@ -95,6 +95,12 @@ pub enum RuntimeError {
         /// Stable operation context supplied by the adapter.
         context: String,
     },
+    /// Provider context capacity was exceeded with safe structured detail.
+    #[error("context_overflow")]
+    ContextOverflow {
+        /// Serializable non-secret overflow detail.
+        detail: ports::ProviderContextOverflowDetail,
+    },
     /// The operating system denied the requested effect.
     #[error("permission_denied: {context}")]
     PermissionDenied {

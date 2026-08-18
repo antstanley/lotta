@@ -228,6 +228,7 @@ pub(super) fn request() -> ProviderRequest {
             tier: None,
         },
         cancellation: CancellationToken::new(),
+        context: None,
         deadline: ProviderDeadline::new(Duration::from_secs(10)).unwrap(),
     }
 }

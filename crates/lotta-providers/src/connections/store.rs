@@ -1,7 +1,7 @@
 use super::types::{
     AuthFile, ConnectionError, ProviderAuth, ProviderRecord, ProviderSecret, RawFile, RawRecord,
 };
-use super::{PROVIDER_AUTH_BYTES_MAX, PROVIDER_TEXT_BYTES_MAX, PROVIDERS_MAX};
+use super::{PROVIDER_AUTH_BYTES_MAX, PROVIDER_TEXT_BYTES_MAX};
 use lotta_store::atomic::{WriteMode, atomic_write};
 use lotta_store::side::{SideRevision, read_opaque, write_opaque_expected};
 use lotta_store::{StoreErrorKind, StorePaths};
@@ -47,9 +47,8 @@ impl ProviderAuthStore {
         records: &BTreeMap<String, ProviderRecord>,
         expected: u64,
     ) -> Result<u64, ConnectionError> {
-        if records.len() > PROVIDERS_MAX {
-            return Err(ConnectionError::Capacity);
-        }
+        crate::limits::validate_provider_count(records.len())
+            .map_err(|_| ConnectionError::Capacity)?;
         let path = self.paths.provider_auth();
         let bytes = serialize_file(records)?;
         if expected == 0 && !path.exists() {
@@ -102,7 +101,7 @@ fn parse_file(bytes: &[u8]) -> Result<AuthFile, ConnectionError> {
         .end()
         .map_err(|_| ConnectionError::InvalidInput("provider auth JSON"))?;
     validate_extras(&raw.extras)?;
-    if raw.version != 1 || raw.providers.len() > PROVIDERS_MAX {
+    if raw.version != 1 || crate::limits::validate_provider_count(raw.providers.len()).is_err() {
         return Err(if raw.version == 1 {
             ConnectionError::Capacity
         } else {
@@ -424,7 +423,7 @@ impl<'de> Visitor<'de> for UniqueProvidersVisitor {
             if output.insert(key, value).is_some() {
                 return Err(de::Error::custom("duplicate provider"));
             }
-            if output.len() > PROVIDERS_MAX {
+            if crate::limits::validate_provider_count(output.len()).is_err() {
                 return Err(de::Error::custom("provider limit"));
             }
         }

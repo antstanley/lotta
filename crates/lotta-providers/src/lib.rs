@@ -6,6 +6,11 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+/// Provider context-window resolution, estimation, and overflow recovery.
+pub mod context;
+/// Canonical provider resource limits.
+pub mod limits;
+
 /// Baseline-compatible provider connections and credential persistence.
 pub mod connections;
 

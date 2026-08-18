@@ -176,6 +176,7 @@ pub(super) fn request(deadline_ms: u64) -> ProviderRequest {
             tier: None,
         },
         cancellation: CancellationToken::new(),
+        context: None,
         deadline: ProviderDeadline::new(Duration::from_millis(deadline_ms)).unwrap(),
     }
 }
@@ -196,6 +197,7 @@ pub(super) fn failure(kind: ProviderFailureKind) -> ProviderEvent {
         ProviderFailureKind::Invalid => ProviderError::InvalidRequest(context()),
         ProviderFailureKind::Unsupported => ProviderError::Unknown(context()),
         ProviderFailureKind::Schema => ProviderError::Protocol(context()),
+        ProviderFailureKind::ContextOverflow => ProviderError::ContextOverflow(context()),
         ProviderFailureKind::Empty | ProviderFailureKind::Terminal => {
             ProviderError::Unknown(context())
         }

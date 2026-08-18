@@ -509,6 +509,7 @@ fn runtime_failure(error: &RuntimeError) -> ProviderFailure {
     let kind = match error {
         RuntimeError::Unsupported { .. } => ProviderFailureKind::Unsupported,
         RuntimeError::InvalidData { .. } => ProviderFailureKind::Schema,
+        RuntimeError::ContextOverflow { .. } => ProviderFailureKind::ContextOverflow,
         RuntimeError::Timeout { .. } | RuntimeError::AdapterFailure { .. } => {
             ProviderFailureKind::Transient
         }

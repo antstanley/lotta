@@ -17,6 +17,9 @@ thiserror.workspace = true
 lotta-runtime = { version = "0.1.0", path = "crates/lotta-runtime" }
 lotta-testkit = { version = "0.1.0", path = "crates/lotta-testkit" }
 lotta-memfs = { version = "0.1.0", path = "crates/lotta-memfs" }
+lotta-providers = { version = "0.1.0", path = "crates/lotta-providers" }
+lotta-extensions = { version = "0.1.0", path = "crates/lotta-extensions" }
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -30,6 +33,10 @@ path = "tests/slice/main.rs"
 [[test]]
 name = "cross_runtime"
 path = "tests/conformance/cross_runtime.rs"
+
+[[test]]
+name = "provider_equivalence"
+path = "tests/provider_equivalence.rs"
 
 [workspace]
 resolver = "3"

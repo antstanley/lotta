@@ -8,7 +8,7 @@ mod types;
 pub use load::{load_all, load_case, load_index};
 pub use replay::{
     ProviderFixtureError, ProviderReplayDivergence, ProviderReplayError, ProviderReplaySide,
-    replay_provider,
+    compare_provider_traces, replay_provider,
 };
 pub use types::{
     Dialect, Dimension, ErrorKindCase, HeaderFixture, InventoryEntry, InventoryKind, ProviderCase,

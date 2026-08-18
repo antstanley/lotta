@@ -12,7 +12,7 @@ pub use policy::{
     Clock, PROVIDER_BACKOFF_MS_MAX, PROVIDER_BUSY_BACKOFF_MS_BASE,
     PROVIDER_EMPTY_BACKOFF_MS_LINEAR, PROVIDER_FALLBACK_RETRY_ATTEMPT, PROVIDER_RETRIES_MAX,
     PROVIDER_RETRY_DEADLINE_MS_DEFAULT, ProviderFailure, ProviderFailureKind, RetryAfter,
-    RetryPolicy, Sleeper, SystemClock, TokioSleeper,
+    RetryPolicy, Sleeper, SystemClock, TokioSleeper, cap_backoff, validate_provider_retries,
 };
 
 #[cfg(test)]

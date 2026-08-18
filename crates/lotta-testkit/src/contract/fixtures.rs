@@ -127,6 +127,7 @@ pub fn provider_request(cancellation: CancellationToken) -> ProviderRequest {
             tier: None,
         },
         cancellation,
+        context: None,
         deadline: ProviderDeadline::new(Duration::from_secs(1)).expect("deadline"),
     }
 }

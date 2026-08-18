@@ -557,6 +557,7 @@ fn provider_request(text: &str) -> ProviderRequest {
             tier: None,
         },
         cancellation: CancellationToken::new(),
+        context: None,
         deadline: ProviderDeadline::new(Duration::from_secs(5)).unwrap(),
     }
 }

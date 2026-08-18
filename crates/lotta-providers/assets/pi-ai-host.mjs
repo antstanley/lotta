@@ -181,6 +181,7 @@ function validateRegistration(value) {
   if (models.some((model, index) => index && models[index - 1].id === model.id)) throw new Error("duplicate model");
   return { id, name, owner: registrationOwner, source: "mod", adapter: { ...value.adapter }, models,
     getModels() { return this.models; },
+    get api() { return value.adapter.api; },
     streamSimple(model, context, options) {
       const api = model.api === "openai-completions" ? openAICompletionsApi() : anthropicMessagesApi();
       return api.streamSimple(model, context, options);
@@ -275,9 +276,21 @@ function piContext(request) {
 function explicitOptions(params, controller) {
   const auth = params.auth;
   const provider = params.options?.provider ?? {};
+  const api = params.options?.api;
   const timeoutMs = Math.max(1, Math.min(TIMEOUT_MAX_MS, params.request.deadline_ms));
   const options = { ...provider, signal: controller.signal,
     maxTokens: Number(params.request.output_tokens_max), maxRetries: 0, timeoutMs,
+    onPayload: (payload) => {
+      if (payload && typeof payload === "object") {
+        payload.max_tokens = Number(params.request.output_tokens_max);
+        if (api === "anthropic-messages") {
+          payload.thinking = params.request.reasoning?.enabled
+            ? { type: "enabled", budget_tokens: Number(params.request.reasoning.budget_tokens) }
+            : { type: "disabled" };
+        }
+      }
+      return payload;
+    },
 
     env: params.options?.env ?? {}, headers: params.options?.headers ?? {},
     ...(params.request.tool_choice ? { toolChoice: params.request.tool_choice.type === "named"
@@ -287,7 +300,11 @@ function explicitOptions(params, controller) {
     AWS_SECRET_ACCESS_KEY: auth.secret_access_key, AWS_REGION: auth.region,
     ...(auth.session_token ? { AWS_SESSION_TOKEN: auth.session_token } : {}) };
   if (auth.type === "google_credentials") throw new Error("google credentials unsupported");
-  if (params.request.reasoning?.enabled) options.reasoning = params.request.reasoning.effort ?? "medium";
+  if (params.request.reasoning?.enabled) {
+    options.reasoning = params.request.reasoning.effort ?? "medium";
+    if (params.request.reasoning.budget_tokens != null)
+      options.thinkingBudgetTokens = Number(params.request.reasoning.budget_tokens);
+  }
   return options;
 }
 
@@ -329,6 +346,8 @@ function eventFromPi(event, state) {
     const entries = [];
     if (event.message.responseId) entries.push({ key: "id", value: event.message.responseId });
     if (event.message.model) entries.push({ key: "model", value: event.message.model });
+    if (state.transport.systemFingerprint) entries.push(
+      { key: "system_fingerprint", value: state.transport.systemFingerprint });
     const metadata = entries.length ? [{ type: "ProviderMetadata", entries }] : [];
     const usages = [...state.usages.values()];
     const completed = event.message.api === "anthropic-messages"
@@ -363,9 +382,15 @@ async function collectPi(params, stream) {
       const response = await nativeFetch(...args);
       transport.status = response.status;
       transport.headers = response.headers;
+      const clone = response.clone();
+      clone.json().then((body) => {
+        if (typeof body?.system_fingerprint === "string")
+          transport.systemFingerprint = body.system_fingerprint;
+      }).catch(() => {});
       return response;
     };
-    const source = provider.streamSimple(model, piContext(request), explicitOptions(params, stream.controller));
+    const source = provider.streamSimple(model, piContext(request),
+      explicitOptions({ ...params, options: { ...params.options, api: model.api } }, stream.controller));
     const state = { tools: new Map(), usages: new Map(), transport };
     try {
       for await (const event of source) {
@@ -458,7 +483,6 @@ function assertFixtureRequest(actual, expected) {
       delete tool.eager_input_streaming;
       delete tool.cache_control;
     }
-    stableBody.thinking = structuredClone(expected.body.thinking);
   }
   if (expected.endpoint === "/api/chat") {
     delete stableBody.stream_options;
@@ -473,7 +497,6 @@ function assertFixtureRequest(actual, expected) {
         message.content = message.content.filter((part) => part.type === "text").map((part) => part.text).join("");
     }
   }
-  stableBody.max_tokens ??= expected.body.max_tokens;
   for (const tool of stableBody.tools ?? []) {
     if (tool.function) delete tool.function.strict;
   }

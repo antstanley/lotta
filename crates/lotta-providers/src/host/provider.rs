@@ -127,6 +127,66 @@ impl HostProvider {
     pub fn shutdown(self) -> Result<(), HostError> {
         Ok(())
     }
+
+    async fn stream_operation(
+        &self,
+        wire: Value,
+        fixture: Option<HostFixtureStream>,
+        events: ProviderEventSink,
+        deadline: std::time::Duration,
+        started: Instant,
+    ) -> Result<(), RuntimeError> {
+        let mut client = HostClient::spawn(self.config.clone(), self.owner.clone())
+            .await
+            .map_err(|error| host_error(&error))?
+            .with_request_timeout(remaining(deadline, started)?);
+        let descriptors = self.descriptors.read().map_err(|_| unavailable())?.clone();
+        for descriptor in descriptors {
+            client
+                .register(descriptor)
+                .await
+                .map_err(|error| host_error(&error))?;
+        }
+        let stream_id = client
+            .inference_start(HostInferenceStart {
+                request: wire,
+                auth: self.auth.clone(),
+                options: self.options.clone(),
+                fixture,
+            })
+            .await
+            .map_err(|error| host_error(&error))?;
+        for sequence in 0..HOST_STREAM_EVENTS_MAX as u64 {
+            if events.is_cancelled() {
+                let _ = client.inference_cancel(&stream_id).await;
+                return Err(cancelled());
+            }
+            let payload = client
+                .inference_event(&stream_id, sequence)
+                .await
+                .map_err(|error| host_error(&error))?;
+            let raw_bytes =
+                serde_json::to_vec(&payload.event).map_err(|_| invalid("provider host event"))?;
+            crate::limits::validate_response_event_bytes(raw_bytes.len()).map_err(|_| {
+                RuntimeError::LimitExceeded {
+                    context: "PROVIDER_RESPONSE_EVENT_BYTES_MAX".into(),
+                }
+            })?;
+            let event = decode_event(&payload.event)?;
+            let terminal = matches!(
+                event,
+                ProviderEvent::Stop { .. } | ProviderEvent::Error { .. }
+            );
+            events.send(event).await?;
+            if terminal {
+                return client.shutdown().await.map_err(|error| host_error(&error));
+            }
+        }
+        let _ = client.inference_cancel(&stream_id).await;
+        Err(RuntimeError::LimitExceeded {
+            context: "provider host stream events".into(),
+        })
+    }
 }
 
 impl ProviderPort for HostProvider {
@@ -146,56 +206,35 @@ impl ProviderPort for HostProvider {
     ) -> lotta_runtime::ports::PortFuture<'_, ()> {
         Box::pin(async move {
             request.validate_bytes()?;
-            let wire = request_wire(&request)?;
+            crate::context::ContextGuard
+                .check(&request, None)
+                .map_err(context_error)?;
+            let supports_images = {
+                let descriptors = self.descriptors.read().map_err(|_| unavailable())?;
+                descriptors
+                    .iter()
+                    .find(|descriptor| {
+                        descriptor["id"].as_str() == Some(request.model.provider_id.as_str())
+                    })
+                    .and_then(|descriptor| descriptor["models"].as_array())
+                    .and_then(|models| {
+                        models.iter().find(|model| {
+                            model["id"].as_str().is_some_and(|id| {
+                                request.model.handle.as_str().ends_with(&format!("/{id}"))
+                            })
+                        })
+                    })
+                    .and_then(|model| model["input"].as_array())
+                    .is_some_and(|inputs| {
+                        inputs.iter().any(|input| input.as_str() == Some("image"))
+                    })
+            };
+            let wire = request_wire(&request, supports_images)?;
             let fixture = self.fixture.as_ref().map(fixture_wire).transpose()?;
             let deadline = request.deadline.get();
             let cancellation = request.cancellation.clone();
             let started = Instant::now();
-            let operation = async {
-                let mut client = HostClient::spawn(self.config.clone(), self.owner.clone())
-                    .await
-                    .map_err(|error| host_error(&error))?
-                    .with_request_timeout(remaining(deadline, started)?);
-                let descriptors = self.descriptors.read().map_err(|_| unavailable())?.clone();
-                for descriptor in descriptors {
-                    client
-                        .register(descriptor)
-                        .await
-                        .map_err(|error| host_error(&error))?;
-                }
-                let stream_id = client
-                    .inference_start(HostInferenceStart {
-                        request: wire,
-                        auth: self.auth.clone(),
-                        options: self.options.clone(),
-                        fixture,
-                    })
-                    .await
-                    .map_err(|error| host_error(&error))?;
-                for sequence in 0..HOST_STREAM_EVENTS_MAX as u64 {
-                    if events.is_cancelled() {
-                        let _ = client.inference_cancel(&stream_id).await;
-                        return Err(cancelled());
-                    }
-                    let payload = client
-                        .inference_event(&stream_id, sequence)
-                        .await
-                        .map_err(|error| host_error(&error))?;
-                    let event = decode_event(&payload.event)?;
-                    let terminal = matches!(
-                        event,
-                        ProviderEvent::Stop { .. } | ProviderEvent::Error { .. }
-                    );
-                    events.send(event).await?;
-                    if terminal {
-                        return client.shutdown().await.map_err(|error| host_error(&error));
-                    }
-                }
-                let _ = client.inference_cancel(&stream_id).await;
-                Err(RuntimeError::LimitExceeded {
-                    context: "provider host stream events".into(),
-                })
-            };
+            let operation = self.stream_operation(wire, fixture, events, deadline, started);
             tokio::select! {
                 biased;
                 () = cancellation.cancelled() => Err(cancelled()),
@@ -210,6 +249,18 @@ impl ProviderPort for HostProvider {
     }
 }
 
+fn context_error(error: crate::context::ContextGuardError) -> RuntimeError {
+    match error {
+        crate::context::ContextGuardError::Window(_) => invalid("provider context window"),
+        crate::context::ContextGuardError::Overflow(decision) => match decision {
+            lotta_runtime::ports::ProviderContextDecision::CompactionRequired(detail)
+            | lotta_runtime::ports::ProviderContextDecision::ContextOverflow(detail) => {
+                RuntimeError::ContextOverflow { detail }
+            }
+        },
+    }
+}
+
 fn validate_auth(auth: &HostAuth) -> Result<(), HostError> {
     let bytes = serde_json::to_vec(auth).map_err(|_| HostError::Configuration)?;
     if bytes.len() > HOST_CREDENTIAL_BYTES_MAX {
@@ -219,7 +270,8 @@ fn validate_auth(auth: &HostAuth) -> Result<(), HostError> {
     }
 }
 
-fn request_wire(request: &ProviderRequest) -> Result<Value, RuntimeError> {
+fn request_wire(request: &ProviderRequest, supports_images: bool) -> Result<Value, RuntimeError> {
+    request.validate_bytes()?;
     let model_id = request
         .model
         .handle
@@ -233,10 +285,10 @@ fn request_wire(request: &ProviderRequest) -> Result<Value, RuntimeError> {
         .map(|value| serde_json::to_value(value).map_err(|_| invalid("provider model settings")))
         .transpose()?
         .unwrap_or(Value::Null);
-    let messages = wire_messages(request)?;
+    let messages = wire_messages(request, supports_images)?;
     let tools = wire_tools(request);
     let tool_choice = wire_tool_choice(request);
-    Ok(json!({
+    let wire = json!({
         "model":{
             "id":model_id,
             "handle":request.model.handle.as_str(),
@@ -260,12 +312,36 @@ fn request_wire(request: &ProviderRequest) -> Result<Value, RuntimeError> {
         "reasoning":{
             "enabled":request.reasoning.enabled,
             "effort":request.reasoning.effort.as_ref().map(ProviderName::as_str),
-            "tier":request.reasoning.tier.as_ref().map(ProviderName::as_str)
+            "tier":request.reasoning.tier.as_ref().map(ProviderName::as_str),
+            "budget_tokens":reasoning_budget(request)
         }
-    }))
+    });
+    let bytes = serde_json::to_vec(&wire).map_err(|_| invalid("provider host request"))?;
+    crate::limits::validate_provider_request_bytes(bytes.len()).map_err(|_| {
+        RuntimeError::LimitExceeded {
+            context: "PROVIDER_REQUEST_BYTES_MAX".into(),
+        }
+    })?;
+    Ok(wire)
 }
 
-fn wire_messages(request: &ProviderRequest) -> Result<Vec<Value>, RuntimeError> {
+fn reasoning_budget(request: &ProviderRequest) -> Option<u64> {
+    if !request.reasoning.enabled {
+        return None;
+    }
+    let requested = match request.reasoning.effort.as_ref().map(ProviderName::as_str) {
+        Some("minimal") => 1_024,
+        Some("low") => 4_096,
+        Some("high" | "xhigh") => 16_384,
+        _ => 7_168,
+    };
+    Some(requested.min(request.output_tokens_max.get().saturating_sub(1_024)))
+}
+
+fn wire_messages(
+    request: &ProviderRequest,
+    supports_images: bool,
+) -> Result<Vec<Value>, RuntimeError> {
     request
         .messages
         .as_slice()
@@ -277,7 +353,7 @@ fn wire_messages(request: &ProviderRequest) -> Result<Vec<Value>, RuntimeError> 
                 ProviderMessageRole::Tool => "tool",
             };
             let content = request
-                .content_for_image_support(&message.content, true)?
+                .content_for_image_support(&message.content, supports_images)?
                 .as_slice()
                 .iter()
                 .map(|part| match part {
@@ -384,6 +460,11 @@ fn decode_tool_arguments(value: &Value) -> Result<ProviderEvent, RuntimeError> {
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(bytes)
         .map_err(|_| invalid("provider host arguments"))?;
+    crate::limits::validate_tool_argument_bytes(decoded.len()).map_err(|_| {
+        RuntimeError::LimitExceeded {
+            context: "TOOL_ARGUMENT_BYTES_MAX".into(),
+        }
+    })?;
     Ok(ProviderEvent::ToolCallArgumentsDelta {
         call_id: call_id(&value["call_id"])?,
         chunk: ToolArgumentChunk::new(decoded)?,

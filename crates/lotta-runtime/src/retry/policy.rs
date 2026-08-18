@@ -37,6 +37,8 @@ pub enum ProviderFailureKind {
     Unsupported,
     /// Response schema/protocol failure.
     Schema,
+    /// Context overflow requiring an explicit compaction decision.
+    ContextOverflow,
     /// Other terminal failure.
     Terminal,
 }
@@ -179,11 +181,36 @@ pub struct RetryPolicy {
     pub deadline_ms: u64,
 }
 
+/// Validates a configured retry count against the runtime/provider contract.
+///
+/// # Errors
+/// Returns a limit error above the canonical retry count.
+pub fn validate_provider_retries(value: u32) -> Result<(), crate::RuntimeError> {
+    if value > PROVIDER_RETRIES_MAX {
+        Err(crate::RuntimeError::LimitExceeded {
+            context: "PROVIDER_RETRIES_MAX".into(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// Caps retry backoff at the canonical maximum.
+#[must_use]
+pub const fn cap_backoff(value: u64) -> u64 {
+    if value > PROVIDER_BACKOFF_MS_MAX {
+        PROVIDER_BACKOFF_MS_MAX
+    } else {
+        value
+    }
+}
+
 impl Default for RetryPolicy {
     fn default() -> Self {
+        debug_assert!(validate_provider_retries(PROVIDER_RETRIES_MAX).is_ok());
         Self {
             retries_max: PROVIDER_RETRIES_MAX,
-            backoff_ms_max: PROVIDER_BACKOFF_MS_MAX,
+            backoff_ms_max: cap_backoff(PROVIDER_BACKOFF_MS_MAX),
             deadline_ms: PROVIDER_RETRY_DEADLINE_MS_DEFAULT,
         }
     }
@@ -211,7 +238,7 @@ impl RetryPolicy {
             || shaped_delay_ms(failure.kind, retry_attempt),
             |value| value.delay_ms(wall_now_ms),
         );
-        Some(selected.min(self.backoff_ms_max))
+        Some(cap_backoff(selected).min(self.backoff_ms_max))
     }
 }
 

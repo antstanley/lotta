@@ -3,7 +3,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Canonical maximum catalog entries owned by one provider.
-pub const MODELS_PER_PROVIDER_MAX: usize = 10_000;
+pub use crate::limits::MODELS_PER_PROVIDER_MAX;
 
 /// Non-secret provider connection state projected into model readiness.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -45,9 +45,8 @@ impl ModelCatalog {
         let mut models = BTreeMap::new();
         let mut handles = BTreeSet::new();
         for (provider, provider_models) in entries {
-            if provider_models.len() > MODELS_PER_PROVIDER_MAX {
-                return Err(ModelCatalogError::TooManyModels);
-            }
+            crate::limits::validate_models_per_provider(provider_models.len())
+                .map_err(|_| ModelCatalogError::TooManyModels)?;
             for model in &provider_models {
                 if model.handle.provider_id() != provider {
                     return Err(ModelCatalogError::ProviderMismatch);

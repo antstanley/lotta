@@ -6,7 +6,7 @@ use crate::bounds::{
     PROVIDER_STREAM_EVENTS_MAX, PROVIDER_TOOLS_MAX, TOOL_ARGUMENT_BYTES_MAX,
 };
 use lotta_domain::{BoundedJsonValue, BoundedVec, ModelDescriptor};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{self, Write};
@@ -121,6 +121,16 @@ impl TokenLimit {
 /// Validated finite, positive duration available to one provider operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProviderDeadline(Duration);
+/// Returns the canonical default provider operation timeout.
+#[must_use]
+pub const fn provider_timeout_default() -> Duration {
+    Duration::from_mins(10)
+}
+impl Default for ProviderDeadline {
+    fn default() -> Self {
+        Self(provider_timeout_default())
+    }
+}
 impl ProviderDeadline {
     /// Validates a duration representable as wire milliseconds.
     ///
@@ -138,6 +148,72 @@ impl ProviderDeadline {
     pub const fn get(self) -> Duration {
         self.0
     }
+}
+
+/// Safe source of a provider context token count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderContextTokenProvenance {
+    /// Count measured by a provider response.
+    Measured,
+    /// Estimate used provider/model tokenizer metadata.
+    ProviderTokenizer,
+    /// Estimate used the conservative fallback byte rule.
+    FallbackBytesPerToken,
+}
+
+/// Bounded context token count and its safe provenance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderContextTokenCount {
+    /// Token count.
+    pub tokens: u64,
+    /// How the count was obtained.
+    pub provenance: ProviderContextTokenProvenance,
+}
+
+/// Runtime-owned non-secret context-overflow diagnostic.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderContextOverflowDetail {
+    /// Optional provider-measured count.
+    pub measured: Option<ProviderContextTokenCount>,
+    /// Locally estimated count.
+    pub estimated: ProviderContextTokenCount,
+    /// Effective context limit.
+    pub limit: u64,
+    /// Safe provider identifier.
+    pub provider: String,
+    /// Safe model identifier.
+    pub model: String,
+    /// One-based provider attempt.
+    pub attempt: u8,
+    /// Number of completed overflow compactions.
+    pub compactions_completed: u8,
+}
+
+/// Typed context preflight decision returned by production adapters.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProviderContextDecision {
+    /// Compact and retry using the supplied safe detail.
+    CompactionRequired(ProviderContextOverflowDetail),
+    /// Repeated overflow is terminal.
+    ContextOverflow(ProviderContextOverflowDetail),
+}
+
+/// Non-secret context-window policy and optional provider observation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProviderContext {
+    /// Configured server ceiling.
+    pub server_max: Option<u64>,
+    /// Catalog model ceiling.
+    pub catalog_max: Option<u64>,
+    /// Agent setting ceiling.
+    pub agent_max: Option<u64>,
+    /// Conversation override ceiling.
+    pub conversation_max: Option<u64>,
+    /// Provider-measured input use from a prior response.
+    pub measured_input_tokens: Option<u64>,
+    /// Number of overflow-triggered compactions already completed.
+    pub compactions_completed: u8,
 }
 
 /// Fully normalized, owning input to one provider operation.
@@ -167,6 +243,8 @@ pub struct ProviderRequest {
     pub reasoning: ReasoningControls,
     /// Terminal cancellation shared with the bounded event channel.
     pub cancellation: CancellationToken,
+    /// Optional non-secret context policy and observation; never mapped to vendor requests.
+    pub context: Option<ProviderContext>,
     /// Maximum operation duration enforced by the adapter/runtime owner.
     pub deadline: ProviderDeadline,
 }
@@ -307,7 +385,20 @@ impl ProviderRequest {
     /// # Errors
     /// Returns the request byte-limit error when serialization overflows or exceeds 32 MiB.
     pub fn validate_bytes(&self) -> Result<(), RuntimeError> {
+        self.validate_images()?;
         self.normalized_wire_bytes().map(|_| ())
+    }
+
+    fn validate_images(&self) -> Result<(), RuntimeError> {
+        let mut total = 0_usize;
+        for message in self.messages.as_slice() {
+            for part in message.content.as_slice() {
+                if let ProviderContentPart::Image { bytes, .. } = part {
+                    validate_provider_image_bytes(bytes.as_slice().len(), &mut total)?;
+                }
+            }
+        }
+        Ok(())
     }
     /// Measures the exact compact normalized JSON wire size without allocating that wire.
     ///
@@ -338,7 +429,9 @@ impl ProviderRequest {
             },
             deadline_millis,
         };
-        measure_wire_with_limit(&wire, PROVIDER_REQUEST_BYTES_MAX.value)
+        let bytes = measure_wire_with_limit(&wire, PROVIDER_REQUEST_BYTES_MAX.value)?;
+        validate_provider_request_bytes(bytes)?;
+        Ok(bytes)
     }
     /// Maps content for an adapter's image capability without reordering retained parts.
     ///
@@ -366,6 +459,35 @@ impl ProviderRequest {
         ProviderContent::new(retained).map_err(|_| invalid("provider content"))
     }
 }
+/// Validates exact normalized provider request bytes at the runtime boundary.
+///
+/// # Errors
+/// Returns the canonical request limit error above 32 MiB.
+pub fn validate_provider_request_bytes(value: usize) -> Result<(), RuntimeError> {
+    if value > PROVIDER_REQUEST_BYTES_MAX.value {
+        Err(limit_request())
+    } else {
+        Ok(())
+    }
+}
+
+/// Validates one image and the checked aggregate at request construction/dispatch.
+///
+/// # Errors
+/// Returns the canonical image or request limit error.
+pub fn validate_provider_image_bytes(
+    value: usize,
+    aggregate: &mut usize,
+) -> Result<(), RuntimeError> {
+    if value > crate::bounds::PROVIDER_IMAGE_BYTES_MAX.value {
+        return Err(RuntimeError::LimitExceeded {
+            context: crate::bounds::PROVIDER_IMAGE_BYTES_MAX.name.into(),
+        });
+    }
+    *aggregate = aggregate.checked_add(value).ok_or_else(limit_request)?;
+    validate_provider_request_bytes(*aggregate)
+}
+
 fn measure_wire_with_limit(value: &impl Serialize, max: usize) -> Result<usize, RuntimeError> {
     let mut counter = BoundedCounter { count: 0, max };
     serde_json::to_writer(&mut counter, value).map_err(|_| limit_request())?;
@@ -478,10 +600,10 @@ impl ProviderError {
                 (ProviderFailureKind::Transient, value)
             }
             Self::Protocol(value) => (ProviderFailureKind::Schema, value),
-            Self::Quota(value)
-            | Self::ContextOverflow(value)
-            | Self::Cancelled(value)
-            | Self::Unknown(value) => (ProviderFailureKind::Terminal, value),
+            Self::ContextOverflow(value) => (ProviderFailureKind::ContextOverflow, value),
+            Self::Quota(value) | Self::Cancelled(value) | Self::Unknown(value) => {
+                (ProviderFailureKind::Terminal, value)
+            }
         };
         let failure = ProviderFailure::new(
             kind,
@@ -600,6 +722,11 @@ impl ProviderMetadata {
     #[must_use]
     pub fn get(&self, key: &ProviderName) -> Option<&serde_json::Value> {
         self.0.get(key).map(BoundedJsonValue::as_value)
+    }
+
+    /// Iterates retained, safe metadata entries in canonical key order.
+    pub fn iter(&self) -> impl Iterator<Item = (&ProviderName, &serde_json::Value)> {
+        self.0.iter().map(|(key, value)| (key, value.as_value()))
     }
 }
 fn secret_key(key: &str) -> bool {

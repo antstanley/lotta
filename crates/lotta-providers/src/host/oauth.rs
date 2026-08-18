@@ -13,7 +13,7 @@ use subtle::ConstantTimeEq as _;
 use url::Url;
 
 /// Canonical OAuth state lifetime from spec 06.
-pub const OAUTH_STATE_TTL_SECONDS: u64 = 600;
+pub use crate::limits::OAUTH_STATE_TTL_SECONDS;
 /// Maximum concurrent pending OAuth flows.
 pub const OAUTH_PENDING_FLOWS_MAX: usize = 64;
 /// Maximum OAuth protocol string bytes.
@@ -489,7 +489,7 @@ impl OAuthManager {
         let challenge = pkce_challenge(verifier.expose());
         let now = self.clock.now_seconds();
         let expires_at = now
-            .checked_add(OAUTH_STATE_TTL_SECONDS)
+            .checked_add(crate::limits::oauth_state_ttl().as_secs())
             .ok_or(OAuthError::InvalidInput)?;
         let url = authorization_url(&state, &challenge, redirect)?;
         {

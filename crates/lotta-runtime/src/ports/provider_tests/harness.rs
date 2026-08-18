@@ -63,6 +63,7 @@ pub(super) fn request(policy: ImagePolicy) -> ProviderRequest {
             tier: Some(name("priority")),
         },
         cancellation: CancellationToken::new(),
+        context: None,
         deadline: ProviderDeadline::new(Duration::from_secs(30)).unwrap(),
     }
 }
@@ -629,6 +630,7 @@ pub(crate) fn provider_request_fields_have_exact_types() {
         output_tokens_max,
         reasoning,
         cancellation,
+        context,
         deadline,
     } = request(ImagePolicy::Strict);
     let _: ModelDescriptor = model;
@@ -641,6 +643,7 @@ pub(crate) fn provider_request_fields_have_exact_types() {
     let _: TokenLimit = output_tokens_max;
     let _: ReasoningControls = reasoning;
     let _: CancellationToken = cancellation;
+    let _: Option<crate::ports::ProviderContext> = context;
     let _: ProviderDeadline = deadline;
 }
 

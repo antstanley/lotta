@@ -59,6 +59,10 @@ async fn execute(dialect: Dialect, size: usize) -> (bool, Loopback) {
     };
     let mut request = provider_request(CancellationToken::new());
     request.system_prompt = Some(ProviderText::new("x".repeat(size)).expect("text"));
+    request.context = Some(lotta_runtime::ports::ProviderContext {
+        catalog_max: Some(u64::from(u32::MAX)),
+        ..Default::default()
+    });
     let cancellation = CancellationToken::new();
     let (sink, _receiver) = provider_event_channel(8, &cancellation).expect("channel");
     let expected = request.validate_bytes().is_ok();
@@ -84,6 +88,10 @@ async fn assert_public_outbound_bound(dialect: Dialect) {
 fn request_with_size(size: usize) -> lotta_runtime::ports::ProviderRequest {
     let mut request = provider_request(CancellationToken::new());
     request.system_prompt = Some(ProviderText::new("x".repeat(size)).expect("text"));
+    request.context = Some(lotta_runtime::ports::ProviderContext {
+        catalog_max: Some(u64::from(u32::MAX)),
+        ..Default::default()
+    });
     request
 }
 

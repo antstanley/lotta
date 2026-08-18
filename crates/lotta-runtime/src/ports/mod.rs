@@ -24,12 +24,14 @@ pub use process::{
     SandboxPort,
 };
 pub use provider_contract::{
-    ImagePolicy, ProviderContent, ProviderContentPart, ProviderDeadline, ProviderError,
-    ProviderErrorContext, ProviderEventReceiver, ProviderEventSink, ProviderMessage,
-    ProviderMessageRole, ProviderMessages, ProviderMetadata, ProviderMetadataInput, ProviderPort,
-    ProviderRequest, ProviderToolChoice, ProviderToolDefinition, ProviderTools, ReasoningControls,
-    StopReason, TokenLimit, ToolArgumentBuffer, ToolCallAccumulator, ToolCallId,
-    provider_event_channel,
+    ImagePolicy, ProviderContent, ProviderContentPart, ProviderContext, ProviderContextDecision,
+    ProviderContextOverflowDetail, ProviderContextTokenCount, ProviderContextTokenProvenance,
+    ProviderDeadline, ProviderError, ProviderErrorContext, ProviderEventReceiver,
+    ProviderEventSink, ProviderMessage, ProviderMessageRole, ProviderMessages, ProviderMetadata,
+    ProviderMetadataInput, ProviderPort, ProviderRequest, ProviderToolChoice,
+    ProviderToolDefinition, ProviderTools, ReasoningControls, StopReason, TokenLimit,
+    ToolArgumentBuffer, ToolCallAccumulator, ToolCallId, provider_event_channel,
+    provider_timeout_default, validate_provider_image_bytes, validate_provider_request_bytes,
 };
 pub use provider_event::{ProviderEvent, ProviderUsage};
 pub use store::{AgentStore, ConversationStore};

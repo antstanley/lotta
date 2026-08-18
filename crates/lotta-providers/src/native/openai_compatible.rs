@@ -106,6 +106,18 @@ impl OpenAiCompatible {
     }
 }
 
+fn context_error(error: crate::context::ContextGuardError) -> RuntimeError {
+    match error {
+        crate::context::ContextGuardError::Window(_) => invalid("provider context window"),
+        crate::context::ContextGuardError::Overflow(decision) => match decision {
+            lotta_runtime::ports::ProviderContextDecision::CompactionRequired(detail)
+            | lotta_runtime::ports::ProviderContextDecision::ContextOverflow(detail) => {
+                RuntimeError::ContextOverflow { detail }
+            }
+        },
+    }
+}
+
 fn invalid(context: &'static str) -> RuntimeError {
     RuntimeError::InvalidData {
         context: context.into(),
@@ -140,6 +152,9 @@ async fn stream_openai(
     events: ProviderEventSink,
 ) -> Result<(), RuntimeError> {
     request.validate_bytes()?;
+    crate::context::ContextGuard
+        .check(&request, None)
+        .map_err(context_error)?;
     let body = map_request(adapter, &request)?;
     let deadline = Instant::now() + request.deadline.get();
     let mut builder = adapter
@@ -269,6 +284,8 @@ async fn read_error_body(
         };
         let Some(chunk) = chunk else { break };
         let chunk = chunk.map_err(|_| transport_error())?;
+        crate::limits::validate_response_event_bytes(chunk.len())
+            .map_err(|_| protocol_error("provider response chunk limit"))?;
         if body.len().saturating_add(chunk.len()) > shared::ERROR_BODY_BYTES_MAX {
             break;
         }
@@ -435,7 +452,12 @@ async fn next_chunk(
         result = tokio::time::timeout_at(deadline, stream.next()) => match result {
             Err(_) => Err(terminal_error("timeout", "provider request timed out")),
             Ok(Some(Err(_))) => Err(transport_error()),
-            Ok(value) => Ok(value.transpose().expect("transport error handled")),
+            Ok(Some(Ok(value))) => {
+                crate::limits::validate_response_event_bytes(value.len())
+                    .map_err(|_| protocol_error("provider response chunk limit"))?;
+                Ok(Some(value))
+            }
+            Ok(None) => Ok(None),
         }
     }
 }

@@ -60,6 +60,7 @@ pub(super) fn convert_request(
             tier: value.reasoning.tier.map(ProviderName::new).transpose()?,
         },
         cancellation: CancellationToken::new(),
+        context: None,
         deadline: ProviderDeadline::new(Duration::from_millis(value.deadline_ms))?,
     };
     request.validate_bytes()?;
