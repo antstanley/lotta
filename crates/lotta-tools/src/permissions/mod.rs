@@ -122,6 +122,7 @@ impl PermissionGate for PolicyGate<'_> {
 ///
 /// Canonical paths retained here are policy snapshots, never I/O capabilities. A later
 /// sandbox/effect adapter must re-resolve and no-follow-check every path before every effect.
+#[derive(Clone)]
 pub struct PermissionPolicy {
     file_rules: Vec<PermissionRule>,
     cwd: PathBuf,

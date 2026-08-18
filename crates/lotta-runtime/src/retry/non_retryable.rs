@@ -30,7 +30,7 @@ async fn assert_single_attempt(time: &FakeTime, events: &Events, port: &Scripted
     let (terminal, output) = run(RetryPolicy::default(), time, events, port)
         .await
         .unwrap();
-    assert!(matches!(terminal, RetryTerminal::Failure(_)));
+    assert!(matches!(terminal, RetryTerminal::Failure { .. }));
     assert!(output.is_empty());
     assert_eq!(port.calls(), 1);
     assert!(events.values.lock().unwrap().is_empty());

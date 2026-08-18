@@ -63,6 +63,12 @@ impl LeaseGuard {
         }
     }
 
+    /// Returns the exact captured turn lease for scoped adapter calls.
+    #[must_use]
+    pub const fn lease(&self) -> &TurnLease {
+        &self.lease
+    }
+
     /// Applies one effect only after all four live checks pass.
     pub fn apply_after_await<T>(
         &self,
@@ -91,6 +97,34 @@ impl LeaseGuard {
             Ok(()) => LeaseEffect::Applied(()),
             Err(_) => LeaseEffect::Suppressed(SuppressionReason::StaleLease),
         }
+    }
+
+    /// Applies terminal cancellation cleanup when this exact owner is still current.
+    ///
+    /// # Errors
+    /// Returns the durable effect failure or a lifecycle ownership invariant failure.
+    pub fn finish_cancelled_turn_with_effect_after_await<T>(
+        &self,
+        registry: &mut ListenerRuntime,
+        stop_reason: StopReason,
+        effect: impl FnOnce() -> Result<T, crate::RuntimeError>,
+    ) -> Result<LeaseEffect<T>, crate::RuntimeError> {
+        if let Err(reason) = self.check_owner(registry) {
+            return Ok(LeaseEffect::Suppressed(reason));
+        }
+        let value = effect()?;
+        let owner =
+            registry
+                .lifecycle_mut(&self.handle)
+                .map_err(|_| crate::RuntimeError::NotFound {
+                    context: "checked cancelled turn runtime".into(),
+                })?;
+        owner
+            .finish_turn(&self.lease, stop_reason)
+            .map_err(|_| crate::RuntimeError::Conflict {
+                context: "checked cancelled turn lease".into(),
+            })?;
+        Ok(LeaseEffect::Applied(value))
     }
 
     /// Checks once, applies a terminal effect, then releases the exact owner synchronously.
@@ -126,6 +160,16 @@ impl LeaseGuard {
     }
 
     fn check(&self, registry: &ListenerRuntime) -> Result<(), SuppressionReason> {
+        self.check_owner(registry)?;
+        if self.cancellation.is_cancelled()
+            && self.policy == CancellationPolicy::SuppressWhenCancelled
+        {
+            return Err(SuppressionReason::CancellationDenied);
+        }
+        Ok(())
+    }
+
+    fn check_owner(&self, registry: &ListenerRuntime) -> Result<(), SuppressionReason> {
         if !registry.is_active() {
             return Err(SuppressionReason::ListenerInactive);
         }
@@ -134,11 +178,6 @@ impl LeaseGuard {
         };
         if !owner.is_current(&self.lease) {
             return Err(SuppressionReason::StaleLease);
-        }
-        if self.cancellation.is_cancelled()
-            && self.policy == CancellationPolicy::SuppressWhenCancelled
-        {
-            return Err(SuppressionReason::CancellationDenied);
         }
         Ok(())
     }

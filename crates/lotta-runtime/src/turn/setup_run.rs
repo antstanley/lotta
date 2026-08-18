@@ -48,7 +48,9 @@ pub async fn run_turn_with_setup<'ports>(
 ) -> Result<TurnRunOutcome, RuntimeError> {
     let prepared = setup.prepare(input).await?;
     debug_assert_eq!(prepared.status, SetupStatus::Sending);
-    let status = DispatchStatus { ports: setup_ports };
+    let status = DispatchStatus {
+        sink: prepared.status_sink.as_ref(),
+    };
     let ports = turn_ports(&prepared.tools, provider, tools, effects).with_provider_start(&status);
     let result = super::run_turn(runtime, handle, lease, prepared.request, ports).await;
     if let Err(error) = &result {
@@ -63,14 +65,14 @@ pub async fn run_turn_with_setup<'ports>(
 }
 
 struct DispatchStatus<'a> {
-    ports: &'a dyn SetupPorts,
+    sink: &'a dyn super::setup::SetupStatusSink,
 }
 
 impl ProviderStartPort for DispatchStatus<'_> {
     fn provider_start(&self) -> crate::ports::PortFuture<'_, ()> {
         Box::pin(async move {
-            self.ports
-                .emit_status(SetupStatus::Sending)
+            self.sink
+                .emit(SetupStatus::Sending)
                 .map_err(|error| setup_error(&error))?;
             Ok(())
         })
@@ -78,8 +80,8 @@ impl ProviderStartPort for DispatchStatus<'_> {
 
     fn provider_waiting(&self) -> crate::ports::PortFuture<'_, ()> {
         Box::pin(async move {
-            self.ports
-                .emit_status(SetupStatus::Waiting)
+            self.sink
+                .emit(SetupStatus::Waiting)
                 .map_err(|error| setup_error(&error))
         })
     }

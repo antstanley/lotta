@@ -198,6 +198,14 @@ impl ConnectionManager {
             .collect()
     }
 
+    /// Returns a scrubbed snapshot for one stable connection ID.
+    #[must_use]
+    pub fn snapshot(&self, provider_id: &str) -> Option<ConnectionSnapshot> {
+        self.snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.id == provider_id)
+    }
+
     /// Resolves secret authentication by stable connection ID for one adapter call.
     ///
     /// # Errors
@@ -212,6 +220,32 @@ impl ConnectionManager {
             .find(|record| record.id == provider_id)
             .map(|record| use_auth(&record.auth))
             .ok_or(ConnectionError::NotFound)
+    }
+
+    /// Builds one adapter through an injected secret-scoped resolver.
+    ///
+    /// # Errors
+    /// Returns a scrubbed connection error without reflecting credentials or vendor details.
+    pub async fn build_with<T, F>(&self, provider_id: &str, build: F) -> Result<T, ConnectionError>
+    where
+        F: for<'a> FnOnce(
+            &'a str,
+            &'a ProviderAuth,
+            Option<&'a str>,
+        )
+            -> Pin<Box<dyn Future<Output = Result<T, ConnectionError>> + Send + 'a>>,
+    {
+        let record = self
+            .records
+            .values()
+            .find(|record| record.id == provider_id)
+            .ok_or(ConnectionError::NotFound)?;
+        build(
+            &record.provider_type,
+            &record.auth,
+            record.base_url.as_deref(),
+        )
+        .await
     }
 
     /// Resolves a stored connection into a real stream without exposing its secret publicly.

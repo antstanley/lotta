@@ -151,6 +151,8 @@ pub struct ResolvedTurnModel {
     pub toolset: String,
     /// Optional post-merge allowlist.
     pub allowlist: Option<Vec<String>>,
+    /// Deterministically ordered, available request-local fallback candidates.
+    pub fallback_candidates: Vec<lotta_domain::ModelDescriptor>,
 }
 
 /// Opaque extension snapshot identity captured by the production composition port.
@@ -217,6 +219,29 @@ impl ReminderClaim {
 }
 
 /// Setup input retained before any allocating setup stage.
+pub trait SetupStatusSink: Send + Sync {
+    /// Emits one status for this exact setup call.
+    fn emit(&self, status: SetupStatus) -> Result<(), SetupError>;
+}
+
+/// Opaque canonical scope identity retained for one prepared turn.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SetupScopeHandle(u64);
+
+impl SetupScopeHandle {
+    /// Creates a handle from a production-owned unique identifier.
+    #[must_use]
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+    /// Returns the opaque identifier.
+    #[must_use]
+    pub const fn id(self) -> u64 {
+        self.0
+    }
+}
+
+/// Setup input retained before any allocating setup stage.
 pub struct SetupInput {
     /// Requested agent scope.
     pub agent_id: AgentId,
@@ -236,6 +261,8 @@ pub struct SetupInput {
     pub cancellation: CancellationToken,
     /// Whole-setup deadline.
     pub deadline: Duration,
+    /// Per-call status destination retained through dispatch.
+    pub status_sink: std::sync::Arc<dyn SetupStatusSink>,
 }
 
 /// Production setup boundaries. Implementations adapt actual store, `MemFS`, extension, provider,
@@ -262,7 +289,7 @@ pub trait SetupPorts: Send + Sync {
         cwd: &Path,
         mode: PermissionMode,
         cancellation: &CancellationToken,
-    ) -> crate::ports::PortFuture<'_, ()>;
+    ) -> crate::ports::PortFuture<'_, SetupScopeHandle>;
     /// Synchronizes or initializes the real agent `MemFS` repository.
     fn prepare_memfs(
         &self,
@@ -282,6 +309,7 @@ pub trait SetupPorts: Send + Sync {
         agent: &Agent,
         conversation: &Conversation,
         inventory: &SkillInventory,
+        scope: SetupScopeHandle,
         reminder: Option<&str>,
         cancellation: &CancellationToken,
     ) -> crate::ports::PortFuture<'_, String>;
@@ -307,6 +335,7 @@ pub trait SetupPorts: Send + Sync {
     /// Collects five real tool-source candidates.
     fn tool_candidates(
         &self,
+        scope: SetupScopeHandle,
         extensions: &ExtensionSnapshot,
         cancellation: &CancellationToken,
     ) -> Result<Vec<ToolCandidate>, SetupError>;
@@ -350,6 +379,7 @@ pub trait SetupPorts: Send + Sync {
         agent: &AgentId,
         conversation: &ConversationId,
         original: &Path,
+        scope: SetupScopeHandle,
         cancellation: &CancellationToken,
     ) -> crate::ports::PortFuture<'_, Option<ReminderClaim>>;
     /// Releases an unconsumed reminder claim after a pre-admission failure.
@@ -364,16 +394,22 @@ pub trait SetupPorts: Send + Sync {
         receipt: &AdmissionReceipt,
         failure: &SetupError,
     ) -> crate::ports::PortFuture<'_, ()>;
-    /// Emits loop status.
-    fn emit_status(&self, status: SetupStatus) -> Result<(), SetupError>;
-    /// Releases stage-three resources on pre-admission failure.
-    fn rollback_scope(&self);
+    /// Releases one exact stage-three scope snapshot.
+    fn release_scope(&self, scope: SetupScopeHandle);
 }
 
 /// Successful complete setup.
 pub struct SetupOutput {
     /// Validated provider request.
     pub request: ProviderRequest,
+    /// Exact resolved model inputs retained for request refresh.
+    pub model: ResolvedTurnModel,
+    /// Deterministically ordered available fallback models retained for execution.
+    pub fallback_candidates: Vec<lotta_domain::ModelDescriptor>,
+    /// Exact compiled prompt retained for request refresh.
+    pub prompt: String,
+    /// Exact submitted user input retained for request refresh.
+    pub input: String,
     /// Turn-local validated tool catalog.
     pub tools: TurnToolCatalog,
     /// Exact log appended only after each completed stage.
@@ -382,6 +418,10 @@ pub struct SetupOutput {
     pub admission: AdmissionReceipt,
     /// Exact immutable extensions captured at stage eight for this turn.
     pub extensions: ExtensionSnapshot,
+    /// Exact immutable production scope captured at stage three.
+    pub scope: SetupScopeHandle,
+    /// Per-call status destination for provider dispatch.
+    pub status_sink: std::sync::Arc<dyn SetupStatusSink>,
     /// Loop status that must be emitted immediately before provider dispatch.
     pub status: SetupStatus,
 }

@@ -19,6 +19,28 @@ pub enum RuntimeEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         conversation_id: Option<NonEmptyString>,
     },
+    /// Controller-owned external tool execution request.
+    #[serde(rename = "controller_tool_request")]
+    ControllerToolRequest {
+        /// Stable provider call identifier.
+        call_id: NonEmptyString,
+        /// Captured lifecycle lease generation.
+        lease_generation: u64,
+        /// Bounded non-secret request body.
+        request: BoundedJsonValue,
+    },
+    /// Context compaction request delegated to a production service.
+    #[serde(rename = "compaction_request")]
+    CompactionRequest {
+        /// Captured lifecycle lease generation.
+        lease_generation: u64,
+        /// Estimated model-visible tokens before compaction.
+        tokens_before: u64,
+        /// Model-visible messages before compaction.
+        messages_before: usize,
+        /// Stable compaction reason.
+        reason: NonEmptyString,
+    },
     /// Authoritative device status snapshot.
     #[serde(rename = "update_device_status")]
     UpdateDeviceStatus {
@@ -76,6 +98,8 @@ impl RuntimeEvent {
     pub const fn discriminant(&self) -> &'static str {
         match self {
             Self::ControlRequest { .. } => "control_request",
+            Self::ControllerToolRequest { .. } => "controller_tool_request",
+            Self::CompactionRequest { .. } => "compaction_request",
             Self::UpdateDeviceStatus { .. } => "update_device_status",
             Self::UpdateLoopStatus { .. } => "update_loop_status",
             Self::UpdateQueue { .. } => "update_queue",

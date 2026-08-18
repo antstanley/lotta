@@ -1,7 +1,8 @@
 //! Concrete production server composition.
 
 use crate::production_setup::{
-    ProductionSetupConfig, ProductionSetupPorts, ProductionStatusSink, ProductionTurnController,
+    ProductionCompactionService, ProductionSetupConfig, ProductionSetupPorts,
+    ProductionTurnBrokers, ProductionTurnController,
 };
 use lotta_app_server::config::PreparedServer;
 use lotta_app_server::error::AppServerError;
@@ -26,14 +27,21 @@ use lotta_extensions::{
     skills::{SkillDiscovery, SkillRoots, SkillSources, SkillToolPort},
 };
 use lotta_memfs::GitMemFs;
+use lotta_providers::connections::{
+    ConnectionAdapterFactory, ConnectionError, ConnectionManager, HostConnectionAdapterFactory,
+    ProviderAuthStore,
+};
+use lotta_providers::host::client::{HostConfig, materialize_host_script};
 use lotta_providers::model::ModelHandle;
+use lotta_providers::native::NativeAdapterRegistry;
 use lotta_runtime::boundary::{ProviderEventText, ProviderName};
 use lotta_runtime::ports::{
     AgentStore, ConversationStore, PortFuture, ProviderError, ProviderErrorContext, ProviderEvent,
     ProviderEventSink, ProviderPort, ProviderRequest, ToolExecutionRequest, ToolOutcome, ToolPort,
 };
 use lotta_runtime::turn::{
-    SetupError, SetupStatus, ToolResultRecord, TurnEffectPort, TurnEvent, TurnProjection,
+    ControlRequest, ControllerToolRequestRecord, SetupError, ToolResultRecord, TurnEffectPort,
+    TurnEvent, TurnProjection, TurnStopRecord,
 };
 use lotta_runtime::{
     AdmissionOutcome, AdmissionRequest, AdmissionRoute, ListenerRuntime, RuntimeKey,
@@ -57,6 +65,7 @@ use lotta_tools::builtin::{
 use lotta_tools::sandbox::OsSandbox;
 use lotta_tools::{ToolRegistration, ToolsetId, WorkspacePolicy};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -71,6 +80,11 @@ const TRANSCRIPT_SESSION_SCHEMA_VERSION: u8 = 3;
 pub struct ProductionComponents {
     runtime_service: Arc<ProductionRuntimeService>,
     turn_controller: Arc<ProductionTurnController>,
+    #[allow(
+        dead_code,
+        reason = "internal Task56/future service seam owns shared brokers"
+    )]
+    brokers: Arc<ProductionTurnBrokers>,
 }
 
 impl ProductionComponents {
@@ -81,16 +95,30 @@ impl ProductionComponents {
     ) -> Result<Self, SetupError> {
         let root = prepared.storage_dir.clone();
         let workspace = prepared.workspace_dir.clone();
-        let setup = Arc::new(ProductionSetupPorts::new(setup_config(&root, &workspace)?)?);
-        let provider: Arc<dyn ProviderPort> = Arc::new(UnavailableProvider);
-        let tools: Arc<dyn ToolPort> = Arc::new(ProductionToolPort);
         let store_paths = StorePaths::new(&root).map_err(adapter)?;
+        let provider_runtime = production_provider_runtime(&store_paths, &root)?;
+        let (models, default_model) = production_catalog(&provider_runtime)?;
+        let setup = Arc::new(ProductionSetupPorts::new(setup_config(
+            &root,
+            &workspace,
+            models,
+            default_model,
+            provider_runtime.connections(),
+        )?)?);
+        let provider = Arc::new(provider_runtime);
+        let tools = Arc::new(ProductionToolPort::new(
+            setup.registry(),
+            setup.hook_runtime(),
+            root.join("artifacts"),
+        )?);
         let runtime_state = Arc::new(ProductionRuntimeState::new());
+        let brokers = Arc::new(ProductionTurnBrokers::new());
         let runtime_service = Arc::new(ProductionRuntimeService::new(
             store_paths.clone(),
             Arc::clone(&clock),
             setup.hook_runtime(),
             Arc::clone(&runtime_state),
+            Arc::clone(&brokers),
         ));
         let turn_controller = Arc::new(ProductionTurnController::new(
             Arc::clone(&setup),
@@ -100,10 +128,12 @@ impl ProductionComponents {
             Arc::clone(&clock),
             workspace,
             runtime_state,
+            Arc::clone(&brokers),
         ));
         Ok(Self {
             runtime_service,
             turn_controller,
+            brokers,
         })
     }
 
@@ -117,6 +147,15 @@ impl ProductionComponents {
     #[must_use]
     pub fn turn_controller(&self) -> Arc<dyn TurnController> {
         self.turn_controller.clone()
+    }
+
+    /// Registers or clears the internal production compaction service seam.
+    #[allow(dead_code, reason = "internal Task58 registration seam")]
+    pub fn register_compaction_service(
+        &self,
+        service: Option<Arc<dyn ProductionCompactionService>>,
+    ) {
+        self.brokers.register_compaction_service(service);
     }
 }
 
@@ -234,9 +273,10 @@ fn production_hostname() -> String {
 fn setup_config(
     root: &std::path::Path,
     workspace: &std::path::Path,
+    models: Vec<ModelDescriptor>,
+    default_model: ModelHandle,
+    connections: Vec<lotta_providers::connections::ConnectionSnapshot>,
 ) -> Result<ProductionSetupConfig, SetupError> {
-    let handle = ModelHandle::from_str("openai/gpt-5.4").map_err(adapter)?;
-    let model = production_model(&handle)?;
     let sandbox = WorkspaceSandbox::new(workspace.to_path_buf(), root.to_path_buf());
     let workspace_policy = WorkspacePolicy::new(&sandbox)
         .map_err(|_| SetupError::Adapter("workspace policy".into()))?;
@@ -251,8 +291,9 @@ fn setup_config(
     Ok(ProductionSetupConfig {
         store_paths: StorePaths::new(root).map_err(adapter)?,
         skill_roots,
-        models: vec![model],
-        default_model: handle,
+        models,
+        default_model,
+        connections,
         server_context_window: DEFAULT_CONTEXT_WINDOW_TOKENS,
         output_tokens: DEFAULT_OUTPUT_TOKENS,
         registry,
@@ -265,16 +306,121 @@ fn setup_config(
         workspace_policy,
         toolset: ToolsetId::Codex,
         allowlist: None,
-        status_sink: Arc::new(ProductionStatus),
     })
 }
 
-fn production_model(handle: &ModelHandle) -> Result<ModelDescriptor, SetupError> {
+fn production_provider_runtime(
+    paths: &StorePaths,
+    root: &Path,
+) -> Result<ProductionProviderPort, SetupError> {
+    let config = production_host_config(root)?;
+    let owner = lotta_extensions::sidecar::SidecarOwnerIdentity::new(
+        "production-provider",
+        "production-provider-runtime",
+        "production-provider-conversation",
+    )
+    .map_err(adapter)?;
+    let host: Arc<dyn ConnectionAdapterFactory> =
+        Arc::new(HostConnectionAdapterFactory::new(config, owner));
+    let manager = ConnectionManager::load(ProviderAuthStore::new(paths.clone()))
+        .map_err(|_| SetupError::Adapter("provider connection store".into()))?;
+    Ok(ProductionProviderPort::new(
+        manager,
+        NativeAdapterRegistry::production(),
+        host,
+    ))
+}
+
+fn production_host_config(root: &Path) -> Result<HostConfig, SetupError> {
+    let bun = std::env::var_os("LOTTA_BUN")
+        .map(PathBuf::from)
+        .or_else(|| {
+            [
+                "/opt/homebrew/bin/bun",
+                "/usr/local/bin/bun",
+                "/usr/bin/bun",
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file())
+        })
+        .ok_or_else(|| SetupError::Adapter("provider host runtime".into()))?
+        .canonicalize()
+        .map_err(adapter)?;
+    let package = std::env::var_os("LOTTA_PI_AI_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../letta-code/node_modules/@earendil-works/pi-ai")
+        })
+        .canonicalize()
+        .map_err(|_| SetupError::Adapter("provider host package".into()))?;
+    let host_root = root.join("provider-host");
+    let scratch = host_root.join("scratch");
+    let script = host_root.join("pi-ai-host.mjs");
+    std::fs::create_dir_all(&scratch).map_err(adapter)?;
+    materialize_host_script(&script)
+        .map_err(|_| SetupError::Adapter("provider host script".into()))?;
+    Ok(HostConfig {
+        bun_executable: bun,
+        host_script: script.canonicalize().map_err(adapter)?,
+        package_root: package,
+        scratch_cwd: scratch.canonicalize().map_err(adapter)?,
+        test_mode: false,
+    })
+}
+
+fn production_catalog(
+    runtime: &ProductionProviderPort,
+) -> Result<(Vec<ModelDescriptor>, ModelHandle), SetupError> {
+    let mut models = Vec::new();
+    for connection in runtime.connections() {
+        let model_id = default_model_id(&connection.provider_type);
+        models.push(production_model(
+            &connection.id,
+            model_id,
+            DEFAULT_CONTEXT_WINDOW_TOKENS,
+            connection.is_connected,
+        )?);
+    }
+    models.sort_by(|left, right| left.handle.as_str().cmp(right.handle.as_str()));
+    if let Some(handle) = models
+        .iter()
+        .find(|model| model.available)
+        .map(|model| model.handle.as_str().to_owned())
+    {
+        return Ok((models, ModelHandle::from_str(&handle).map_err(adapter)?));
+    }
+    // Task54 contract: a typed unavailable descriptor is retained only when configuration is empty.
+    let unavailable = production_model(
+        "unavailable",
+        "unavailable",
+        DEFAULT_CONTEXT_WINDOW_TOKENS,
+        false,
+    )?;
+    let handle = ModelHandle::from_str(unavailable.handle.as_str()).map_err(adapter)?;
+    Ok((vec![unavailable], handle))
+}
+
+fn default_model_id(provider_type: &str) -> &str {
+    match provider_type {
+        "anthropic" => "claude-sonnet-4-5",
+        "openai" => "gpt-5.4",
+        _ => "default",
+    }
+}
+
+fn production_model(
+    provider_id: &str,
+    model_id: &str,
+    context_window: u64,
+    available: bool,
+) -> Result<ModelDescriptor, SetupError> {
     Ok(ModelDescriptor {
-        handle: NonEmptyString::new(handle.to_string()).map_err(adapter)?,
-        provider_id: NonEmptyString::new("openai").map_err(adapter)?,
-        available: true,
-        context_window: Some(DEFAULT_CONTEXT_WINDOW_TOKENS),
+        handle: NonEmptyString::new(format!("{provider_id}/{model_id}")).map_err(adapter)?,
+        provider_id: NonEmptyString::new(provider_id.to_owned()).map_err(adapter)?,
+        available,
+        context_window: Some(context_window),
         model_settings: None,
     })
 }
@@ -340,13 +486,6 @@ impl lotta_runtime::ports::ModelCapabilityPort for UnavailableModelCapability {
     }
 }
 
-struct ProductionStatus;
-impl ProductionStatusSink for ProductionStatus {
-    fn emit(&self, _status: SetupStatus) -> Result<(), SetupError> {
-        Ok(())
-    }
-}
-
 const PENDING_ADMISSIONS_MAX: usize = lotta_domain::bounds::RUNTIMES_MAX.value;
 
 type PendingAdmissionKey = (RuntimeKey, String);
@@ -404,6 +543,11 @@ struct ProductionRuntimeService {
     clock: Arc<dyn Clock + Send + Sync>,
     hooks: Arc<dyn lotta_runtime::hooks::HookRuntime>,
     state: Arc<ProductionRuntimeState>,
+    #[allow(
+        dead_code,
+        reason = "internal resolution seam exercised by integration owners"
+    )]
+    brokers: Arc<ProductionTurnBrokers>,
 }
 
 impl ProductionRuntimeService {
@@ -412,13 +556,43 @@ impl ProductionRuntimeService {
         clock: Arc<dyn Clock + Send + Sync>,
         hooks: Arc<dyn lotta_runtime::hooks::HookRuntime>,
         state: Arc<ProductionRuntimeState>,
+        brokers: Arc<ProductionTurnBrokers>,
     ) -> Self {
         Self {
             store: LocalStore::new(store_paths),
             clock,
             hooks,
             state,
+            brokers,
         }
+    }
+
+    #[allow(dead_code, reason = "internal Task56 resolution seam")]
+    pub(crate) fn resolve_approval(
+        &self,
+        scope: &RuntimeScope,
+        lease_generation: u64,
+        request_id: &str,
+        call_id: &str,
+        allow: bool,
+        edited: Option<BoundedJsonValue>,
+    ) -> Result<bool, AppServerError> {
+        self.brokers
+            .resolve_approval(scope, lease_generation, request_id, call_id, allow, edited)
+            .map_err(runtime_service_error)
+    }
+
+    #[allow(dead_code, reason = "internal controller resolution seam")]
+    pub(crate) fn resolve_controller_tool(
+        &self,
+        scope: &RuntimeScope,
+        lease_generation: u64,
+        call_id: &str,
+        outcome: ToolOutcome,
+    ) -> Result<bool, AppServerError> {
+        self.brokers
+            .resolve_controller_tool(scope, lease_generation, call_id, outcome)
+            .map_err(runtime_service_error)
     }
 
     fn ensure_runtime(
@@ -876,31 +1050,223 @@ impl RuntimeCommandService for ProductionRuntimeService {
     }
 }
 
-struct UnavailableProvider;
-impl ProviderPort for UnavailableProvider {
-    fn stream(&self, _request: ProviderRequest, events: ProviderEventSink) -> PortFuture<'_, ()> {
+#[derive(Clone)]
+pub(crate) struct ProductionProviderPort {
+    connections: Arc<ConnectionManager>,
+    native: NativeAdapterRegistry,
+    host: Arc<dyn ConnectionAdapterFactory>,
+    pinned_connection: Option<String>,
+}
+
+impl ProductionProviderPort {
+    fn new(
+        connections: ConnectionManager,
+        native: NativeAdapterRegistry,
+        host: Arc<dyn ConnectionAdapterFactory>,
+    ) -> Self {
+        Self {
+            connections: Arc::new(connections),
+            native,
+            host,
+            pinned_connection: None,
+        }
+    }
+
+    pub(crate) fn connections(&self) -> Vec<lotta_providers::connections::ConnectionSnapshot> {
+        self.connections.snapshots()
+    }
+
+    /// Pins one request-local adapter to the selected connection while the request model changes.
+    pub(crate) fn for_route(&self, connection_id: &str) -> Result<Self, SetupError> {
+        self.connections
+            .snapshot(connection_id)
+            .ok_or_else(|| SetupError::Adapter("provider route unavailable".into()))?;
+        let mut route = self.clone();
+        route.pinned_connection = Some(connection_id.to_owned());
+        Ok(route)
+    }
+
+    fn route_for(&self, connection_id: &str) -> &'static str {
+        self.connections
+            .snapshot(connection_id)
+            .filter(|snapshot| self.native.contains(&snapshot.provider_type))
+            .map_or("host", |_| "native")
+    }
+}
+
+impl ProviderPort for ProductionProviderPort {
+    fn route_hint(&self, provider_id: &str) -> Option<&'static str> {
+        Some(self.route_for(provider_id))
+    }
+
+    fn stream(&self, request: ProviderRequest, events: ProviderEventSink) -> PortFuture<'_, ()> {
         Box::pin(async move {
-            let context = ProviderErrorContext::new(
-                ProviderName::new("provider_unavailable".into())?,
-                ProviderEventText::new("no configured provider connection".into())?,
-            );
-            events
-                .send(ProviderEvent::Error {
-                    error: ProviderError::Unavailable(context),
-                })
-                .await
+            let connection_id = self
+                .pinned_connection
+                .clone()
+                .unwrap_or_else(|| request.model.provider_id.as_str().to_owned());
+            let adapter = if self.route_for(&connection_id) == "native" {
+                let native = self.native.clone();
+                self.connections
+                    .build_with(&connection_id, move |provider_type, auth, base_url| {
+                        Box::pin(async move { native.build(provider_type, auth, base_url).await })
+                    })
+                    .await
+            } else {
+                let host = Arc::clone(&self.host);
+                self.connections
+                    .build_with(&connection_id, move |provider_type, auth, base_url| {
+                        let auth = host_auth(auth);
+                        let options = lotta_providers::host::protocol::HostOptions {
+                            base_url: base_url.map(str::to_owned),
+                            ..Default::default()
+                        };
+                        Box::pin(async move { host.build(provider_type, auth?, options).await })
+                    })
+                    .await
+            };
+            match adapter {
+                Ok(adapter) => adapter.stream(request, events).await,
+                Err(error) => send_connection_error(&events, error).await,
+            }
         })
     }
 }
 
-struct ProductionToolPort;
-impl ToolPort for ProductionToolPort {
-    fn execute(&self, _request: ToolExecutionRequest) -> PortFuture<'_, ToolOutcome> {
-        Box::pin(async {
-            Err(lotta_runtime::RuntimeError::AdapterFailure {
-                code: "tool_executor_unavailable",
-                context: "production tool execution".into(),
+fn host_auth(
+    auth: &lotta_providers::connections::ProviderAuth,
+) -> Result<lotta_providers::host::protocol::HostAuth, ConnectionError> {
+    use lotta_providers::connections::ProviderAuth;
+    use lotta_providers::host::protocol::HostAuth;
+    match auth {
+        ProviderAuth::Api { key, .. } => Ok(HostAuth::ApiKey {
+            value: key.expose().to_owned(),
+        }),
+        ProviderAuth::OAuth { access, .. } => Ok(HostAuth::OAuthAccess {
+            value: access.expose().to_owned(),
+        }),
+        ProviderAuth::BedrockProfile { .. } => Err(ConnectionError::Unsupported),
+    }
+}
+
+async fn send_connection_error(
+    events: &ProviderEventSink,
+    error: ConnectionError,
+) -> Result<(), lotta_runtime::RuntimeError> {
+    let kind = match error {
+        ConnectionError::NotFound => "provider_connection_missing",
+        ConnectionError::InvalidInput(_) | ConnectionError::Unsupported => {
+            "provider_connection_invalid"
+        }
+        _ => "provider_connection_unavailable",
+    };
+    let context = ProviderErrorContext::new(
+        ProviderName::new(kind.into())?,
+        ProviderEventText::new("configured provider is unavailable".into())?,
+    );
+    events
+        .send(ProviderEvent::Error {
+            error: ProviderError::Unavailable(context),
+        })
+        .await
+}
+
+pub(crate) struct ProductionToolPort {
+    registry: Arc<lotta_tools::ToolRegistry>,
+    hook_runtime: Arc<dyn lotta_runtime::hooks::HookRuntime>,
+    overflow: Arc<lotta_tools::clamp::FileOverflowWriter>,
+}
+
+impl ProductionToolPort {
+    fn new(
+        registry: Arc<lotta_tools::ToolRegistry>,
+        hook_runtime: Arc<dyn lotta_runtime::hooks::HookRuntime>,
+        overflow_root: std::path::PathBuf,
+    ) -> Result<Self, SetupError> {
+        Ok(Self {
+            registry,
+            hook_runtime,
+            overflow: Arc::new(
+                lotta_tools::clamp::FileOverflowWriter::new(overflow_root)
+                    .map_err(|error| SetupError::Adapter(format!("{error:?}")))?,
+            ),
+        })
+    }
+}
+
+struct NoSecrets;
+impl lotta_tools::SecretResolver for NoSecrets {
+    fn resolve(&self, _: &str) -> Result<Option<String>, lotta_tools::PipelineError> {
+        Ok(None)
+    }
+}
+struct NoTrace;
+impl lotta_tools::TraceSink for NoTrace {
+    fn record(&self, _: lotta_tools::TraceEvent) {}
+}
+struct NoOutcome;
+impl lotta_tools::OutcomeSink for NoOutcome {
+    fn record(&self, _: &str, _: &ToolOutcome) -> Result<(), lotta_tools::PipelineError> {
+        Ok(())
+    }
+}
+
+pub(crate) struct ScopedProductionToolPort {
+    registry: Arc<lotta_tools::ToolRegistry>,
+    hook_runtime: Arc<dyn lotta_runtime::hooks::HookRuntime>,
+    overflow: Arc<lotta_tools::clamp::FileOverflowWriter>,
+    permissions: Arc<lotta_tools::PermissionPolicy>,
+    workspace: Arc<lotta_tools::WorkspacePolicy>,
+    cwd: PathBuf,
+}
+
+impl ProductionToolPort {
+    pub(crate) fn scoped(
+        &self,
+        permissions: Arc<lotta_tools::PermissionPolicy>,
+        workspace: Arc<lotta_tools::WorkspacePolicy>,
+        cwd: PathBuf,
+    ) -> ScopedProductionToolPort {
+        ScopedProductionToolPort {
+            registry: Arc::clone(&self.registry),
+            hook_runtime: Arc::clone(&self.hook_runtime),
+            overflow: Arc::clone(&self.overflow),
+            permissions,
+            workspace,
+            cwd,
+        }
+    }
+}
+
+impl ToolPort for ScopedProductionToolPort {
+    fn execute(&self, request: ToolExecutionRequest) -> PortFuture<'_, ToolOutcome> {
+        Box::pin(async move {
+            let snapshot = self.registry.snapshot().map_err(tool_adapter)?;
+            let model_name = request.definition.model_name.as_str().to_owned();
+            let input =
+                BoundedJsonValue::new(request.input.as_value().clone()).map_err(tool_adapter)?;
+            let permissions = lotta_tools::PolicyGate::new(self.permissions.as_ref(), &[], &[]);
+            let sandbox =
+                lotta_tools::WorkspaceSandboxGate::new(self.workspace.as_ref(), &self.cwd);
+            lotta_tools::execute(lotta_tools::PipelineRequest {
+                tool_call_id: lotta_runtime::ports::ToolCallId::from_name(
+                    ProviderName::new(format!("local-{model_name}")).map_err(tool_adapter)?,
+                ),
+                registry: snapshot,
+                model_name: &model_name,
+                input,
+                cancellation: request.cancellation,
+                hook_runtime: self.hook_runtime.as_ref(),
+                permissions: &permissions,
+                sandbox: &sandbox,
+                secrets: &NoSecrets,
+                trace: &NoTrace,
+                overflow: self.overflow.as_ref(),
+                persistence: &NoOutcome,
+                emit: &NoOutcome,
             })
+            .await
+            .map_err(tool_adapter)
         })
     }
 }
@@ -1136,8 +1502,34 @@ impl TurnEffectPort for ProductionEffects {
         )
     }
 
+    fn persist_stop_reason(&self, record: TurnStopRecord) -> EffectResult {
+        self.append_message(
+            lotta_domain::LocalMessageRole::Assistant,
+            serde_json::json!({"type": "turn_stop", "record": record}),
+            format!("{}-stop", self.turn_id.as_str()),
+        )
+    }
+
     fn emit(&self, event: TurnEvent) -> EffectResult {
         let wire = match event {
+            TurnEvent::ControlRequest(request) => {
+                lotta_app_server::ws::RuntimeEvent::ControlRequest {
+                    request_id: request.request_id,
+                    request: BoundedJsonValue::new(serde_json::json!({
+                        "tool_call_id": request.call_id.as_str(),
+                        "lease_generation": request.lease_generation,
+                        "tool_name": request.tool_name.as_str(),
+                        "input": request.input.as_value(),
+                        "schema": request.schema.as_value()
+                    }))
+                    .map_err(effect_error)?,
+                    agent_id: NonEmptyString::new(self.scope.agent_id.as_str().to_owned()).ok(),
+                    conversation_id: NonEmptyString::new(
+                        self.scope.conversation_id.as_str().to_owned(),
+                    )
+                    .ok(),
+                }
+            }
             TurnEvent::StreamDelta(projection) => lotta_app_server::ws::RuntimeEvent::StreamDelta {
                 delta: BoundedJsonValue::new(serde_json::json!({
                     "kind": format!("{:?}", projection.kind).to_lowercase(),
@@ -1152,6 +1544,12 @@ impl TurnEffectPort for ProductionEffects {
                 run_id: Some(self.run_id.clone()),
                 stop_reason: NonEmptyString::new(format!("{reason:?}").to_lowercase())
                     .map_err(effect_error)?,
+                error: None,
+            },
+            TurnEvent::Failed { reason } => lotta_app_server::ws::RuntimeEvent::TurnFinished {
+                turn_id: self.turn_id.clone(),
+                run_id: Some(self.run_id.clone()),
+                stop_reason: NonEmptyString::new(reason.wire_value()).map_err(effect_error)?,
                 error: None,
             },
             TurnEvent::Retry(retry) => lotta_app_server::ws::RuntimeEvent::UpdateLoopStatus {
@@ -1173,6 +1571,71 @@ impl TurnEffectPort for ProductionEffects {
             .map_err(|_| effect_error("runtime event sink"))
     }
 
+    fn persist_compaction_request(
+        &self,
+        request: &lotta_runtime::turn::CompactionRequest,
+    ) -> EffectResult {
+        let sequence = self
+            .sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.append_message(
+            lotta_domain::LocalMessageRole::Assistant,
+            serde_json::json!({
+                "type": "compaction_request",
+                "scope": {
+                    "agent_id": request.scope.agent_id.as_str(),
+                    "conversation_id": request.scope.conversation_id.as_str(),
+                },
+                "lease_generation": request.lease_generation,
+                "reason": request.reason.as_str(),
+                "tokens_before": request.tokens_before,
+                "messages_before": request.messages_before,
+            }),
+            format!("{}-compaction-{sequence}", self.turn_id.as_str()),
+        )
+    }
+
+    fn persist_controller_request(&self, request: ControllerToolRequestRecord) -> EffectResult {
+        let sequence = self
+            .sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.append_message(
+            lotta_domain::LocalMessageRole::Assistant,
+            serde_json::json!({
+                "type": "controller_tool_request",
+                "scope": {
+                    "agent_id": request.scope.agent_id.as_str(),
+                    "conversation_id": request.scope.conversation_id.as_str(),
+                },
+                "run_id": request.run_id.as_str(),
+                "lease_generation": request.lease_generation,
+                "call_id": request.call_id.as_str(),
+                "tool_name": request.tool_name.as_str(),
+                "input": request.input.as_value(),
+            }),
+            format!("{}-controller-{sequence}", self.turn_id.as_str()),
+        )
+    }
+
+    fn persist_control_request(&self, request: &ControlRequest) -> EffectResult {
+        let sequence = self
+            .sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.append_message(
+            lotta_domain::LocalMessageRole::Assistant,
+            serde_json::json!({
+                "type": "control_request",
+                "request_id": request.request_id.as_str(),
+                "call_id": request.call_id.as_str(),
+                "lease_generation": request.lease_generation,
+                "tool_name": request.tool_name.as_str(),
+                "input": request.input.as_value(),
+                "schema": request.schema.as_value()
+            }),
+            format!("{}-control-{sequence}", self.turn_id.as_str()),
+        )
+    }
+
     fn append_tool_result(&self, result: ToolResultRecord) -> EffectResult {
         let sequence = self
             .sequence
@@ -1181,10 +1644,17 @@ impl TurnEffectPort for ProductionEffects {
             lotta_domain::LocalMessageRole::ToolResult,
             serde_json::json!({
                 "call_id": result.call_id.as_str(),
-                "outcome": format!("{:?}", result.outcome)
+                "outcome": result.outcome
             }),
             format!("{}-tool-{sequence}", self.turn_id.as_str()),
         )
+    }
+}
+
+fn tool_adapter(error: impl std::fmt::Debug) -> lotta_runtime::RuntimeError {
+    lotta_runtime::RuntimeError::AdapterFailure {
+        code: "tool_pipeline",
+        context: format!("{error:?}"),
     }
 }
 
@@ -1313,7 +1783,26 @@ mod production_tests {
         std::fs::create_dir_all(&workspace).unwrap();
         let root = root.canonicalize().unwrap();
         let workspace = workspace.canonicalize().unwrap();
-        let config = setup_config(&root, &workspace).expect("exact production builder");
+        let model = production_model("openai", "gpt-5.4", 128_000, true).unwrap();
+        let config = setup_config(
+            &root,
+            &workspace,
+            vec![model],
+            ModelHandle::from_str("openai/gpt-5.4").unwrap(),
+            vec![lotta_providers::connections::ConnectionSnapshot {
+                id: "openai".into(),
+                provider_name: "openai".into(),
+                provider_type: "openai".into(),
+                auth_type: lotta_providers::connections::AuthMethod::Api,
+                base_url: None,
+                timeout: None,
+                region: None,
+                access_key: None,
+                is_connected: true,
+                revision: 1,
+            }],
+        )
+        .expect("exact production builder");
         let expected: std::collections::BTreeSet<_> = production_builtins(
             &root,
             &workspace,
@@ -1364,6 +1853,7 @@ mod production_tests {
             Arc::new(TestClock),
             Arc::new(lotta_runtime::hooks::NoopHookRuntime),
             Arc::new(ProductionRuntimeState::new()),
+            Arc::new(ProductionTurnBrokers::new()),
         )
     }
 

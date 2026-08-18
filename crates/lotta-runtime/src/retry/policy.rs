@@ -39,6 +39,10 @@ pub enum ProviderFailureKind {
     Schema,
     /// Context overflow requiring an explicit compaction decision.
     ContextOverflow,
+    /// Account quota exhaustion; never retryable.
+    Quota,
+    /// User cancellation; never retryable.
+    Cancelled,
     /// Other terminal failure.
     Terminal,
 }
@@ -70,6 +74,8 @@ pub struct ProviderFailure {
     pub reason: String,
     /// Optional provider-directed retry timing.
     pub retry_after: Option<RetryAfter>,
+    /// Safe structured overflow detail, present only for context overflow.
+    pub context_overflow: Option<crate::ports::ProviderContextOverflowDetail>,
 }
 
 impl ProviderFailure {
@@ -80,6 +86,7 @@ impl ProviderFailure {
             kind,
             reason: reason.into(),
             retry_after: None,
+            context_overflow: None,
         }
     }
 
@@ -87,6 +94,16 @@ impl ProviderFailure {
     #[must_use]
     pub const fn with_retry_after(mut self, retry_after: RetryAfter) -> Self {
         self.retry_after = Some(retry_after);
+        self
+    }
+
+    /// Attaches safe structured context-overflow detail.
+    #[must_use]
+    pub fn with_context_overflow(
+        mut self,
+        detail: crate::ports::ProviderContextOverflowDetail,
+    ) -> Self {
+        self.context_overflow = Some(detail);
         self
     }
 

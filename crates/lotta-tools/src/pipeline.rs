@@ -639,7 +639,11 @@ fn finalize(
     Ok(final_outcome)
 }
 
-fn validate_input(
+/// Validates bounded edited input against the exact registered tool schema.
+///
+/// # Errors
+/// Returns the same typed pipeline validation failures used by normal tool admission.
+pub fn validate_input(
     value: BoundedJsonValue,
     definition: &ToolDefinition,
 ) -> Result<ValidatedToolInput, PipelineError> {

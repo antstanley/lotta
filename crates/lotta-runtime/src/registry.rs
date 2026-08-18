@@ -44,6 +44,14 @@ pub struct RuntimeHandle {
     generation: u64,
 }
 
+impl RuntimeHandle {
+    /// Returns the exact runtime owner key.
+    #[must_use]
+    pub const fn key(&self) -> &RuntimeKey {
+        &self.key
+    }
+}
+
 /// Complete auxiliary snapshot controlling runtime residency.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeResidency {

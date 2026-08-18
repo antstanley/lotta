@@ -28,7 +28,7 @@ pub use permissions::{
 pub use pipeline::{
     ExecutorError, OutcomeSink, PipelineError, PipelineRequest, PipelineStage, PreflightEvent,
     RawToolExecutionRequest, RawToolOutcome, SecretDelivery, SecretDeliveryKind, SecretResolver,
-    ToolExecutor, TraceEvent, TraceSink, execute,
+    ToolExecutor, TraceEvent, TraceSink, execute, validate_input,
 };
 pub use registry::{
     RegisteredTool, RegistryError, RegistrySnapshot, TOOLS_LOADED_MAX, ToolRegistration,

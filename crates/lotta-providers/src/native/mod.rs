@@ -16,6 +16,8 @@ pub(crate) mod lifecycle;
 #[cfg(test)]
 pub(crate) mod loopback;
 pub mod openai_compatible;
+mod registry;
+pub use registry::{NativeAdapterFactory, NativeAdapterRegistry, NativeFactoryFuture};
 #[cfg(test)]
 mod reasoning;
 #[cfg(test)]

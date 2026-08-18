@@ -104,13 +104,17 @@ async fn retry_executor_composes_with_task19_and_finishes_once() {
         provider: TurnProvider::Retrying {
             route: ProviderRoute::new("native", "openai"),
             source: &provider,
-            fallback: None,
+            fallbacks: Vec::new(),
             executor: std::sync::Arc::new(executor),
         },
         provider_start: None,
         tools: &tool,
+        controller_tools: None,
+        approvals: None,
         catalog: &catalog(&[]),
         effects: &effects,
+        compaction: None,
+        request_refresh: None,
     };
     let outcome = run_turn(&mut runtime, handle, lease, request(), ports)
         .await
@@ -198,7 +202,7 @@ async fn cancelled_lease_suppresses_production_retry_event() {
     )
     .await
     .unwrap();
-    assert_eq!(outcome, TurnRunOutcome::Suppressed);
+    assert_eq!(outcome, TurnRunOutcome::Completed);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert!(
         effects
@@ -270,11 +274,16 @@ async fn cancellation_during_tool_execute_suppresses_all_later_effects() {
     )
     .await
     .unwrap();
-    assert_eq!(outcome, TurnRunOutcome::Suppressed);
+    assert_eq!(outcome, TurnRunOutcome::Completed);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-    assert!(effects.events.lock().unwrap().is_empty());
     assert!(effects.results.lock().unwrap().is_empty());
-    assert_ne!(
+    assert_eq!(
+        effects.events.lock().unwrap().as_slice(),
+        &[TurnEvent::Failed {
+            reason: super::TurnStopReason::UserCancellation,
+        }]
+    );
+    assert_eq!(
         runtime.lifecycle(&handle).unwrap().projection().state(),
         TurnStateKind::Idle
     );
@@ -339,9 +348,14 @@ async fn cancellation_before_terminal_helper_suppresses_without_release() {
     )
     .await
     .unwrap();
-    assert_eq!(outcome, TurnRunOutcome::Suppressed);
-    assert!(effects.events.lock().unwrap().is_empty());
-    assert_ne!(
+    assert_eq!(outcome, TurnRunOutcome::Completed);
+    assert_eq!(
+        effects.events.lock().unwrap().as_slice(),
+        &[TurnEvent::Failed {
+            reason: super::TurnStopReason::UserCancellation,
+        }]
+    );
+    assert_eq!(
         runtime.lifecycle(&handle).unwrap().projection().state(),
         TurnStateKind::Idle
     );

@@ -31,11 +31,12 @@ use lotta_runtime::ports::{
     ProviderMessages, ProviderRequest, ProviderToolChoice, ProviderToolDefinition, ProviderTools,
     ReasoningControls, TokenLimit,
 };
+use lotta_runtime::retry::{FallbackRoute, ProviderRoute};
 use lotta_runtime::turn::{
     AdmissionReceipt, CwdFailure, CwdResolution, ExtensionSnapshot, ReminderClaim,
     ResolvedTurnModel, SetupError, SetupFailure, SetupInput, SetupOrchestrator, SetupPorts,
-    SetupStatus, SetupToolSource, SkillInventory, ToolCandidate, TurnPorts, TurnRunOutcome,
-    TurnToolCatalog,
+    SetupScopeHandle, SetupStatus, SetupStatusSink, SetupToolSource, SkillInventory, ToolCandidate,
+    TurnPorts, TurnRunOutcome, TurnToolCatalog,
 };
 use lotta_runtime::{ListenerRuntime, RuntimeHandle};
 use lotta_store::{
@@ -48,7 +49,9 @@ use lotta_tools::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{
     Arc, Mutex,
@@ -69,6 +72,9 @@ const REMINDER_LOCK_RETRY_MAX: usize = 500;
 const REMINDER_STATE_REVISION: u64 = 1;
 const CWD_REMINDER_PATH_BYTES_MAX: usize = 4_096;
 const RESOLVE_AGENT_CHANNEL_CAPACITY: usize = 64;
+const PRODUCTION_BROKER_WAITERS_MAX: usize = 1_024;
+const APPROVAL_WAIT_MS_MAX: u64 = 86_400_000;
+const EXTERNAL_TOOL_CALL_TIMEOUT_MS: u64 = 300_000;
 const TRANSCRIPT_MANIFEST_SCHEMA_VERSION: u8 = 2;
 const TRANSCRIPT_SESSION_SCHEMA_VERSION: u8 = 3;
 
@@ -82,6 +88,8 @@ pub struct ProductionSetupConfig {
     pub models: Vec<ModelDescriptor>,
     /// Required fallback model handle.
     pub default_model: ModelHandle,
+    /// Persistent redacted provider connections available to setup.
+    pub connections: Vec<lotta_providers::connections::ConnectionSnapshot>,
     /// Server context-window ceiling.
     pub server_context_window: u64,
     /// Output token ceiling.
@@ -102,8 +110,16 @@ pub struct ProductionSetupConfig {
     pub toolset: ToolsetId,
     /// Trusted fallback allowlist, overridden by agent settings when present.
     pub allowlist: Option<Vec<String>>,
-    /// Required live loop-status sink.
-    pub status_sink: Arc<dyn ProductionStatusSink>,
+}
+
+fn provider_route(
+    model: &ModelDescriptor,
+    provider: &dyn lotta_runtime::ports::ProviderPort,
+) -> ProviderRoute {
+    let transport = provider
+        .route_hint(model.provider_id.as_str())
+        .unwrap_or("configured");
+    ProviderRoute::new(transport, model.provider_id.as_str())
 }
 
 /// Live application-loop status boundary.
@@ -122,6 +138,7 @@ pub struct ProductionSetupPorts {
     skills: SkillRoots,
     models: Vec<ModelDescriptor>,
     default_model: ModelHandle,
+    connections: Vec<lotta_providers::connections::ConnectionSnapshot>,
     server_context_window: u64,
     output_tokens: u64,
     registry: Arc<ToolRegistry>,
@@ -129,14 +146,14 @@ pub struct ProductionSetupPorts {
     hook_registry: Arc<HookRegistry>,
     hook_runtime: Arc<dyn HookRuntime>,
     extension_snapshots: Mutex<HashMap<u64, CanonicalExtensionSnapshot>>,
+    scope_snapshots: Mutex<HashMap<u64, ProductionScope>>,
+    next_scope_snapshot: AtomicU64,
     next_extension_snapshot: AtomicU64,
     permission_sources: PermissionSourcePaths,
     workspace_policy: WorkspacePolicy,
     toolset: ToolsetId,
     allowlist: Option<Vec<String>>,
-    status_sink: Mutex<Arc<dyn ProductionStatusSink>>,
     reminders_path: PathBuf,
-    scope: Mutex<Option<ProductionScope>>,
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
@@ -149,25 +166,20 @@ impl ProductionSetupPorts {
         clippy::too_many_arguments,
         reason = "explicit production dependency injection"
     )]
-    pub async fn run_production_turn<'ports, F>(
+    pub(crate) async fn run_production_turn(
         &self,
         runtime: &mut ListenerRuntime,
         handle: RuntimeHandle,
         lease: TurnLease,
         input: SetupInput,
-        turn_ports: F,
-        provider: &'ports dyn lotta_runtime::ports::ProviderPort,
-        tools: &'ports dyn lotta_runtime::ports::ToolPort,
-        effects: &'ports dyn lotta_runtime::turn::TurnEffectPort,
-    ) -> Result<TurnRunOutcome, RuntimeError>
-    where
-        F: for<'catalog> FnOnce(
-            &'catalog TurnToolCatalog,
-            &'ports dyn lotta_runtime::ports::ProviderPort,
-            &'ports dyn lotta_runtime::ports::ToolPort,
-            &'ports dyn lotta_runtime::turn::TurnEffectPort,
-        ) -> TurnPorts<'ports, 'catalog>,
-    {
+        approval: &dyn lotta_runtime::turn::ApprovalPort,
+        controller_tools: &dyn lotta_runtime::turn::ControllerToolPort,
+        compaction: &dyn lotta_runtime::turn::CompactionPort,
+        refresh: Arc<dyn lotta_runtime::turn::RequestRefreshPort>,
+        provider: &crate::production_components::ProductionProviderPort,
+        tools: &crate::production_components::ProductionToolPort,
+        effects: &dyn lotta_runtime::turn::TurnEffectPort,
+    ) -> Result<TurnRunOutcome, RuntimeError> {
         let cancellation = input.cancellation.clone();
         let setup = SetupOrchestrator::new(self);
         let prepared = setup.prepare(input).await.map_err(setup_failure_runtime)?;
@@ -176,9 +188,49 @@ impl ProductionSetupPorts {
         let host = HookLifecycleHost::with_snapshot(&hook_runtime, prepared.extensions.id());
         let stop_payload = events::lifecycle_payload(HookEvent::Stop).map_err(runtime_adapter)?;
         let admission = prepared.admission.clone();
-        let status = ProductionDispatchStatus { ports: self };
-        let ports =
-            turn_ports(&prepared.tools, provider, tools, effects).with_provider_start(&status);
+        let status = ProductionDispatchStatus {
+            sink: prepared.status_sink.as_ref(),
+        };
+        let mut fallback_providers = Vec::new();
+        for candidate in &prepared.fallback_candidates {
+            fallback_providers.push(
+                provider
+                    .for_route(candidate.provider_id.as_str())
+                    .map_err(setup_error_runtime)?,
+            );
+        }
+        let scope = self
+            .scope_snapshot(prepared.scope)
+            .map_err(setup_error_runtime)?;
+        let scoped_tools = tools.scoped(
+            Arc::new(scope.permissions),
+            Arc::new(self.workspace_policy.clone()),
+            scope.cwd,
+        );
+        let ports = TurnPorts::new(provider, &scoped_tools, &prepared.tools, effects)
+            .with_approvals(approval)
+            .with_controller_tools(controller_tools)
+            .with_context_ports(compaction, refresh);
+        self.release_scope(prepared.scope);
+        let source_route = provider_route(&prepared.model.model, provider);
+        let fallbacks = prepared
+            .fallback_candidates
+            .into_iter()
+            .zip(fallback_providers.iter())
+            .map(|(destination, fallback_provider)| {
+                let destination_route = provider_route(&destination, fallback_provider);
+                let route =
+                    FallbackRoute::new(source_route.clone(), destination_route, destination)
+                        .map_err(|error| RuntimeError::InvalidData {
+                            context: error.to_string(),
+                        })?;
+                Ok::<_, RuntimeError>(lotta_runtime::turn::ConfiguredFallback {
+                    route,
+                    provider: fallback_provider,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let ports = ports.with_fallbacks(fallbacks).with_provider_start(&status);
         let result =
             lotta_runtime::turn::run_turn(runtime, handle, lease, prepared.request, ports).await;
         match host
@@ -210,6 +262,21 @@ impl ProductionSetupPorts {
         Arc::clone(&self.hook_runtime)
     }
 
+    /// Returns the shared canonical tool registry used by production execution.
+    #[must_use]
+    pub fn registry(&self) -> Arc<ToolRegistry> {
+        Arc::clone(&self.registry)
+    }
+
+    fn scope_snapshot(&self, handle: SetupScopeHandle) -> Result<ProductionScope, SetupError> {
+        self.scope_snapshots
+            .lock()
+            .map_err(|_| SetupError::Adapter("scope snapshot lock".into()))?
+            .get(&handle.id())
+            .cloned()
+            .ok_or_else(|| SetupError::Adapter("scope snapshot unavailable".into()))
+    }
+
     /// Constructs production adapters and validates required model/tool configuration.
     pub fn new(config: ProductionSetupConfig) -> Result<Self, SetupError> {
         let root = config.store_paths.root().to_path_buf();
@@ -222,7 +289,7 @@ impl ProductionSetupPorts {
         if !config
             .models
             .iter()
-            .any(|model| model.handle.as_str() == default && model.available)
+            .any(|model| model.handle.as_str() == default)
         {
             return Err(SetupError::Availability(default));
         }
@@ -232,6 +299,7 @@ impl ProductionSetupPorts {
             skills: config.skill_roots,
             models: config.models,
             default_model: config.default_model,
+            connections: config.connections,
             server_context_window: config.server_context_window,
             output_tokens: config.output_tokens,
             registry,
@@ -240,13 +308,13 @@ impl ProductionSetupPorts {
             hook_runtime: config.hook_runtime,
             extension_snapshots: Mutex::new(HashMap::new()),
             next_extension_snapshot: AtomicU64::new(1),
+            scope_snapshots: Mutex::new(HashMap::new()),
+            next_scope_snapshot: AtomicU64::new(1),
             permission_sources: config.permission_sources,
             workspace_policy: config.workspace_policy,
             toolset: config.toolset,
             allowlist: config.allowlist,
-            status_sink: Mutex::new(config.status_sink),
             reminders_path: root.join("settings").join("turn-setup-reminders.json"),
-            scope: Mutex::new(None),
             now_ms: Arc::new(system_epoch_ms),
         })
     }
@@ -338,6 +406,7 @@ enum ReminderEntry {
     },
 }
 
+#[derive(Clone)]
 struct ProductionScope {
     cwd: PathBuf,
     permissions: PermissionPolicy,
@@ -480,7 +549,7 @@ impl SetupPorts for ProductionSetupPorts {
         cwd: &Path,
         mode: PermissionMode,
         cancellation: &CancellationToken,
-    ) -> lotta_runtime::ports::PortFuture<'_, ()> {
+    ) -> lotta_runtime::ports::PortFuture<'_, SetupScopeHandle> {
         let result = (|| {
             if cancellation.is_cancelled() {
                 return Err(RuntimeError::Cancelled {
@@ -508,18 +577,21 @@ impl SetupPorts for ProductionSetupPorts {
                 .map_err(|_| RuntimeError::PermissionDenied {
                     context: "permission policy".into(),
                 })?;
-            self.scope
+            let id = self.next_scope_snapshot.fetch_add(1, Ordering::Relaxed);
+            self.scope_snapshots
                 .lock()
                 .map_err(|_| RuntimeError::AdapterFailure {
-                    code: "scope_lock",
-                    context: "scope".into(),
-                })
-                .map(|mut scope| {
-                    *scope = Some(ProductionScope {
+                    code: "scope_snapshot_lock",
+                    context: "scope snapshot".into(),
+                })?
+                .insert(
+                    id,
+                    ProductionScope {
                         cwd: canonical,
                         permissions,
-                    });
-                })
+                    },
+                );
+            Ok(SetupScopeHandle::new(id))
         })();
         Box::pin(async move { result })
     }
@@ -571,16 +643,18 @@ impl SetupPorts for ProductionSetupPorts {
         agent: &Agent,
         conversation: &Conversation,
         inventory: &SkillInventory,
+        scope: SetupScopeHandle,
         reminder: Option<&str>,
         cancellation: &CancellationToken,
     ) -> lotta_runtime::ports::PortFuture<'_, String> {
-        let catalog = self.discover_skills(
-            self.scope
-                .lock()
-                .ok()
-                .and_then(|scope| scope.as_ref().map(|value| value.cwd.clone()))
-                .as_deref()
-                .unwrap_or(Path::new("/")),
+        let cwd = self
+            .scope_snapshots
+            .lock()
+            .ok()
+            .and_then(|snapshots| snapshots.get(&scope.id()).map(|value| value.cwd.clone()));
+        let catalog = cwd.as_deref().map_or_else(
+            || Err(SetupError::Adapter("scope snapshot unavailable".into())),
+            |cwd| self.discover_skills(cwd),
         );
         let selected = catalog.and_then(|catalog| {
             SkillDiscovery::select(&catalog, &inventory.selected).map_err(debug_adapter)
@@ -652,9 +726,16 @@ impl SetupPorts for ProductionSetupPorts {
         let descriptor = self
             .models
             .iter()
-            .find(|model| model.handle.as_str() == resolved.handle.to_string() && model.available)
+            .find(|model| model.handle.as_str() == resolved.handle.to_string())
             .cloned()
             .ok_or_else(|| SetupError::Availability(resolved.handle.to_string()))?;
+        let connection = self
+            .connections
+            .iter()
+            .find(|connection| connection.id == descriptor.provider_id.as_str());
+        if !descriptor.available || !connection.is_some_and(|value| value.is_connected) {
+            return Err(SetupError::Availability(resolved.handle.to_string()));
+        }
         let context_window = effective_window(ContextWindowSources {
             server_max: Some(self.server_context_window),
             model_catalog: descriptor.context_window,
@@ -662,6 +743,8 @@ impl SetupPorts for ProductionSetupPorts {
             conversation: conversation.context_window_limit,
         })
         .map_err(adapter)?;
+        let fallback_candidates =
+            fallback_candidates(agent, &descriptor, &self.models, &self.connections);
         Ok(ResolvedTurnModel {
             model: descriptor,
             context_window,
@@ -670,6 +753,7 @@ impl SetupPorts for ProductionSetupPorts {
                 .unwrap_or(self.toolset)
                 .to_string(),
             allowlist: configured_allowlist(agent).unwrap_or_else(|| self.allowlist.clone()),
+            fallback_candidates,
         })
     }
 
@@ -707,19 +791,20 @@ impl SetupPorts for ProductionSetupPorts {
 
     fn tool_candidates(
         &self,
+        scope_handle: SetupScopeHandle,
         extensions: &ExtensionSnapshot,
         cancellation: &CancellationToken,
     ) -> Result<Vec<ToolCandidate>, SetupError> {
         if cancellation.is_cancelled() {
             return Err(SetupError::Cancelled);
         }
-        let scope = self
-            .scope
+        let snapshots = self
+            .scope_snapshots
             .lock()
-            .map_err(|_| SetupError::Adapter("scope lock".into()))?;
-        let scope = scope
-            .as_ref()
-            .ok_or_else(|| SetupError::Adapter("scope unavailable".into()))?;
+            .map_err(|_| SetupError::Adapter("scope snapshot lock".into()))?;
+        let scope = snapshots
+            .get(&scope_handle.id())
+            .ok_or_else(|| SetupError::Adapter("scope snapshot unavailable".into()))?;
         if extensions.id() != 0 {
             let snapshot = self.extension_snapshot(extensions)?;
             let _ = snapshot.mods.registrations().len();
@@ -906,19 +991,20 @@ impl SetupPorts for ProductionSetupPorts {
         agent: &AgentId,
         conversation: &ConversationId,
         original: &Path,
+        scope_handle: SetupScopeHandle,
         cancellation: &CancellationToken,
     ) -> lotta_runtime::ports::PortFuture<'_, Option<ReminderClaim>> {
         let key = reminder_key(agent, conversation, original);
         let now = (self.now_ms)();
         let fallback = self
-            .scope
+            .scope_snapshots
             .lock()
-            .map_err(|_| SetupError::Adapter("scope lock".into()))
-            .map(|scope| {
-                scope
-                    .as_ref()
+            .map_err(|_| SetupError::Adapter("scope snapshot lock".into()))
+            .and_then(|snapshots| {
+                snapshots
+                    .get(&scope_handle.id())
                     .map(|scope| scope.cwd.clone())
-                    .unwrap_or_default()
+                    .ok_or_else(|| SetupError::Adapter("scope snapshot unavailable".into()))
             });
         let original = original.to_path_buf();
         let cancellation = cancellation.clone();
@@ -996,15 +1082,9 @@ impl SetupPorts for ProductionSetupPorts {
         })
     }
 
-    fn emit_status(&self, status: SetupStatus) -> Result<(), SetupError> {
-        self.status_sink
-            .lock()
-            .map_err(|_| SetupError::Adapter("status sink lock".into()))?
-            .emit(status)
-    }
-    fn rollback_scope(&self) {
-        if let Ok(mut scope) = self.scope.lock() {
-            *scope = None;
+    fn release_scope(&self, scope: SetupScopeHandle) {
+        if let Ok(mut snapshots) = self.scope_snapshots.lock() {
+            snapshots.remove(&scope.id());
         }
     }
 }
@@ -1125,6 +1205,52 @@ fn canonical_directory(path: &Path, confined: Option<&Path>) -> Result<PathBuf, 
         return Err(CwdFailure::SymlinkOrEscape);
     }
     Ok(canonical)
+}
+
+fn fallback_candidates(
+    agent: &Agent,
+    primary: &ModelDescriptor,
+    models: &[ModelDescriptor],
+    connections: &[lotta_providers::connections::ConnectionSnapshot],
+) -> Vec<ModelDescriptor> {
+    let configured = agent
+        .model_settings
+        .get("fallbackModels")
+        .or_else(|| agent.extras.get("fallback_models"))
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        });
+    let mut candidates = models
+        .iter()
+        .filter(|model| {
+            model.available
+                && model.handle != primary.handle
+                && connections.iter().any(|connection| {
+                    connection.id == model.provider_id.as_str() && connection.is_connected
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.handle.as_str().cmp(right.handle.as_str()));
+    if let Some(order) = configured {
+        candidates.sort_by_key(|candidate| {
+            order
+                .iter()
+                .position(|handle| handle == candidate.handle.as_str())
+                .unwrap_or(usize::MAX)
+        });
+        candidates.retain(|candidate| {
+            order
+                .iter()
+                .any(|handle| handle == candidate.handle.as_str())
+        });
+    }
+    candidates
 }
 
 fn configured_toolset(agent: &Agent) -> Option<ToolsetId> {
@@ -1451,23 +1577,415 @@ fn setup_failure_runtime(error: SetupFailure) -> RuntimeError {
 }
 
 struct ProductionDispatchStatus<'a> {
-    ports: &'a dyn lotta_runtime::turn::SetupPorts,
+    sink: &'a dyn SetupStatusSink,
 }
 
 impl lotta_runtime::turn::ProviderStartPort for ProductionDispatchStatus<'_> {
     fn provider_start(&self) -> lotta_runtime::ports::PortFuture<'_, ()> {
         Box::pin(async move {
-            self.ports
-                .emit_status(SetupStatus::Sending)
+            self.sink
+                .emit(SetupStatus::Sending)
                 .map_err(runtime_adapter)
         })
     }
 
     fn provider_waiting(&self) -> lotta_runtime::ports::PortFuture<'_, ()> {
         Box::pin(async move {
-            self.ports
-                .emit_status(SetupStatus::Waiting)
+            self.sink
+                .emit(SetupStatus::Waiting)
                 .map_err(runtime_adapter)
+        })
+    }
+}
+
+type BrokerFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, RuntimeError>> + Send + 'a>>;
+
+/// Service that owns transcript compaction mechanics outside Task55.
+pub trait ProductionCompactionService: Send + Sync {
+    /// Updates durable transcript state for one exact scoped request.
+    fn compact(
+        &self,
+        scope: lotta_domain::RuntimeScope,
+        lease: TurnLease,
+        detail: lotta_runtime::ports::ProviderContextOverflowDetail,
+        cancellation: CancellationToken,
+    ) -> BrokerFuture<'_, lotta_runtime::turn::CompactionProgress>;
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ApprovalKey {
+    scope: lotta_domain::RuntimeScope,
+    run_generation: u64,
+    request_id: String,
+    call_id: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ControllerKey {
+    scope: lotta_domain::RuntimeScope,
+    run_generation: u64,
+    call_id: String,
+}
+
+struct ApprovalWaiter {
+    schema: lotta_runtime::ports::ToolInputSchema,
+    sender: tokio::sync::oneshot::Sender<lotta_runtime::turn::ApprovalResolution>,
+}
+
+/// Shared bounded production broker registry owned by the production component graph.
+pub struct ProductionTurnBrokers {
+    approvals: Mutex<HashMap<ApprovalKey, ApprovalWaiter>>,
+    controller_tools: Mutex<
+        HashMap<ControllerKey, tokio::sync::oneshot::Sender<lotta_runtime::ports::ToolOutcome>>,
+    >,
+    compaction: Mutex<Option<Arc<dyn ProductionCompactionService>>>,
+}
+
+impl ProductionTurnBrokers {
+    /// Creates empty bounded broker registries.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            approvals: Mutex::new(HashMap::new()),
+            controller_tools: Mutex::new(HashMap::new()),
+            compaction: Mutex::new(None),
+        }
+    }
+
+    /// Resolves an exact current approval once. Late and stale responses are ignored.
+    pub fn resolve_approval(
+        &self,
+        scope: &lotta_domain::RuntimeScope,
+        lease_generation: u64,
+        request_id: &str,
+        call_id: &str,
+        allow: bool,
+        edited: Option<BoundedJsonValue>,
+    ) -> Result<bool, RuntimeError> {
+        let key = ApprovalKey {
+            scope: scope.clone(),
+            run_generation: lease_generation,
+            request_id: request_id.to_owned(),
+            call_id: call_id.to_owned(),
+        };
+        let mut waiters = self
+            .approvals
+            .lock()
+            .map_err(|_| broker_error("approval lock"))?;
+        let Some(waiter) = waiters.remove(&key) else {
+            return Ok(false);
+        };
+        let resolution = if allow {
+            let edited = edited
+                .map(|value| {
+                    let definition = approval_validation_definition(waiter.schema.clone())?;
+                    lotta_tools::validate_input(value, &definition)
+                        .map(|input| BoundedJsonValue::new(input.as_value().clone()))
+                        .map_err(|_| broker_error("approval edited input schema"))?
+                        .map_err(|_| broker_error("approval edited input bound"))
+                })
+                .transpose()?;
+            lotta_runtime::turn::ApprovalResolution::Allow(edited)
+        } else {
+            lotta_runtime::turn::ApprovalResolution::Deny
+        };
+        Ok(waiter.sender.send(resolution).is_ok())
+    }
+
+    /// Resolves one exact current controller-owned call once.
+    pub fn resolve_controller_tool(
+        &self,
+        scope: &lotta_domain::RuntimeScope,
+        lease_generation: u64,
+        call_id: &str,
+        outcome: lotta_runtime::ports::ToolOutcome,
+    ) -> Result<bool, RuntimeError> {
+        let key = ControllerKey {
+            scope: scope.clone(),
+            run_generation: lease_generation,
+            call_id: call_id.to_owned(),
+        };
+        let sender = self
+            .controller_tools
+            .lock()
+            .map_err(|_| broker_error("controller tool lock"))?
+            .remove(&key);
+        Ok(sender.is_some_and(|sender| sender.send(outcome).is_ok()))
+    }
+
+    /// Registers or clears the production compaction service.
+    pub fn register_compaction_service(
+        &self,
+        service: Option<Arc<dyn ProductionCompactionService>>,
+    ) {
+        if let Ok(mut current) = self.compaction.lock() {
+            *current = service;
+        }
+    }
+}
+
+impl Default for ProductionTurnBrokers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn broker_error(context: &'static str) -> RuntimeError {
+    RuntimeError::AdapterFailure {
+        code: "production_turn_broker",
+        context: context.into(),
+    }
+}
+
+fn approval_validation_definition(
+    schema: lotta_runtime::ports::ToolInputSchema,
+) -> Result<lotta_runtime::ports::ToolDefinition, RuntimeError> {
+    use lotta_domain::BoundedVec;
+    use lotta_runtime::ports::*;
+    Ok(ToolDefinition::new(
+        InternalToolName::new("approval_validation".to_owned())?,
+        ModelFacingToolName::new("approval_validation".to_owned())?,
+        schema,
+        ToolDescriptionAsset::new("approval validation".to_owned())?,
+        ToolExecutionOwner::Controller,
+        ToolApprovalPolicy::Never,
+        PermissionAction::new("approval_validation".to_owned())?,
+        ToolTimeout::new(std::time::Duration::from_millis(1))?,
+        ToolOutputLimit::new(1, 1)?,
+        SecretRedactionSpec::new(
+            BoundedVec::new(Vec::new()).map_err(|_| broker_error("approval secret spec"))?,
+            SecretRedactionPolicy::Omit,
+        )?,
+    ))
+}
+
+struct ApprovalBrokerAdapter {
+    brokers: Arc<ProductionTurnBrokers>,
+    scope: lotta_domain::RuntimeScope,
+    lease_generation: u64,
+}
+
+impl lotta_runtime::turn::ApprovalPort for ApprovalBrokerAdapter {
+    fn await_resolution(
+        &self,
+        request: lotta_runtime::turn::ControlRequest,
+        cancellation: CancellationToken,
+        deadline: lotta_runtime::ports::ToolTimeout,
+    ) -> lotta_runtime::ports::PortFuture<'_, lotta_runtime::turn::ApprovalResolution> {
+        let key = ApprovalKey {
+            scope: self.scope.clone(),
+            run_generation: self.lease_generation,
+            request_id: request.request_id.as_str().to_owned(),
+            call_id: request.call_id.as_str().to_owned(),
+        };
+        let brokers = Arc::clone(&self.brokers);
+        Box::pin(async move {
+            if request.lease_generation != key.run_generation {
+                return Err(broker_error("stale approval lease"));
+            }
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            {
+                let mut waiters = brokers
+                    .approvals
+                    .lock()
+                    .map_err(|_| broker_error("approval lock"))?;
+                if waiters.len() >= PRODUCTION_BROKER_WAITERS_MAX || waiters.contains_key(&key) {
+                    return Err(broker_error("approval waiter unavailable"));
+                }
+                waiters.insert(
+                    key.clone(),
+                    ApprovalWaiter {
+                        schema: request.schema,
+                        sender,
+                    },
+                );
+            }
+            let timeout = deadline
+                .get()
+                .min(std::time::Duration::from_millis(APPROVAL_WAIT_MS_MAX));
+            let result = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => Err(RuntimeError::Cancelled { context: "approval wait".into() }),
+                () = tokio::time::sleep(timeout) => Err(RuntimeError::Timeout { context: "approval wait".into() }),
+                value = receiver => value.map_err(|_| broker_error("approval waiter dropped")),
+            };
+            if let Ok(mut waiters) = brokers.approvals.lock() {
+                waiters.remove(&key);
+            }
+            result
+        })
+    }
+}
+
+struct ControllerToolBrokerAdapter {
+    brokers: Arc<ProductionTurnBrokers>,
+    scope: lotta_domain::RuntimeScope,
+    lease_generation: u64,
+    sink: Arc<dyn lotta_app_server::ws::RuntimeEventSink>,
+}
+
+impl lotta_runtime::turn::ControllerToolPort for ControllerToolBrokerAdapter {
+    fn execute_external(
+        &self,
+        record: lotta_runtime::turn::ControllerToolRequestRecord,
+        request: lotta_runtime::ports::ToolExecutionRequest,
+    ) -> lotta_runtime::ports::PortFuture<'_, lotta_runtime::ports::ToolOutcome> {
+        let key = ControllerKey {
+            scope: self.scope.clone(),
+            run_generation: self.lease_generation,
+            call_id: record.call_id.as_str().to_owned(),
+        };
+        let brokers = Arc::clone(&self.brokers);
+        let sink = Arc::clone(&self.sink);
+        Box::pin(async move {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            {
+                let mut waiters = brokers
+                    .controller_tools
+                    .lock()
+                    .map_err(|_| broker_error("controller tool lock"))?;
+                if waiters.len() >= PRODUCTION_BROKER_WAITERS_MAX
+                    || waiters.insert(key.clone(), sender).is_some()
+                {
+                    return Err(broker_error("controller tool waiter unavailable"));
+                }
+            }
+            let payload = BoundedJsonValue::new(serde_json::json!({
+                "tool_name": request.definition.model_name.as_str(),
+                "input": request.input.as_value(),
+                "owner": format!("{:?}", request.definition.execution_owner).to_lowercase(),
+            }))
+            .map_err(|_| broker_error("controller request payload"))?;
+            if sink
+                .emit(
+                    &key.scope,
+                    lotta_app_server::ws::RuntimeEvent::ControllerToolRequest {
+                        call_id: NonEmptyString::new(key.call_id.clone())
+                            .map_err(|_| broker_error("controller call id"))?,
+                        lease_generation: key.run_generation,
+                        request: payload,
+                    },
+                )
+                .is_err()
+            {
+                brokers
+                    .controller_tools
+                    .lock()
+                    .map_err(|_| broker_error("controller tool lock"))?
+                    .remove(&key);
+                return Err(broker_error("controller request emit"));
+            }
+            let timeout = request.deadline.get().min(std::time::Duration::from_millis(
+                EXTERNAL_TOOL_CALL_TIMEOUT_MS,
+            ));
+            let result = tokio::select! {
+                biased;
+                () = request.cancellation.cancelled() => Err(RuntimeError::Cancelled { context: "controller tool wait".into() }),
+                () = tokio::time::sleep(timeout) => Err(RuntimeError::Timeout { context: "controller tool wait".into() }),
+                value = receiver => value.map_err(|_| broker_error("controller tool waiter dropped")),
+            };
+            if let Ok(mut waiters) = brokers.controller_tools.lock() {
+                waiters.remove(&key);
+            }
+            result
+        })
+    }
+}
+
+struct CompactionBrokerAdapter<'a> {
+    brokers: Arc<ProductionTurnBrokers>,
+    scope: lotta_domain::RuntimeScope,
+    cancellation: CancellationToken,
+    sink: Arc<dyn lotta_app_server::ws::RuntimeEventSink>,
+    effects: &'a dyn lotta_runtime::turn::TurnEffectPort,
+}
+
+impl lotta_runtime::turn::CompactionPort for CompactionBrokerAdapter<'_> {
+    fn compact(
+        &self,
+        request: ProviderRequest,
+        lease: TurnLease,
+        detail: lotta_runtime::ports::ProviderContextOverflowDetail,
+    ) -> lotta_runtime::ports::PortFuture<'_, lotta_runtime::turn::CompactionProgress> {
+        let service = self
+            .brokers
+            .compaction
+            .lock()
+            .ok()
+            .and_then(|service| service.clone());
+        let scope = self.scope.clone();
+        let cancellation = self.cancellation.clone();
+        let sink = Arc::clone(&self.sink);
+        let effects = self.effects;
+        Box::pin(async move {
+            // Task58 owns mechanics; Task55 only invokes an explicitly registered service.
+            let service = service.ok_or(RuntimeError::CompactionUnavailable)?;
+            let compaction_request = lotta_runtime::turn::CompactionRequest {
+                scope: scope.clone(),
+                lease_generation: lease.generation(),
+                reason: NonEmptyString::new("context_overflow".to_owned())
+                    .map_err(|_| broker_error("compaction reason"))?,
+                tokens_before: detail.estimated.tokens,
+                messages_before: request.messages.as_slice().len(),
+            };
+            effects.persist_compaction_request(&compaction_request)?;
+            sink.emit(
+                &scope,
+                lotta_app_server::ws::RuntimeEvent::CompactionRequest {
+                    lease_generation: compaction_request.lease_generation,
+                    tokens_before: compaction_request.tokens_before,
+                    messages_before: compaction_request.messages_before,
+                    reason: compaction_request.reason,
+                },
+            )
+            .map_err(|_| broker_error("compaction request emit"))?;
+            service.compact(scope, lease, detail, cancellation).await
+        })
+    }
+}
+
+struct RequestRefreshAdapter {
+    setup: Arc<ProductionSetupPorts>,
+    agent: AgentId,
+    conversation: ConversationId,
+    input: String,
+    input_id: String,
+    prompt: String,
+    model: ResolvedTurnModel,
+    catalog: TurnToolCatalog,
+    cancellation: CancellationToken,
+}
+
+impl lotta_runtime::turn::RequestRefreshPort for RequestRefreshAdapter {
+    fn refresh(
+        &self,
+        request: ProviderRequest,
+        _: TurnLease,
+    ) -> lotta_runtime::ports::PortFuture<'static, ProviderRequest> {
+        let _ = request;
+        let setup = Arc::clone(&self.setup);
+        let agent = self.agent.clone();
+        let conversation = self.conversation.clone();
+        let prompt = self.prompt.clone();
+        let input = self.input.clone();
+        let input_id = self.input_id.clone();
+        let model = self.model.clone();
+        let catalog = TurnToolCatalog::new(self.catalog.definitions().cloned().collect())
+            .expect("stored refresh catalog remains valid");
+        let cancellation = self.cancellation.clone();
+        Box::pin(async move {
+            setup
+                .build_request(
+                    &agent,
+                    &conversation,
+                    prompt,
+                    &input,
+                    Some(&input_id),
+                    &model,
+                    &catalog,
+                    cancellation,
+                )
+                .await
         })
     }
 }
@@ -1476,25 +1994,31 @@ impl lotta_runtime::turn::ProviderStartPort for ProductionDispatchStatus<'_> {
 pub struct ProductionTurnController {
     setup: Arc<ProductionSetupPorts>,
     runtime_state: Arc<crate::production_components::ProductionRuntimeState>,
-    provider: Arc<dyn lotta_runtime::ports::ProviderPort>,
-    tools: Arc<dyn lotta_runtime::ports::ToolPort>,
+    provider: Arc<crate::production_components::ProductionProviderPort>,
+    tools: Arc<crate::production_components::ProductionToolPort>,
     store: LocalStore,
     clock: Arc<dyn lotta_domain::Clock + Send + Sync>,
     fallback_cwd: PathBuf,
     turn_sequence: AtomicU64,
+    brokers: Arc<ProductionTurnBrokers>,
 }
 
 impl ProductionTurnController {
     /// Creates the controller with all real runtime/provider/tool/turn dependencies.
     #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "explicit production dependency graph"
+    )]
     pub(crate) fn new(
         setup: Arc<ProductionSetupPorts>,
-        provider: Arc<dyn lotta_runtime::ports::ProviderPort>,
-        tools: Arc<dyn lotta_runtime::ports::ToolPort>,
+        provider: Arc<crate::production_components::ProductionProviderPort>,
+        tools: Arc<crate::production_components::ProductionToolPort>,
         store: LocalStore,
         clock: Arc<dyn lotta_domain::Clock + Send + Sync>,
         fallback_cwd: PathBuf,
         runtime_state: Arc<crate::production_components::ProductionRuntimeState>,
+        brokers: Arc<ProductionTurnBrokers>,
     ) -> Self {
         Self {
             setup,
@@ -1505,6 +2029,7 @@ impl ProductionTurnController {
             clock,
             fallback_cwd,
             turn_sequence: AtomicU64::new(1),
+            brokers,
         }
     }
 
@@ -1574,15 +2099,10 @@ impl ProductionTurnController {
         )
         .await
         .map_err(app_server_error)?;
-        *self
-            .setup
-            .status_sink
-            .lock()
-            .map_err(|_| lotta_app_server::error::AppServerError::Internal)? =
-            Arc::new(WebSocketStatusSink {
-                scope: command.runtime.clone(),
-                sink: Arc::clone(&sink),
-            });
+        let status_sink: Arc<dyn SetupStatusSink> = Arc::new(WebSocketStatusSink {
+            scope: command.runtime.clone(),
+            sink: Arc::clone(&sink),
+        });
         let input = SetupInput {
             agent_id: command.runtime.agent_id.clone(),
             conversation_id: command.runtime.conversation_id.clone(),
@@ -1593,6 +2113,7 @@ impl ProductionTurnController {
             permission_mode: configured_permission_mode(&agent),
             cancellation,
             deadline: std::time::Duration::from_secs(SETUP_DEADLINE_SECONDS),
+            status_sink,
         };
         let input_id = input_client_message_id(command.payload.as_value())?;
         let effects = crate::production_components::ProductionEffects::new(
@@ -1618,7 +2139,54 @@ impl ProductionTurnController {
         let text = canonical_user_text(command.payload.as_value())?;
         self.run_prompt_hook(command, &text, cancellation.clone())
             .await?;
+        let scope = command.runtime.clone();
+        let sink_for_brokers = Arc::clone(&sink);
+        let turn_cancellation = cancellation.clone();
         let (input, effects) = self.prepare_turn(command, text, cancellation, sink).await?;
+        let approval = ApprovalBrokerAdapter {
+            brokers: Arc::clone(&self.brokers),
+            scope: scope.clone(),
+            lease_generation: pending.lease.generation(),
+        };
+        let controller_tools = ControllerToolBrokerAdapter {
+            brokers: Arc::clone(&self.brokers),
+            scope: scope.clone(),
+            lease_generation: pending.lease.generation(),
+            sink: Arc::clone(&sink_for_brokers),
+        };
+        let compaction = CompactionBrokerAdapter {
+            brokers: Arc::clone(&self.brokers),
+            scope: scope.clone(),
+            cancellation: turn_cancellation.clone(),
+            sink: sink_for_brokers,
+            effects: &effects,
+        };
+        let refresh: Arc<dyn lotta_runtime::turn::RequestRefreshPort> =
+            Arc::new(RequestRefreshAdapter {
+                setup: Arc::clone(&self.setup),
+                agent: scope.agent_id.clone(),
+                conversation: scope.conversation_id.clone(),
+                input: input.user_input.clone(),
+                input_id: input_client_message_id(command.payload.as_value())?,
+                prompt: String::new(),
+                model: self
+                    .setup
+                    .resolve_model(
+                        &AgentStore::load(&self.setup.store, &scope.agent_id)
+                            .await
+                            .map_err(app_server_error)?,
+                        &ConversationStore::load(
+                            &self.setup.store,
+                            &scope.agent_id,
+                            &scope.conversation_id,
+                        )
+                        .await
+                        .map_err(app_server_error)?,
+                    )
+                    .map_err(|error| app_server_error(setup_error_runtime(error)))?,
+                catalog: TurnToolCatalog::new(Vec::new()).expect("empty catalog"),
+                cancellation: turn_cancellation,
+            });
         let mut state = self.runtime_state.0.lock().await;
         self.setup
             .run_production_turn(
@@ -1626,9 +2194,10 @@ impl ProductionTurnController {
                 pending.handle.clone(),
                 pending.lease.clone(),
                 input,
-                |catalog, provider, tools, effects| {
-                    TurnPorts::new(provider, tools, catalog, effects)
-                },
+                &approval,
+                &controller_tools,
+                &compaction,
+                refresh,
                 self.provider.as_ref(),
                 self.tools.as_ref(),
                 &effects,
@@ -1737,7 +2306,7 @@ struct WebSocketStatusSink {
     sink: Arc<dyn lotta_app_server::ws::RuntimeEventSink>,
 }
 
-impl ProductionStatusSink for WebSocketStatusSink {
+impl SetupStatusSink for WebSocketStatusSink {
     fn emit(&self, status: SetupStatus) -> Result<(), SetupError> {
         let value = match status {
             SetupStatus::Sending => "sending",

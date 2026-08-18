@@ -1,7 +1,9 @@
-use super::{ToolResultRecord, TurnEffectPort, TurnEvent, TurnProjection, TurnToolCatalog};
+use super::{
+    ToolResultRecord, TurnEffectPort, TurnEvent, TurnProjection, TurnStopRecord, TurnToolCatalog,
+};
 use crate::boundary::{ProviderEventText, ProviderName, ToolArgumentChunk};
 use crate::ports::*;
-use crate::{ListenerRuntime, RuntimeError, RuntimeHandle};
+use crate::{ListenerRuntime, RuntimeError, RuntimeHandle, turn::ControlRequest};
 use lotta_domain::{
     AgentId, BoundedJsonValue, BoundedVec, ConversationId, ModelDescriptor, NonEmptyString, RunId,
     RuntimeScope, TurnLease,
@@ -143,6 +145,7 @@ pub(super) struct RecordingEffects {
     pub(super) projections: Arc<Mutex<Vec<TurnProjection>>>,
     pub(super) events: Arc<Mutex<Vec<TurnEvent>>>,
     pub(super) results: Arc<Mutex<Vec<ToolResultRecord>>>,
+    pub(super) stops: Arc<Mutex<Vec<TurnStopRecord>>>,
     pub(super) order: Arc<Mutex<Vec<&'static str>>>,
     cancel_on_finished: Option<CancellationToken>,
     fail_finished: bool,
@@ -168,6 +171,12 @@ impl TurnEffectPort for RecordingEffects {
         Ok(())
     }
 
+    fn persist_stop_reason(&self, record: TurnStopRecord) -> Result<(), RuntimeError> {
+        self.stops.lock().unwrap().push(record);
+        self.order.lock().unwrap().push("stop");
+        Ok(())
+    }
+
     fn emit(&self, event: TurnEvent) -> Result<(), RuntimeError> {
         if matches!(event, TurnEvent::Finished { .. }) {
             if let Some(token) = &self.cancel_on_finished {
@@ -190,6 +199,22 @@ impl TurnEffectPort for RecordingEffects {
     fn append_tool_result(&self, result: ToolResultRecord) -> Result<(), RuntimeError> {
         self.results.lock().unwrap().push(result);
         self.order.lock().unwrap().push("result");
+        Ok(())
+    }
+
+    fn persist_controller_request(
+        &self,
+        _: super::ControllerToolRequestRecord,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    fn persist_compaction_request(&self, _: &super::CompactionRequest) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    fn persist_control_request(&self, _: &ControlRequest) -> Result<(), RuntimeError> {
+        self.order.lock().unwrap().push("control");
         Ok(())
     }
 }

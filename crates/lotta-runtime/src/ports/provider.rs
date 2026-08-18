@@ -601,9 +601,9 @@ impl ProviderError {
             }
             Self::Protocol(value) => (ProviderFailureKind::Schema, value),
             Self::ContextOverflow(value) => (ProviderFailureKind::ContextOverflow, value),
-            Self::Quota(value) | Self::Cancelled(value) | Self::Unknown(value) => {
-                (ProviderFailureKind::Terminal, value)
-            }
+            Self::Quota(value) => (ProviderFailureKind::Quota, value),
+            Self::Cancelled(value) => (ProviderFailureKind::Cancelled, value),
+            Self::Unknown(value) => (ProviderFailureKind::Terminal, value),
         };
         let failure = ProviderFailure::new(
             kind,
@@ -1009,6 +1009,12 @@ pub trait ProviderPort: Send + Sync {
                 context: "provider host registration".into(),
             })
         })
+    }
+
+    /// Returns a non-secret transport hint for one resolved provider connection.
+    #[must_use]
+    fn route_hint(&self, _provider_id: &str) -> Option<&'static str> {
+        None
     }
 
     /// Streams one normalized request into the opaque bounded event sink.

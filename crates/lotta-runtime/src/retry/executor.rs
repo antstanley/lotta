@@ -17,8 +17,13 @@ pub const PENDING_NON_VISIBLE_BYTES_MAX: usize = 16_384;
 pub enum RetryTerminal {
     /// Provider stream completed successfully.
     Success,
-    /// Retry policy ended with one normalized provider failure.
-    Failure(ProviderFailure),
+    /// Retry policy ended with one normalized provider failure and exact send count.
+    Failure {
+        /// Last normalized failure.
+        failure: ProviderFailure,
+        /// Total provider sends performed across the execution.
+        attempt_count: u32,
+    },
 }
 
 /// Runtime-owned provider attempt orchestrator.
@@ -54,6 +59,33 @@ where
         }
     }
 
+    /// Executes ordered fallback candidates under one bounded central policy.
+    ///
+    /// # Errors
+    /// Returns typed cancellation, deadline, provider adapter, or event delivery failures.
+    pub async fn execute_candidates(
+        &self,
+        source: ProviderRoute,
+        source_port: &dyn ProviderPort,
+        fallback_ports: &[&dyn ProviderPort],
+        request: ProviderRequest,
+        output: crate::ports::ProviderEventSink,
+    ) -> Result<RetryTerminal, RuntimeError> {
+        if self.fallback.is_some() && fallback_ports.len() > 1 {
+            return Err(RuntimeError::InvalidData {
+                context: "single fallback route with multiple providers".into(),
+            });
+        }
+        self.execute(
+            source,
+            source_port,
+            fallback_ports.as_ref().split_first().map(|(port, _)| *port),
+            request,
+            output,
+        )
+        .await
+    }
+
     /// Executes single-attempt provider adapters under one central budget and deadline.
     ///
     /// Events are forwarded as they arrive. Once model-visible output has escaped, any attempt
@@ -82,7 +114,10 @@ where
         }
         let mut state = ExecutionState::new(source, source_port);
         let mut retry_attempt = 0;
+        let mut empty_attempt = 0;
+        let mut attempt_count = 0_u32;
         loop {
+            attempt_count = attempt_count.saturating_add(1);
             let attempt = self
                 .execute_attempt(&state, &request, output.clone(), deadline_ms)
                 .await?;
@@ -91,7 +126,23 @@ where
                     return Ok(RetryTerminal::Success);
                 }
                 AttemptTerminal::Success => {
-                    return Ok(RetryTerminal::Failure(empty_failure()));
+                    let failure = empty_failure();
+                    if empty_attempt == retries_max(&self.policy, &failure) {
+                        return Ok(RetryTerminal::Failure {
+                            failure,
+                            attempt_count,
+                        });
+                    }
+                    empty_attempt += 1;
+                    self.prepare_retry(
+                        &mut state,
+                        &request,
+                        fallback_port,
+                        deadline_ms,
+                        empty_attempt,
+                        &failure,
+                    )
+                    .await?;
                 }
                 AttemptTerminal::Failure(failure) => {
                     if attempt.model_output
@@ -99,7 +150,10 @@ where
                         || !failure.is_retryable()
                     {
                         forward_terminal(attempt.stop, &output).await?;
-                        return Ok(RetryTerminal::Failure(failure));
+                        return Ok(RetryTerminal::Failure {
+                            failure,
+                            attempt_count,
+                        });
                     }
                     let next_attempt = retry_attempt + 1;
                     self.prepare_retry(
@@ -515,7 +569,11 @@ fn runtime_failure(error: &RuntimeError) -> ProviderFailure {
         }
         _ => ProviderFailureKind::Terminal,
     };
-    ProviderFailure::new(kind, error.to_string())
+    let failure = ProviderFailure::new(kind, error.to_string());
+    match error {
+        RuntimeError::ContextOverflow { detail } => failure.with_context_overflow(detail.clone()),
+        _ => failure,
+    }
 }
 
 fn duration_ms(value: Duration) -> u64 {

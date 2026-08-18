@@ -29,7 +29,8 @@ impl SetupOrchestrator<'_> {
         stages.push(SetupStage::ResolveCwd);
 
         self.check_ready(&input)?;
-        self.ports
+        let scope = self
+            .ports
             .apply_scope(cwd.effective(), input.permission_mode, &input.cancellation)
             .await
             .map_err(SetupError::from)
@@ -37,10 +38,10 @@ impl SetupOrchestrator<'_> {
         stages.push(SetupStage::ApplyWorkspaceSandboxAndPermissions);
 
         let result = self
-            .finish_pre_admission(&input, &agent, &conversation, &cwd, &mut stages)
+            .finish_pre_admission(&input, &agent, &conversation, &cwd, scope, &mut stages)
             .await;
         if result.is_err() {
-            self.ports.rollback_scope();
+            self.ports.release_scope(scope);
         }
         result
     }
@@ -51,6 +52,7 @@ impl SetupOrchestrator<'_> {
         agent: &Agent,
         conversation: &Conversation,
         cwd: &CwdResolution,
+        scope: super::setup::SetupScopeHandle,
         stages: &mut Vec<SetupStage>,
     ) -> Result<SetupOutput, SetupFailure> {
         self.check_ready(input)?;
@@ -66,7 +68,7 @@ impl SetupOrchestrator<'_> {
             .ports
             .skill_inventory(agent, cwd.effective(), &input.selected_skills)
             .map_err(SetupFailure::pre)?;
-        let reminder = self.reminder_claim(input, cwd).await?;
+        let reminder = self.reminder_claim(input, cwd, scope).await?;
         let context = ClaimedContext {
             agent,
             conversation,
@@ -74,7 +76,7 @@ impl SetupOrchestrator<'_> {
             inventory: &inventory,
             reminder: reminder.as_ref(),
         };
-        let result = self.finish_claimed(input, context, stages).await;
+        let result = self.finish_claimed(input, context, scope, stages).await;
         if result.is_err() {
             let _ = self
                 .release_reminder(reminder.as_ref(), &input.cancellation)
@@ -87,11 +89,12 @@ impl SetupOrchestrator<'_> {
         &self,
         input: &SetupInput,
         context: ClaimedContext<'_>,
+        scope: super::setup::SetupScopeHandle,
         stages: &mut Vec<SetupStage>,
     ) -> Result<SetupOutput, SetupFailure> {
-        let prompt = self.compile(input, &context, stages).await?;
+        let prompt = self.compile(input, &context, scope, stages).await?;
         let (model, extensions) = self.model_and_extensions(input, &context, stages).await?;
-        let tools = self.tools(input, &model, &extensions, stages)?;
+        let tools = self.tools(input, scope, &model, &extensions, stages)?;
         self.admit_and_finish(
             input,
             prompt,
@@ -99,6 +102,7 @@ impl SetupOrchestrator<'_> {
             tools,
             extensions,
             context.reminder.cloned(),
+            scope,
             stages,
         )
         .await
@@ -108,6 +112,7 @@ impl SetupOrchestrator<'_> {
         &self,
         input: &SetupInput,
         context: &ClaimedContext<'_>,
+        scope: super::setup::SetupScopeHandle,
         stages: &mut Vec<SetupStage>,
     ) -> Result<String, SetupFailure> {
         let prompt = self
@@ -116,6 +121,7 @@ impl SetupOrchestrator<'_> {
                 context.agent,
                 context.conversation,
                 context.inventory,
+                scope,
                 context.reminder.map(|claim| claim.message.as_str()),
                 &input.cancellation,
             )
@@ -167,6 +173,7 @@ impl SetupOrchestrator<'_> {
     fn tools(
         &self,
         input: &SetupInput,
+        scope: super::setup::SetupScopeHandle,
         model: &super::setup::ResolvedTurnModel,
         extensions: &super::setup::ExtensionSnapshot,
         stages: &mut Vec<SetupStage>,
@@ -174,7 +181,7 @@ impl SetupOrchestrator<'_> {
         self.check_ready(input)?;
         let candidates = self
             .ports
-            .tool_candidates(extensions, &input.cancellation)
+            .tool_candidates(scope, extensions, &input.cancellation)
             .map_err(SetupFailure::pre)?;
         let authorized = candidates
             .into_iter()
@@ -240,6 +247,7 @@ impl SetupOrchestrator<'_> {
         tools: super::TurnToolCatalog,
         extensions: super::setup::ExtensionSnapshot,
         reminder: Option<super::setup::ReminderClaim>,
+        scope: super::setup::SetupScopeHandle,
         stages: &mut Vec<SetupStage>,
     ) -> Result<SetupOutput, SetupFailure> {
         self.check_ready(input)?;
@@ -248,7 +256,7 @@ impl SetupOrchestrator<'_> {
             .build_request(
                 &input.agent_id,
                 &input.conversation_id,
-                prompt,
+                prompt.clone(),
                 &input.user_input,
                 reminder.as_ref().map(super::setup::ReminderClaim::input_id),
                 &model,
@@ -295,10 +303,16 @@ impl SetupOrchestrator<'_> {
         stages.push(SetupStage::BuildProviderRequestAndEmitStatus);
         Ok(SetupOutput {
             request,
+            fallback_candidates: model.fallback_candidates.clone(),
+            model,
+            prompt,
+            input: input.user_input.clone(),
             tools,
             stages: std::mem::take(stages),
             admission: receipt,
             extensions,
+            scope,
+            status_sink: std::sync::Arc::clone(&input.status_sink),
             status: SetupStatus::Sending,
         })
     }
@@ -307,6 +321,7 @@ impl SetupOrchestrator<'_> {
         &self,
         input: &SetupInput,
         cwd: &CwdResolution,
+        scope: super::setup::SetupScopeHandle,
     ) -> Result<Option<super::setup::ReminderClaim>, SetupFailure> {
         match cwd {
             CwdResolution::Requested(_) => Ok(None),
@@ -316,6 +331,7 @@ impl SetupOrchestrator<'_> {
                     &input.agent_id,
                     &input.conversation_id,
                     original,
+                    scope,
                     &input.cancellation,
                 )
                 .await

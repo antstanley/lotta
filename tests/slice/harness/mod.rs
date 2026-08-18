@@ -430,6 +430,12 @@ impl TurnEffectPort for Effects<'_> {
         stats.projections = stats.projections.checked_add(1).expect("projection count");
         Ok(())
     }
+    fn persist_stop_reason(
+        &self,
+        _: lotta_runtime::turn::TurnStopRecord,
+    ) -> Result<(), lotta_runtime::RuntimeError> {
+        Ok(())
+    }
     fn emit(&self, event: TurnEvent) -> Result<(), lotta_runtime::RuntimeError> {
         let wire = match event {
             TurnEvent::StreamDelta(_) => RuntimeEvent::StreamDelta {
@@ -451,7 +457,12 @@ impl TurnEffectPort for Effects<'_> {
                     error: None,
                 }
             }
-            TurnEvent::Retry(_) | TurnEvent::ToolResult(_) => return Ok(()),
+            TurnEvent::ControlRequest(_)
+            | TurnEvent::Retry(_)
+            | TurnEvent::ToolResult(_)
+            | TurnEvent::Failed { .. } => {
+                return Ok(());
+            }
         };
         self.sink
             .emit(self.scope, wire)
@@ -463,6 +474,26 @@ impl TurnEffectPort for Effects<'_> {
     fn append_tool_result(
         &self,
         _: lotta_runtime::ToolResultRecord,
+    ) -> Result<(), lotta_runtime::RuntimeError> {
+        Ok(())
+    }
+    fn persist_controller_request(
+        &self,
+        _: lotta_runtime::turn::ControllerToolRequestRecord,
+    ) -> Result<(), lotta_runtime::RuntimeError> {
+        Ok(())
+    }
+
+    fn persist_compaction_request(
+        &self,
+        _: &lotta_runtime::turn::CompactionRequest,
+    ) -> Result<(), lotta_runtime::RuntimeError> {
+        Ok(())
+    }
+
+    fn persist_control_request(
+        &self,
+        _: &lotta_runtime::turn::ControlRequest,
     ) -> Result<(), lotta_runtime::RuntimeError> {
         Ok(())
     }

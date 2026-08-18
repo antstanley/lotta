@@ -1,10 +1,14 @@
 use super::step::tool_message;
-use super::{ProjectionKind, ToolResultRecord, TurnEffectPort, TurnEvent, TurnToolCatalog};
+use super::{
+    ControlRequest, ControllerToolRequestRecord, ProjectionKind, ProviderFailureDetail,
+    ToolResultRecord, TurnEffectPort, TurnEvent, TurnStopReason, TurnStopRecord, TurnToolCatalog,
+};
 use crate::bounds::{PROVIDER_MESSAGES_MAX, TURN_STEPS_MAX, TURN_TOOL_CALLS_MAX};
 use crate::ports::{
     ParallelSafety, ProviderEvent, ProviderMessage, ProviderMessages, ProviderPort,
     ProviderRequest, StopReason, ToolApprovalPolicy, ToolCallAccumulator, ToolCallId,
-    ToolExecutionOwner, ToolExecutionRequest, ToolPort, ValidatedToolInput, provider_event_channel,
+    ToolExecutionOwner, ToolExecutionRequest, ToolOutcome, ToolOutcomeMessage, ToolPort,
+    ValidatedToolInput, provider_event_channel,
 };
 use crate::retry::{
     Clock, EventSink, FallbackRoute, ProviderRoute, RETRY_EVENT_CHANNEL_CAPACITY, RetryEvent,
@@ -13,7 +17,7 @@ use crate::retry::{
 use crate::{
     CancellationPolicy, LeaseEffect, LeaseGuard, ListenerRuntime, RuntimeError, RuntimeHandle,
 };
-use lotta_domain::TurnLease;
+use lotta_domain::{BoundedJsonValue, NonEmptyString, RunId, TurnLease};
 use std::collections::BTreeMap;
 
 /// Outcome of an admitted turn loop.
@@ -28,7 +32,51 @@ pub enum TurnRunOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Flow {
     Continue,
+    Failed,
     Suppressed,
+}
+
+/// Maximum context-overflow compactions before the fourth overflow is terminal.
+pub const CONTEXT_OVERFLOW_COMPACTIONS_MAX: u8 = 3;
+
+/// Safe before/after size observations returned by the injected Task58 seam.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompactionProgress {
+    /// Estimated model-visible tokens before compaction.
+    pub tokens_before: u64,
+    /// Estimated model-visible tokens after compaction.
+    pub tokens_after: u64,
+    /// Model-visible messages before compaction.
+    pub messages_before: usize,
+    /// Model-visible messages after compaction.
+    pub messages_after: usize,
+}
+
+impl CompactionProgress {
+    fn progressed(self) -> bool {
+        self.tokens_after < self.tokens_before || self.messages_after < self.messages_before
+    }
+}
+
+/// Object-safe Task58 compaction seam. Implementations own persistence and lifecycle emission.
+pub trait CompactionPort: Send + Sync {
+    /// Compacts once for the exact request, lease, cancellation, and overflow detail.
+    fn compact(
+        &self,
+        request: ProviderRequest,
+        lease: TurnLease,
+        detail: crate::ports::ProviderContextOverflowDetail,
+    ) -> crate::ports::PortFuture<'_, CompactionProgress>;
+}
+
+/// Object-safe refresh/recompile/rebuild seam invoked after successful compaction.
+pub trait RequestRefreshPort: Send + Sync {
+    /// Rebuilds the provider request from current durable state.
+    fn refresh(
+        &self,
+        request: ProviderRequest,
+        lease: TurnLease,
+    ) -> crate::ports::PortFuture<'static, ProviderRequest>;
 }
 
 struct ProviderStepState {
@@ -61,12 +109,50 @@ pub struct TurnPorts<'ports, 'catalog> {
     pub provider: TurnProvider<'ports>,
     /// Optional callbacks fired around the provider's first poll.
     pub provider_start: Option<&'catalog dyn ProviderStartPort>,
-    /// Local tool execution boundary.
+    /// Local Rust tool execution boundary.
     pub tools: &'ports dyn ToolPort,
+    /// External non-Rust execution boundary.
+    pub controller_tools: Option<&'ports dyn ControllerToolPort>,
+    /// Interactive approval boundary.
+    pub approvals: Option<&'ports dyn ApprovalPort>,
     /// Tools admitted for this turn.
     pub catalog: &'catalog TurnToolCatalog,
     /// Owner-local projection and event effects.
     pub effects: &'ports dyn TurnEffectPort,
+    /// Optional injected Task58 compaction seam.
+    pub compaction: Option<&'ports dyn CompactionPort>,
+    /// Optional request refresh/recompile/rebuild seam paired with compaction.
+    pub request_refresh: Option<std::sync::Arc<dyn RequestRefreshPort>>,
+}
+
+/// Resolution returned by the runtime approval backend.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ApprovalResolution {
+    /// Execute with original or edited input.
+    Allow(Option<BoundedJsonValue>),
+    /// Append a structured user-denied result.
+    Deny,
+}
+
+/// Approval backend for one exact persisted request and lease.
+pub trait ApprovalPort: Send + Sync {
+    /// Waits for a matching resolution, cancellation, or deadline.
+    fn await_resolution(
+        &self,
+        request: ControlRequest,
+        cancellation: tokio_util::sync::CancellationToken,
+        deadline: crate::ports::ToolTimeout,
+    ) -> crate::ports::PortFuture<'_, ApprovalResolution>;
+}
+
+/// External execution backend for controller, MCP, sidecar, and channel owners.
+pub trait ControllerToolPort: Send + Sync {
+    /// Executes exactly one bounded externally-owned call.
+    fn execute_external(
+        &self,
+        record: ControllerToolRequestRecord,
+        request: ToolExecutionRequest,
+    ) -> crate::ports::PortFuture<'_, ToolOutcome>;
 }
 
 /// Provider lifecycle callbacks straddling the stream future's first poll.
@@ -95,7 +181,7 @@ impl<'ports, 'catalog> TurnPorts<'ports, 'catalog> {
         Self::configured(
             ProviderRoute::new("native", "configured"),
             provider,
-            None,
+            Vec::new(),
             tools,
             catalog,
             effects,
@@ -107,36 +193,102 @@ impl<'ports, 'catalog> TurnPorts<'ports, 'catalog> {
     pub fn configured(
         route: ProviderRoute,
         provider: &'ports dyn ProviderPort,
-        fallback: Option<ConfiguredFallback<'ports>>,
+        fallbacks: Vec<ConfiguredFallback<'ports>>,
         tools: &'ports dyn ToolPort,
         catalog: &'catalog TurnToolCatalog,
         effects: &'ports dyn TurnEffectPort,
     ) -> Self {
-        let fallback_port = fallback.as_ref().map(|value| value.provider);
-        let fallback_route = fallback.map(|value| value.route);
+        let fallback_ports = fallbacks
+            .iter()
+            .map(|value| value.provider)
+            .collect::<Vec<_>>();
+        let fallback_routes = fallbacks
+            .into_iter()
+            .map(|value| value.route)
+            .collect::<Vec<_>>();
         Self {
             provider: TurnProvider::Retrying {
                 route,
                 source: provider,
-                fallback: fallback_port,
+                fallbacks: fallback_ports,
                 executor: std::sync::Arc::new(ProductionRetryExecutor {
                     clock: crate::retry::SystemClock::default(),
                     sleeper: crate::retry::TokioSleeper,
                     events: TurnRetryEventSink::new(),
-                    fallback: fallback_route,
+                    fallbacks: fallback_routes,
                 }),
             },
             provider_start: None,
             tools,
+            controller_tools: None,
+            approvals: None,
             catalog,
             effects,
+            compaction: None,
+            request_refresh: None,
         }
+    }
+
+    /// Installs ordered immutable request-local fallback routes and providers atomically.
+    #[must_use]
+    pub fn with_fallbacks(mut self, configured: Vec<ConfiguredFallback<'ports>>) -> Self {
+        if let TurnProvider::Retrying {
+            fallbacks,
+            executor,
+            ..
+        } = &mut self.provider
+        {
+            let (routes, providers): (Vec<_>, Vec<_>) = configured
+                .into_iter()
+                .map(|candidate| (candidate.route, candidate.provider))
+                .unzip();
+            *fallbacks = providers;
+            *executor = std::sync::Arc::new(ProductionRetryExecutor {
+                clock: crate::retry::SystemClock::default(),
+                sleeper: crate::retry::TokioSleeper,
+                events: TurnRetryEventSink::new(),
+                fallbacks: routes,
+            });
+        }
+        self
+    }
+
+    /// Preserves the legacy one-fallback composition wrapper.
+    #[must_use]
+    pub fn with_fallback(self, route: FallbackRoute, provider: &'ports dyn ProviderPort) -> Self {
+        self.with_fallbacks(vec![ConfiguredFallback { route, provider }])
+    }
+
+    /// Installs compaction and refresh seams for context pressure/overflow.
+    #[must_use]
+    pub fn with_context_ports(
+        mut self,
+        compaction: &'ports dyn CompactionPort,
+        refresh: std::sync::Arc<dyn RequestRefreshPort>,
+    ) -> Self {
+        self.compaction = Some(compaction);
+        self.request_refresh = Some(refresh);
+        self
     }
 
     /// Installs a callback for the first provider stream admission boundary.
     #[must_use]
     pub fn with_provider_start(mut self, callback: &'catalog dyn ProviderStartPort) -> Self {
         self.provider_start = Some(callback);
+        self
+    }
+
+    /// Installs the external execution backend.
+    #[must_use]
+    pub fn with_controller_tools(mut self, port: &'ports dyn ControllerToolPort) -> Self {
+        self.controller_tools = Some(port);
+        self
+    }
+
+    /// Installs the approval backend.
+    #[must_use]
+    pub fn with_approvals(mut self, port: &'ports dyn ApprovalPort) -> Self {
+        self.approvals = Some(port);
         self
     }
 
@@ -152,8 +304,12 @@ impl<'ports, 'catalog> TurnPorts<'ports, 'catalog> {
             provider: TurnProvider::Direct(provider),
             provider_start: None,
             tools,
+            controller_tools: None,
+            approvals: None,
             catalog,
             effects,
+            compaction: None,
+            request_refresh: None,
         }
     }
 }
@@ -178,7 +334,7 @@ pub enum TurnProvider<'a> {
         /// Initial single-attempt adapter.
         source: &'a dyn ProviderPort,
         /// Optional destination single-attempt adapter.
-        fallback: Option<&'a dyn ProviderPort>,
+        fallbacks: Vec<&'a dyn ProviderPort>,
         /// Runtime retry executor.
         executor: std::sync::Arc<dyn ProviderTurnExecutorPort + 'a>,
     },
@@ -209,7 +365,7 @@ pub trait ProviderTurnExecutorPort: Send + Sync {
         &'a self,
         route: ProviderRoute,
         source: &'a dyn ProviderPort,
-        fallback: Option<&'a dyn ProviderPort>,
+        fallbacks: &'a [&'a dyn ProviderPort],
         request: ProviderRequest,
         output: crate::ports::ProviderEventSink,
     ) -> crate::ports::PortFuture<'a, RetryTerminal>;
@@ -225,11 +381,11 @@ where
         &'a self,
         route: ProviderRoute,
         source: &'a dyn ProviderPort,
-        fallback: Option<&'a dyn ProviderPort>,
+        fallbacks: &'a [&'a dyn ProviderPort],
         request: ProviderRequest,
         output: crate::ports::ProviderEventSink,
     ) -> crate::ports::PortFuture<'a, RetryTerminal> {
-        Box::pin(self.execute(route, source, fallback, request, output))
+        Box::pin(self.execute_candidates(route, source, fallbacks, request, output))
     }
 }
 
@@ -294,7 +450,7 @@ struct ProductionRetryExecutor {
     clock: crate::retry::SystemClock,
     sleeper: crate::retry::TokioSleeper,
     events: TurnRetryEventSink,
-    fallback: Option<FallbackRoute>,
+    fallbacks: Vec<FallbackRoute>,
 }
 
 impl ProviderTurnExecutorPort for ProductionRetryExecutor {
@@ -312,20 +468,77 @@ impl ProviderTurnExecutorPort for ProductionRetryExecutor {
         &'a self,
         route: ProviderRoute,
         source: &'a dyn ProviderPort,
-        fallback: Option<&'a dyn ProviderPort>,
+        fallbacks: &'a [&'a dyn ProviderPort],
         request: ProviderRequest,
         output: crate::ports::ProviderEventSink,
     ) -> crate::ports::PortFuture<'a, RetryTerminal> {
         Box::pin(async move {
-            RetryExecutor::new(
-                &self.clock,
-                &self.sleeper,
-                &self.events,
-                RetryPolicy::default(),
-                self.fallback.as_ref(),
-            )
-            .execute(route, source, fallback, request, output)
-            .await
+            let mut current_route = route;
+            let mut current_port = source;
+            let mut current_request = request;
+            let mut total_attempts = 0_u32;
+            for candidate in self
+                .fallbacks
+                .iter()
+                .zip(fallbacks.iter().copied())
+                .map(Some)
+                .chain(std::iter::once(None))
+            {
+                let terminal = RetryExecutor::new(
+                    &self.clock,
+                    &self.sleeper,
+                    &self.events,
+                    RetryPolicy::default(),
+                    None,
+                )
+                .execute(
+                    current_route.clone(),
+                    current_port,
+                    None,
+                    current_request.clone(),
+                    output.clone(),
+                )
+                .await?;
+                match terminal {
+                    RetryTerminal::Success => return Ok(RetryTerminal::Success),
+                    RetryTerminal::Failure {
+                        failure,
+                        attempt_count,
+                    } => {
+                        total_attempts = total_attempts.saturating_add(attempt_count);
+                        let Some((route, provider)) = candidate else {
+                            return Ok(RetryTerminal::Failure {
+                                failure,
+                                attempt_count: total_attempts,
+                            });
+                        };
+                        if !matches!(
+                            failure.kind,
+                            crate::retry::ProviderFailureKind::Transient
+                                | crate::retry::ProviderFailureKind::Busy
+                        ) {
+                            return Ok(RetryTerminal::Failure {
+                                failure,
+                                attempt_count: total_attempts,
+                            });
+                        }
+                        self.events
+                            .emit(RetryEvent::new(
+                                current_route.clone(),
+                                route.destination().clone(),
+                                crate::retry::RetryReason::TransportFallback,
+                                total_attempts,
+                                0,
+                                &failure.reason,
+                            ))
+                            .await?;
+                        current_route = route.destination().clone();
+                        current_port = provider;
+                        current_request.model = route.destination_model().clone();
+                    }
+                }
+            }
+            unreachable!("fallback chain includes terminal sentinel")
         })
     }
 }
@@ -336,10 +549,20 @@ struct TurnContext<'ports, 'catalog> {
     provider: TurnProvider<'ports>,
     provider_start: Option<&'catalog dyn ProviderStartPort>,
     tools: &'ports dyn ToolPort,
+    controller_tools: Option<&'ports dyn ControllerToolPort>,
+    approvals: Option<&'ports dyn ApprovalPort>,
     catalog: &'catalog TurnToolCatalog,
     effects: &'ports dyn TurnEffectPort,
     request: ProviderRequest,
+    compaction: Option<&'ports dyn CompactionPort>,
+    request_refresh: Option<std::sync::Arc<dyn RequestRefreshPort>>,
+    context_compactions: u8,
     total_tool_calls: usize,
+    lease_generation: u64,
+    turn_id: NonEmptyString,
+    run_id: RunId,
+    input_id: NonEmptyString,
+    scope: lotta_domain::RuntimeScope,
 }
 
 /// Runs one bounded provider turn and sequential local-tool continuations.
@@ -353,6 +576,23 @@ pub async fn run_turn(
     request: ProviderRequest,
     ports: TurnPorts<'_, '_>,
 ) -> Result<TurnRunOutcome, RuntimeError> {
+    let lease_generation = lease.generation();
+    let scope = lotta_domain::RuntimeScope::new(
+        handle.key().agent_id().clone(),
+        handle.key().conversation_id().clone(),
+        None,
+    );
+    let lifecycle = runtime
+        .lifecycle(&handle)
+        .ok_or_else(|| protocol("runtime lifecycle missing"))?;
+    let turn_id = NonEmptyString::new("turn").map_err(|_| protocol("turn id"))?;
+    let run_id = lifecycle
+        .projection()
+        .active_run_ids()
+        .first()
+        .cloned()
+        .ok_or_else(|| protocol("active run id missing"))?;
+    let input_id = turn_id.clone();
     let guard = LeaseGuard::new(
         handle,
         lease,
@@ -363,8 +603,12 @@ pub async fn run_turn(
         provider,
         provider_start,
         tools,
+        controller_tools,
+        approvals,
         catalog,
         effects,
+        compaction,
+        request_refresh,
     } = ports;
     let mut turn = TurnContext {
         runtime,
@@ -372,25 +616,51 @@ pub async fn run_turn(
         provider,
         provider_start,
         tools,
+        controller_tools,
+        approvals,
         catalog,
         effects,
         request,
+        compaction,
+        request_refresh,
+        context_compactions: 0,
         total_tool_calls: 0,
+        lease_generation,
+        turn_id,
+        run_id,
+        input_id,
+        scope,
     };
     run_loop(&mut turn).await
 }
 
 async fn run_loop(turn: &mut TurnContext<'_, '_>) -> Result<TurnRunOutcome, RuntimeError> {
     if turn.is_suppressed() {
+        if turn.request.cancellation.is_cancelled() {
+            return cancel_turn(turn).map(|flow| match flow {
+                Flow::Failed => TurnRunOutcome::Completed,
+                Flow::Suppressed | Flow::Continue => TurnRunOutcome::Suppressed,
+            });
+        }
         turn.request.cancellation.cancel();
         return Ok(TurnRunOutcome::Suppressed);
     }
     for step_index in 0..TURN_STEPS_MAX.value {
         let remaining = TURN_TOOL_CALLS_MAX.value - turn.total_tool_calls;
         let mut state = ProviderStepState::new(remaining)?;
-        if run_provider_step(turn, &mut state).await? == Flow::Suppressed {
-            turn.request.cancellation.cancel();
-            return Ok(TurnRunOutcome::Suppressed);
+        match run_provider_step(turn, &mut state).await? {
+            Flow::Suppressed => {
+                if turn.request.cancellation.is_cancelled() {
+                    return cancel_turn(turn).map(|flow| match flow {
+                        Flow::Failed => TurnRunOutcome::Completed,
+                        Flow::Suppressed | Flow::Continue => TurnRunOutcome::Suppressed,
+                    });
+                }
+                turn.request.cancellation.cancel();
+                return Ok(TurnRunOutcome::Suppressed);
+            }
+            Flow::Failed => return Ok(TurnRunOutcome::Completed),
+            Flow::Continue => {}
         }
         if turn.is_suppressed() {
             turn.request.cancellation.cancel();
@@ -463,14 +733,14 @@ fn execute_provider(
         TurnProvider::Retrying {
             route,
             source,
-            fallback,
+            fallbacks,
             executor,
         } => {
             let retry_events = executor.begin_retry_step()?;
             Ok((
                 Box::pin(async move {
                     executor
-                        .execute(route, source, fallback, request, sink)
+                        .execute(route, source, &fallbacks, request, sink)
                         .await
                 }),
                 retry_events,
@@ -483,6 +753,27 @@ async fn run_provider_step(
     turn: &mut TurnContext<'_, '_>,
     state: &mut ProviderStepState,
 ) -> Result<Flow, RuntimeError> {
+    loop {
+        if let Some(detail) = preflight_pressure(&turn.request) {
+            compact_and_refresh(turn, detail).await?;
+            continue;
+        }
+        match run_provider_attempt(turn, state).await? {
+            ProviderStepResult::Flow(flow) => return Ok(flow),
+            ProviderStepResult::Overflow(detail) => compact_and_refresh(turn, detail).await?,
+        }
+    }
+}
+
+enum ProviderStepResult {
+    Flow(Flow),
+    Overflow(crate::ports::ProviderContextOverflowDetail),
+}
+
+async fn run_provider_attempt(
+    turn: &mut TurnContext<'_, '_>,
+    state: &mut ProviderStepState,
+) -> Result<ProviderStepResult, RuntimeError> {
     turn.request.validate_bytes()?;
     let (sink, mut output) = provider_event_channel(1, &turn.request.cancellation)?;
     let (future, mut retry_events) =
@@ -512,23 +803,30 @@ async fn run_provider_step(
                 biased;
                 event = receive_retry(&mut retry_events), if retry_events.is_some() => {
                     if let Some(event) = event && apply_retry(turn, event)? == Flow::Suppressed {
-                        return suppress_provider(turn, &mut output);
+                        return suppress_provider(turn, &mut output).map(ProviderStepResult::Flow);
                     }
                 }
                 result = &mut future => break result,
                 result = output.receive() => {
                     if drain_ready_retries(turn, &mut retry_events)? == Flow::Suppressed {
-                        return suppress_provider(turn, &mut output);
+                        return suppress_provider(turn, &mut output).map(ProviderStepResult::Flow);
                     }
                     if turn.is_suppressed() {
-                        return suppress_provider(turn, &mut output);
+                        return suppress_provider(turn, &mut output).map(ProviderStepResult::Flow);
                     }
                     match result? {
-                        Some(event) => {
-                            if handle_event(turn, state, event).await? == Flow::Suppressed {
-                                return suppress_provider(turn, &mut output);
+                        Some(event) => match handle_event(turn, state, event).await? {
+                            Flow::Suppressed => {
+                                return suppress_provider(turn, &mut output)
+                                    .map(ProviderStepResult::Flow);
                             }
-                        }
+                            Flow::Failed => {
+                                output.cancel();
+                                close_retry_step(&turn.provider)?;
+                                return Ok(ProviderStepResult::Flow(Flow::Failed));
+                            }
+                            Flow::Continue => {}
+                        },
                         None => return Err(protocol("provider stream closed before executor")),
                     }
                 }
@@ -536,10 +834,153 @@ async fn run_provider_step(
         }
     };
     close_retry_step(&turn.provider)?;
-    if turn.is_suppressed() || drain_retries(turn, &mut retry_events).await? == Flow::Suppressed {
-        return suppress_provider(turn, &mut output);
+    if turn.request.cancellation.is_cancelled() {
+        output.cancel();
+        return suppress_provider(turn, &mut output).map(ProviderStepResult::Flow);
     }
-    handle_terminal(terminal?, turn, state, &mut output).await
+    if turn.is_suppressed() || drain_retries(turn, &mut retry_events).await? == Flow::Suppressed {
+        return suppress_provider(turn, &mut output).map(ProviderStepResult::Flow);
+    }
+    let terminal = terminal?;
+    if let RetryTerminal::Failure { failure, .. } = &terminal
+        && failure.kind == crate::retry::ProviderFailureKind::ContextOverflow
+    {
+        let detail = failure.context_overflow.clone().unwrap_or_else(|| {
+            overflow_detail(
+                &turn.request,
+                turn.context_compactions,
+                estimate_request_tokens(&turn.request),
+            )
+        });
+        return Ok(ProviderStepResult::Overflow(detail));
+    }
+    handle_terminal(terminal, turn, state, &mut output)
+        .await
+        .map(ProviderStepResult::Flow)
+}
+
+fn estimate_request_tokens(request: &ProviderRequest) -> u64 {
+    let bytes = request.normalized_wire_bytes().unwrap_or(usize::MAX);
+    u64::try_from(bytes).unwrap_or(u64::MAX).div_ceil(3)
+}
+
+fn effective_context_limit(request: &ProviderRequest) -> u64 {
+    let context = request.context.unwrap_or_default();
+    [
+        context.server_max,
+        context.catalog_max.or(request.model.context_window),
+        context.agent_max,
+        context.conversation_max,
+        Some(request.context_tokens_max.get()),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(request.context_tokens_max.get())
+}
+
+fn overflow_detail(
+    request: &ProviderRequest,
+    compactions: u8,
+    estimated: u64,
+) -> crate::ports::ProviderContextOverflowDetail {
+    crate::ports::ProviderContextOverflowDetail {
+        measured: None,
+        estimated: crate::ports::ProviderContextTokenCount {
+            tokens: estimated,
+            provenance: crate::ports::ProviderContextTokenProvenance::FallbackBytesPerToken,
+        },
+        limit: effective_context_limit(request),
+        provider: request.model.provider_id.as_str().to_owned(),
+        model: request.model.handle.as_str().to_owned(),
+        attempt: compactions.saturating_add(1),
+        compactions_completed: compactions,
+    }
+}
+
+fn preflight_pressure(
+    request: &ProviderRequest,
+) -> Option<crate::ports::ProviderContextOverflowDetail> {
+    let estimated = estimate_request_tokens(request);
+    let context = request.context?;
+    let observed = context.measured_input_tokens.unwrap_or(estimated);
+    let limit = effective_context_limit(request);
+    let reserve = request.output_tokens_max.get().min(limit / 4);
+    if observed.saturating_add(reserve) > limit {
+        Some(overflow_detail(
+            request,
+            context.compactions_completed,
+            estimated,
+        ))
+    } else {
+        None
+    }
+}
+
+async fn compact_and_refresh(
+    turn: &mut TurnContext<'_, '_>,
+    mut detail: crate::ports::ProviderContextOverflowDetail,
+) -> Result<(), RuntimeError> {
+    if turn.context_compactions >= CONTEXT_OVERFLOW_COMPACTIONS_MAX {
+        detail.compactions_completed = turn.context_compactions;
+        detail.attempt = turn.context_compactions.saturating_add(1);
+        return Err(RuntimeError::ContextOverflow { detail });
+    }
+    if turn.is_suppressed() {
+        return Err(RuntimeError::Cancelled {
+            context: "context compaction".into(),
+        });
+    }
+    let compaction = turn.compaction.ok_or_else(|| RuntimeError::Unsupported {
+        context: "transcript compaction unavailable".into(),
+    })?;
+    let refresh = turn
+        .request_refresh
+        .as_ref()
+        .ok_or_else(|| RuntimeError::Unsupported {
+            context: "provider request refresh unavailable".into(),
+        })?;
+    let original_detail = detail.clone();
+    let progress = match compaction
+        .compact(turn.request.clone(), turn.guard.lease().clone(), detail)
+        .await
+    {
+        Ok(progress) => progress,
+        Err(RuntimeError::CompactionUnavailable) => {
+            return Err(RuntimeError::ContextOverflow {
+                detail: original_detail,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    ensure_live_after_context_await(turn)?;
+    if !progress.progressed() {
+        return Err(RuntimeError::ContextOverflow {
+            detail: overflow_detail(
+                &turn.request,
+                turn.context_compactions,
+                progress.tokens_after,
+            ),
+        });
+    }
+    turn.context_compactions = turn.context_compactions.saturating_add(1);
+    turn.request = refresh
+        .refresh(turn.request.clone(), turn.guard.lease().clone())
+        .await?;
+    ensure_live_after_context_await(turn)?;
+    let context = turn.request.context.get_or_insert_default();
+    context.compactions_completed = turn.context_compactions;
+    context.measured_input_tokens = None;
+    Ok(())
+}
+
+fn ensure_live_after_context_await(turn: &TurnContext<'_, '_>) -> Result<(), RuntimeError> {
+    match turn.guard.apply_after_await(turn.runtime, || ()) {
+        LeaseEffect::Applied(()) => Ok(()),
+        LeaseEffect::Suppressed(_) => Err(RuntimeError::Cancelled {
+            context: "context compaction lease".into(),
+        }),
+    }
 }
 
 fn drain_ready_retries(
@@ -620,15 +1061,24 @@ async fn handle_terminal(
     state: &mut ProviderStepState,
     output: &mut crate::ports::ProviderEventReceiver,
 ) -> Result<Flow, RuntimeError> {
-    if let RetryTerminal::Failure(failure) = terminal {
-        return Err(RuntimeError::AdapterFailure {
-            code: "provider_terminal_error",
-            context: failure.reason,
-        });
+    if let RetryTerminal::Failure {
+        failure,
+        attempt_count,
+    } = terminal
+    {
+        let reason = TurnStopReason::from_failure(&failure);
+        let detail =
+            ProviderFailureDetail::from_failure(&failure, attempt_count, turn.context_compactions);
+        return fail_turn(turn, reason, Some(detail));
     }
     while let Some(event) = output.receive().await? {
-        if handle_event(turn, state, event).await? == Flow::Suppressed {
-            return suppress_provider(turn, output);
+        match handle_event(turn, state, event).await? {
+            Flow::Suppressed => return suppress_provider(turn, output),
+            Flow::Failed => {
+                output.cancel();
+                return Ok(Flow::Failed);
+            }
+            Flow::Continue => {}
         }
     }
     state.accumulator.terminal_stop()?;
@@ -636,6 +1086,59 @@ async fn handle_terminal(
         || Err(protocol("provider stream closed without terminal")),
         |_| Ok(Flow::Continue),
     )
+}
+
+fn cancel_turn(turn: &mut TurnContext<'_, '_>) -> Result<Flow, RuntimeError> {
+    let reason = TurnStopReason::UserCancellation;
+    let record = TurnStopRecord {
+        turn_id: turn.turn_id.clone(),
+        run_id: turn.run_id.clone(),
+        input_id: turn.input_id.clone(),
+        reason,
+        provider_failure: None,
+    };
+    match turn.guard.finish_cancelled_turn_with_effect_after_await(
+        turn.runtime,
+        failure_domain_stop(reason),
+        || {
+            turn.effects.persist_stop_reason(record)?;
+            turn.effects.emit(TurnEvent::Failed { reason })
+        },
+    )? {
+        LeaseEffect::Applied(()) => Ok(Flow::Failed),
+        LeaseEffect::Suppressed(_) => Ok(Flow::Suppressed),
+    }
+}
+
+fn fail_turn(
+    turn: &mut TurnContext<'_, '_>,
+    reason: TurnStopReason,
+    provider_failure: Option<ProviderFailureDetail>,
+) -> Result<Flow, RuntimeError> {
+    let domain = failure_domain_stop(reason);
+    let record = TurnStopRecord {
+        turn_id: turn.turn_id.clone(),
+        run_id: turn.run_id.clone(),
+        input_id: turn.input_id.clone(),
+        reason,
+        provider_failure,
+    };
+    match turn
+        .guard
+        .finish_turn_with_effect_after_await(turn.runtime, domain, || {
+            turn.effects.persist_stop_reason(record)?;
+            turn.effects.emit(TurnEvent::Failed { reason })
+        })? {
+        LeaseEffect::Applied(()) => Ok(Flow::Failed),
+        LeaseEffect::Suppressed(_) => Ok(Flow::Suppressed),
+    }
+}
+
+fn failure_domain_stop(reason: TurnStopReason) -> lotta_domain::StopReason {
+    match lotta_domain::StopReason::new(reason.wire_value()) {
+        Ok(reason) => reason,
+        Err(_) => unreachable!("static stop reason is valid"),
+    }
 }
 
 async fn handle_event(
@@ -661,12 +1164,12 @@ async fn handle_event(
         ProviderEvent::ToolCallEnd { call_id } => execute_call(turn, state, call_id).await,
         ProviderEvent::Usage { .. } | ProviderEvent::ProviderMetadata { .. } => Ok(Flow::Continue),
         ProviderEvent::Stop { reason } => terminal_stop(state, reason),
-        ProviderEvent::Error { .. } => {
+        ProviderEvent::Error { error } => {
             state.accumulator.terminal_error();
-            Err(RuntimeError::AdapterFailure {
-                code: "provider_terminal_error",
-                context: "turn provider stream".into(),
-            })
+            let reason = TurnStopReason::from_provider(&error);
+            let failure = error.into_failure();
+            let detail = ProviderFailureDetail::from_failure(&failure, 1, turn.context_compactions);
+            fail_turn(turn, reason, Some(detail))
         }
     }
 }
@@ -727,21 +1230,13 @@ async fn execute_call(
         .catalog
         .get(name.as_str())
         .ok_or_else(|| protocol("provider tool definition missing"))?;
-    require_minimal_tool(definition)?;
-    let execution = ToolExecutionRequest {
-        definition: definition.clone(),
-        input: ValidatedToolInput::new(value)?,
-        cancellation: turn.request.cancellation.clone(),
-        deadline: definition.timeout,
-    };
-    let outcome = turn.tools.execute(execution).await;
+    require_sequential_tool(definition)?;
+    let input = ValidatedToolInput::new(value)?;
+    let outcome = execute_branch(turn, &call_id, definition, input).await?;
     if turn.is_suppressed() {
         return Ok(Flow::Suppressed);
     }
-    let result = ToolResultRecord {
-        call_id,
-        outcome: outcome?,
-    };
+    let result = ToolResultRecord { call_id, outcome };
     if state.completed.len() == TURN_TOOL_CALLS_MAX.value {
         return Err(limit(TURN_TOOL_CALLS_MAX.name));
     }
@@ -760,15 +1255,97 @@ async fn execute_call(
     Ok(Flow::Continue)
 }
 
-fn require_minimal_tool(definition: &crate::ports::ToolDefinition) -> Result<(), RuntimeError> {
+async fn execute_branch(
+    turn: &mut TurnContext<'_, '_>,
+    call_id: &ToolCallId,
+    definition: &crate::ports::ToolDefinition,
+    mut input: ValidatedToolInput,
+) -> Result<ToolOutcome, RuntimeError> {
+    if definition.approval_policy == ToolApprovalPolicy::Always {
+        let request = ControlRequest {
+            request_id: NonEmptyString::new(format!(
+                "approval-{}-{}",
+                turn.lease_generation,
+                call_id.as_str()
+            ))
+            .map_err(|_| protocol("approval request id"))?,
+            call_id: call_id.clone(),
+            lease_generation: turn.lease_generation,
+            tool_name: NonEmptyString::new(definition.model_name.as_str().to_owned())
+                .map_err(|_| protocol("approval tool name"))?,
+            input: input.clone(),
+            schema: definition.input_schema.clone(),
+        };
+        match turn.guard.apply_after_await(turn.runtime, || {
+            turn.effects.persist_control_request(&request)?;
+            turn.effects
+                .emit(TurnEvent::ControlRequest(request.clone()))
+        }) {
+            LeaseEffect::Applied(effect) => effect?,
+            LeaseEffect::Suppressed(_) => return Err(cancelled("approval suppressed")),
+        }
+        let approval = turn
+            .approvals
+            .ok_or_else(|| unavailable("approval backend"))?;
+        match approval
+            .await_resolution(
+                request,
+                turn.request.cancellation.clone(),
+                definition.timeout,
+            )
+            .await?
+        {
+            ApprovalResolution::Deny => return denied("Tool execution denied by user."),
+            ApprovalResolution::Allow(Some(edited)) => {
+                input = ValidatedToolInput::new(edited)?;
+            }
+            ApprovalResolution::Allow(None) => {}
+        }
+    }
+    let execution = ToolExecutionRequest {
+        definition: definition.clone(),
+        input,
+        cancellation: turn.request.cancellation.clone(),
+        deadline: definition.timeout,
+    };
     match definition.execution_owner {
-        ToolExecutionOwner::Rust => {}
-        _ => return Err(unsupported("turn tool execution owner")),
+        ToolExecutionOwner::Rust => turn.tools.execute(execution).await,
+        ToolExecutionOwner::Mcp
+        | ToolExecutionOwner::Controller
+        | ToolExecutionOwner::ModSidecar
+        | ToolExecutionOwner::ChannelGateway => {
+            let record = ControllerToolRequestRecord {
+                scope: turn.scope.clone(),
+                run_id: turn.run_id.clone(),
+                lease_generation: turn.lease_generation,
+                call_id: call_id.clone(),
+                tool_name: NonEmptyString::new(definition.model_name.as_str().to_owned())
+                    .map_err(|_| protocol("controller tool name"))?,
+                input: execution.input.clone(),
+            };
+            match turn.guard.apply_after_await(turn.runtime, || {
+                turn.effects.persist_controller_request(record.clone())
+            }) {
+                LeaseEffect::Applied(effect) => effect?,
+                LeaseEffect::Suppressed(_) => {
+                    return Err(cancelled("controller request suppressed"));
+                }
+            }
+            turn.controller_tools
+                .ok_or_else(|| unavailable("external tool backend"))?
+                .execute_external(record, execution)
+                .await
+        }
     }
-    match definition.approval_policy {
-        ToolApprovalPolicy::Never => {}
-        ToolApprovalPolicy::Always => return Err(unsupported("turn tool approval")),
-    }
+}
+
+fn denied(message: &str) -> Result<ToolOutcome, RuntimeError> {
+    Ok(ToolOutcome::UserDenied {
+        message: ToolOutcomeMessage::new(message.to_owned())?,
+    })
+}
+
+fn require_sequential_tool(definition: &crate::ports::ToolDefinition) -> Result<(), RuntimeError> {
     match definition.parallel_safety {
         ParallelSafety::Sequential => Ok(()),
         ParallelSafety::CertifiedParallel(_) => Err(unsupported("turn parallel tool")),
@@ -829,6 +1406,19 @@ fn protocol(context: &'static str) -> RuntimeError {
 
 fn limit(context: &'static str) -> RuntimeError {
     RuntimeError::LimitExceeded {
+        context: context.into(),
+    }
+}
+
+fn unavailable(context: &'static str) -> RuntimeError {
+    RuntimeError::AdapterFailure {
+        code: "tool_branch_unavailable",
+        context: context.into(),
+    }
+}
+
+fn cancelled(context: &'static str) -> RuntimeError {
+    RuntimeError::Cancelled {
         context: context.into(),
     }
 }

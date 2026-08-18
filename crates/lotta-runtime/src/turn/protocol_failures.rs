@@ -112,22 +112,38 @@ async fn incomplete_call_at_stop() {
 }
 
 #[tokio::test]
-async fn provider_event_error() {
+async fn provider_event_error_finishes_with_typed_reason() {
     let error = ProviderError::Unknown(ProviderErrorContext {
         retry_after: None,
         code: ProviderName::new("fake".into()).unwrap(),
         context: ProviderEventText::new("safe".into()).unwrap(),
     });
-    assert_failure(
-        vec![ProviderScript::Events(vec![ProviderEvent::Error { error }])],
-        vec![],
-        &[],
-        crate::RuntimeError::AdapterFailure {
-            code: "provider_terminal_error",
-            context: "turn provider stream".into(),
-        },
+    let provider =
+        ScriptedProvider::configured(vec![ProviderScript::Events(vec![ProviderEvent::Error {
+            error,
+        }])]);
+    let tool = SequencingTool::configured(vec![], None);
+    let effects = RecordingEffects::default();
+    let (mut runtime, handle, lease) = runtime();
+    let outcome = run_turn(
+        &mut runtime,
+        handle.clone(),
+        lease,
+        request(),
+        TurnPorts::direct(&provider, &tool, &catalog(&[]), &effects),
     )
     .await;
+    assert_eq!(outcome, Ok(TurnRunOutcome::Completed));
+    assert_eq!(
+        runtime.lifecycle(&handle).unwrap().projection().state(),
+        TurnStateKind::Idle
+    );
+    assert!(effects.events.lock().unwrap().iter().any(|event| matches!(
+        event,
+        TurnEvent::Failed {
+            reason: TurnStopReason::TransportFailure
+        }
+    )));
 }
 
 #[tokio::test]

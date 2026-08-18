@@ -51,8 +51,9 @@ pub use scope_context::{
     try_current,
 };
 pub use turn::{
-    ConfiguredFallback, ProjectionKind, ProviderTurnExecutorPort, ToolResultRecord, TurnEffectPort,
-    TurnEvent, TurnPorts, TurnProjection, TurnProvider, TurnRunOutcome, TurnToolCatalog, run_turn,
+    CompactionPort, CompactionProgress, ConfiguredFallback, ProjectionKind,
+    ProviderTurnExecutorPort, RequestRefreshPort, ToolResultRecord, TurnEffectPort, TurnEvent,
+    TurnPorts, TurnProjection, TurnProvider, TurnRunOutcome, TurnToolCatalog, run_turn,
 };
 pub use worktree_watcher::{WORKTREE_WATCHER_IDLE_STOP_MS, WorktreeWatcher};
 
@@ -101,6 +102,9 @@ pub enum RuntimeError {
         /// Serializable non-secret overflow detail.
         detail: ports::ProviderContextOverflowDetail,
     },
+    /// Required transcript compaction service is not registered.
+    #[error("compaction_unavailable")]
+    CompactionUnavailable,
     /// The operating system denied the requested effect.
     #[error("permission_denied: {context}")]
     PermissionDenied {

@@ -198,6 +198,8 @@ pub(super) fn failure(kind: ProviderFailureKind) -> ProviderEvent {
         ProviderFailureKind::Unsupported => ProviderError::Unknown(context()),
         ProviderFailureKind::Schema => ProviderError::Protocol(context()),
         ProviderFailureKind::ContextOverflow => ProviderError::ContextOverflow(context()),
+        ProviderFailureKind::Quota => ProviderError::Quota(context()),
+        ProviderFailureKind::Cancelled => ProviderError::Cancelled(context()),
         ProviderFailureKind::Empty | ProviderFailureKind::Terminal => {
             ProviderError::Unknown(context())
         }

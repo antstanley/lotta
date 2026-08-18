@@ -13,7 +13,7 @@ async fn stop_only_retries_exact_budget_and_forwards_one_terminal() {
     let (terminal, output) = run(RetryPolicy::default(), &time, &events, &port)
         .await
         .unwrap();
-    assert!(matches!(terminal, RetryTerminal::Failure(_)));
+    assert!(matches!(terminal, RetryTerminal::Failure { .. }));
     assert_eq!(port.calls(), 3);
     assert_eq!(time.delays(), [500, 1_000]);
     assert_eq!(output.len(), 1);
@@ -28,7 +28,7 @@ async fn no_events_is_empty_and_retries() {
     let (terminal, output) = run(RetryPolicy::default(), &time, &events, &port)
         .await
         .unwrap();
-    assert!(matches!(terminal, RetryTerminal::Failure(_)));
+    assert!(matches!(terminal, RetryTerminal::Failure { .. }));
     assert_eq!(port.calls(), 3);
     assert_eq!(time.delays(), [500, 1_000]);
     assert!(output.is_empty());
@@ -47,7 +47,7 @@ async fn exact_retry_budget_and_one_terminal_output() {
     let (terminal, output) = run(RetryPolicy::default(), &time, &events, &port)
         .await
         .unwrap();
-    assert!(matches!(terminal, RetryTerminal::Failure(_)));
+    assert!(matches!(terminal, RetryTerminal::Failure { .. }));
     assert!(output.is_empty());
     assert_eq!(port.calls(), 4);
     assert_eq!(events.values.lock().unwrap().len(), 3);
@@ -106,8 +106,10 @@ async fn held_stop_then_content_is_ordered_schema_terminal() {
     let (terminal, output) = run(RetryPolicy::default(), &time, &events, &port)
         .await
         .unwrap();
-    assert!(matches!(terminal, RetryTerminal::Failure(ref failure)
-        if failure.kind == ProviderFailureKind::Schema));
+    assert!(
+        matches!(terminal, RetryTerminal::Failure { ref failure, .. }
+        if failure.kind == ProviderFailureKind::Schema)
+    );
     assert!(matches!(
         output.as_slice(),
         [ProviderEvent::Stop { .. }, ProviderEvent::TextDelta { .. }]
@@ -123,8 +125,10 @@ async fn held_stop_then_stop_is_ordered_schema_terminal() {
     let (terminal, output) = run(RetryPolicy::default(), &time, &events, &port)
         .await
         .unwrap();
-    assert!(matches!(terminal, RetryTerminal::Failure(ref failure)
-        if failure.kind == ProviderFailureKind::Schema));
+    assert!(
+        matches!(terminal, RetryTerminal::Failure { ref failure, .. }
+        if failure.kind == ProviderFailureKind::Schema)
+    );
     assert!(matches!(
         output.as_slice(),
         [ProviderEvent::Stop { .. }, ProviderEvent::Stop { .. }]
@@ -145,7 +149,7 @@ async fn partial_output_failure_is_forwarded_and_never_retried() {
     let (terminal, output) = run(RetryPolicy::default(), &time, &events, &port)
         .await
         .unwrap();
-    assert!(matches!(terminal, RetryTerminal::Failure(_)));
+    assert!(matches!(terminal, RetryTerminal::Failure { .. }));
     assert_eq!(output.len(), 1);
     assert!(matches!(output[0], ProviderEvent::TextDelta { .. }));
     assert_eq!(port.calls(), 1);

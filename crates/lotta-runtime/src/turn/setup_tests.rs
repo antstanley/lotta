@@ -3,7 +3,8 @@ mod setup {
     use super::super::setup::{
         AdmissionReceipt, CwdFailure, CwdResolution, ExtensionSnapshot, ReminderClaim,
         ResolvedTurnModel, SetupError, SetupFailure, SetupInput, SetupOrchestrator, SetupPorts,
-        SetupStage, SetupStatus, SetupToolSource, SkillInventory, ToolCandidate,
+        SetupScopeHandle, SetupStage, SetupStatus, SetupStatusSink, SetupToolSource,
+        SkillInventory, ToolCandidate,
     };
     use crate::RuntimeError;
     use crate::boundary::ProviderText;
@@ -17,7 +18,7 @@ mod setup {
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::mpsc::Sender;
     use tokio_util::sync::CancellationToken;
@@ -38,14 +39,25 @@ mod setup {
         interrupted: Mutex<BTreeMap<String, String>>,
         claims: Mutex<BTreeSet<String>>,
         consumed: Mutex<BTreeSet<String>>,
-        statuses: Mutex<Vec<SetupStatus>>,
         fault: Mutex<Option<(SetupStage, Fault)>>,
         candidates: Mutex<Vec<ToolCandidate>>,
         inventory: Mutex<SkillInventory>,
         compile_inputs: Mutex<Vec<(SkillInventory, Option<String>)>>,
         cwd: Mutex<Option<CwdResolution>>,
-        scope_active: Mutex<bool>,
-        allocations: Mutex<usize>,
+        scopes: Mutex<BTreeMap<u64, (PathBuf, PermissionMode)>>,
+        next_scope: Mutex<u64>,
+    }
+
+    #[derive(Default)]
+    struct RecordingStatusSink {
+        statuses: Mutex<Vec<SetupStatus>>,
+    }
+
+    impl SetupStatusSink for RecordingStatusSink {
+        fn emit(&self, status: SetupStatus) -> Result<(), SetupError> {
+            self.statuses.lock().unwrap().push(status);
+            Ok(())
+        }
     }
 
     impl RecordingSetupPorts {
@@ -85,7 +97,7 @@ mod setup {
                         cancellation.cancel();
                         return Err(SetupError::Cancelled);
                     }
-                    Fault::Pause => std::thread::sleep(Duration::from_millis(15)),
+                    Fault::Pause => {}
                 }
             }
             Ok(())
@@ -202,18 +214,24 @@ mod setup {
             cwd: &Path,
             mode: PermissionMode,
             cancellation: &CancellationToken,
-        ) -> crate::ports::PortFuture<'_, ()> {
+        ) -> crate::ports::PortFuture<'_, SetupScopeHandle> {
             self.log(format!("scope.apply:{}:{mode:?}", cwd.display()));
             let result = self
                 .stage(
                     SetupStage::ApplyWorkspaceSandboxAndPermissions,
                     cancellation,
                 )
-                .map_err(|error| runtime(&error));
-            if result.is_ok() {
-                *self.scope_active.lock().unwrap() = true;
-                *self.allocations.lock().unwrap() += 1;
-            }
+                .map_err(|error| runtime(&error))
+                .map(|()| {
+                    let mut next = self.next_scope.lock().unwrap();
+                    *next += 1;
+                    let handle = SetupScopeHandle::new(*next);
+                    self.scopes
+                        .lock()
+                        .unwrap()
+                        .insert(handle.id(), (cwd.to_path_buf(), mode));
+                    handle
+                });
             Box::pin(async move { result })
         }
         fn prepare_memfs(
@@ -245,9 +263,11 @@ mod setup {
             agent: &Agent,
             conversation: &Conversation,
             inventory: &SkillInventory,
+            scope: SetupScopeHandle,
             reminder: Option<&str>,
             cancellation: &CancellationToken,
         ) -> crate::ports::PortFuture<'_, String> {
+            let cwd = self.scopes.lock().unwrap()[&scope.id()].0.clone();
             self.log(format!(
                 "prompt.compile:{}:{}:{:?}:{reminder:?}",
                 agent.id.as_str(),
@@ -262,8 +282,9 @@ mod setup {
                 .stage(SetupStage::CompileSystemPrompt, cancellation)
                 .map(|()| {
                     format!(
-                        "prompt skills={:?} reminder={reminder:?}",
-                        inventory.selected
+                        "prompt skills={:?} cwd={} reminder={reminder:?}",
+                        inventory.selected,
+                        cwd.display()
                     )
                 })
                 .map_err(|error| runtime(&error));
@@ -289,6 +310,7 @@ mod setup {
                 output_tokens: 512,
                 toolset: "openai".into(),
                 allowlist: None,
+                fallback_candidates: Vec::new(),
             })
         }
         fn discover_selected(
@@ -325,9 +347,11 @@ mod setup {
         }
         fn tool_candidates(
             &self,
+            scope: SetupScopeHandle,
             extensions: &ExtensionSnapshot,
             cancellation: &CancellationToken,
         ) -> Result<Vec<ToolCandidate>, SetupError> {
+            let _ = &self.scopes.lock().unwrap()[&scope.id()];
             self.log(format!("tools.candidates:{extensions:?}"));
             self.stage(SetupStage::MergeTools, cancellation)?;
             Ok(self.candidates.lock().unwrap().clone())
@@ -395,7 +419,7 @@ mod setup {
             if self.fault.lock().unwrap().is_some_and(|(stage, fault)| {
                 stage == SetupStage::BuildProviderRequestAndEmitStatus && fault == Fault::Pause
             }) {
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(Duration::from_millis(200));
             }
             let _ = reminder_claim;
             Box::pin(async {
@@ -420,8 +444,10 @@ mod setup {
             agent: &AgentId,
             conversation: &ConversationId,
             original: &Path,
+            scope: SetupScopeHandle,
             _: &CancellationToken,
         ) -> crate::ports::PortFuture<'_, Option<ReminderClaim>> {
+            let _ = &self.scopes.lock().unwrap()[&scope.id()];
             let claim = format!(
                 "{}:{}:{}",
                 agent.as_str(),
@@ -464,16 +490,9 @@ mod setup {
                 .or_insert_with(|| failure.to_string());
             Box::pin(async { Ok(()) })
         }
-        fn emit_status(&self, status: SetupStatus) -> Result<(), SetupError> {
-            self.log(format!("status:{status:?}"));
-            self.statuses.lock().unwrap().push(status);
-            Ok(())
-        }
-        fn rollback_scope(&self) {
-            self.log("scope.rollback");
-            *self.scope_active.lock().unwrap() = false;
-            *self.allocations.lock().unwrap() = 0;
-            self.claims.lock().unwrap().clear();
+        fn release_scope(&self, scope: SetupScopeHandle) {
+            self.log(format!("scope.release:{}", scope.id()));
+            self.scopes.lock().unwrap().remove(&scope.id());
         }
     }
 
@@ -567,6 +586,7 @@ mod setup {
             permission_mode: PermissionMode::default(),
             cancellation: CancellationToken::new(),
             deadline: Duration::from_secs(1),
+            status_sink: Arc::new(RecordingStatusSink::default()),
         }
     }
     fn temp() -> PathBuf {
@@ -619,7 +639,10 @@ mod setup {
                     &format!("extensions.load:agent-a:{}", canonical.display()),
                     "tools.candidates:ExtensionSnapshot { id: 0 }",
                     "tools.merge:openai:[]",
-                    "request.build:prompt skills=[\"skill-a\"] reminder=None:hello:openai/gpt-4o:0",
+                    &format!(
+                        "request.build:prompt skills=[\"skill-a\"] cwd={} reminder=None:hello:openai/gpt-4o:0",
+                        canonical.display()
+                    ),
                     "input.admit:agent-a:conversation-a:hello:None"
                 ]
             );
@@ -720,11 +743,20 @@ mod setup {
                 original: missing.clone(),
                 fallback: root.clone(),
             });
+            let scope = ports
+                .apply_scope(
+                    &root,
+                    PermissionMode::Unrestricted,
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
             let claim = ports
                 .claim_cwd_reminder(
                     &AgentId::accept("agent-a").unwrap(),
                     &ConversationId::accept("conversation-a").unwrap(),
                     &missing,
+                    scope,
                     &CancellationToken::new(),
                 )
                 .await
@@ -734,6 +766,7 @@ mod setup {
                     &AgentId::accept("agent-a").unwrap(),
                     &ConversationId::accept("conversation-a").unwrap(),
                     &missing,
+                    scope,
                     &CancellationToken::new(),
                 )
                 .await
@@ -817,7 +850,7 @@ mod setup {
                 prepare(&ports, &root, &root).await,
                 Err(SetupFailure::PreAdmission(SetupError::CrossAgent))
             ));
-            assert_eq!(*ports.allocations.lock().unwrap(), 0);
+            assert_eq!(ports.scopes.lock().unwrap().len(), 0);
             assert!(ports.transcript.lock().unwrap().is_empty());
             assert_eq!(ports.calls.lock().unwrap().len(), 2);
         }
@@ -837,7 +870,7 @@ mod setup {
                 Err(SetupFailure::PreAdmission(SetupError::ArchivedOrInvalid))
             ));
             assert!(ports.transcript.lock().unwrap().is_empty());
-            assert_eq!(*ports.allocations.lock().unwrap(), 0);
+            assert_eq!(ports.scopes.lock().unwrap().len(), 0);
         }
         #[tokio::test]
         async fn unknown_typed() {
@@ -862,7 +895,7 @@ mod setup {
                 ports.set_fault(stage, Fault::Fail);
                 let _ = prepare(&ports, &root, &root).await;
                 assert!(ports.transcript.lock().unwrap().is_empty(), "{stage:?}");
-                assert!(!*ports.scope_active.lock().unwrap(), "{stage:?}");
+                assert!(ports.scopes.lock().unwrap().is_empty(), "{stage:?}");
             }
         }
         #[tokio::test]
@@ -871,7 +904,7 @@ mod setup {
             let ports = RecordingSetupPorts::valid();
             ports.set_fault(SetupStage::BuildProviderRequestAndEmitStatus, Fault::Pause);
             let mut request = input(root.clone(), root.clone());
-            request.deadline = Duration::from_millis(20);
+            request.deadline = Duration::from_millis(100);
             let Err(error) = SetupOrchestrator::new(&ports).prepare(request).await else {
                 panic!("expected failure")
             };
@@ -909,7 +942,7 @@ mod setup {
             let ports = RecordingSetupPorts::valid();
             ports.set_fault(SetupStage::BuildProviderRequestAndEmitStatus, Fault::Pause);
             let mut request = input(root.clone(), root);
-            request.deadline = Duration::from_millis(20);
+            request.deadline = Duration::from_millis(100);
             let _ = SetupOrchestrator::new(&ports).prepare(request).await;
             assert_eq!(ports.transcript.lock().unwrap()[0].1, "hello");
             assert_eq!(ports.interrupted.lock().unwrap().len(), 1);
@@ -1060,7 +1093,7 @@ mod setup {
             let ports = RecordingSetupPorts::valid();
             ports.set_fault(stage, Fault::Cancel);
             let _ = prepare(&ports, &root, &root).await;
-            assert!(!*ports.scope_active.lock().unwrap(), "{stage:?}");
+            assert!(ports.scopes.lock().unwrap().is_empty(), "{stage:?}");
         }
     }
     #[tokio::test]
@@ -1073,7 +1106,7 @@ mod setup {
             request.deadline = Duration::from_millis(5);
             let _ = SetupOrchestrator::new(&ports).prepare(request).await;
             assert!(
-                !*ports.scope_active.lock().unwrap()
+                ports.scopes.lock().unwrap().is_empty()
                     || !ports.transcript.lock().unwrap().is_empty(),
                 "{stage:?}"
             );
@@ -1099,6 +1132,6 @@ mod setup {
         let ports = RecordingSetupPorts::valid();
         let output = prepare(&ports, &root, &root).await.unwrap();
         assert_eq!(output.status, SetupStatus::Sending);
-        assert!(ports.statuses.lock().unwrap().is_empty());
+        assert_eq!(Arc::strong_count(&output.status_sink), 1);
     }
 }
