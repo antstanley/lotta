@@ -66,17 +66,25 @@ impl CompactionProgress {
 
 /// Object-safe Task58 compaction seam. Implementations own persistence and lifecycle emission.
 pub trait CompactionPort: Send + Sync {
-    /// Compacts once for the exact request, lease, cancellation, and overflow detail.
+    /// Compacts once for the exact request, lease, cancellation, detail, and trigger.
     fn compact(
         &self,
         request: ProviderRequest,
         lease: TurnLease,
         detail: crate::ports::ProviderContextOverflowDetail,
+        trigger: crate::compaction::CompactionTrigger,
     ) -> crate::ports::PortFuture<'_, CompactionProgress>;
 }
 
 /// Object-safe refresh/recompile/rebuild seam invoked after successful compaction.
 pub trait RequestRefreshPort: Send + Sync {
+    /// Seeds exact prompt/model/catalog artifacts produced by ordinary turn setup.
+    ///
+    /// # Errors
+    /// Returns an adapter failure when the implementation cannot atomically store the snapshot.
+    fn seed(&self, _: &crate::turn::SetupOutput) -> Result<(), RuntimeError> {
+        Ok(())
+    }
     /// Rebuilds the provider request from current durable state.
     fn refresh(
         &self,
@@ -836,12 +844,20 @@ async fn run_provider_step(
 ) -> Result<Flow, RuntimeError> {
     loop {
         if let Some(detail) = preflight_pressure(&turn.request) {
-            compact_and_refresh(turn, detail).await?;
+            compact_and_refresh(turn, detail, crate::compaction::CompactionTrigger::Pressure)
+                .await?;
             continue;
         }
         match run_provider_attempt(turn, state).await? {
             ProviderStepResult::Flow(flow) => return Ok(flow),
-            ProviderStepResult::Overflow(detail) => compact_and_refresh(turn, detail).await?,
+            ProviderStepResult::Overflow(detail) => {
+                compact_and_refresh(
+                    turn,
+                    detail,
+                    crate::compaction::CompactionTrigger::ProviderOverflow,
+                )
+                .await?;
+            }
         }
     }
 }
@@ -941,18 +957,21 @@ async fn run_provider_attempt(
 }
 
 fn estimate_request_tokens(request: &ProviderRequest) -> u64 {
-    let bytes = request.normalized_wire_bytes().unwrap_or(usize::MAX);
-    u64::try_from(bytes).unwrap_or(u64::MAX).div_ceil(3)
+    crate::ports::estimate_request_tokens(request).tokens
 }
 
-fn effective_context_limit(request: &ProviderRequest) -> u64 {
+/// Returns the effective positive context limit across all configured sources.
+#[must_use]
+pub fn effective_context_limit(request: &ProviderRequest) -> u64 {
     let context = request.context.unwrap_or_default();
     [
         context.server_max,
-        context.catalog_max.or(request.model.context_window),
+        context
+            .catalog_max
+            .or(request.model.context_window)
+            .or(Some(request.context_tokens_max.get())),
         context.agent_max,
         context.conversation_max,
-        Some(request.context_tokens_max.get()),
     ]
     .into_iter()
     .flatten()
@@ -1001,6 +1020,7 @@ fn preflight_pressure(
 async fn compact_and_refresh(
     turn: &mut TurnContext<'_, '_>,
     mut detail: crate::ports::ProviderContextOverflowDetail,
+    trigger: crate::compaction::CompactionTrigger,
 ) -> Result<(), RuntimeError> {
     if turn.context_compactions >= CONTEXT_OVERFLOW_COMPACTIONS_MAX {
         detail.compactions_completed = turn.context_compactions;
@@ -1023,7 +1043,12 @@ async fn compact_and_refresh(
         })?;
     let original_detail = detail.clone();
     let progress = match compaction
-        .compact(turn.request.clone(), turn.guard.lease().clone(), detail)
+        .compact(
+            turn.request.clone(),
+            turn.guard.lease().clone(),
+            detail,
+            trigger,
+        )
         .await
     {
         Ok(progress) => progress,

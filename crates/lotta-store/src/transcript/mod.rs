@@ -4,7 +4,7 @@
 //! concurrent mixed-runtime writes remain unsupported. A crash may leave an append tail; tolerant
 //! prefix recovery belongs to Task 25.
 
-mod append;
+pub(crate) mod append;
 pub mod bounds;
 pub mod load;
 pub mod manifest;
@@ -182,6 +182,47 @@ impl LocalStore {
         run_blocking(self.blocking_pool(), move || append::append(&paths, &line)).await
     }
 
+    /// Appends a transcript entry once by stable entry ID.
+    ///
+    /// A retry after an uncertain append returns success when the exact ID already exists.
+    ///
+    /// # Errors
+    /// Returns typed load, validation, confinement, lock, size, or I/O failures.
+    pub async fn append_transcript_entry_idempotent(
+        &self,
+        agent: &AgentId,
+        conversation: &ConversationId,
+        entry: &TranscriptEntry,
+    ) -> Result<(), StoreError> {
+        let id = match entry {
+            TranscriptEntry::Session(value) => value.id.as_str(),
+            TranscriptEntry::Message(value) => value.id.as_str(),
+            TranscriptEntry::Compaction(value) => value.id.as_str(),
+        };
+        let paths = transcript_paths(self.paths(), agent, conversation)?;
+        let id = id.to_owned();
+        let exists = run_blocking(self.blocking_pool(), move || {
+            let rows = load::load(&paths)?;
+            Ok(rows
+                .messages()
+                .iter()
+                .any(|message| message.id.as_str() == id)
+                || rows
+                    .conversation()
+                    .in_context_message_ids
+                    .as_slice()
+                    .iter()
+                    .any(|value| value.as_str() == id))
+        })
+        .await?;
+        if exists {
+            Ok(())
+        } else {
+            self.append_transcript_entry(agent, conversation, entry)
+                .await
+        }
+    }
+
     /// Persists a loaded projection, upgrading a non-empty legacy transcript on demand.
     ///
     /// Empty persistence is a no-op. A legacy non-empty persistence takes a durable confined
@@ -348,7 +389,10 @@ fn ensure_absent(path: &Path) -> Result<(), StoreError> {
     }
 }
 
-fn encode_append_entry(entry: &TranscriptEntry, path: &Path) -> Result<Vec<u8>, StoreError> {
+pub(crate) fn encode_append_entry(
+    entry: &TranscriptEntry,
+    path: &Path,
+) -> Result<Vec<u8>, StoreError> {
     if matches!(entry, TranscriptEntry::Session(_)) {
         return Err(StoreError::new(StoreErrorKind::Parse, path));
     }

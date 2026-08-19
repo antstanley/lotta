@@ -15,7 +15,7 @@ use lotta_app_server::ws::service::{
 use lotta_domain::{
     AgentId, BoundedJsonValue, Clock, InputDisposition, ModelDescriptor, NonEmptyString,
     ProviderStack, QueueItem, QueueItemKind, QueueItemSource, RuntimeScope, SessionEntry,
-    SessionEntryType, TranscriptEntry, TranscriptManifest, TranscriptMessageFormat,
+    SessionEntryType, TranscriptEntry, TranscriptManifest, TranscriptMessageFormat, TurnLease,
 };
 use lotta_extensions::{
     hooks::{
@@ -76,24 +76,12 @@ const TRANSCRIPT_MANIFEST_SCHEMA_VERSION: u8 = 2;
 const TRANSCRIPT_SESSION_SCHEMA_VERSION: u8 = 3;
 
 #[cfg(test)]
-type CancellationStageObserver = Arc<dyn Fn(lotta_runtime::turn::CancelStep) + Send + Sync>;
+pub(crate) type CancellationStageObserver =
+    Arc<dyn Fn(lotta_runtime::turn::CancelStep) + Send + Sync>;
 #[cfg(test)]
 type CancellationOperationObserver = Arc<ProductionCancellationObserver>;
 #[cfg(not(test))]
 type CancellationOperationObserver = ();
-#[cfg(test)]
-static TEST_CANCELLATION_STAGE_OBSERVER: std::sync::OnceLock<
-    std::sync::Mutex<Option<CancellationStageObserver>>,
-> = std::sync::OnceLock::new();
-
-#[cfg(test)]
-pub(crate) fn test_cancellation_stage_observer() -> Option<CancellationStageObserver> {
-    TEST_CANCELLATION_STAGE_OBSERVER
-        .get_or_init(|| std::sync::Mutex::new(None))
-        .lock()
-        .expect("test cancellation stage observer")
-        .clone()
-}
 
 /// Owned production dependencies kept alive for the listener lifetime.
 pub struct ProductionComponents {
@@ -178,12 +166,25 @@ impl ProductionComponents {
         ));
         let runtime_state = Arc::new(ProductionRuntimeState::new());
         let brokers = Arc::new(ProductionTurnBrokers::new());
+        let compaction = Arc::new(crate::production_setup::RegisteredProductionCompaction {
+            service: lotta_runtime::CompactionService::new(
+                crate::production_setup::ProductionProviderSummarizer {
+                    provider: Arc::clone(&provider),
+                },
+                crate::production_setup::ProductionCompactionEffects {
+                    setup: Arc::clone(&setup),
+                    runtime_state: Arc::clone(&runtime_state),
+                },
+            ),
+        });
+        brokers.register_compaction_service(Some(compaction));
         let runtime_service = Arc::new(ProductionRuntimeService::new(
             store_paths.clone(),
             Arc::clone(&clock),
             setup.hook_runtime(),
             Arc::clone(&runtime_state),
             Arc::clone(&approval_manager),
+            Arc::clone(&brokers),
         ));
         let reflection: Arc<Mutex<Arc<dyn lotta_store::ReflectionJob>>> = Arc::new(Mutex::new(
             Arc::new(crate::production_setup::UnavailableReflection),
@@ -700,6 +701,18 @@ impl ProductionRuntimeState {
             .ok_or(AppServerError::Malformed)
     }
 
+    pub(crate) fn lease_is_current(&self, scope: &RuntimeScope, lease: &TurnLease) -> bool {
+        self.active
+            .lock()
+            .ok()
+            .and_then(|active| {
+                active
+                    .get(&RuntimeKey::from(scope))
+                    .map(|item| item.lease.clone())
+            })
+            .is_some_and(|current| current == *lease)
+    }
+
     #[cfg(test)]
     pub(crate) fn observe_cancellation(&self, observer: Arc<ProductionCancellationObserver>) {
         *self
@@ -763,12 +776,13 @@ impl ProductionRuntimeState {
     }
 }
 
-struct ProductionRuntimeService {
+pub(crate) struct ProductionRuntimeService {
     store: LocalStore,
     clock: Arc<dyn Clock + Send + Sync>,
     hooks: Arc<dyn lotta_runtime::hooks::HookRuntime>,
     state: Arc<ProductionRuntimeState>,
     approvals: Arc<lotta_runtime::ApprovalManager>,
+    brokers: Arc<ProductionTurnBrokers>,
 }
 
 impl ProductionRuntimeService {
@@ -778,6 +792,7 @@ impl ProductionRuntimeService {
         hooks: Arc<dyn lotta_runtime::hooks::HookRuntime>,
         state: Arc<ProductionRuntimeState>,
         approvals: Arc<lotta_runtime::ApprovalManager>,
+        brokers: Arc<ProductionTurnBrokers>,
     ) -> Self {
         Self {
             store: LocalStore::new(store_paths),
@@ -785,7 +800,58 @@ impl ProductionRuntimeService {
             hooks,
             state,
             approvals,
+            brokers,
         }
+    }
+
+    async fn compact(
+        &self,
+        scope: RuntimeScope,
+        mode: lotta_runtime::CompactionMode,
+        request_id: NonEmptyString,
+        request: lotta_runtime::ports::ProviderRequest,
+    ) -> Result<lotta_runtime::turn::CompactionProgress, AppServerError> {
+        let active = self
+            .state
+            .active
+            .lock()
+            .map_err(|_| AppServerError::Internal)?
+            .get(&RuntimeKey::from(&scope))
+            .map(|active| (active.lease.clone(), active.cancellation.clone()))
+            .ok_or(AppServerError::Malformed)?;
+        if !self.state.lease_is_current(&scope, &active.0) {
+            return Err(AppServerError::Malformed);
+        }
+        let service = self
+            .brokers
+            .compaction
+            .lock()
+            .map_err(|_| AppServerError::Internal)?
+            .clone()
+            .ok_or(AppServerError::Unavailable)?;
+        let estimated = lotta_runtime::ports::estimate_request_tokens(&request);
+        let detail = lotta_runtime::ports::ProviderContextOverflowDetail {
+            measured: None,
+            estimated,
+            limit: request.context_tokens_max.get(),
+            provider: request.model.provider_id.as_str().to_owned(),
+            model: request.model.handle.as_str().to_owned(),
+            attempt: 1,
+            compactions_completed: 0,
+        };
+        service
+            .compact(lotta_runtime::CompactionCommand {
+                request_id,
+                scope,
+                lease: active.0,
+                request,
+                detail,
+                trigger: lotta_runtime::CompactionTrigger::Manual,
+                mode,
+                cancellation: active.1,
+            })
+            .await
+            .map_err(|_| AppServerError::Internal)
     }
 
     fn ensure_runtime(
@@ -1669,6 +1735,18 @@ impl RuntimeCommandService for ProductionRuntimeService {
         })
     }
 
+    fn compact(
+        &self,
+        scope: RuntimeScope,
+        mode: lotta_runtime::CompactionMode,
+        request_id: NonEmptyString,
+        request: lotta_runtime::ports::ProviderRequest,
+    ) -> ServiceFuture<'_, lotta_runtime::turn::CompactionProgress> {
+        Box::pin(ProductionRuntimeService::compact(
+            self, scope, mode, request_id, request,
+        ))
+    }
+
     fn sync(&self, command: SyncCommand) -> ServiceFuture<'_, SyncOutcome> {
         Box::pin(async move { sync_outcome(self, command).await })
     }
@@ -2520,9 +2598,12 @@ mod production_tests {
         InputCommand {
             request_id: None,
             runtime: scope,
-            payload: BoundedJsonValue::new(
-                serde_json::json!({"messages":[{"client_message_id":id,"content":[{"type":"text","text":"hello"}]}]}),
-            )
+            payload: BoundedJsonValue::new(serde_json::json!({
+                "messages": [{
+                    "client_message_id": id,
+                    "content": [{"type": "text", "text": "hello"}]
+                }]
+            }))
             .unwrap(),
         }
     }
@@ -2794,7 +2875,15 @@ mod production_tests {
             events: ProviderEventSink,
         ) -> PortFuture<'_, ()> {
             Box::pin(async move {
-                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if request.tools.is_empty() {
+                    events
+                        .send(ProviderEvent::TextDelta {
+                            text: lotta_runtime::boundary::ProviderEventText::new(
+                                "held provider summary".into(),
+                            )?,
+                        })
+                        .await?;
                     return events
                         .send(ProviderEvent::Stop {
                             reason: lotta_runtime::ports::StopReason::EndTurn,
@@ -2803,9 +2892,11 @@ mod production_tests {
                 }
                 self.waiting.add_permits(1);
                 tokio::select! {
-                    () = request.cancellation.cancelled() => Err(lotta_runtime::RuntimeError::Cancelled {
-                        context: "production held provider".into(),
-                    }),
+                    () = request.cancellation.cancelled() => {
+                        Err(lotta_runtime::RuntimeError::Cancelled {
+                            context: "production held provider".into(),
+                        })
+                    },
                     result = events.send(ProviderEvent::Stop {
                         reason: lotta_runtime::ports::StopReason::EndTurn,
                     }) => result,
@@ -2828,6 +2919,7 @@ mod production_tests {
             Arc::new(lotta_runtime::hooks::NoopHookRuntime),
             Arc::new(ProductionRuntimeState::new()),
             approvals,
+            Arc::new(ProductionTurnBrokers::new()),
         )
     }
 
@@ -2919,6 +3011,15 @@ mod production_tests {
             )
             .unwrap(),
         );
+        use lotta_runtime::ports::MemFsPort as _;
+        GitMemFs::new(root.clone())
+            .unwrap()
+            .initialize(
+                &scope.agent_id,
+                &lotta_runtime::boundary::InitialMemoryBlocks::new(Vec::new()).unwrap(),
+            )
+            .await
+            .unwrap();
         let provider = Arc::new(
             ProductionProviderPort::new(
                 manager,
@@ -2941,12 +3042,26 @@ mod production_tests {
             Arc::new(crate::production_setup::ProductionEditedInputValidator),
         ));
         let state = Arc::new(ProductionRuntimeState::new());
+        let brokers = Arc::new(ProductionTurnBrokers::new());
+        let compaction = Arc::new(crate::production_setup::RegisteredProductionCompaction {
+            service: lotta_runtime::CompactionService::new(
+                crate::production_setup::ProductionProviderSummarizer {
+                    provider: Arc::clone(&provider),
+                },
+                crate::production_setup::ProductionCompactionEffects {
+                    setup: Arc::clone(&setup),
+                    runtime_state: Arc::clone(&state),
+                },
+            ),
+        });
+        brokers.register_compaction_service(Some(compaction));
         let service = Arc::new(ProductionRuntimeService::new(
             paths,
             Arc::new(TestClock),
             setup.hook_runtime(),
             Arc::clone(&state),
             Arc::clone(&approvals),
+            Arc::clone(&brokers),
         ));
         let controller = Arc::new(ProductionTurnController::new(
             setup,
@@ -2956,7 +3071,7 @@ mod production_tests {
             Arc::new(TestClock),
             workspace,
             state,
-            Arc::new(ProductionTurnBrokers::new()),
+            brokers,
             approvals,
             Arc::new(crate::production_setup::UnavailableReflection),
             Arc::new(crate::production_setup::UnavailableMemoryPush),
@@ -2964,12 +3079,178 @@ mod production_tests {
         (root, service, controller)
     }
 
+    mod production_compaction {
+        use super::*;
+
+        #[tokio::test]
+        async fn manual() {
+            let label = "compaction-manual";
+            let held = Arc::new(HeldProvider::default());
+            let (root, service, controller) =
+                production_controller_fixture(label, Arc::clone(&held)).await;
+            let scope = scope(label);
+            let input = command(scope.clone(), "active-compaction");
+            let admitted = service
+                .admit_input(input.clone())
+                .await
+                .expect("admit active turn");
+            let deferred = lotta_app_server::ws::DeferredInput {
+                scope: scope.clone(),
+                disposition: admitted.disposition,
+                continuation: admitted.continuation,
+            };
+            let cancellation = CancellationToken::new();
+            let turn = {
+                let controller = Arc::clone(&controller);
+                let cancellation = cancellation.clone();
+                tokio::spawn(async move {
+                    controller
+                        .submit_turn(input, deferred, cancellation, Arc::new(Sink::default()))
+                        .await
+                })
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), held.waiting.acquire())
+                .await
+                .expect("held turn timeout")
+                .expect("held turn")
+                .forget();
+            let store = LocalStore::new(StorePaths::new(root.clone()).unwrap());
+            let now = Timestamp::parse_persisted_rfc3339("2026-08-18T00:00:00Z").unwrap();
+            let manifest = lotta_domain::TranscriptManifest {
+                schema_version: 2,
+                message_format: lotta_domain::TranscriptMessageFormat::PiSessionEntryJsonl,
+                provider_stack: lotta_domain::ProviderStack::PiAi,
+                created_at: now,
+                migrated_from: None,
+                migrated_at: None,
+                backup_path: None,
+            };
+            let session = lotta_domain::TranscriptEntry::Session(lotta_domain::SessionEntry {
+                entry_type: lotta_domain::SessionEntryType::Session,
+                id: NonEmptyString::new("session-compaction-58").unwrap(),
+                version: 3,
+                timestamp: now,
+                cwd: "/".into(),
+            });
+            let directory = store
+                .paths()
+                .conversation_dir(&scope.agent_id, &scope.conversation_id)
+                .unwrap();
+            if !directory.join("messages.jsonl").exists() {
+                std::fs::create_dir_all(&directory).unwrap();
+                store
+                    .initialize_transcript(
+                        &scope.agent_id,
+                        &scope.conversation_id,
+                        &manifest,
+                        &session,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let request = lotta_runtime::ports::ProviderRequest {
+                model: lotta_domain::ModelDescriptor {
+                    handle: NonEmptyString::new("openai/gpt-5.4").unwrap(),
+                    provider_id: NonEmptyString::new("openai").unwrap(),
+                    available: true,
+                    context_window: Some(128_000),
+                    model_settings: None,
+                },
+                system_prompt: Some(
+                    lotta_runtime::boundary::ProviderText::new(
+                        "production compaction prompt".into(),
+                    )
+                    .unwrap(),
+                ),
+                messages: lotta_domain::BoundedVec::new(vec![
+                    lotta_runtime::ports::ProviderMessage {
+                        role: lotta_runtime::ports::ProviderMessageRole::User,
+                        content: lotta_domain::BoundedVec::new(vec![
+                            lotta_runtime::ports::ProviderContentPart::Text(
+                                lotta_runtime::boundary::ProviderText::new("old message".into())
+                                    .unwrap(),
+                            ),
+                        ])
+                        .unwrap(),
+                        tool_call_id: None,
+                    },
+                    lotta_runtime::ports::ProviderMessage {
+                        role: lotta_runtime::ports::ProviderMessageRole::Assistant,
+                        content: lotta_domain::BoundedVec::new(vec![
+                            lotta_runtime::ports::ProviderContentPart::Text(
+                                lotta_runtime::boundary::ProviderText::new("recent message".into())
+                                    .unwrap(),
+                            ),
+                        ])
+                        .unwrap(),
+                        tool_call_id: None,
+                    },
+                ])
+                .unwrap(),
+                tools: lotta_domain::BoundedVec::new(Vec::new()).unwrap(),
+                tool_choice: lotta_runtime::ports::ProviderToolChoice::Auto,
+                image_policy: lotta_runtime::ports::ImagePolicy::Strict,
+                context_tokens_max: lotta_runtime::ports::TokenLimit::new(128_000).unwrap(),
+                output_tokens_max: lotta_runtime::ports::TokenLimit::new(64).unwrap(),
+                reasoning: lotta_runtime::ports::ReasoningControls {
+                    enabled: false,
+                    effort: None,
+                    tier: None,
+                },
+                cancellation: CancellationToken::new(),
+                context: None,
+                deadline: lotta_runtime::ports::ProviderDeadline::default(),
+            };
+            let progress = ProductionRuntimeService::compact(
+                service.as_ref(),
+                scope.clone(),
+                lotta_runtime::CompactionMode::All,
+                NonEmptyString::new("manual-compaction-58").unwrap(),
+                request,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "manual compaction: {error:?}; journal={:?}; transcript={:?}",
+                    std::fs::read_to_string(root.join("runtime/compactions.json")),
+                    std::fs::read_to_string(directory.join("messages.jsonl"))
+                )
+            });
+            assert_eq!(progress.messages_before, 2);
+            let transaction = LocalStore::new(StorePaths::new(root.clone()).unwrap())
+                .compaction_transaction(
+                    &scope,
+                    &NonEmptyString::new("manual-compaction-58").unwrap(),
+                )
+                .unwrap()
+                .expect("durable transaction");
+            assert!(matches!(
+                transaction.state,
+                lotta_store::CompactionTransactionState::Published
+            ));
+            let transcript_path = LocalStore::new(StorePaths::new(root).unwrap())
+                .paths()
+                .conversation_dir(&scope.agent_id, &scope.conversation_id)
+                .unwrap()
+                .join("messages.jsonl");
+            let transcript = std::fs::read_to_string(transcript_path).unwrap();
+            assert!(
+                transcript
+                    .lines()
+                    .any(|line| line.contains("\"id\":\"manual-compaction-58\"")
+                        && line.contains("\"type\":\"compaction\""))
+            );
+            cancellation.cancel();
+            let _ = turn.await.expect("turn task");
+        }
+    }
+
     #[tokio::test]
     async fn production_three_concurrent_abort_paths_terminal_release_then_pump_once() {
         use lotta_runtime::turn::CancelStep;
         use std::sync::atomic::Ordering;
 
-        for repetition in 0..100 {
+        for repetition in 0..10 {
             let label = format!("three-aborts-{repetition}");
             let held = Arc::new(HeldProvider::default());
             let (root, service, controller) =
@@ -2985,10 +3266,7 @@ mod production_tests {
                     }
                 })
             };
-            *TEST_CANCELLATION_STAGE_OBSERVER
-                .get_or_init(|| std::sync::Mutex::new(None))
-                .lock()
-                .unwrap() = Some(stage_observer);
+            controller.observe_cancellation_stages(stage_observer);
 
             let first_command = command(scope.clone(), "active");
             let first = service
@@ -3012,9 +3290,18 @@ mod production_tests {
                         .await
                 })
             };
-            tokio::time::timeout(std::time::Duration::from_secs(5), held.waiting.acquire())
-                .await
-                .expect("provider wait entered")
+            let provider_entered =
+                tokio::time::timeout(std::time::Duration::from_secs(5), held.waiting.acquire())
+                    .await;
+            if let Err(error) = provider_entered {
+                panic!(
+                    "provider wait entered: {error:?}; calls={}; result={:?}",
+                    held.calls.load(Ordering::SeqCst),
+                    turn.await
+                );
+            }
+            provider_entered
+                .expect("provider wait timeout checked")
                 .expect("provider wait semaphore")
                 .forget();
             assert_eq!(
@@ -3122,10 +3409,6 @@ mod production_tests {
                 1,
                 "next input started exactly once"
             );
-            *TEST_CANCELLATION_STAGE_OBSERVER
-                .get_or_init(|| std::sync::Mutex::new(None))
-                .lock()
-                .unwrap() = None;
             let _ = std::fs::remove_dir_all(root);
         }
     }

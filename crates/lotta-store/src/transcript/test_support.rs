@@ -79,6 +79,9 @@ pub(crate) fn compaction(summary: String) -> TranscriptEntry {
         summary,
         first_kept_entry_id: Some("entry-1".into()),
         tokens_before: 42,
+        tokens_after: None,
+        messages_before: None,
+        messages_after: None,
         message: local_message("ui-compact-boundary", "summary"),
         details: None,
     })

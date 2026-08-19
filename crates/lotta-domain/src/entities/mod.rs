@@ -20,7 +20,8 @@ pub use channel::{
 };
 pub use common::EntityExtras;
 pub use core::{
-    Agent, Conversation, LocalMessage, LocalMessageRole, MemoryBlockInput, Run, RunStatus,
+    Agent, Conversation, InContextMessageIds, LocalMessage, LocalMessageRole, MemoryBlockInput,
+    Run, RunStatus,
 };
 pub use schedule::{
     IanaTimezone, Schedule, ScheduleCancelReason, ScheduleRunOutcome, ScheduleStatus,

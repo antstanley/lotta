@@ -140,6 +140,15 @@ impl RuntimeCommandService for RecordingService {
             )
         })
     }
+    fn compact(
+        &self,
+        _: RuntimeScope,
+        _: lotta_runtime::CompactionMode,
+        _: NonEmptyString,
+        _: lotta_runtime::ports::ProviderRequest,
+    ) -> ServiceFuture<'_, lotta_runtime::turn::CompactionProgress> {
+        Box::pin(async { Err(crate::error::AppServerError::Unavailable) })
+    }
     fn sync(&self, _: command::SyncCommand) -> ServiceFuture<'_, SyncOutcome> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async {

@@ -2,7 +2,9 @@ use crate::adapter::{read_record, write_record_locked};
 use crate::atomic::FileRevision;
 use crate::refresh::{RecordCache, Snapshot};
 use crate::{LottaStorageLock, StoreError, StoreErrorKind, StorePaths};
-use lotta_domain::{AgentId, BoundedMap, Conversation, ConversationId, Timestamp};
+use lotta_domain::{
+    AgentId, BoundedMap, Conversation, ConversationId, InContextMessageIds, Timestamp,
+};
 use std::path::Path;
 
 /// Maximum number of persisted conversations belonging to one agent.
@@ -66,6 +68,22 @@ pub(crate) fn archive(
         } else {
             Some(None)
         };
+        value.updated_at = now;
+    })
+}
+
+pub(crate) fn compaction_context(
+    paths: &StorePaths,
+    agent: &AgentId,
+    conversation: &ConversationId,
+    summary: String,
+    ids: InContextMessageIds,
+    now: Timestamp,
+    cache: &RecordCache,
+) -> Result<Conversation, StoreError> {
+    update(paths, agent, conversation, cache, |value| {
+        value.summary = Some(Some(summary));
+        value.in_context_message_ids = ids;
         value.updated_at = now;
     })
 }

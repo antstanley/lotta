@@ -2,9 +2,10 @@
 
 use lotta_domain::TurnLease;
 use lotta_domain::{
-    Agent, AgentId, BoundedJsonValue, Conversation, ConversationId, LocalMessage, LocalMessageRole,
-    MessageEntry, MessageEntryType, MessageId, ModelDescriptor, NonEmptyString, PermissionMode,
-    ProviderStack, SessionEntry, SessionEntryType, Timestamp, TranscriptEntry, TranscriptManifest,
+    Agent, AgentId, BoundedJsonValue, CompactionEntry, CompactionEntryType, Conversation,
+    ConversationId, InContextMessageIds, LocalMessage, LocalMessageRole, MessageEntry,
+    MessageEntryType, MessageId, ModelDescriptor, NonEmptyString, PermissionMode, ProviderStack,
+    SessionEntry, SessionEntryType, Timestamp, TranscriptEntry, TranscriptManifest,
     TranscriptMessageFormat,
 };
 use lotta_extensions::{
@@ -16,20 +17,21 @@ use lotta_extensions::{
     skills::{SkillDiscovery, SkillRoots, SkillSources},
 };
 use lotta_memfs::{
-    GitMemFs, PromptCompiler, PromptInputs, PromptSections, PromptSkill, PromptText,
+    CacheRoot, DeliveryCapability, GitMemFs, PromptCompiler, PromptInputs, PromptSections,
+    PromptSkill, PromptText,
 };
 use lotta_providers::{
     context::{ContextWindowSources, effective_window},
     model::{ModelHandle, ModelOverride, resolve_model},
 };
-use lotta_runtime::RuntimeError;
 use lotta_runtime::boundary::{InitialMemoryBlocks, ProviderName, ProviderText};
 use lotta_runtime::hooks::{HookFailure, HookLifecycleHost, LifecycleError};
 use lotta_runtime::ports::{
     AgentStore, ConversationStore, ImagePolicy, MemFsPort, ModelFacingToolName, ProviderContent,
-    ProviderContentPart, ProviderContext, ProviderDeadline, ProviderMessage, ProviderMessageRole,
-    ProviderMessages, ProviderRequest, ProviderToolChoice, ProviderToolDefinition, ProviderTools,
-    ReasoningControls, TokenLimit,
+    ProviderContentPart, ProviderContext, ProviderDeadline, ProviderEvent, ProviderMessage,
+    ProviderMessageRole, ProviderMessages, ProviderPort, ProviderRequest, ProviderToolChoice,
+    ProviderToolDefinition, ProviderTools, ReasoningControls, StopReason, TokenLimit,
+    provider_event_channel,
 };
 use lotta_runtime::retry::{FallbackRoute, ProviderRoute};
 use lotta_runtime::turn::{
@@ -38,10 +40,15 @@ use lotta_runtime::turn::{
     SetupPorts, SetupScopeHandle, SetupStatus, SetupStatusSink, SetupToolSource, SkillInventory,
     ToolCandidate, TurnPorts, TurnRunOutcome, TurnToolCatalog,
 };
+use lotta_runtime::{
+    CompactionCommand, CompactionEffects, CompactionMode, CompactionRecovery, CompactionService,
+    CompactionSummarizer, CompactionSummary, CompactionTrigger, RuntimeError,
+};
 use lotta_runtime::{ListenerRuntime, RuntimeHandle};
 use lotta_store::{
-    LocalStore, LottaStorageLock, MemoryPushJob, PostTurnExecution, PostTurnJob, PostTurnJobRunner,
-    PostTurnQueue, ReflectionJob, StoreError, StoreErrorKind, StorePaths, WriteMode, atomic_write,
+    CompactionProjection, CompactionTransactionState, LocalStore, LottaStorageLock, MemoryPushJob,
+    PostTurnExecution, PostTurnJob, PostTurnJobRunner, PostTurnQueue, ReflectionJob, StoreError,
+    StoreErrorKind, StorePaths, WriteMode, atomic_write,
 };
 use lotta_tools::{
     PermissionDecision, PermissionInvocation, PermissionPolicy, ToolRegistration, ToolRegistry,
@@ -59,6 +66,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -181,6 +189,7 @@ pub struct ProductionSetupPorts {
     toolset: ToolsetId,
     allowlist: Option<Vec<String>>,
     reminders_path: PathBuf,
+    prompt_caches: Mutex<HashMap<(AgentId, ConversationId), Arc<CacheRoot>>>,
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
@@ -208,6 +217,9 @@ impl ProductionSetupPorts {
         provider: &crate::production_components::ProductionProviderPort,
         tools: &crate::production_components::ProductionToolPort,
         effects: &dyn lotta_runtime::turn::TurnEffectPort,
+        #[cfg(test)] cancellation_stage_observer: Option<
+            crate::production_components::CancellationStageObserver,
+        >,
     ) -> Result<TurnRunOutcome, RuntimeError> {
         let cancellation = input.cancellation.clone();
         let setup = SetupOrchestrator::new(self);
@@ -222,6 +234,8 @@ impl ProductionSetupPorts {
         };
         let fallback_providers = self.fallback_providers(&prepared, provider)?;
         let scoped_tools = self.scoped_tools(&prepared, tools)?;
+        refresh.seed(&prepared).map_err(runtime_adapter)?;
+        let refreshed = prepared.request.clone();
         let ports = TurnPorts::new(provider, &scoped_tools, &prepared.tools, effects)
             .with_approvals(approval)
             .with_controller_tools(controller_tools)
@@ -231,20 +245,17 @@ impl ProductionSetupPorts {
         let fallbacks = configured_fallbacks(&prepared, provider, &fallback_providers)?;
         let ports = ports.with_fallbacks(fallbacks).with_provider_start(&status);
         #[cfg(test)]
-        let observer = crate::production_components::test_cancellation_stage_observer();
-        #[cfg(test)]
         let result = lotta_runtime::turn::run_turn_observed(
             runtime,
             handle,
             lease,
-            prepared.request,
+            refreshed,
             ports,
-            observer,
+            cancellation_stage_observer,
         )
         .await;
         #[cfg(not(test))]
-        let result =
-            lotta_runtime::turn::run_turn(runtime, handle, lease, prepared.request, ports).await;
+        let result = lotta_runtime::turn::run_turn(runtime, handle, lease, refreshed, ports).await;
         match host
             .stop(stop_payload, cancellation, move || async move { result })
             .await
@@ -381,8 +392,34 @@ impl ProductionSetupPorts {
             toolset: config.toolset,
             allowlist: config.allowlist,
             reminders_path: root.join("settings").join("turn-setup-reminders.json"),
+            prompt_caches: Mutex::new(HashMap::new()),
             now_ms: Arc::new(system_epoch_ms),
         })
+    }
+
+    fn prompt_cache(
+        &self,
+        agent: &AgentId,
+        conversation: &ConversationId,
+    ) -> Result<Arc<CacheRoot>, RuntimeError> {
+        let key = (agent.clone(), conversation.clone());
+        let mut caches = self
+            .prompt_caches
+            .lock()
+            .map_err(|_| runtime_adapter("prompt cache registry"))?;
+        if let Some(cache) = caches.get(&key) {
+            return Ok(cache.clone());
+        }
+        let directory = self
+            .store
+            .paths()
+            .conversation_dir(agent, conversation)
+            .map_err(runtime_adapter)?;
+        std::fs::create_dir_all(&directory).map_err(runtime_adapter)?;
+        let canonical = std::fs::canonicalize(&directory).map_err(runtime_adapter)?;
+        let cache = Arc::new(CacheRoot::new(&canonical)?);
+        caches.insert(key, Arc::clone(&cache));
+        Ok(cache)
     }
 
     fn capture_extension_snapshot(&self) -> Result<ExtensionSnapshot, SetupError> {
@@ -725,6 +762,7 @@ impl SetupPorts for ProductionSetupPorts {
         let selected = catalog.and_then(|catalog| {
             SkillDiscovery::select(&catalog, &inventory.selected).map_err(debug_adapter)
         });
+        let cache = self.prompt_cache(&agent.id, &conversation.id);
         let memfs = self.memfs.clone();
         let agent = agent.clone();
         let conversation = conversation.clone();
@@ -753,10 +791,15 @@ impl SetupPorts for ProductionSetupPorts {
                 Timestamp::from_utc(chrono::Utc::now()),
                 sections,
             )?;
-            PromptCompiler::new(&memfs)
-                .compile(&inputs, cancellation)
+            cache?
+                .get_or_compile(
+                    &PromptCompiler::new(&memfs),
+                    &inputs,
+                    DeliveryCapability::RequestBoundaryOnly,
+                    cancellation.clone(),
+                )
                 .await
-                .map(|record| record.content)
+                .map(|delivery| delivery.delivery.content)
         })
     }
 
@@ -1677,10 +1720,7 @@ pub trait ProductionCompactionService: Send + Sync {
     /// Updates durable transcript state for one exact scoped request.
     fn compact(
         &self,
-        scope: lotta_domain::RuntimeScope,
-        lease: TurnLease,
-        detail: lotta_runtime::ports::ProviderContextOverflowDetail,
-        cancellation: CancellationToken,
+        command: CompactionCommand,
     ) -> BrokerFuture<'_, lotta_runtime::turn::CompactionProgress>;
 }
 
@@ -1696,7 +1736,7 @@ pub struct ProductionTurnBrokers {
     controller_tools: Mutex<
         HashMap<ControllerKey, tokio::sync::oneshot::Sender<lotta_runtime::ports::ToolOutcome>>,
     >,
-    compaction: Mutex<Option<Arc<dyn ProductionCompactionService>>>,
+    pub(crate) compaction: Mutex<Option<Arc<dyn ProductionCompactionService>>>,
 }
 
 impl ProductionTurnBrokers {
@@ -1994,20 +2034,20 @@ async fn execute_controller_request(
     result
 }
 
-struct CompactionBrokerAdapter<'a> {
+struct CompactionBrokerAdapter {
     brokers: Arc<ProductionTurnBrokers>,
     scope: lotta_domain::RuntimeScope,
     cancellation: CancellationToken,
     sink: Arc<dyn lotta_app_server::ws::RuntimeEventSink>,
-    effects: &'a dyn lotta_runtime::turn::TurnEffectPort,
 }
 
-impl lotta_runtime::turn::CompactionPort for CompactionBrokerAdapter<'_> {
+impl lotta_runtime::turn::CompactionPort for CompactionBrokerAdapter {
     fn compact(
         &self,
         request: ProviderRequest,
         lease: TurnLease,
         detail: lotta_runtime::ports::ProviderContextOverflowDetail,
+        trigger: CompactionTrigger,
     ) -> lotta_runtime::ports::PortFuture<'_, lotta_runtime::turn::CompactionProgress> {
         let service = self
             .brokers
@@ -2018,19 +2058,22 @@ impl lotta_runtime::turn::CompactionPort for CompactionBrokerAdapter<'_> {
         let scope = self.scope.clone();
         let cancellation = self.cancellation.clone();
         let sink = Arc::clone(&self.sink);
-        let effects = self.effects;
         Box::pin(async move {
             // Task58 owns mechanics; Task55 only invokes an explicitly registered service.
             let service = service.ok_or(RuntimeError::CompactionUnavailable)?;
+            let reason = match trigger {
+                CompactionTrigger::Manual => "manual",
+                CompactionTrigger::Pressure => "pressure",
+                CompactionTrigger::ProviderOverflow => "provider_overflow",
+            };
             let compaction_request = lotta_runtime::turn::CompactionRequest {
                 scope: scope.clone(),
                 lease_generation: lease.generation(),
-                reason: NonEmptyString::new("context_overflow".to_owned())
+                reason: NonEmptyString::new(reason.to_owned())
                     .map_err(|_| broker_error("compaction reason"))?,
                 tokens_before: detail.estimated.tokens,
                 messages_before: request.messages.as_slice().len(),
             };
-            effects.persist_compaction_request(&compaction_request)?;
             sink.emit(
                 &scope,
                 lotta_app_server::ws::RuntimeEvent::CompactionRequest {
@@ -2041,50 +2084,546 @@ impl lotta_runtime::turn::CompactionPort for CompactionBrokerAdapter<'_> {
                 },
             )
             .map_err(|_| broker_error("compaction request emit"))?;
-            service.compact(scope, lease, detail, cancellation).await
+            service
+                .compact(CompactionCommand {
+                    request_id: NonEmptyString::new(format!(
+                        "context-{}-{}",
+                        lease.generation(),
+                        detail.attempt
+                    ))
+                    .map_err(|_| broker_error("compaction request id"))?,
+                    scope,
+                    lease,
+                    request,
+                    detail,
+                    trigger,
+                    mode: CompactionMode::default(),
+                    cancellation,
+                })
+                .await
         })
+    }
+}
+
+pub(crate) struct ProductionProviderSummarizer {
+    pub(crate) provider: Arc<crate::production_components::ProductionProviderPort>,
+}
+
+impl CompactionSummarizer for ProductionProviderSummarizer {
+    fn summarize(
+        &self,
+        mut request: ProviderRequest,
+        messages: Vec<ProviderMessage>,
+        cancellation: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<CompactionSummary, RuntimeError>> + Send + '_>> {
+        let provider = Arc::clone(&self.provider);
+        Box::pin(async move {
+            request.messages = ProviderMessages::new(messages)
+                .map_err(|_| broker_error("compaction summary messages"))?;
+            request.tools = ProviderTools::new(Vec::new())
+                .map_err(|_| broker_error("compaction summary tools"))?;
+            request.tool_choice = ProviderToolChoice::None;
+            request.cancellation = cancellation;
+            let (sink, mut events) = provider_event_channel(8, &request.cancellation)?;
+            let future = provider.stream(request, sink);
+            tokio::pin!(future);
+            let mut summary = String::new();
+            let mut provider_done = false;
+            loop {
+                tokio::select! {
+                    result = &mut future, if !provider_done => {
+                        result?;
+                        provider_done = true;
+                    }
+                    event = events.receive() => match event? {
+                        Some(ProviderEvent::TextDelta { text }) => summary.push_str(text.as_str()),
+                        Some(ProviderEvent::Stop { reason: StopReason::EndTurn }) => break,
+                        Some(ProviderEvent::Error { .. }) => {
+                            return Err(RuntimeError::AdapterFailure {
+                                code: "compaction_provider",
+                                context: "summary provider failed".into(),
+                            });
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+            }
+            let summary = summary.trim();
+            if summary.is_empty() {
+                return Err(broker_error("empty compaction summary"));
+            }
+            Ok(CompactionSummary(summary.to_owned()))
+        })
+    }
+}
+
+pub(crate) struct ProductionCompactionEffects {
+    pub(crate) setup: Arc<ProductionSetupPorts>,
+    pub(crate) runtime_state: Arc<crate::production_components::ProductionRuntimeState>,
+}
+
+impl CompactionEffects for ProductionCompactionEffects {
+    fn claim(
+        &self,
+        command: &CompactionCommand,
+    ) -> Pin<Box<dyn Future<Output = Result<CompactionRecovery, RuntimeError>> + Send + '_>> {
+        let command = command.clone();
+        Box::pin(async move {
+            let (_, transaction) = self
+                .setup
+                .store
+                .claim_compaction(&command.scope, &command.request_id)
+                .map_err(RuntimeError::from)?;
+            recovery(&transaction)
+        })
+    }
+
+    fn record_projection(
+        &self,
+        command: &CompactionCommand,
+        summary: CompactionSummary,
+        retained: Vec<ProviderMessage>,
+        progress: lotta_runtime::turn::CompactionProgress,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + '_>> {
+        let command = command.clone();
+        Box::pin(async move {
+            let current = self
+                .setup
+                .store
+                .compaction_transaction(&command.scope, &command.request_id)
+                .map_err(RuntimeError::from)?
+                .ok_or_else(|| broker_error("compaction transaction missing"))?;
+            let retained_message_ids =
+                retained_message_ids(&self.setup.store, &command, retained.len())
+                    .await?
+                    .into_iter()
+                    .map(|id| NonEmptyString::new(id.as_str().to_owned()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(runtime_adapter)?;
+            self.setup
+                .store
+                .record_compaction_projection(
+                    current.revision,
+                    &command.scope,
+                    &command.request_id,
+                    CompactionProjection {
+                        summary: summary.0,
+                        retained_message_ids,
+                        tokens_before: progress.tokens_before,
+                        tokens_after: progress.tokens_after,
+                        messages_before: progress.messages_before,
+                        messages_after: progress.messages_after,
+                    },
+                )
+                .map_err(RuntimeError::from)?;
+            Ok(())
+        })
+    }
+
+    fn lease_is_current(&self, scope: &lotta_domain::RuntimeScope, lease: &TurnLease) -> bool {
+        self.runtime_state.lease_is_current(scope, lease)
+    }
+
+    fn pre_compact(
+        &self,
+        command: &CompactionCommand,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + '_>> {
+        let cancellation = command.cancellation.clone();
+        let runtime = self.setup.hook_runtime();
+        Box::pin(async move {
+            let host = HookLifecycleHost::new(runtime.as_ref());
+            let payload =
+                events::lifecycle_payload(HookEvent::PreCompact).map_err(runtime_adapter)?;
+            host.pre_compact(payload, cancellation, || async {
+                Ok::<(), RuntimeError>(())
+            })
+            .await
+            .map_err(|error| match error {
+                LifecycleError::Operation(error) => error,
+                error => {
+                    setup_failure_runtime(SetupFailure::PreAdmission(lifecycle_setup_error(error)))
+                }
+            })
+        })
+    }
+
+    fn append(
+        &self,
+        command: &CompactionCommand,
+        summary: CompactionSummary,
+        retained: Vec<ProviderMessage>,
+        progress: lotta_runtime::turn::CompactionProgress,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + '_>> {
+        Box::pin(append_production_compaction(
+            self,
+            command.clone(),
+            summary,
+            retained,
+            progress,
+        ))
+    }
+
+    fn publish(
+        &self,
+        command: &CompactionCommand,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + '_>> {
+        Box::pin(publish_production_compaction(self, command.clone()))
+    }
+
+    fn post_compact(
+        &self,
+        command: &CompactionCommand,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + '_>> {
+        let cancellation = command.cancellation.clone();
+        let runtime = self.setup.hook_runtime();
+        Box::pin(async move {
+            let host = HookLifecycleHost::new(runtime.as_ref());
+            let payload =
+                events::lifecycle_payload(HookEvent::PostCompact).map_err(runtime_adapter)?;
+            host.post_compact(payload, cancellation, || async {
+                Ok::<(), RuntimeError>(())
+            })
+            .await
+            .map_err(|error| match error {
+                LifecycleError::Operation(error) => error,
+                error => {
+                    setup_failure_runtime(SetupFailure::PreAdmission(lifecycle_setup_error(error)))
+                }
+            })
+        })
+    }
+}
+
+fn recovery(
+    transaction: &lotta_store::CompactionTransaction,
+) -> Result<CompactionRecovery, RuntimeError> {
+    let progress =
+        transaction
+            .projection
+            .as_ref()
+            .map(|projection| lotta_runtime::turn::CompactionProgress {
+                tokens_before: projection.tokens_before,
+                tokens_after: projection.tokens_after,
+                messages_before: projection.messages_before,
+                messages_after: projection.messages_after,
+            });
+    match transaction.state {
+        CompactionTransactionState::Pending if progress.is_none() => {
+            Ok(CompactionRecovery::Pending)
+        }
+        CompactionTransactionState::Pending => {
+            Ok(CompactionRecovery::Planned(progress.ok_or_else(|| {
+                broker_error("compaction progress missing")
+            })?))
+        }
+        CompactionTransactionState::Appended { .. } => {
+            Ok(CompactionRecovery::Appended(progress.ok_or_else(|| {
+                broker_error("compaction progress missing")
+            })?))
+        }
+        CompactionTransactionState::Published => Ok(CompactionRecovery::Published(
+            progress.ok_or_else(|| broker_error("compaction progress missing"))?,
+        )),
+    }
+}
+
+async fn append_production_compaction(
+    effects: &ProductionCompactionEffects,
+    command: CompactionCommand,
+    summary: CompactionSummary,
+    retained: Vec<ProviderMessage>,
+    progress: lotta_runtime::turn::CompactionProgress,
+) -> Result<(), RuntimeError> {
+    let current = effects
+        .setup
+        .store
+        .compaction_transaction(&command.scope, &command.request_id)
+        .map_err(RuntimeError::from)?
+        .ok_or_else(|| broker_error("compaction transaction missing"))?;
+    if matches!(current.state, CompactionTransactionState::Appended { .. }) {
+        return Ok(());
+    }
+    let projection = current
+        .projection
+        .clone()
+        .ok_or_else(|| broker_error("compaction projection missing"))?;
+    let summary = if summary.0.is_empty() {
+        CompactionSummary(projection.summary.clone())
+    } else {
+        summary
+    };
+    let now = Timestamp::from_utc(chrono::Utc::now());
+    let message_id = MessageId::accept(format!("compact-{}", command.request_id.as_str()))
+        .map_err(runtime_adapter)?;
+    let message = LocalMessage {
+        id: message_id,
+        role: LocalMessageRole::User,
+        content: Some(
+            BoundedJsonValue::new(serde_json::json!(summary.0)).map_err(runtime_adapter)?,
+        ),
+        timestamp: chrono::Utc::now().timestamp_millis() as f64,
+        metadata: None,
+        extras: Default::default(),
+    };
+    let details = compaction_details(command.trigger, progress)?;
+    let entry = TranscriptEntry::Compaction(CompactionEntry {
+        entry_type: CompactionEntryType::Compaction,
+        id: command.request_id.clone(),
+        parent_id: None,
+        timestamp: now,
+        summary: summary.0.clone(),
+        first_kept_entry_id: projection
+            .retained_message_ids
+            .first()
+            .map(|id| id.as_str().to_owned()),
+        tokens_before: progress.tokens_before,
+        tokens_after: Some(progress.tokens_after),
+        messages_before: Some(progress.messages_before),
+        messages_after: Some(progress.messages_after),
+        message,
+        details: Some(details),
+    });
+    let _ = retained;
+    effects
+        .setup
+        .store
+        .append_compaction_if_absent(
+            current.revision,
+            &command.scope,
+            &command.request_id,
+            &entry,
+        )
+        .await
+        .map_err(RuntimeError::from)?;
+    Ok(())
+}
+
+async fn publish_production_compaction(
+    effects: &ProductionCompactionEffects,
+    command: CompactionCommand,
+) -> Result<(), RuntimeError> {
+    let current = effects
+        .setup
+        .store
+        .compaction_transaction(&command.scope, &command.request_id)
+        .map_err(RuntimeError::from)?
+        .ok_or_else(|| broker_error("compaction transaction missing"))?;
+    if matches!(current.state, CompactionTransactionState::Published) {
+        return Ok(());
+    }
+    let projection = current
+        .projection
+        .clone()
+        .ok_or_else(|| broker_error("compaction projection missing"))?;
+    let mut ids = vec![
+        MessageId::accept(format!("compact-{}", command.request_id.as_str()))
+            .map_err(runtime_adapter)?,
+    ];
+    ids.extend(
+        projection
+            .retained_message_ids
+            .iter()
+            .map(|id| MessageId::accept(id.as_str().to_owned()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(runtime_adapter)?,
+    );
+    effects
+        .setup
+        .store
+        .publish_compaction_context(
+            &command.scope.agent_id,
+            &command.scope.conversation_id,
+            projection.summary,
+            InContextMessageIds::new(ids).map_err(runtime_adapter)?,
+            Timestamp::from_utc(chrono::Utc::now()),
+        )
+        .await
+        .map_err(RuntimeError::from)?;
+    effects
+        .setup
+        .store
+        .mark_compaction_published(current.revision, &command.scope, &command.request_id)
+        .map_err(RuntimeError::from)?;
+    Ok(())
+}
+
+async fn retained_message_ids(
+    store: &LocalStore,
+    command: &CompactionCommand,
+    retained: usize,
+) -> Result<Vec<MessageId>, RuntimeError> {
+    let loaded = store
+        .load_transcript(&command.scope.agent_id, &command.scope.conversation_id)
+        .await
+        .map_err(RuntimeError::from)?;
+    Ok(loaded
+        .messages()
+        .iter()
+        .rev()
+        .take(retained)
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect())
+}
+
+fn compaction_details(
+    trigger: CompactionTrigger,
+    progress: lotta_runtime::turn::CompactionProgress,
+) -> Result<lotta_domain::BoundedMap<1_024>, RuntimeError> {
+    let value = serde_json::json!({
+        "stats": {
+            "trigger": match trigger {
+                CompactionTrigger::Manual => "manual",
+                CompactionTrigger::Pressure => "pressure",
+                CompactionTrigger::ProviderOverflow => "provider_overflow",
+            },
+            "context_tokens_before": progress.tokens_before,
+            "context_tokens_after": progress.tokens_after,
+            "messages_count_before": progress.messages_before,
+            "messages_count_after": progress.messages_after,
+        }
+    });
+    let object = value
+        .as_object()
+        .ok_or_else(|| broker_error("compaction details"))?;
+    lotta_domain::BoundedMap::new(
+        object
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+    .map_err(runtime_adapter)
+}
+
+pub(crate) struct RegisteredProductionCompaction {
+    pub(crate) service:
+        CompactionService<ProductionProviderSummarizer, ProductionCompactionEffects>,
+}
+
+impl ProductionCompactionService for RegisteredProductionCompaction {
+    fn compact(
+        &self,
+        command: CompactionCommand,
+    ) -> BrokerFuture<'_, lotta_runtime::turn::CompactionProgress> {
+        Box::pin(self.service.compact(command))
     }
 }
 
 struct RequestRefreshAdapter {
     setup: Arc<ProductionSetupPorts>,
+    state: Arc<AsyncMutex<PromptRefreshState>>,
     agent: AgentId,
     conversation: ConversationId,
     input: String,
     input_id: String,
-    prompt: String,
-    model: ResolvedTurnModel,
-    catalog: TurnToolCatalog,
     cancellation: CancellationToken,
 }
 
+struct PromptRefreshState {
+    prompt: String,
+    model: ResolvedTurnModel,
+    catalog: TurnToolCatalog,
+}
+
+async fn compile_prompt_for_refresh(
+    setup: &ProductionSetupPorts,
+    state: &PromptRefreshState,
+    agent_id: &AgentId,
+    conversation_id: &ConversationId,
+    cancellation: &CancellationToken,
+) -> Result<String, RuntimeError> {
+    let agent = AgentStore::load(&setup.store, agent_id).await?;
+    let conversation = ConversationStore::load(&setup.store, agent_id, conversation_id).await?;
+    let sections = PromptSections {
+        tool_guidance: prompt_tool_guidance(&state.catalog)?,
+        model_guidance: vec![PromptText::new(format!(
+            "Active model: {}. Context window: {} tokens. Output limit: {} tokens.",
+            state.model.model.handle.as_str(),
+            state.model.context_window,
+            state.model.output_tokens,
+        ))?],
+        ..PromptSections::default()
+    };
+    let inputs = PromptInputs::new(
+        PromptText::new(agent.system)?,
+        agent.id,
+        conversation.id,
+        0,
+        Timestamp::from_utc(chrono::Utc::now()),
+        sections,
+    )?;
+    setup
+        .prompt_cache(agent_id, conversation_id)?
+        .get_or_compile(
+            &PromptCompiler::new(&setup.memfs),
+            &inputs,
+            DeliveryCapability::RequestBoundaryOnly,
+            cancellation.clone(),
+        )
+        .await
+        .map(|delivery| delivery.delivery.content)
+}
+
+fn prompt_tool_guidance(catalog: &TurnToolCatalog) -> Result<Vec<PromptText>, RuntimeError> {
+    catalog
+        .definitions()
+        .map(|definition| {
+            PromptText::new(format!(
+                "Available tool: {}.",
+                definition.model_name.as_str()
+            ))
+        })
+        .collect()
+}
+
 impl lotta_runtime::turn::RequestRefreshPort for RequestRefreshAdapter {
+    fn seed(&self, prepared: &SetupOutput) -> Result<(), RuntimeError> {
+        let mut state = self
+            .state
+            .try_lock()
+            .map_err(|_| broker_error("refresh state lock"))?;
+        state.prompt.clone_from(&prepared.prompt);
+        state.model.clone_from(&prepared.model);
+        state.catalog = TurnToolCatalog::new(prepared.tools.definitions().cloned().collect())?;
+        Ok(())
+    }
+
     fn refresh(
         &self,
-        request: ProviderRequest,
+        _request: ProviderRequest,
         _: TurnLease,
     ) -> lotta_runtime::ports::PortFuture<'static, ProviderRequest> {
-        let _ = request;
         let setup = Arc::clone(&self.setup);
+        let state = self.state.clone();
         let agent = self.agent.clone();
         let conversation = self.conversation.clone();
-        let prompt = self.prompt.clone();
         let input = self.input.clone();
         let input_id = self.input_id.clone();
-        let model = self.model.clone();
-        let catalog = TurnToolCatalog::new(self.catalog.definitions().cloned().collect())
-            .expect("stored refresh catalog remains valid");
         let cancellation = self.cancellation.clone();
         Box::pin(async move {
+            let mut state = state.lock().await;
+            let compiled =
+                compile_prompt_for_refresh(&setup, &state, &agent, &conversation, &cancellation)
+                    .await?;
+            if compiled.is_empty() {
+                return Err(broker_error("empty refreshed prompt"));
+            }
+            state.prompt = compiled;
+            if state.prompt.is_empty() {
+                return Err(broker_error("empty seeded prompt"));
+            }
             setup
                 .build_request(
                     &agent,
                     &conversation,
-                    prompt,
+                    state.prompt.clone(),
                     &input,
                     Some(&input_id),
-                    &model,
-                    &catalog,
+                    &state.model,
+                    &state.catalog,
                     cancellation,
                 )
                 .await
@@ -2106,6 +2645,9 @@ pub struct ProductionTurnController {
     approvals: Arc<lotta_runtime::ApprovalManager>,
     reflection: Arc<dyn ReflectionJob>,
     memory_push: Arc<dyn MemoryPushJob>,
+    #[cfg(test)]
+    cancellation_stage_observer:
+        Mutex<Option<crate::production_components::CancellationStageObserver>>,
 }
 
 impl ProductionTurnController {
@@ -2141,7 +2683,20 @@ impl ProductionTurnController {
             approvals,
             reflection,
             memory_push,
+            #[cfg(test)]
+            cancellation_stage_observer: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_cancellation_stages(
+        &self,
+        observer: crate::production_components::CancellationStageObserver,
+    ) {
+        *self
+            .cancellation_stage_observer
+            .lock()
+            .expect("cancellation stage observer") = Some(observer);
     }
 
     fn validate_submission(
@@ -2286,7 +2841,6 @@ impl ProductionTurnController {
             scope: scope.clone(),
             cancellation: turn_cancellation.clone(),
             sink: sink_for_brokers,
-            effects: &effects,
         };
         let refresh = self
             .request_refresh(command, &scope, &input, turn_cancellation)
@@ -2302,6 +2856,12 @@ impl ProductionTurnController {
             Arc::clone(&self.reflection),
             Arc::clone(&self.memory_push),
         );
+        #[cfg(test)]
+        let cancellation_stage_observer = self
+            .cancellation_stage_observer
+            .lock()
+            .expect("cancellation stage observer")
+            .clone();
         let mut state = self.runtime_state.inner.lock().await;
         self.setup
             .run_production_turn(
@@ -2318,6 +2878,8 @@ impl ProductionTurnController {
                 self.provider.as_ref(),
                 self.tools.as_ref(),
                 &effects,
+                #[cfg(test)]
+                cancellation_stage_observer,
             )
             .await
             .map_err(app_server_error)
@@ -2346,13 +2908,15 @@ impl ProductionTurnController {
             .map_err(|error| app_server_error(setup_error_runtime(error)))?;
         Ok(Arc::new(RequestRefreshAdapter {
             setup: Arc::clone(&self.setup),
+            state: Arc::new(AsyncMutex::new(PromptRefreshState {
+                prompt: String::new(),
+                model,
+                catalog: TurnToolCatalog::new(Vec::new()).expect("empty catalog"),
+            })),
             agent: scope.agent_id.clone(),
             conversation: scope.conversation_id.clone(),
             input: input.user_input.clone(),
             input_id: input_client_message_id(command.payload.as_value())?,
-            prompt: String::new(),
-            model,
-            catalog: TurnToolCatalog::new(Vec::new()).expect("empty catalog"),
             cancellation,
         }))
     }

@@ -46,6 +46,15 @@ impl RuntimeCommandService for BlockingService {
     ) -> ServiceFuture<'_, ()> {
         panic!("unused")
     }
+    fn compact(
+        &self,
+        _: lotta_domain::RuntimeScope,
+        _: lotta_runtime::CompactionMode,
+        _: lotta_domain::NonEmptyString,
+        _: lotta_runtime::ports::ProviderRequest,
+    ) -> ServiceFuture<'_, lotta_runtime::turn::CompactionProgress> {
+        panic!("unused")
+    }
     fn sync(&self, _: command::SyncCommand) -> ServiceFuture<'_, SyncOutcome> {
         panic!("unused")
     }

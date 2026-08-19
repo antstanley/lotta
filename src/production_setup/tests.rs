@@ -366,6 +366,102 @@ async fn production_fresh_conversation_initializes_and_admits() {
     assert!(text.contains("\"type\":\"session\""));
 }
 
+mod compaction {
+    use super::*;
+    use lotta_runtime::ports::MemFsPort;
+
+    mod prompt_refresh {
+        use super::*;
+        use lotta_runtime::boundary::{CommitMessage, MemoryFileContent, RepositoryPath};
+
+        fn provider_prompt(output: SetupOutput) -> String {
+            output
+                .request
+                .system_prompt
+                .expect("provider system prompt")
+                .as_str()
+                .to_owned()
+        }
+
+        async fn write_persona(ports: &ProductionSetupPorts, agent: &AgentId, value: &str) {
+            ports
+                .memfs
+                .write(
+                    agent,
+                    &RepositoryPath::new("system/persona.md".into()).expect("persona path"),
+                    &MemoryFileContent::new(
+                        format!("---\ndescription: persona\n---\n{value}").into_bytes(),
+                    )
+                    .expect("persona content"),
+                )
+                .await
+                .expect("write persona");
+        }
+
+        #[tokio::test]
+        async fn production_ordinary_turns_deliver_committed_cached_prompt() {
+            let fixture = Fixture::new("ordinary-prompt-refresh").await;
+            let ports = fixture.ports();
+            SetupPorts::prepare_memfs(&ports, &fixture.agent, &CancellationToken::new())
+                .await
+                .expect("prepare memfs");
+            write_persona(&ports, &fixture.agent.id, "initial provider persona").await;
+            ports
+                .memfs
+                .commit(
+                    &fixture.agent.id,
+                    &CommitMessage::new("initial persona".into()).expect("commit message"),
+                )
+                .await
+                .expect("initial commit");
+            let cwd = fixture.root.join("isolation/workspace");
+            let first = provider_prompt(
+                SetupOrchestrator::new(&ports)
+                    .prepare(fixture.input(cwd.clone(), cwd.clone(), "first ordinary turn"))
+                    .await
+                    .expect("first turn"),
+            );
+            write_persona(&ports, &fixture.agent.id, "dirty provider persona").await;
+            let dirty = provider_prompt(
+                SetupOrchestrator::new(&ports)
+                    .prepare(fixture.input(cwd.clone(), cwd.clone(), "second ordinary turn"))
+                    .await
+                    .expect("dirty turn"),
+            );
+            assert_eq!(dirty, first);
+            assert!(dirty.contains("initial provider persona"));
+            assert!(!dirty.contains("dirty provider persona"));
+            ports
+                .memfs
+                .commit(
+                    &fixture.agent.id,
+                    &CommitMessage::new("dirty persona committed".into()).expect("commit message"),
+                )
+                .await
+                .expect("commit dirty persona");
+            let committed = provider_prompt(
+                SetupOrchestrator::new(&ports)
+                    .prepare(fixture.input(cwd.clone(), cwd, "third ordinary turn"))
+                    .await
+                    .expect("committed turn"),
+            );
+            assert_ne!(committed, first);
+            assert!(committed.contains("dirty provider persona"));
+            let cache = ports
+                .prompt_cache(&fixture.agent.id, &fixture.conversation.id)
+                .expect("production prompt cache");
+            assert_eq!(
+                cache
+                    .load()
+                    .expect("load cache")
+                    .expect("cache record")
+                    .content,
+                committed
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn production_toolset_preserves_model_names_and_allowlist() {
     let fixture = Fixture::new("toolset").await;

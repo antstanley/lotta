@@ -60,6 +60,9 @@ pub enum HookEvent {
     /// Immediately before compaction.
     #[serde(rename = "PreCompact")]
     PreCompact,
+    /// Immediately after compaction publication and prompt recompilation succeed.
+    #[serde(rename = "PostCompact")]
+    PostCompact,
     /// When a session begins or resumes.
     #[serde(rename = "SessionStart")]
     SessionStart,
@@ -70,7 +73,7 @@ pub enum HookEvent {
 
 impl HookEvent {
     /// All events in canonical load and dispatch order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::PreToolUse,
         Self::PostToolUse,
         Self::PostToolUseFailure,
@@ -80,6 +83,7 @@ impl HookEvent {
         Self::Stop,
         Self::SubagentStop,
         Self::PreCompact,
+        Self::PostCompact,
         Self::SessionStart,
         Self::SessionEnd,
     ];
@@ -94,9 +98,10 @@ impl HookEvent {
         Self::SubagentStop,
     ];
     /// Events restricted to command hooks.
-    pub const COMMAND_ONLY: [Self; 4] = [
+    pub const COMMAND_ONLY: [Self; 5] = [
         Self::Notification,
         Self::PreCompact,
+        Self::PostCompact,
         Self::SessionStart,
         Self::SessionEnd,
     ];
@@ -301,6 +306,7 @@ impl<'a> HookLifecycle<'a> {
     lifecycle_method!(stop, Stop);
     lifecycle_method!(subagent_stop, SubagentStop);
     lifecycle_method!(pre_compact, PreCompact);
+    lifecycle_method!(post_compact, PostCompact);
     lifecycle_method!(session_start, SessionStart);
     lifecycle_method!(session_end, SessionEnd);
 }
@@ -412,6 +418,24 @@ impl<'a> HookLifecycleHost<'a> {
         self.before(HookEvent::PreCompact, payload, cancellation)
             .await?;
         operation.run().await.map_err(LifecycleError::Operation)
+    }
+    /// Fires after the compaction operation succeeds.
+    ///
+    /// # Errors
+    /// Returns a hook, block, or wrapped operation failure.
+    pub async fn post_compact<T, E, O>(
+        &self,
+        payload: HookPayload,
+        cancellation: CancellationToken,
+        operation: O,
+    ) -> Result<T, LifecycleError<E>>
+    where
+        O: LifecycleOperation<T, E>,
+    {
+        let value = operation.run().await.map_err(LifecycleError::Operation)?;
+        self.before(HookEvent::PostCompact, payload, cancellation)
+            .await?;
+        Ok(value)
     }
     /// Fires after session initialization succeeds.
     ///

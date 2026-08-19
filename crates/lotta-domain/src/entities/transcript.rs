@@ -124,6 +124,27 @@ pub struct CompactionEntry {
     /// Token count before compaction.
     #[serde(rename = "tokensBefore")]
     pub tokens_before: u64,
+    /// Token count after compaction when produced by a current runtime.
+    #[serde(
+        rename = "tokensAfter",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tokens_after: Option<u64>,
+    /// Message count before compaction when produced by a current runtime.
+    #[serde(
+        rename = "messagesBefore",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub messages_before: Option<usize>,
+    /// Message count after compaction when produced by a current runtime.
+    #[serde(
+        rename = "messagesAfter",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub messages_after: Option<usize>,
     /// Embedded summary message.
     pub message: LocalMessage,
     /// Optional compaction details.

@@ -397,6 +397,16 @@ impl RuntimeCommandService for Service {
         })
     }
 
+    fn compact(
+        &self,
+        _: RuntimeScope,
+        _: lotta_runtime::CompactionMode,
+        _: NonEmptyString,
+        _: lotta_runtime::ports::ProviderRequest,
+    ) -> ServiceFuture<'_, lotta_runtime::turn::CompactionProgress> {
+        Box::pin(async { Err(lotta_app_server::error::AppServerError::Unavailable) })
+    }
+
     fn sync(&self, _: SyncCommand) -> ServiceFuture<'_, SyncOutcome> {
         Box::pin(async {
             Ok(SyncOutcome {

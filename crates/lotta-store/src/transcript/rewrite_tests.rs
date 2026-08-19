@@ -1,42 +1,52 @@
 use super::*;
-#[tokio::test]
-async fn no_rewrite_on_compaction() {
-    use test_support::{compaction, manifest, message, session, setup, transcript_files};
-    let (_owned, store, agent, conversation) = setup("transcript-no-rewrite");
-    store
-        .initialize_transcript(&agent, &conversation, &manifest(), &session())
-        .await
-        .expect("initialize");
-    store
-        .append_transcript_entry(&agent, &conversation, &message("entry-1", None, "one"))
-        .await
-        .expect("message");
-    let (manifest_path, messages) = transcript_files(&store, &agent, &conversation);
-    let before = std::fs::read(&messages).expect("before");
-    let manifest_before = std::fs::read(&manifest_path).expect("manifest before");
-    let identity = file_identity(&messages);
-    let listing = directory_names(messages.parent().expect("parent"));
-    store
-        .append_transcript_entry(&agent, &conversation, &compaction("summary".into()))
-        .await
-        .expect("compaction");
-    let after = std::fs::read(&messages).expect("after");
-    assert_eq!(&after[..before.len()], before);
-    let suffix = &after[before.len()..];
-    assert_eq!(suffix.last(), Some(&b'\n'));
-    let rows = suffix
-        .split(|byte| *byte == b'\n')
-        .filter(|row| !row.is_empty())
-        .collect::<Vec<_>>();
-    assert_eq!(rows.len(), 1);
-    let appended: serde_json::Value = serde_json::from_slice(rows[0]).expect("appended row");
-    assert_eq!(appended["type"], "compaction");
-    assert_eq!(file_identity(&messages), identity);
-    assert_eq!(directory_names(messages.parent().expect("parent")), listing);
-    assert_eq!(
-        std::fs::read(manifest_path).expect("manifest after"),
-        manifest_before
-    );
+mod no_rewrite_on_compaction {
+    use super::*;
+
+    mod transcript {
+        use super::*;
+
+        #[tokio::test]
+        async fn no_rewrite_on_compaction() {
+            use test_support::{compaction, manifest, message, session, setup, transcript_files};
+            let (_owned, store, agent, conversation) = setup("transcript-no-rewrite");
+            store
+                .initialize_transcript(&agent, &conversation, &manifest(), &session())
+                .await
+                .expect("initialize");
+            store
+                .append_transcript_entry(&agent, &conversation, &message("entry-1", None, "one"))
+                .await
+                .expect("message");
+            let (manifest_path, messages) = transcript_files(&store, &agent, &conversation);
+            let before = std::fs::read(&messages).expect("before");
+            let manifest_before = std::fs::read(&manifest_path).expect("manifest before");
+            let identity = file_identity(&messages);
+            let listing = directory_names(messages.parent().expect("parent"));
+            let compacted = compaction("summary".into());
+            store
+                .append_transcript_entry(&agent, &conversation, &compacted)
+                .await
+                .expect("compaction");
+            let after = std::fs::read(&messages).expect("after");
+            assert_eq!(&after[..before.len()], before);
+            let suffix = &after[before.len()..];
+            assert_eq!(suffix.last(), Some(&b'\n'));
+            let rows = suffix
+                .split(|byte| *byte == b'\n')
+                .filter(|row| !row.is_empty())
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), 1);
+            let appended: serde_json::Value =
+                serde_json::from_slice(rows[0]).expect("appended row");
+            assert_eq!(appended["type"], "compaction");
+            assert_eq!(file_identity(&messages), identity);
+            assert_eq!(directory_names(messages.parent().expect("parent")), listing);
+            assert_eq!(
+                std::fs::read(manifest_path).expect("manifest after"),
+                manifest_before
+            );
+        }
+    }
 }
 
 #[cfg(all(test, unix))]

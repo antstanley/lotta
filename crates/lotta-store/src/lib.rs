@@ -13,6 +13,8 @@ mod agent;
 pub mod approval;
 /// Durable bounded atomic file replacement.
 pub mod atomic;
+/// Durable process-safe compaction transaction journal.
+pub mod compaction;
 mod confinement;
 mod conversation;
 mod error;
@@ -39,6 +41,10 @@ pub use atomic::{
     ATOMIC_WRITE_BYTES_MAX, ATOMIC_WRITE_RETRIES_MAX, AtomicObserver, WriteMode, atomic_delete,
     atomic_delete_observed, atomic_write, atomic_write_observed,
 };
+pub use compaction::{
+    COMPACTION_JOURNAL_BYTES_MAX, COMPACTION_PROJECTION_BYTES_MAX, COMPACTION_TRANSACTIONS_MAX,
+    CompactionClaim, CompactionProjection, CompactionTransaction, CompactionTransactionState,
+};
 pub use conversation::CONVERSATIONS_PER_AGENT_MAX;
 pub use error::{StoreError, StoreErrorKind};
 pub use lock::{LOTTA_STORAGE_LOCK_WAIT_MS, LottaStorageLock};
@@ -52,6 +58,8 @@ pub use post_turn::{
 pub use side::{ChannelFile, OpaqueFile, ProjectFile, SidePaths, SideRevision};
 pub use transcript::{TRANSCRIPT_BYTES_MAX, TRANSCRIPT_LINE_BYTES_MAX};
 
+#[cfg(test)]
+mod compaction_tests;
 #[cfg(test)]
 mod post_turn_tests;
 #[cfg(test)]

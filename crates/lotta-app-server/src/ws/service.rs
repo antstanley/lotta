@@ -1,6 +1,7 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use lotta_domain::{BoundedJsonValue, BoundedVec, InputDisposition, NonEmptyString, RuntimeScope};
+use lotta_runtime::{CompactionMode, ports::ProviderRequest, turn::CompactionProgress};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -113,6 +114,14 @@ pub trait RuntimeCommandService: Send + Sync {
         continuation: Option<BoundedJsonValue>,
         sink: Arc<dyn RuntimeEventSink>,
     ) -> ServiceFuture<'_, ()>;
+    /// Manually compacts an active runtime through its canonical production coordinator.
+    fn compact(
+        &self,
+        scope: RuntimeScope,
+        mode: CompactionMode,
+        request_id: NonEmptyString,
+        request: ProviderRequest,
+    ) -> ServiceFuture<'_, CompactionProgress>;
     /// Replays runtime state.
     fn sync(&self, command: SyncCommand) -> ServiceFuture<'_, SyncOutcome>;
     /// Aborts runtime work.
@@ -182,6 +191,15 @@ impl RuntimeCommandService for UnsupportedRuntimeCommandService {
         _: Option<BoundedJsonValue>,
         _: Arc<dyn RuntimeEventSink>,
     ) -> ServiceFuture<'_, ()> {
+        unsupported()
+    }
+    fn compact(
+        &self,
+        _: RuntimeScope,
+        _: CompactionMode,
+        _: NonEmptyString,
+        _: ProviderRequest,
+    ) -> ServiceFuture<'_, CompactionProgress> {
         unsupported()
     }
     fn sync(&self, _: SyncCommand) -> ServiceFuture<'_, SyncOutcome> {

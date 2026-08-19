@@ -5,7 +5,21 @@ use std::fs::OpenOptions;
 use std::io::Write as _;
 
 pub(crate) fn append(paths: &TranscriptPaths, line: &[u8]) -> Result<(), StoreError> {
-    let _lock = LottaStorageLock::try_acquire_confined(&paths.root)?;
+    let lock = LottaStorageLock::try_acquire_confined(&paths.root)?;
+    append_locked(paths, line, &lock)
+}
+
+pub(crate) fn append_locked(
+    paths: &TranscriptPaths,
+    line: &[u8],
+    lock: &LottaStorageLock,
+) -> Result<(), StoreError> {
+    if !lock.guards_root(&paths.root) {
+        return Err(StoreError::new(
+            crate::StoreErrorKind::LottaLock,
+            &paths.messages,
+        ));
+    }
     super::manifest::read_current(&paths.manifest)?;
     validate_regular_file(&paths.root, &paths.messages)?;
     let metadata = std::fs::symlink_metadata(&paths.messages)

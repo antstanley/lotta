@@ -49,6 +49,10 @@ pub trait TranscriptStore: Send + Sync {
 
 /// One ordered item from a transcript load stream.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "public port contract preserves owning entry shape"
+)]
 pub enum TranscriptItem {
     /// Schema and format declaration, emitted exactly once first.
     Manifest(TranscriptManifest),

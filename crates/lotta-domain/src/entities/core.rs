@@ -165,6 +165,9 @@ impl<'de> Deserialize<'de> for Agent {
     }
 }
 
+/// Owning type of the bounded in-context message identifier projection.
+pub type InContextMessageIds = BoundedVec<MessageId, UNBOUNDED_COLLECTION_ITEMS_MAX>;
+
 /// Persisted agent conversation.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct Conversation {

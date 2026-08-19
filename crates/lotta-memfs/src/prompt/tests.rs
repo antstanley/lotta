@@ -45,6 +45,111 @@ fn compiler<'a>(port: &'a GitMemFs, renders: &'a AtomicUsize) -> PromptCompiler<
     PromptCompiler::with_render_counter(port, renders)
 }
 
+mod compaction {
+    use super::*;
+    use std::sync::Arc;
+
+    mod prompt_refresh {
+        use super::*;
+
+        #[tokio::test]
+        async fn ordinary_turns_follow_committed_revision_authority() {
+            let (root, port, agent) = fixture_port();
+            port.initialize(&agent, &empty()).await.expect("initialize");
+            port.write(
+                &agent,
+                &path("system/persona.md"),
+                &valid("initial persona"),
+            )
+            .await
+            .expect("initial persona");
+            port.commit(&agent, &message("initial persona"))
+                .await
+                .expect("initial commit");
+            let cache = cache(&root, "conversation-prompt-refresh");
+            let renders = AtomicUsize::new(0);
+            let first = cache
+                .get_or_compile(
+                    &compiler(&port, &renders),
+                    &inputs("raw {CORE_MEMORY}", "2000-01-01T00:00:00Z"),
+                    DeliveryCapability::RequestBoundaryOnly,
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("first ordinary turn");
+            port.write(&agent, &path("system/persona.md"), &valid("dirty persona"))
+                .await
+                .expect("dirty persona");
+            let dirty = cache
+                .get_or_compile(
+                    &compiler(&port, &renders),
+                    &inputs("raw {CORE_MEMORY}", "2001-01-01T00:00:00Z"),
+                    DeliveryCapability::RequestBoundaryOnly,
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("dirty ordinary turn");
+            assert!(first.rendered);
+            assert!(!dirty.rendered);
+            assert_eq!(dirty.delivery.content, first.delivery.content);
+            assert!(dirty.delivery.content.contains("initial persona"));
+            assert!(!dirty.delivery.content.contains("dirty persona"));
+            assert_eq!(dirty.delivery.memfs_revision, first.delivery.memfs_revision);
+            port.commit(&agent, &message("commit persona"))
+                .await
+                .expect("committed persona");
+            let committed = cache
+                .get_or_compile(
+                    &compiler(&port, &renders),
+                    &inputs("raw {CORE_MEMORY}", "2002-01-01T00:00:00Z"),
+                    DeliveryCapability::RequestBoundaryOnly,
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("committed ordinary turn");
+            assert!(committed.rendered);
+            assert!(committed.delivery.content.contains("dirty persona"));
+            assert_ne!(
+                committed.delivery.memfs_revision,
+                first.delivery.memfs_revision
+            );
+            assert_eq!(renders.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn concurrent_same_revision_renders_once() {
+            let (root, port, agent) = fixture_port();
+            port.initialize(&agent, &empty()).await.expect("initialize");
+            let cache = Arc::new(cache(&root, "concurrent-prompt-refresh"));
+            let port = Arc::new(port);
+            let renders = Arc::new(AtomicUsize::new(0));
+            let mut tasks = Vec::new();
+            for _ in 0..8 {
+                let cache = Arc::clone(&cache);
+                let port = Arc::clone(&port);
+                let renders = Arc::clone(&renders);
+                tasks.push(tokio::spawn(async move {
+                    cache
+                        .get_or_compile(
+                            &compiler(&port, &renders),
+                            &inputs("raw {CORE_MEMORY}", "2000-01-01T00:00:00Z"),
+                            DeliveryCapability::RequestBoundaryOnly,
+                            CancellationToken::new(),
+                        )
+                        .await
+                        .expect("concurrent compile")
+                }));
+            }
+            let mut rendered = 0;
+            for task in tasks {
+                rendered += usize::from(task.await.expect("join").rendered);
+            }
+            assert_eq!(rendered, 1);
+            assert_eq!(renders.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
 mod cache {
     use super::*;
 

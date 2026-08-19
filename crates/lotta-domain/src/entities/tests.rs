@@ -383,6 +383,9 @@ schema_case!(
         summary: "summary".into(),
         first_kept_entry_id: None,
         tokens_before: 12,
+        tokens_after: None,
+        messages_before: None,
+        messages_after: None,
         message: local_message(),
         details: Some(BoundedMap::new(BTreeMap::new()).unwrap_or_else(|e| panic!("map: {e}"))),
     }
@@ -510,6 +513,9 @@ fn transcript_discriminants_and_names() {
         summary: "s".into(),
         first_kept_entry_id: None,
         tokens_before: 10,
+        tokens_after: None,
+        messages_before: None,
+        messages_after: None,
         message: local_message(),
         details: None,
     };

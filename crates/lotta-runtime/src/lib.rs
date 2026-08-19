@@ -16,6 +16,8 @@ pub mod approval;
 pub mod boundary;
 /// Immutable Task 06 runtime resource bounds exported for inward-dependent adapters.
 pub mod bounds;
+/// Transcript compaction planning and service orchestration.
+pub mod compaction;
 /// Dependency-neutral hook wire types and firing capability.
 pub mod hooks;
 /// Lease-guarded post-await effects.
@@ -46,6 +48,10 @@ pub use approval::{
     APPROVAL_WAIT_MS_MAX, ApprovalJournal, ApprovalManager, ApprovalRecovery, ApprovalRequest,
     ApprovalResolution, ApprovalResolutionInput, ApprovalState, EditedInputValidator,
     PENDING_APPROVALS_PER_RUNTIME_MAX, RecoveryAction,
+};
+pub use compaction::{
+    CompactionCommand, CompactionEffects, CompactionMode, CompactionPlan, CompactionRecovery,
+    CompactionService, CompactionSummarizer, CompactionSummary, CompactionTrigger,
 };
 pub use lease::{
     CancellationClaim, CancellationPolicy, CancellationReceipt, LeaseEffect, LeaseGuard,

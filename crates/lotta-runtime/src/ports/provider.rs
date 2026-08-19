@@ -65,6 +65,49 @@ pub struct ProviderMessage {
     /// Required call identifier for a tool result, absent for ordinary messages.
     pub tool_call_id: Option<ToolCallId>,
 }
+/// Estimates all model-visible request content using the canonical fallback estimator.
+#[must_use]
+pub fn estimate_request_tokens(request: &ProviderRequest) -> ProviderContextTokenCount {
+    const BYTES_PER_TOKEN: u64 = 3;
+    const IMAGE_TOKENS: u64 = 1_200;
+    const MESSAGE_TOKENS: u64 = 8;
+    const TOOL_TOKENS: u64 = 16;
+    let mut bytes = request
+        .system_prompt
+        .as_ref()
+        .map_or(0_u64, |v| v.as_str().len() as u64);
+    let mut tokens = request.messages.len() as u64 * MESSAGE_TOKENS;
+    for message in request.messages.as_slice() {
+        bytes = bytes.saturating_add(
+            message
+                .tool_call_id
+                .as_ref()
+                .map_or(0, |v| v.as_str().len() as u64),
+        );
+        for part in message.content.as_slice() {
+            match part {
+                ProviderContentPart::Text(value) => {
+                    bytes = bytes.saturating_add(value.as_str().len() as u64);
+                }
+                ProviderContentPart::Image { media_type, .. } => {
+                    bytes = bytes.saturating_add(media_type.as_str().len() as u64);
+                    tokens = tokens.saturating_add(IMAGE_TOKENS);
+                }
+            }
+        }
+    }
+    for tool in request.tools.as_slice() {
+        tokens = tokens.saturating_add(TOOL_TOKENS);
+        bytes = bytes.saturating_add(tool.name.as_str().len() as u64);
+        bytes = bytes.saturating_add(tool.description.as_str().len() as u64);
+        bytes = bytes.saturating_add(tool.input_schema.as_value().to_string().len() as u64);
+    }
+    ProviderContextTokenCount {
+        tokens: tokens.saturating_add(bytes.div_ceil(BYTES_PER_TOKEN)),
+        provenance: ProviderContextTokenProvenance::FallbackBytesPerToken,
+    }
+}
+
 /// Model-visible tool definition supplied with a provider request.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProviderToolDefinition {

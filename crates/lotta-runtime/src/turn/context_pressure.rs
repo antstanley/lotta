@@ -18,6 +18,7 @@ struct ContextSeam {
     compactions: AtomicUsize,
     refreshes: AtomicUsize,
     requests: Mutex<VecDeque<ProviderRequest>>,
+    triggers: Mutex<Vec<crate::compaction::CompactionTrigger>>,
 }
 
 impl ContextSeam {
@@ -26,6 +27,7 @@ impl ContextSeam {
             compactions: AtomicUsize::new(0),
             refreshes: AtomicUsize::new(0),
             requests: Mutex::new(requests.into()),
+            triggers: Mutex::new(Vec::new()),
         }
     }
 }
@@ -36,8 +38,10 @@ impl CompactionPort for ContextSeam {
         request: ProviderRequest,
         _: TurnLease,
         _: ProviderContextOverflowDetail,
+        trigger: crate::compaction::CompactionTrigger,
     ) -> PortFuture<'_, CompactionProgress> {
         self.compactions.fetch_add(1, Ordering::SeqCst);
+        self.triggers.lock().unwrap().push(trigger);
         Box::pin(async move {
             Ok(CompactionProgress {
                 tokens_before: request.normalized_wire_bytes()? as u64,
@@ -74,8 +78,10 @@ fn pressured() -> ProviderRequest {
     let mut request = request();
     request.system_prompt = Some(crate::boundary::ProviderText::new("x".repeat(12_000)).unwrap());
     request.context = Some(ProviderContext {
-        server_max: Some(1_000),
-        catalog_max: Some(1_000),
+        server_max: Some(1_400),
+        catalog_max: Some(1_300),
+        agent_max: Some(1_200),
+        conversation_max: Some(1_000),
         ..ProviderContext::default()
     });
     request
@@ -108,7 +114,15 @@ async fn preflight_compacts_rebuilds_and_retries_once() {
     assert_eq!(outcome, TurnRunOutcome::Completed);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert_eq!(seam.compactions.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        super::turn_loop::effective_context_limit(&pressured()),
+        1_000
+    );
     assert_eq!(seam.refreshes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *seam.triggers.lock().unwrap(),
+        vec![crate::compaction::CompactionTrigger::Pressure]
+    );
 }
 
 fn overflow_detail() -> ProviderContextOverflowDetail {
@@ -141,6 +155,7 @@ async fn compaction_without_progress_is_terminal_before_refresh_or_resend() {
             request: ProviderRequest,
             _: TurnLease,
             _: ProviderContextOverflowDetail,
+            _: crate::compaction::CompactionTrigger,
         ) -> PortFuture<'_, CompactionProgress> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
@@ -204,5 +219,13 @@ async fn provider_overflow_compacts_max_three_then_typed() {
     assert!(matches!(error, RuntimeError::ContextOverflow { .. }));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
     assert_eq!(seam.compactions.load(Ordering::SeqCst), 3);
+    assert!(
+        matches!(error, RuntimeError::ContextOverflow { detail } if detail.attempt == 4
+        && detail.compactions_completed == 3)
+    );
     assert_eq!(seam.refreshes.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        *seam.triggers.lock().unwrap(),
+        vec![crate::compaction::CompactionTrigger::ProviderOverflow; 3]
+    );
 }

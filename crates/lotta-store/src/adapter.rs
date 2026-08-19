@@ -116,6 +116,36 @@ impl LocalStore {
         .await
     }
 
+    /// Publishes a compaction projection after its transcript entry is durable.
+    ///
+    /// # Errors
+    /// Returns typed read, conflict, validation, or durable-write failures.
+    pub async fn publish_compaction_context(
+        &self,
+        agent: &AgentId,
+        conversation: &ConversationId,
+        summary: String,
+        ids: lotta_domain::InContextMessageIds,
+        now: lotta_domain::Timestamp,
+    ) -> Result<Conversation, StoreError> {
+        let paths = self.paths.clone();
+        let cache = self.cache.clone();
+        let agent = agent.clone();
+        let conversation = conversation.clone();
+        run_blocking(Arc::clone(&self.blocking), move || {
+            crate::conversation::compaction_context(
+                &paths,
+                &agent,
+                &conversation,
+                summary,
+                ids,
+                now,
+                &cache,
+            )
+        })
+        .await
+    }
+
     /// Sets a conversation model/settings override without touching its owning agent record.
     ///
     /// # Errors

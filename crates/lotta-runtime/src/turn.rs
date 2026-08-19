@@ -34,7 +34,7 @@ pub use turn_loop::{
     ApprovalPort, ApprovalResolution, CONTEXT_OVERFLOW_COMPACTIONS_MAX, CompactionPort,
     CompactionProgress, ConfiguredFallback, ControllerToolPort, ProviderStartPort,
     ProviderTurnExecutorPort, RequestRefreshPort, TurnPorts, TurnProvider, TurnRunOutcome,
-    run_turn, run_turn_observed,
+    effective_context_limit, run_turn, run_turn_observed,
 };
 
 #[cfg(test)]
