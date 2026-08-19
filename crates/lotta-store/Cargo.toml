@@ -20,6 +20,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+getrandom.workspace = true
 
 [dev-dependencies]
 lotta-testkit = { version = "0.1.0", path = "../lotta-testkit" }

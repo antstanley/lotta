@@ -1217,6 +1217,30 @@ mod tests {
                     LoopClass::NamedBound("end -= 1"),
                 ),
                 (
+                    "schedule/cron.rs",
+                    "for _ in 0..SEARCH_MINUTES_MAX {",
+                    0,
+                    LoopClass::NamedBound("SEARCH_MINUTES_MAX"),
+                ),
+                (
+                    "schedule/cron.rs",
+                    "for part in field.split(',') {",
+                    0,
+                    LoopClass::BoundedIterator("field.split(',')"),
+                ),
+                (
+                    "schedule/jitter.rs",
+                    "loop {",
+                    0,
+                    LoopClass::NamedBound("source.next_u64()"),
+                ),
+                (
+                    "schedule/store.rs",
+                    "for task in &self.tasks {",
+                    0,
+                    LoopClass::BoundedIterator("&self.tasks"),
+                ),
+                (
                     "turn/cancel.rs",
                     "for call in &self.calls {",
                     0,

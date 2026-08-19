@@ -205,6 +205,7 @@ fn validate_id(value: &str) -> Result<(), StoreError> {
     let path = Path::new(value);
     if value.is_empty()
         || value.len() > SIDE_ID_BYTES_MAX
+        || value.trim() != value
         || value == "."
         || value == ".."
         || value.contains(['/', '\\', '\0'])
@@ -261,6 +262,7 @@ mod evidence_impl {
     fn run() {
         crate::side::evidence::paths::run();
     }
+
     #[test]
     fn pending() {
         crate::side::evidence::paths::pending();

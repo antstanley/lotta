@@ -333,7 +333,7 @@ impl FileRevision {
         Self::sample_bounded(root, path, ATOMIC_WRITE_BYTES_MAX as u64, observer)
     }
 
-    fn sample_bounded(
+    pub(crate) fn sample_bounded(
         root: &Path,
         path: &Path,
         max_bytes: u64,

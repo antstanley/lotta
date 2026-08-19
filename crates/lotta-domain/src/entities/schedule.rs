@@ -4,6 +4,7 @@ use crate::{AgentId, ConversationId, NonEmptyString, Timestamp};
 use chrono_tz::Tz;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde_json::{Map, Value};
 use std::{fmt, str::FromStr};
 
 /// Validated IANA timezone identifier.
@@ -27,6 +28,12 @@ impl IanaTimezone {
     #[must_use]
     pub fn as_str(&self) -> &str {
         self.0.name()
+    }
+
+    /// Returns the parsed timezone value.
+    #[must_use]
+    pub const fn as_tz(&self) -> Tz {
+        self.0
     }
 }
 
@@ -93,7 +100,7 @@ pub enum ScheduleRunOutcome {
     Skipped,
 }
 
-/// Canonical persisted schedule with 25 properties.
+/// Canonical persisted schedule with all 26 observed properties.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Schedule {
     /// Schedule identifier.
@@ -156,6 +163,13 @@ pub struct Schedule {
         skip_serializing_if = "Option::is_none"
     )]
     pub last_run_error: Option<Option<String>>,
+    /// Latest missed-run timestamp; optional and nullable.
+    #[serde(
+        default,
+        deserialize_with = "super::nullable::deserialize",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_missed_at: Option<Option<Timestamp>>,
     /// Missed-run count; optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub missed_count: Option<u64>,
@@ -168,4 +182,7 @@ pub struct Schedule {
     pub fired_at: Option<Timestamp>,
     /// One-shot missed timestamp; required and nullable.
     pub missed_at: Option<Timestamp>,
+    /// Schema-open per-schedule extensions preserved without loss.
+    #[serde(flatten)]
+    pub extras: Map<String, Value>,
 }

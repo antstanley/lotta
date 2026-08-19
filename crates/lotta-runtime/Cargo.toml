@@ -14,9 +14,14 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 tracing.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+cron.workspace = true
+getrandom.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true
+jsonschema = { version = "0.32.1", default-features = false }
 syn = { version = "2.0.106", features = ["full", "visit"] }
 quote = "1.0.40"
 proc-macro2 = "1.0.95"

@@ -28,6 +28,8 @@ pub mod post_turn;
 /// Bounded canonical JSON/JSONL query API.
 pub mod query;
 mod refresh;
+/// Secure canonical schedule and run-log persistence.
+pub mod schedule;
 /// Opaque bounded baseline side-store persistence.
 pub mod side;
 /// Bounded append-only transcript persistence.

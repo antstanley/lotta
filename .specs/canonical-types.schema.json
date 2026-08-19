@@ -265,7 +265,7 @@
     },
     "Schedule": {
       "type": "object",
-      "required": ["id", "agent_id", "conversation_id", "name", "description", "cron", "timezone", "recurring", "prompt", "status", "created_at", "expires_at", "last_fired_at", "fire_count", "cancel_reason", "jitter_offset_ms", "scheduled_for", "fired_at", "missed_at"],
+      "required": ["id", "agent_id", "conversation_id", "name", "description", "cron", "timezone", "recurring", "prompt", "status", "created_at", "expires_at", "last_fired_at", "fire_count", "cancel_reason", "jitter_offset_ms", "last_run_at", "last_run_outcome", "last_run_reason", "last_run_error", "last_missed_at", "missed_count", "failed_count", "scheduled_for", "fired_at", "missed_at"],
       "additionalProperties": true,
       "properties": {
         "id": { "$ref": "#/$defs/NonEmptyString" },
@@ -288,6 +288,7 @@
         "last_run_outcome": { "enum": ["queued", "missed", "failed", "skipped", null] },
         "last_run_reason": { "type": ["string", "null"] },
         "last_run_error": { "type": ["string", "null"] },
+        "last_missed_at": { "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
         "missed_count": { "type": "integer", "minimum": 0 },
         "failed_count": { "type": "integer", "minimum": 0 },
         "scheduled_for": { "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },

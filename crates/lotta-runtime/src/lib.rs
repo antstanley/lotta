@@ -38,6 +38,8 @@ pub mod queue_snapshot;
 pub mod registry;
 /// Runtime-owned deterministic provider retry and fallback.
 pub mod retry;
+/// Schedule persistence-neutral timing and lifecycle logic.
+pub mod schedule;
 /// Explicit task-local per-turn context.
 pub mod scope_context;
 /// Lease-guarded provider and local-tool turn loop.

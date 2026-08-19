@@ -211,11 +211,13 @@ fn schedule() -> Schedule {
         last_run_outcome: None,
         last_run_reason: None,
         last_run_error: None,
+        last_missed_at: None,
         missed_count: Some(0),
         failed_count: Some(0),
         scheduled_for: Some(timestamp()),
         fired_at: None,
         missed_at: None,
+        extras: serde_json::Map::new(),
     }
 }
 
