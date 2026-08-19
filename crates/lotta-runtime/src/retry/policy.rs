@@ -3,10 +3,10 @@ use std::pin::Pin;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
-/// Maximum transient/busy retries after the initial provider attempt.
-pub const PROVIDER_RETRIES_MAX: u32 = 3;
 /// Maximum empty-response retries; total empty attempts are exactly three.
-pub const EMPTY_RESPONSE_RETRIES_MAX: u32 = 2;
+pub use crate::bounds::TURN_EMPTY_RESPONSE_RETRIES_MAX as EMPTY_RESPONSE_RETRIES_MAX;
+/// Maximum transient/busy retries after the initial provider attempt.
+pub use crate::bounds::TURN_PROVIDER_RETRIES_MAX as PROVIDER_RETRIES_MAX;
 /// Maximum delay selected for any provider retry.
 pub const PROVIDER_BACKOFF_MS_MAX: u64 = 60_000;
 /// Exponential transient/busy delay base from the pinned provider path.

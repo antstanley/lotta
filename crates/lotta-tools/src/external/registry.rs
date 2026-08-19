@@ -449,7 +449,7 @@ impl ManagerCore {
                 ExternalCallFailure::Cancellation.outcome(),
             ));
         }
-        let maximum = Duration::from_millis(EXTERNAL_TOOL_CALL_TIMEOUT_MS.value as u64);
+        let maximum = Duration::from_millis(EXTERNAL_TOOL_CALL_TIMEOUT_MS as u64);
         let deadline = now.checked_add(maximum).unwrap_or(now);
         if deadline <= now {
             return Ok(RawToolOutcome::Failure(
@@ -644,10 +644,8 @@ fn validate_member(
         .map_err(|_| ExternalRegistrationError::InvalidDefinition)?;
     let secrets = SecretRedactionSpec::new(secret_fields, SecretRedactionPolicy::Redact)
         .map_err(|_| ExternalRegistrationError::InvalidDefinition)?;
-    let timeout = ToolTimeout::new(Duration::from_millis(
-        EXTERNAL_TOOL_CALL_TIMEOUT_MS.value as u64,
-    ))
-    .map_err(|_| ExternalRegistrationError::InvalidDefinition)?;
+    let timeout = ToolTimeout::new(Duration::from_millis(EXTERNAL_TOOL_CALL_TIMEOUT_MS as u64))
+        .map_err(|_| ExternalRegistrationError::InvalidDefinition)?;
     let output = ToolOutputLimit::new(
         TOOL_RESULT_BYTES_MAX.value,
         TOOL_RESULT_MODEL_CHARS_MAX.value,

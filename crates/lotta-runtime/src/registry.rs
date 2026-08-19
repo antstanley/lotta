@@ -1,5 +1,6 @@
 //! Bounded listener-owned runtime registry.
 
+use crate::observe::RuntimeObserver;
 use crate::{ConversationQueue, LifecycleOwner, PumpMutation, QueueMutation, RuntimeError};
 use lotta_domain::bounds::RUNTIMES_MAX;
 use lotta_domain::{
@@ -108,6 +109,7 @@ pub struct ListenerRuntime {
     entries: HashMap<RuntimeKey, RuntimeEntry>,
     next_generation: u64,
     active: bool,
+    observer: RuntimeObserver,
 }
 
 impl Default for ListenerRuntime {
@@ -120,11 +122,30 @@ impl ListenerRuntime {
     /// Creates an active empty listener runtime registry.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_observer(RuntimeObserver::default())
+    }
+
+    /// Creates an active registry owning one explicitly injected observer instance.
+    #[must_use]
+    pub fn with_observer(observer: RuntimeObserver) -> Self {
         Self {
             entries: HashMap::new(),
             next_generation: 1,
             active: true,
+            observer,
         }
+    }
+
+    /// Returns the shared observer owned by this listener instance.
+    #[must_use]
+    pub const fn observer(&self) -> &RuntimeObserver {
+        &self.observer
+    }
+
+    fn refresh_queue_gauge(&self, handle: &RuntimeHandle) {
+        let depth = self.queue(handle).map_or(0, |queue| queue.len() as u64);
+        self.observer
+            .set_gauge(crate::observe::metrics::MetricFamily::QueueDepth, depth);
     }
 
     /// Returns whether this listener accepts post-await effects.
@@ -191,7 +212,9 @@ impl ListenerRuntime {
         &mut self,
         handle: &RuntimeHandle,
     ) -> Result<Option<QueueMutation>, RuntimeError> {
-        self.current_entry_mut(handle)?.queue.dequeue()
+        let result = self.current_entry_mut(handle)?.queue.dequeue()?;
+        self.refresh_queue_gauge(handle);
+        Ok(result)
     }
 
     /// Removes a queued item with the wire `dequeued` disposition.
@@ -203,7 +226,9 @@ impl ListenerRuntime {
         handle: &RuntimeHandle,
         id: &NonEmptyString,
     ) -> Result<Option<QueueMutation>, RuntimeError> {
-        self.current_entry_mut(handle)?.queue.remove(id)
+        let result = self.current_entry_mut(handle)?.queue.remove(id)?;
+        self.refresh_queue_gauge(handle);
+        Ok(result)
     }
 
     /// Cancels a queued item with the wire `cancelled` disposition.
@@ -215,7 +240,9 @@ impl ListenerRuntime {
         handle: &RuntimeHandle,
         id: &NonEmptyString,
     ) -> Result<Option<QueueMutation>, RuntimeError> {
-        self.current_entry_mut(handle)?.queue.cancel(id)
+        let result = self.current_entry_mut(handle)?.queue.cancel(id)?;
+        self.refresh_queue_gauge(handle);
+        Ok(result)
     }
 
     /// Drops a queued item with the internal stale-generation reason.
@@ -259,7 +286,11 @@ impl ListenerRuntime {
     ) -> Result<Option<lotta_domain::QueueItem>, RuntimeError> {
         let entry = self.current_entry_mut(handle)?;
         let state = entry.owner.projection().state();
-        entry.queue.pump_one(state)
+        let result = entry.queue.pump_one(state)?;
+        let depth = entry.queue.len() as u64;
+        self.observer
+            .set_gauge(crate::observe::metrics::MetricFamily::QueueDepth, depth);
+        Ok(result)
     }
 
     /// Infallibly restores the exact item most recently removed by [`Self::pump_one_queue`].

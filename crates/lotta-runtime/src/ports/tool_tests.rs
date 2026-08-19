@@ -22,10 +22,7 @@ fn definition() -> ToolDefinition {
         ToolExecutionOwner::Rust,
         ToolApprovalPolicy::Never,
         PermissionAction::new("read".into()).unwrap(),
-        ToolTimeout::new(Duration::from_millis(
-            EXTERNAL_TOOL_CALL_TIMEOUT_MS.value as u64,
-        ))
-        .unwrap(),
+        ToolTimeout::new(Duration::from_millis(EXTERNAL_TOOL_CALL_TIMEOUT_MS as u64)).unwrap(),
         output_limit(),
         SecretRedactionSpec::new(
             BoundedVec::new(Vec::new()).unwrap(),
@@ -211,7 +208,7 @@ pub(crate) fn input_output_deadline_boundaries() {
     assert!(ToolTimeout::new(Duration::ZERO).is_err());
     assert!(
         ToolTimeout::new(Duration::from_millis(
-            EXTERNAL_TOOL_CALL_TIMEOUT_MS.value as u64 + 1
+            EXTERNAL_TOOL_CALL_TIMEOUT_MS as u64 + 1
         ))
         .is_err()
     );
@@ -338,12 +335,7 @@ pub(crate) fn owning_constructor_boundaries() {
     assert!(InternalToolName::new("n".repeat(TOOL_NAME_BYTES_MAX.value + 1)).is_err());
     assert!(ToolDescriptionAsset::new("d".repeat(TOOL_DESCRIPTION_BYTES_MAX.value)).is_ok());
     assert!(ToolDescriptionAsset::new("d".repeat(TOOL_DESCRIPTION_BYTES_MAX.value + 1)).is_err());
-    assert!(
-        ToolTimeout::new(Duration::from_millis(
-            EXTERNAL_TOOL_CALL_TIMEOUT_MS.value as u64
-        ))
-        .is_ok()
-    );
+    assert!(ToolTimeout::new(Duration::from_millis(EXTERNAL_TOOL_CALL_TIMEOUT_MS as u64)).is_ok());
     let max = output_limit();
     assert!(ToolResultText::new("a".repeat(TOOL_RESULT_MODEL_CHARS_MAX.value), max).is_ok());
     assert!(ToolResultText::new("a".repeat(TOOL_RESULT_MODEL_CHARS_MAX.value + 1), max).is_err());

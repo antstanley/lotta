@@ -82,7 +82,6 @@ const REMINDER_STATE_REVISION: u64 = 1;
 const CWD_REMINDER_PATH_BYTES_MAX: usize = 4_096;
 const RESOLVE_AGENT_CHANNEL_CAPACITY: usize = 64;
 const PRODUCTION_BROKER_WAITERS_MAX: usize = 1_024;
-const EXTERNAL_TOOL_CALL_TIMEOUT_MS: u64 = 300_000;
 const TRANSCRIPT_MANIFEST_SCHEMA_VERSION: u8 = 2;
 const TRANSCRIPT_SESSION_SCHEMA_VERSION: u8 = 3;
 
@@ -2016,7 +2015,8 @@ async fn execute_controller_request(
         return Err(broker_error("controller request emit"));
     }
     let timeout = request.deadline.get().min(std::time::Duration::from_millis(
-        EXTERNAL_TOOL_CALL_TIMEOUT_MS,
+        u64::try_from(lotta_runtime::bounds::EXTERNAL_TOOL_CALL_TIMEOUT_MS)
+            .map_err(|_| broker_error("external tool timeout"))?,
     ));
     let result = tokio::select! {
         biased;

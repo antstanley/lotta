@@ -21,4 +21,4 @@ pub const APPROVAL_TERMINAL_REPLAY_MAX: usize = 128;
 /// Maximum approval events replayed by one synchronization.
 pub const APPROVAL_SYNC_REPLAY_MAX: usize = 256;
 /// Maximum time an approval may remain pending before explicit interruption.
-pub const APPROVAL_WAIT_MS_MAX: u64 = 86_400_000;
+pub use crate::bounds::APPROVAL_WAIT_MS_MAX;

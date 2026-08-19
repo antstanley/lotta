@@ -15,7 +15,7 @@ use std::{path::Path, sync::Arc};
 pub use manager::{CHILD_PROCESS_OUTPUT_BYTES_MAX, SHELL_CHILD_KILL_GRACE_MS, ShellSandbox};
 
 /// Default local shell-tool deadline in milliseconds.
-pub const LOCAL_TOOL_EXECUTION_TIMEOUT_MS_DEFAULT: u64 = 180_000;
+pub use lotta_runtime::bounds::LOCAL_TOOL_EXECUTION_TIMEOUT_MS_DEFAULT;
 /// Largest pinned shell-family deadline in milliseconds.
 pub const LOCAL_TOOL_EXECUTION_TIMEOUT_MS_MAX: u64 = 3_600_000;
 

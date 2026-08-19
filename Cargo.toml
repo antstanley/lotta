@@ -14,6 +14,7 @@ lotta-memfs = { version = "0.1.0", path = "crates/lotta-memfs" }
 lotta-providers = { version = "0.1.0", path = "crates/lotta-providers" }
 lotta-tools = { version = "0.1.0", path = "crates/lotta-tools" }
 lotta-extensions = { version = "0.1.0", path = "crates/lotta-extensions" }
+lotta-telemetry = { version = "0.1.0", path = "crates/lotta-telemetry" }
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true

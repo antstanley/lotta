@@ -24,14 +24,14 @@ pub(super) enum ProviderScript {
     CancelAfterFirst(Vec<ProviderEvent>, CancellationToken),
 }
 
-pub(super) struct ScriptedProvider {
+pub(crate) struct ScriptedProvider {
     scripts: Mutex<VecDeque<ProviderScript>>,
-    pub(super) requests: Mutex<Vec<ProviderRequest>>,
+    pub(crate) requests: Mutex<Vec<ProviderRequest>>,
     pub(super) calls: AtomicUsize,
 }
 
 impl ScriptedProvider {
-    pub(super) fn new(scripts: Vec<Vec<ProviderEvent>>) -> Self {
+    pub(crate) fn new(scripts: Vec<Vec<ProviderEvent>>) -> Self {
         Self::configured(scripts.into_iter().map(ProviderScript::Events).collect())
     }
 
@@ -86,7 +86,7 @@ async fn send_script(
     Ok(())
 }
 
-pub(super) struct SequencingTool {
+pub(crate) struct SequencingTool {
     outcomes: Mutex<VecDeque<Result<ToolOutcome, RuntimeError>>>,
     pub(super) log: Mutex<Vec<String>>,
     pub(super) calls: AtomicUsize,
@@ -96,7 +96,7 @@ pub(super) struct SequencingTool {
 }
 
 impl SequencingTool {
-    pub(super) fn new(outcomes: Vec<ToolOutcome>) -> Self {
+    pub(crate) fn new(outcomes: Vec<ToolOutcome>) -> Self {
         Self::configured(outcomes.into_iter().map(Ok).collect(), None)
     }
 
@@ -141,7 +141,7 @@ impl ToolPort for SequencingTool {
 }
 
 #[derive(Clone, Default)]
-pub(super) struct RecordingEffects {
+pub(crate) struct RecordingEffects {
     pub(super) projections: Arc<Mutex<Vec<TurnProjection>>>,
     pub(super) events: Arc<Mutex<Vec<TurnEvent>>>,
     pub(super) results: Arc<Mutex<Vec<ToolResultRecord>>>,
@@ -219,7 +219,7 @@ impl TurnEffectPort for RecordingEffects {
     }
 }
 
-pub(super) fn text(value: &str) -> ProviderEventText {
+pub(crate) fn text(value: &str) -> ProviderEventText {
     ProviderEventText::new(value.to_owned()).unwrap()
 }
 
@@ -231,7 +231,7 @@ pub(super) fn chunk(value: &[u8]) -> ToolArgumentChunk {
     ToolArgumentChunk::new(value.to_vec()).unwrap()
 }
 
-pub(super) fn request() -> ProviderRequest {
+pub(crate) fn request() -> ProviderRequest {
     ProviderRequest {
         model: ModelDescriptor {
             handle: NonEmptyString::new("fake").unwrap(),
@@ -276,7 +276,7 @@ pub(super) fn runtime() -> (ListenerRuntime, RuntimeHandle, TurnLease) {
     (runtime, handle, lease)
 }
 
-pub(super) fn outcome(value: &str) -> ToolOutcome {
+pub(crate) fn outcome(value: &str) -> ToolOutcome {
     ToolOutcome::Success {
         content: ToolResultText::new(value.into(), ToolOutputLimit::new(1024, 1024).unwrap())
             .unwrap(),
@@ -302,11 +302,11 @@ pub(super) fn definition(name: &str) -> ToolDefinition {
     )
 }
 
-pub(super) fn catalog(names: &[&str]) -> TurnToolCatalog {
+pub(crate) fn catalog(names: &[&str]) -> TurnToolCatalog {
     TurnToolCatalog::new(names.iter().map(|name| definition(name)).collect()).unwrap()
 }
 
-pub(super) fn call_events(call: &str, tool: &str) -> Vec<ProviderEvent> {
+pub(crate) fn call_events(call: &str, tool: &str) -> Vec<ProviderEvent> {
     let call_id = id(call);
     vec![
         ProviderEvent::ToolCallStart {

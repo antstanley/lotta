@@ -19,7 +19,7 @@ fn record() -> super::TurnStopRecord {
 
 fn context<'a>(
     runtime: &'a mut crate::ListenerRuntime,
-    handle: crate::RuntimeHandle,
+    handle: &crate::RuntimeHandle,
     lease: lotta_domain::TurnLease,
     cancellation: CancellationToken,
     effects: &'a RecordingEffects,
@@ -27,7 +27,7 @@ fn context<'a>(
     CancelContext {
         runtime,
         guard: LeaseGuard::new(
-            handle,
+            handle.clone(),
             lease,
             cancellation.clone(),
             CancellationPolicy::PermitDuringCancellationCleanup,
@@ -38,6 +38,9 @@ fn context<'a>(
         children: None,
         post_turn: None,
         record: record(),
+        runtime_key: handle.key().clone(),
+        run_id: RunId::generate_sequence(1).unwrap(),
+        connection_id: NonEmptyString::new("runtime-local").unwrap(),
         stages: None,
     }
 }
@@ -55,7 +58,7 @@ mod cancel {
             let stages = Arc::new(Mutex::new(Vec::new()));
             let mut context = context(
                 &mut runtime,
-                handle,
+                &handle,
                 lease,
                 CancellationToken::new(),
                 &effects,
@@ -88,7 +91,7 @@ mod cancel {
             let controller = CancellationToken::new();
             let mut context = context(
                 &mut runtime,
-                handle,
+                &handle,
                 lease,
                 CancellationToken::new(),
                 &effects,
@@ -162,7 +165,7 @@ mod cancel {
             let children = Children(Arc::clone(&calls));
             let mut context = context(
                 &mut runtime,
-                handle,
+                &handle,
                 lease,
                 CancellationToken::new(),
                 &effects,
@@ -295,7 +298,7 @@ mod cancel {
             let post = FailingPost(Arc::clone(&calls));
             let mut context = context(
                 &mut runtime,
-                handle,
+                &handle,
                 lease,
                 CancellationToken::new(),
                 &effects,

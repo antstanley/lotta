@@ -913,7 +913,7 @@ fn tool_registry(counter: Arc<AtomicUsize>) -> ToolRegistry {
         ToolApprovalPolicy::Never,
         PermissionAction::new("read".into()).unwrap(),
         ToolTimeout::new(Duration::from_millis(
-            EXTERNAL_TOOL_CALL_TIMEOUT_MS.value as u64,
+            EXTERNAL_TOOL_CALL_TIMEOUT_MS as u64,
         ))
         .unwrap(),
         ToolOutputLimit::new(

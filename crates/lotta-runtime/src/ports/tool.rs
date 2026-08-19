@@ -297,8 +297,12 @@ impl ToolTimeout {
         if value.is_zero() || millis == 0 {
             return Err(invalid("tool timeout"));
         }
-        if millis > EXTERNAL_TOOL_CALL_TIMEOUT_MS.value as u128 {
-            return Err(limit(EXTERNAL_TOOL_CALL_TIMEOUT_MS.name));
+        if millis > EXTERNAL_TOOL_CALL_TIMEOUT_MS as u128
+            || (millis == EXTERNAL_TOOL_CALL_TIMEOUT_MS as u128
+                && crate::bounds::external_timeout_decision(EXTERNAL_TOOL_CALL_TIMEOUT_MS)
+                    != crate::bounds::TimeoutDecision::TimedOut)
+        {
+            return Err(limit("EXTERNAL_TOOL_CALL_TIMEOUT_MS"));
         }
         Ok(Self(value))
     }

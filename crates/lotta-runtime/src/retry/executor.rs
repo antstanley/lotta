@@ -1,6 +1,8 @@
 use super::fallback::{EventSink, FallbackRoute, ProviderRoute, RetryEvent, RetryReason};
+use super::policy::EMPTY_RESPONSE_RETRIES_MAX;
 use super::policy::{Clock, ProviderFailure, RetryPolicy, Sleeper};
 use crate::RuntimeError;
+use crate::bounds::{BoundDecision, empty_response_retry_decision, provider_retry_decision};
 use crate::ports::{ProviderEvent, ProviderPort, ProviderRequest, provider_event_channel};
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -114,10 +116,19 @@ where
         }
         let mut state = ExecutionState::new(source, source_port);
         let mut retry_attempt = 0;
-        let mut empty_attempt = 0;
+        let mut empty_attempt = 0_u32;
         let mut attempt_count = 0_u32;
-        loop {
+        let attempts_max = self
+            .policy
+            .attempts_max()
+            .saturating_add(EMPTY_RESPONSE_RETRIES_MAX);
+        for expected_attempt in 1..=attempts_max {
             attempt_count = attempt_count.saturating_add(1);
+            if attempt_count != expected_attempt {
+                return Err(RuntimeError::InvalidData {
+                    context: "provider_attempt_progress".into(),
+                });
+            }
             let attempt = self
                 .execute_attempt(&state, &request, output.clone(), deadline_ms)
                 .await?;
@@ -127,7 +138,7 @@ where
                 }
                 AttemptTerminal::Success => {
                     let failure = empty_failure();
-                    if empty_attempt == retries_max(&self.policy, &failure) {
+                    if empty_response_retry_decision(empty_attempt) == BoundDecision::Terminal {
                         return Ok(RetryTerminal::Failure {
                             failure,
                             attempt_count,
@@ -145,8 +156,11 @@ where
                     .await?;
                 }
                 AttemptTerminal::Failure(failure) => {
+                    let empty_terminal = failure.kind == super::policy::ProviderFailureKind::Empty
+                        && empty_response_retry_decision(empty_attempt) == BoundDecision::Terminal;
                     if attempt.model_output
-                        || retry_attempt == retries_max(&self.policy, &failure)
+                        || empty_terminal
+                        || provider_retry_decision(retry_attempt) == BoundDecision::Terminal
                         || !failure.is_retryable()
                     {
                         forward_terminal(attempt.stop, &output).await?;
@@ -154,6 +168,9 @@ where
                             failure,
                             attempt_count,
                         });
+                    }
+                    if failure.kind == super::policy::ProviderFailureKind::Empty {
+                        empty_attempt = empty_attempt.saturating_add(1);
                     }
                     let next_attempt = retry_attempt + 1;
                     self.prepare_retry(
@@ -169,6 +186,9 @@ where
                 }
             }
         }
+        Err(RuntimeError::LimitExceeded {
+            context: "provider_attempts_max".into(),
+        })
     }
 
     async fn execute_attempt(
@@ -348,7 +368,9 @@ async fn run_attempt<C: Clock + ?Sized>(
     let future = port.stream(request, sink);
     tokio::pin!(future);
     let mut state = AttemptState::default();
+    let mut progress_count = 0_u64;
     while !state.complete() {
+        let previous_progress_count = progress_count;
         let remaining_ms = deadline_ms.saturating_sub(clock.monotonic_ms());
         if remaining_ms == 0 {
             return Err(deadline());
@@ -362,17 +384,22 @@ async fn run_attempt<C: Clock + ?Sized>(
             result = &mut future, if !state.completion.port_done => match result {
                 Err(error @ RuntimeError::Cancelled { .. }) => return Err(error),
                 Err(error) => return Ok(state.failure(runtime_failure(&error))),
-                Ok(()) => state.completion.port_done = true,
-            },
-            result = receiver.receive(), if !state.completion.channel_done => match result? {
-                Some(event) => {
-                    if let Some(outcome) = state.handle(event, &output).await? {
-                        return Ok(outcome);
-                    }
+                Ok(()) => {
+                    state.completion.port_done = true;
+                    progress_count = progress_count.saturating_add(1);
                 }
-                None => state.completion.channel_done = true,
+            },
+            result = receiver.receive(), if !state.completion.channel_done => if let Some(event) = result? {
+                if let Some(outcome) = state.handle(event, &output).await? {
+                    return Ok(outcome);
+                }
+                progress_count = progress_count.saturating_add(1);
+            } else {
+                state.completion.channel_done = true;
+                progress_count = progress_count.saturating_add(1);
             }
         }
+        assert!(progress_count > previous_progress_count);
     }
     state.finish(&output).await
 }
@@ -461,7 +488,9 @@ impl AttemptState {
         &mut self,
         output: &crate::ports::ProviderEventSink,
     ) -> Result<(), RuntimeError> {
-        while let Some(event) = self.pending.pop_front() {
+        let pending_items_max = self.pending.len();
+        for _ in 0..pending_items_max {
+            let event = self.pending.pop_front().ok_or_else(pending_limit)?;
             output.send(event).await?;
         }
         self.pending_bytes = 0;
@@ -528,13 +557,6 @@ fn schema_failure() -> ProviderFailure {
 fn cancelled_attempt() -> RuntimeError {
     RuntimeError::Cancelled {
         context: "provider retry attempt".into(),
-    }
-}
-
-fn retries_max(policy: &RetryPolicy, failure: &ProviderFailure) -> u32 {
-    match failure.kind {
-        super::policy::ProviderFailureKind::Empty => super::policy::EMPTY_RESPONSE_RETRIES_MAX,
-        _ => policy.retries_max,
     }
 }
 

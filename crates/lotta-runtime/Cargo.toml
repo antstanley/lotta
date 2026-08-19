@@ -18,6 +18,8 @@ tracing.workspace = true
 [dev-dependencies]
 chrono.workspace = true
 syn = { version = "2.0.106", features = ["full", "visit"] }
+quote = "1.0.40"
+proc-macro2 = "1.0.95"
 walkdir = "2.5.0"
 
 [lints]

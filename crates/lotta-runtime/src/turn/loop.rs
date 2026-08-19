@@ -5,7 +5,11 @@ use super::{
     TurnStopReason, TurnStopRecord, TurnToolCatalog, UnfinishedToolCall,
     cancel::{CancelContext, UnfinishedCallTracker, cancel_turn as settle_cancellation},
 };
-use crate::bounds::{PROVIDER_MESSAGES_MAX, TURN_STEPS_MAX, TURN_TOOL_CALLS_MAX};
+use crate::bounds::{
+    BoundDecision, PROVIDER_MESSAGES_MAX, TURN_STEPS_MAX, TURN_TOOL_CALLS_MAX, compaction_decision,
+    step_decision, tool_call_decision,
+};
+use crate::observe::events::{ObservedStopReason, RuntimeEvent, RuntimeEventKind};
 use crate::ports::{
     ParallelSafety, ProviderEvent, ProviderMessage, ProviderMessages, ProviderPort,
     ProviderRequest, StopReason, ToolApprovalPolicy, ToolCallAccumulator, ToolCallId,
@@ -22,6 +26,7 @@ use crate::{
 };
 use lotta_domain::{BoundedJsonValue, NonEmptyString, RunId, TurnLease};
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 /// Outcome of an admitted turn loop.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,7 +48,7 @@ enum Flow {
 }
 
 /// Maximum context-overflow compactions before the fourth overflow is terminal.
-pub const CONTEXT_OVERFLOW_COMPACTIONS_MAX: u8 = 3;
+pub use crate::bounds::CONTEXT_OVERFLOW_COMPACTIONS_MAX;
 
 /// Safe before/after size observations returned by the injected Task58 seam.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,7 +111,7 @@ impl ProviderStepState {
         let mut completed = Vec::new();
         completed
             .try_reserve(remaining)
-            .map_err(|_| limit(TURN_TOOL_CALLS_MAX.name))?;
+            .map_err(|_| limit("TURN_TOOL_CALLS_MAX"))?;
         Ok(Self {
             accumulator: ToolCallAccumulator::default(),
             names: BTreeMap::new(),
@@ -595,6 +600,8 @@ impl ProviderTurnExecutorPort for ProductionRetryExecutor {
     }
 }
 
+const RUNTIME_LOCAL_CONNECTION_ID: &str = "runtime-local";
+
 struct TurnContext<'ports, 'catalog> {
     runtime: &'ports mut ListenerRuntime,
     guard: LeaseGuard,
@@ -619,6 +626,27 @@ struct TurnContext<'ports, 'catalog> {
     post_turn: Option<&'ports dyn PostTurnPort>,
     unfinished: UnfinishedCallTracker,
     cancellation_stages: Option<std::sync::Arc<dyn Fn(super::CancelStep) + Send + Sync>>,
+}
+
+impl TurnContext<'_, '_> {
+    fn safe_event(&self, kind: RuntimeEventKind) -> RuntimeEvent {
+        let connection_id = NonEmptyString::new(RUNTIME_LOCAL_CONNECTION_ID)
+            .expect("static connection id is valid");
+        RuntimeEvent::new(
+            kind,
+            self.guard.handle().key(),
+            &connection_id,
+            self.lease_generation,
+        )
+        .with_run(&self.run_id)
+    }
+
+    fn observe_suppressed(&self) {
+        self.runtime
+            .observer()
+            .clone()
+            .stale_suppression(self.safe_event(RuntimeEventKind::StaleSuppression));
+    }
 }
 
 /// Runs one bounded provider turn and sequential local-tool continuations.
@@ -719,8 +747,9 @@ async fn run_loop(turn: &mut TurnContext<'_, '_>) -> Result<TurnRunOutcome, Runt
         turn.request.cancellation.cancel();
         return Ok(TurnRunOutcome::Suppressed);
     }
-    for step_index in 0..TURN_STEPS_MAX.value {
-        let remaining = TURN_TOOL_CALLS_MAX.value - turn.total_tool_calls;
+    for step_index in 0..TURN_STEPS_MAX {
+        debug_assert_eq!(step_decision(step_index), BoundDecision::Allowed);
+        let remaining = TURN_TOOL_CALLS_MAX - turn.total_tool_calls;
         let mut state = ProviderStepState::new(remaining)?;
         let step = match run_provider_step(turn, &mut state).await {
             Ok(step) => step,
@@ -760,7 +789,7 @@ async fn run_loop(turn: &mut TurnContext<'_, '_>) -> Result<TurnRunOutcome, Runt
         }
         return finish_turn(turn, reason);
     }
-    Err(limit(TURN_STEPS_MAX.name))
+    Err(limit("TURN_STEPS_MAX"))
 }
 
 async fn cancelled_outcome(turn: &mut TurnContext<'_, '_>) -> Result<TurnRunOutcome, RuntimeError> {
@@ -779,8 +808,8 @@ fn continue_after_tools(
         return Err(protocol("provider tool use without completed result"));
     }
     append_messages(&mut turn.request, completed)?;
-    if step_index + 1 == TURN_STEPS_MAX.value {
-        return Err(limit(TURN_STEPS_MAX.name));
+    if step_index + 1 == TURN_STEPS_MAX {
+        return Err(limit("TURN_STEPS_MAX"));
     }
     Ok(())
 }
@@ -795,8 +824,17 @@ fn finish_turn(
         .finish_turn_with_effect_after_await(turn.runtime, domain, || {
             turn.effects.emit(TurnEvent::Finished { reason })
         })? {
-        LeaseEffect::Applied(()) => Ok(TurnRunOutcome::Completed),
-        LeaseEffect::Suppressed(_) => Ok(TurnRunOutcome::Suppressed),
+        LeaseEffect::Applied(()) => {
+            turn.runtime.observer().clone().terminal(
+                turn.safe_event(RuntimeEventKind::Terminal)
+                    .with_stop_reason(reason.into()),
+            );
+            Ok(TurnRunOutcome::Completed)
+        }
+        LeaseEffect::Suppressed(_) => {
+            turn.observe_suppressed();
+            Ok(TurnRunOutcome::Suppressed)
+        }
     }
 }
 
@@ -872,6 +910,14 @@ async fn run_provider_attempt(
     state: &mut ProviderStepState,
 ) -> Result<ProviderStepResult, RuntimeError> {
     turn.request.validate_bytes()?;
+    let attempt_started = Instant::now();
+    let provider_id = turn.request.model.provider_id.clone();
+    let attempt = u32::from(turn.context_compactions).saturating_add(1);
+    let observer = turn.runtime.observer().clone();
+    let provider_event = turn
+        .safe_event(RuntimeEventKind::ProviderAttempt)
+        .with_provider(&provider_id)
+        .with_attempt(attempt);
     let (sink, mut output) = provider_event_channel(1, &turn.request.cancellation)?;
     let (future, mut retry_events) =
         execute_provider(turn.provider.clone(), turn.request.clone(), sink)?;
@@ -951,9 +997,11 @@ async fn run_provider_attempt(
         });
         return Ok(ProviderStepResult::Overflow(detail));
     }
-    handle_terminal(terminal, turn, state, &mut output)
+    let result = handle_terminal(terminal, turn, state, &mut output)
         .await
-        .map(ProviderStepResult::Flow)
+        .map(ProviderStepResult::Flow);
+    observer.provider_attempt(provider_event, elapsed_ms(attempt_started));
+    result
 }
 
 fn estimate_request_tokens(request: &ProviderRequest) -> u64 {
@@ -1022,7 +1070,7 @@ async fn compact_and_refresh(
     mut detail: crate::ports::ProviderContextOverflowDetail,
     trigger: crate::compaction::CompactionTrigger,
 ) -> Result<(), RuntimeError> {
-    if turn.context_compactions >= CONTEXT_OVERFLOW_COMPACTIONS_MAX {
+    if compaction_decision(turn.context_compactions) == BoundDecision::Terminal {
         detail.compactions_completed = turn.context_compactions;
         detail.attempt = turn.context_compactions.saturating_add(1);
         return Err(RuntimeError::ContextOverflow { detail });
@@ -1077,6 +1125,10 @@ async fn compact_and_refresh(
     let context = turn.request.context.get_or_insert_default();
     context.compactions_completed = turn.context_compactions;
     context.measured_input_tokens = None;
+    turn.runtime
+        .observer()
+        .clone()
+        .compaction(turn.safe_event(RuntimeEventKind::Compaction));
     Ok(())
 }
 
@@ -1123,12 +1175,28 @@ async fn receive_retry(
 }
 
 fn apply_retry(turn: &mut TurnContext<'_, '_>, event: RetryEvent) -> Result<Flow, RuntimeError> {
+    let observed = NonEmptyString::new(event.destination.provider.clone())
+        .ok()
+        .map(|provider| {
+            turn.safe_event(RuntimeEventKind::ProviderAttempt)
+                .with_provider(&provider)
+                .with_attempt(event.attempt)
+        });
     match turn
         .guard
         .apply_after_await(turn.runtime, || turn.effects.emit(TurnEvent::Retry(event)))
     {
-        LeaseEffect::Applied(result) => result.map(|()| Flow::Continue),
-        LeaseEffect::Suppressed(_) => Ok(Flow::Suppressed),
+        LeaseEffect::Applied(result) => {
+            result?;
+            if let Some(event) = observed {
+                turn.runtime.observer().clone().retry(event);
+            }
+            Ok(Flow::Continue)
+        }
+        LeaseEffect::Suppressed(_) => {
+            turn.observe_suppressed();
+            Ok(Flow::Suppressed)
+        }
     }
 }
 
@@ -1217,11 +1285,18 @@ async fn cancel_turn(turn: &mut TurnContext<'_, '_>) -> Result<Flow, RuntimeErro
         children: turn.children,
         post_turn: turn.post_turn,
         record,
+        runtime_key: turn.guard.handle().key().clone(),
+        run_id: turn.run_id.clone(),
+        connection_id: NonEmptyString::new(RUNTIME_LOCAL_CONNECTION_ID)
+            .expect("static connection id is valid"),
         stages: turn.cancellation_stages.clone(),
     };
     match settle_cancellation(&mut context).await? {
         LeaseEffect::Applied(receipt) => Ok(Flow::Cancelled(receipt)),
-        LeaseEffect::Suppressed(_) => Ok(Flow::Suppressed),
+        LeaseEffect::Suppressed(_) => {
+            turn.observe_suppressed();
+            Ok(Flow::Suppressed)
+        }
     }
 }
 
@@ -1244,8 +1319,17 @@ fn fail_turn(
             turn.effects.persist_stop_reason(record)?;
             turn.effects.emit(TurnEvent::Failed { reason })
         })? {
-        LeaseEffect::Applied(()) => Ok(Flow::Failed),
-        LeaseEffect::Suppressed(_) => Ok(Flow::Suppressed),
+        LeaseEffect::Applied(()) => {
+            turn.runtime.observer().clone().terminal(
+                turn.safe_event(RuntimeEventKind::Terminal)
+                    .with_stop_reason(observed_failure_reason(reason)),
+            );
+            Ok(Flow::Failed)
+        }
+        LeaseEffect::Suppressed(_) => {
+            turn.observe_suppressed();
+            Ok(Flow::Suppressed)
+        }
     }
 }
 
@@ -1291,10 +1375,13 @@ async fn handle_event(
 
 impl TurnContext<'_, '_> {
     fn is_suppressed(&self) -> bool {
-        matches!(
-            self.guard.apply_after_await(self.runtime, || ()),
-            LeaseEffect::Suppressed(_)
-        )
+        match self.guard.apply_after_await(self.runtime, || ()) {
+            LeaseEffect::Applied(()) => false,
+            LeaseEffect::Suppressed(_) => {
+                self.observe_suppressed();
+                true
+            }
+        }
     }
 
     fn project(
@@ -1308,7 +1395,10 @@ impl TurnContext<'_, '_> {
             self.effects.emit(TurnEvent::StreamDelta(projection))
         }) {
             LeaseEffect::Applied(result) => result.map(|()| Flow::Continue),
-            LeaseEffect::Suppressed(_) => Ok(Flow::Suppressed),
+            LeaseEffect::Suppressed(_) => {
+                self.observe_suppressed();
+                Ok(Flow::Suppressed)
+            }
         }
     }
 }
@@ -1319,8 +1409,8 @@ fn start_call(
     call_id: ToolCallId,
     name: crate::boundary::ProviderEventText,
 ) -> Result<Flow, RuntimeError> {
-    if turn.total_tool_calls == TURN_TOOL_CALLS_MAX.value {
-        return Err(limit(TURN_TOOL_CALLS_MAX.name));
+    if tool_call_decision(turn.total_tool_calls) == BoundDecision::Terminal {
+        return Err(limit("TURN_TOOL_CALLS_MAX"));
     }
     state.accumulator.start(call_id.clone())?;
     if state.names.insert(call_id, name).is_some() {
@@ -1354,7 +1444,16 @@ async fn execute_call(
     }) {
         return Err(protocol("duplicate unfinished tool call"));
     }
-    let outcome = execute_branch(turn, &call_id, definition, input, cancellation).await?;
+    let execution_started = Instant::now();
+    let execution_event = turn
+        .safe_event(RuntimeEventKind::Tool)
+        .with_tool_call(&call_id);
+    let outcome = execute_branch(turn, &call_id, definition, input, cancellation).await;
+    turn.runtime
+        .observer()
+        .clone()
+        .tool_execution(execution_event, elapsed_ms(execution_started));
+    let outcome = outcome?;
     if turn.is_suppressed() {
         return Ok(Flow::Suppressed);
     }
@@ -1362,13 +1461,13 @@ async fn execute_call(
         return Ok(Flow::Suppressed);
     }
     let result = ToolResultRecord { call_id, outcome };
-    if state.completed.len() == TURN_TOOL_CALLS_MAX.value {
-        return Err(limit(TURN_TOOL_CALLS_MAX.name));
+    if state.completed.len() == TURN_TOOL_CALLS_MAX {
+        return Err(limit("TURN_TOOL_CALLS_MAX"));
     }
     state
         .completed
         .try_reserve(1)
-        .map_err(|_| limit(TURN_TOOL_CALLS_MAX.name))?;
+        .map_err(|_| limit("TURN_TOOL_CALLS_MAX"))?;
     let effect = turn.guard.apply_after_await(turn.runtime, || {
         turn.effects.append_tool_result(result.clone())?;
         turn.effects.emit(TurnEvent::ToolResult(result.clone()))
@@ -1380,6 +1479,7 @@ async fn execute_call(
             return Err(error);
         }
         LeaseEffect::Suppressed(_) => {
+            turn.observe_suppressed();
             turn.unfinished.restore_pending(&result.call_id);
             return Ok(Flow::Suppressed);
         }
@@ -1583,6 +1683,20 @@ fn append_messages(
     request.messages =
         ProviderMessages::new(messages).map_err(|_| limit(PROVIDER_MESSAGES_MAX.name))?;
     request.validate_bytes()
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn observed_failure_reason(reason: TurnStopReason) -> ObservedStopReason {
+    match reason {
+        TurnStopReason::ContextOverflow => ObservedStopReason::ContextOverflow,
+        TurnStopReason::UserCancellation => ObservedStopReason::Cancelled,
+        TurnStopReason::EmptyResponse
+        | TurnStopReason::TransportFailure
+        | TurnStopReason::ProviderQuotaError => ObservedStopReason::Failed,
+    }
 }
 
 fn domain_stop(reason: StopReason) -> Result<lotta_domain::StopReason, RuntimeError> {

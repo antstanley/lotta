@@ -77,7 +77,7 @@ mod stop_reasons;
 #[path = "turn/terminal_once.rs"]
 mod terminal_once;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 #[cfg(test)]
 #[path = "turn/tool_call_assembly.rs"]
 mod tool_call_assembly;

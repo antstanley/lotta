@@ -1,5 +1,6 @@
+use crate::bounds::{QUEUE_PUMP_BATCH_MAX, queue_pump_count};
 use crate::{QueueMutation, QueueMutationEvent, QueueSnapshot, RuntimeError};
-use lotta_domain::bounds::{QUEUE_ITEMS_HARD_MAX, QUEUE_ITEMS_SOFT_MAX, QUEUE_PUMP_BATCH_MAX};
+use lotta_domain::bounds::{QUEUE_ITEMS_HARD_MAX, QUEUE_ITEMS_SOFT_MAX};
 use lotta_domain::{
     NonEmptyString, QueueDropReason, QueueItem, QueueItemKind, QueueRemovalDisposition,
     TurnStateKind,
@@ -195,7 +196,7 @@ impl ConversationQueue {
         if state != TurnStateKind::Idle || self.items.is_empty() {
             return Ok(None);
         }
-        let count = self.pump_count();
+        let count = queue_pump_count(self.pump_count());
         let revision = self.next_revision()?;
         let batch: Vec<_> = self.items.drain(..count).collect();
         let more = count == QUEUE_PUMP_BATCH_MAX && !self.items.is_empty();

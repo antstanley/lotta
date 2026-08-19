@@ -88,6 +88,7 @@ pub struct ProductionComponents {
     runtime_service: Arc<ProductionRuntimeService>,
     turn_controller: Arc<ProductionTurnController>,
     post_turn_queue: lotta_store::PostTurnQueue,
+    _observer: Arc<lotta_runtime::observe::RuntimeObserver>,
     reflection: Arc<Mutex<Arc<dyn lotta_store::ReflectionJob>>>,
     memory_push: Arc<Mutex<Arc<dyn lotta_store::MemoryPushJob>>>,
 }
@@ -131,6 +132,11 @@ impl ProductionComponents {
         clock: Arc<dyn Clock + Send + Sync>,
     ) -> Result<Self, SetupError> {
         let root = prepared.storage_dir.clone();
+        let event_sink: Arc<dyn lotta_runtime::observe::events::RuntimeEventSink> =
+            Arc::new(lotta_runtime::observe::events::FanoutRuntimeEventSink::new(
+                vec![Arc::new(lotta_telemetry::TracingRuntimeEventSink)],
+            ));
+        let observer = Arc::new(lotta_runtime::observe::RuntimeObserver::new(event_sink));
         let workspace = prepared.workspace_dir.clone();
         let store_paths = StorePaths::new(&root).map_err(adapter)?;
         let provider_runtime = production_provider_runtime(&store_paths, &root)?;
@@ -164,7 +170,7 @@ impl ProductionComponents {
             LocalStore::new(store_paths.clone()).approval_journal(),
             Arc::new(crate::production_setup::ProductionEditedInputValidator),
         ));
-        let runtime_state = Arc::new(ProductionRuntimeState::new());
+        let runtime_state = Arc::new(ProductionRuntimeState::new(Arc::clone(&observer)));
         let brokers = Arc::new(ProductionTurnBrokers::new());
         let compaction = Arc::new(crate::production_setup::RegisteredProductionCompaction {
             service: lotta_runtime::CompactionService::new(
@@ -214,6 +220,7 @@ impl ProductionComponents {
             runtime_service,
             turn_controller,
             post_turn_queue,
+            _observer: observer,
             reflection,
             memory_push,
         };
@@ -675,10 +682,10 @@ pub(crate) struct ProductionRuntimeState {
 }
 
 impl ProductionRuntimeState {
-    fn new() -> Self {
+    fn new(observer: Arc<lotta_runtime::observe::RuntimeObserver>) -> Self {
         Self {
             inner: tokio::sync::Mutex::new(RuntimeServiceState {
-                registry: ListenerRuntime::new(),
+                registry: ListenerRuntime::with_observer(observer.as_ref().clone()),
                 pending: HashMap::new(),
                 sequence: 1,
             }),
@@ -2917,7 +2924,9 @@ mod production_tests {
             paths,
             Arc::new(TestClock),
             Arc::new(lotta_runtime::hooks::NoopHookRuntime),
-            Arc::new(ProductionRuntimeState::new()),
+            Arc::new(ProductionRuntimeState::new(Arc::new(
+                lotta_runtime::observe::RuntimeObserver::default(),
+            ))),
             approvals,
             Arc::new(ProductionTurnBrokers::new()),
         )
@@ -3041,7 +3050,9 @@ mod production_tests {
             store.approval_journal(),
             Arc::new(crate::production_setup::ProductionEditedInputValidator),
         ));
-        let state = Arc::new(ProductionRuntimeState::new());
+        let state = Arc::new(ProductionRuntimeState::new(Arc::new(
+            lotta_runtime::observe::RuntimeObserver::default(),
+        )));
         let brokers = Arc::new(ProductionTurnBrokers::new());
         let compaction = Arc::new(crate::production_setup::RegisteredProductionCompaction {
             service: lotta_runtime::CompactionService::new(

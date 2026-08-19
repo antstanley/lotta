@@ -3,7 +3,8 @@ mod control;
 pub use control::admit_control_snapshot;
 
 use lotta_domain::{
-    InputDisposition, QueueDropReason, QueueItem, QueueItemKind, TurnLease, TurnStateKind,
+    InputDisposition, NonEmptyString, QueueDropReason, QueueItem, QueueItemKind, TurnLease,
+    TurnStateKind,
 };
 
 /// Admission routing classification established by the inbound adapter.
@@ -87,6 +88,9 @@ impl ListenerRuntime {
         handle: &RuntimeHandle,
         request: AdmissionRequest,
     ) -> Result<AdmissionOutcome, RuntimeError> {
+        let observer = self.observer().clone();
+        let key = handle.key().clone();
+        let connection_id = static_id("runtime-local", "runtime connection id")?;
         let entry = self.current_entry_mut(handle)?;
         if let Some(prior) = entry
             .admission_history
@@ -121,11 +125,27 @@ impl ListenerRuntime {
                 }
             }
         };
+        let queue_depth = entry.queue.len();
+        let active_turns = u64::from(entry.owner.projection().state() != TurnStateKind::Idle);
         let _recorded = entry
             .admission_history
             .admit(&client_message_id, outcome.disposition());
+        observer.admission(
+            &key,
+            &connection_id,
+            None,
+            entry.owner.projection().active_run_ids().first(),
+            queue_depth,
+            active_turns,
+        );
         Ok(outcome)
     }
+}
+
+fn static_id(value: &'static str, context: &'static str) -> Result<NonEmptyString, RuntimeError> {
+    NonEmptyString::new(value).map_err(|_| RuntimeError::InvalidData {
+        context: context.to_owned(),
+    })
 }
 
 fn classify_queue(mutation: QueueMutation) -> AdmissionOutcome {

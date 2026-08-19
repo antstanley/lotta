@@ -42,10 +42,8 @@ fn definition(name: &str) -> Result<ToolDefinition, MemoryBundleError> {
         ToolExecutionOwner::Rust,
         ToolApprovalPolicy::Always,
         PermissionAction::new("write".into()).map_err(|_| MemoryBundleError)?,
-        ToolTimeout::new(Duration::from_millis(
-            EXTERNAL_TOOL_CALL_TIMEOUT_MS.value as u64,
-        ))
-        .map_err(|_| MemoryBundleError)?,
+        ToolTimeout::new(Duration::from_millis(EXTERNAL_TOOL_CALL_TIMEOUT_MS as u64))
+            .map_err(|_| MemoryBundleError)?,
         ToolOutputLimit::new(
             TOOL_RESULT_BYTES_MAX.value,
             TOOL_RESULT_MODEL_CHARS_MAX.value,

@@ -1,16 +1,20 @@
 //! Runtime-owned cancellation settlement.
 
 use super::{ToolResultRecord, TurnEffectPort, TurnEvent, TurnStopRecord};
+use crate::bounds::{BoundDecision, cancel_grace_decision};
+use crate::observe::events::{ObservedStopReason, RuntimeEvent, RuntimeEventKind};
 use crate::ports::{PortFuture, ToolCallId, ToolOutcome, ToolOutcomeMessage};
-use crate::{CancellationClaim, LeaseEffect, LeaseGuard, ListenerRuntime, RuntimeError};
-use lotta_domain::StopReason;
+use crate::{
+    CancellationClaim, LeaseEffect, LeaseGuard, ListenerRuntime, RuntimeError, RuntimeKey,
+};
+use lotta_domain::{NonEmptyString, RunId, StopReason};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 /// Cooperative cancellation grace before forceful child cleanup.
-pub const TURN_CANCEL_GRACE_MS: u64 = 10_000;
+pub use crate::bounds::TURN_CANCEL_GRACE_MS;
 /// SIGTERM-to-SIGKILL grace used by scoped child supervisors.
 pub const CHILD_KILL_GRACE_MS: u64 = 2_000;
 
@@ -127,6 +131,9 @@ pub(crate) struct CancelContext<'a> {
     pub(crate) children: Option<&'a dyn TurnChildOwner>,
     pub(crate) post_turn: Option<&'a dyn PostTurnPort>,
     pub(crate) record: TurnStopRecord,
+    pub(crate) runtime_key: RuntimeKey,
+    pub(crate) run_id: RunId,
+    pub(crate) connection_id: NonEmptyString,
     pub(crate) stages: Option<Arc<dyn Fn(CancelStep) + Send + Sync>>,
 }
 
@@ -145,6 +152,7 @@ impl CancelContext<'_> {
 pub(super) async fn cancel_turn(
     context: &mut CancelContext<'_>,
 ) -> Result<LeaseEffect<crate::CancellationReceipt>, RuntimeError> {
+    let settled_started = Instant::now();
     context.stage(CancelStep::ClaimAndCancel);
     let Some(claim) = claim_and_cancel(context)? else {
         return Ok(LeaseEffect::Suppressed(
@@ -161,6 +169,25 @@ pub(super) async fn cancel_turn(
     context.stage(CancelStep::EmitAndRelease);
     let outcome = finish_terminal(context, claim)?;
     if matches!(outcome, LeaseEffect::Applied(_)) {
+        let event = RuntimeEvent::new(
+            RuntimeEventKind::Cancellation,
+            &context.runtime_key,
+            &context.connection_id,
+            context.guard.lease().generation(),
+        )
+        .with_run(&context.run_id);
+        let observer = context.runtime.observer().clone();
+        observer.cancellation_settled(event, elapsed_ms(settled_started));
+        observer.terminal(
+            RuntimeEvent::new(
+                RuntimeEventKind::Terminal,
+                &context.runtime_key,
+                &context.connection_id,
+                context.guard.lease().generation(),
+            )
+            .with_run(&context.run_id)
+            .with_stop_reason(ObservedStopReason::Cancelled),
+        );
         run_post_turn(context).await;
     }
     Ok(outcome)
@@ -205,7 +232,12 @@ async fn kill_children(context: &CancelContext<'_>) -> Result<(), RuntimeError> 
     if let Some(children) = context.children
         && children.has_operations()
     {
-        tokio::time::sleep(Duration::from_millis(TURN_CANCEL_GRACE_MS)).await;
+        let grace = Duration::from_millis(TURN_CANCEL_GRACE_MS);
+        tokio::time::sleep(grace).await;
+        debug_assert_eq!(
+            cancel_grace_decision(TURN_CANCEL_GRACE_MS),
+            BoundDecision::Terminal
+        );
         children
             .terminate_and_reap(Duration::from_millis(CHILD_KILL_GRACE_MS))
             .await?;
@@ -231,6 +263,10 @@ fn finish_terminal(
             },
         )?;
     Ok(outcome)
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn cancelled_stop_reason() -> StopReason {

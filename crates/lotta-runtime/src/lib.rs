@@ -26,6 +26,8 @@ pub mod lease;
 pub mod lifecycle;
 /// Dependency-neutral model precedence selection.
 pub mod model;
+/// Runtime-scoped structured events and bounded metrics.
+pub mod observe;
 /// Effect interfaces implemented by adapters outside this crate.
 pub mod ports;
 /// Bounded per-conversation FIFO queue.
@@ -45,10 +47,11 @@ pub mod worktree_watcher;
 
 pub use admission::{AdmissionOutcome, AdmissionRequest, AdmissionRoute, admit_control_snapshot};
 pub use approval::{
-    APPROVAL_WAIT_MS_MAX, ApprovalJournal, ApprovalManager, ApprovalRecovery, ApprovalRequest,
-    ApprovalResolution, ApprovalResolutionInput, ApprovalState, EditedInputValidator,
+    ApprovalJournal, ApprovalManager, ApprovalRecovery, ApprovalRequest, ApprovalResolution,
+    ApprovalResolutionInput, ApprovalState, EditedInputValidator,
     PENDING_APPROVALS_PER_RUNTIME_MAX, RecoveryAction,
 };
+pub use bounds::APPROVAL_WAIT_MS_MAX;
 pub use compaction::{
     CompactionCommand, CompactionEffects, CompactionMode, CompactionPlan, CompactionRecovery,
     CompactionService, CompactionSummarizer, CompactionSummary, CompactionTrigger,

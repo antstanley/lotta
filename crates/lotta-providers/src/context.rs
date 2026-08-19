@@ -7,7 +7,7 @@ use lotta_runtime::ports::{
 use serde::{Deserialize, Serialize};
 
 /// Exactly three provider-reported overflow compactions are permitted before terminal failure.
-pub const CONTEXT_OVERFLOW_COMPACTIONS_MAX: u8 = 3;
+pub use lotta_runtime::bounds::CONTEXT_OVERFLOW_COMPACTIONS_MAX;
 /// Conservative fallback estimates one token per this many input bytes, rounded upward.
 pub const FALLBACK_BYTES_PER_TOKEN: u64 = 3;
 /// Fixed image estimate inherited from the pinned local-context estimator.

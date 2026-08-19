@@ -125,7 +125,7 @@ fn assert_definition(definition: &lotta_runtime::ports::ToolDefinition, name: &s
     assert_eq!(definition.permission_action.as_str(), "execute");
     assert_eq!(definition.parallel_safety, ParallelSafety::Sequential);
     assert_eq!(definition.timeout.get().as_millis(), 3_600_000);
-    assert_eq!(EXTERNAL_TOOL_CALL_TIMEOUT_MS.value, 300_000);
+    assert_eq!(EXTERNAL_TOOL_CALL_TIMEOUT_MS, 300_000);
     assert_eq!(
         definition.output_limit.bytes_max(),
         TOOL_RESULT_BYTES_MAX.value

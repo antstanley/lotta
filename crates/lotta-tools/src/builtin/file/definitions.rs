@@ -60,10 +60,8 @@ fn definition(name: &str, action: &str) -> Result<ToolDefinition, FileBundleErro
         ToolExecutionOwner::Rust,
         approval_policy(name),
         PermissionAction::new(action.to_owned()).map_err(|_| FileBundleError)?,
-        ToolTimeout::new(Duration::from_millis(
-            EXTERNAL_TOOL_CALL_TIMEOUT_MS.value as u64,
-        ))
-        .map_err(|_| FileBundleError)?,
+        ToolTimeout::new(Duration::from_millis(EXTERNAL_TOOL_CALL_TIMEOUT_MS as u64))
+            .map_err(|_| FileBundleError)?,
         ToolOutputLimit::new(
             TOOL_RESULT_BYTES_MAX.value,
             TOOL_RESULT_MODEL_CHARS_MAX.value,

@@ -136,10 +136,7 @@ fn definition() -> Arc<ToolDefinition> {
         ToolExecutionOwner::Rust,
         ToolApprovalPolicy::Never,
         PermissionAction::new("execute".into()).unwrap(),
-        ToolTimeout::new(Duration::from_millis(
-            EXTERNAL_TOOL_CALL_TIMEOUT_MS.value as u64,
-        ))
-        .unwrap(),
+        ToolTimeout::new(Duration::from_millis(EXTERNAL_TOOL_CALL_TIMEOUT_MS as u64)).unwrap(),
         ToolOutputLimit::new(
             TOOL_RESULT_BYTES_MAX.value,
             TOOL_RESULT_MODEL_CHARS_MAX.value,

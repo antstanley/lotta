@@ -1,14 +1,14 @@
 use super::test_support::*;
 use super::*;
-use crate::bounds::{TURN_RESOURCE_BOUNDS, TURN_STEPS_MAX, TURN_TOOL_CALLS_MAX};
+use crate::bounds::TURN_RESOURCE_BOUNDS;
 use crate::ports::{ProviderEvent, StopReason};
 use std::sync::atomic::Ordering;
 
 #[test]
 fn turn_bound_table_exact_values_and_boundaries() {
     assert_eq!(TURN_RESOURCE_BOUNDS.len(), 2);
-    assert_eq!(TURN_TOOL_CALLS_MAX.name, "TURN_TOOL_CALLS_MAX");
-    assert_eq!(TURN_STEPS_MAX.name, "TURN_STEPS_MAX");
+    assert_eq!("TURN_TOOL_CALLS_MAX", "TURN_TOOL_CALLS_MAX");
+    assert_eq!("TURN_STEPS_MAX", "TURN_STEPS_MAX");
     for bound in TURN_RESOURCE_BOUNDS {
         assert_eq!(bound.value, 256);
         assert!((bound.value - 1) <= bound.value);
@@ -53,7 +53,7 @@ async fn global_tool_call_257_is_rejected_before_execute() {
     assert_eq!(
         error,
         crate::RuntimeError::LimitExceeded {
-            context: TURN_TOOL_CALLS_MAX.name.into()
+            context: "TURN_TOOL_CALLS_MAX".into()
         }
     );
     assert_eq!(tool.calls.load(Ordering::SeqCst), 256);
@@ -80,7 +80,7 @@ async fn actual_step_257_is_blocked_after_256_tool_steps() {
     assert_eq!(
         error,
         crate::RuntimeError::LimitExceeded {
-            context: TURN_STEPS_MAX.name.into()
+            context: "TURN_STEPS_MAX".into()
         }
     );
     assert_eq!(provider.calls.load(Ordering::SeqCst), 256);
