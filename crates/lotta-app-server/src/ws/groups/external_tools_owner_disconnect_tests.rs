@@ -26,3 +26,14 @@ async fn resolves_every_pending_with_typed_owner_disconnected_outcome() {
     }
     bridge.disconnect(connection);
 }
+
+#[tokio::test]
+async fn evicts_empty_scope_entry_after_last_disconnect() {
+    let (bridge, _) = recorder();
+    let connection: ConnectionId = 11;
+    let owned = update_command(&update_value(&[definition("gone")]));
+    bridge.apply_update(connection, &owned).expect("applied");
+    assert_eq!(bridge.tracked_revision(&scope()), Some(1));
+    bridge.disconnect(connection);
+    assert_eq!(bridge.tracked_revision(&scope()), None);
+}

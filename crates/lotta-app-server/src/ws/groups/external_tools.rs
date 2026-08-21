@@ -12,7 +12,9 @@
 //! and responses resolve only through the originating connection identity
 //! because the bridge always submits them on the handle of the connection that
 //! received the frame; Task 41 then rejects any owner or correlation mismatch
-//! while the call remains pending.
+//! while the call remains pending. Minted request identifiers embed a
+//! process-wide manager-instance ordinal, so one connection's inflight map can
+//! never alias calls belonging to different runtime scopes.
 //!
 //! Each controller connection owns one bounded receiver pump per runtime
 //! scope. Pumps are cancelled by
@@ -114,10 +116,10 @@ pub struct ToolsDefinitionPayload {
 pub struct ToolCallResponseCommand {
     /// Forwarded request identifier this response completes.
     pub request_id: NonEmptyString,
-    /// Result content, mutually exclusive with `error`.
+    /// Result content record; the pinned guard validates its shape when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
-    /// Error text, mutually exclusive with `result`.
+    /// Error text; takes precedence over `result` when both are present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Optional echoed provider tool-call identity checked when present.
@@ -232,15 +234,32 @@ fn validate_update(command: &ToolsUpdateCommand) -> Result<(), ProtocolErrorEnve
 fn validate_call_response(
     command: ToolCallResponseCommand,
 ) -> Result<ExternalToolsCommand, ProtocolErrorEnvelope> {
-    let exclusive = matches!(
-        (&command.result, &command.error),
-        (Some(_), None) | (None, Some(_))
-    );
-    if exclusive {
+    let wellformed = match (&command.result, &command.error) {
+        (None, None) => false,
+        (Some(result), _) => result_shape(result),
+        (None, Some(_)) => true,
+    };
+    if wellformed {
         Ok(ExternalToolsCommand::CallResponse(Box::new(command)))
     } else {
         Err(shape_error(Some(command.request_id.as_str())))
     }
+}
+
+/// Mirrors the pinned controller guard: a present `result` must be a record
+/// holding a `content` array of records and an optional boolean `is_error`.
+/// Both-present frames stay accepted with error precedence downstream.
+fn result_shape(result: &serde_json::Value) -> bool {
+    let Some(result) = result.as_object() else {
+        return false;
+    };
+    let Some(content) = result.get("content").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    content.iter().all(serde_json::Value::is_object)
+        && result
+            .get("is_error")
+            .is_none_or(serde_json::Value::is_boolean)
 }
 
 fn shape_error(request_id: Option<&str>) -> ProtocolErrorEnvelope {
@@ -375,6 +394,9 @@ impl ExternalToolBridge {
                 handle.close();
             }
         }
+        state
+            .scopes
+            .retain(|_, entry| !entry.connections.is_empty());
         state.inflight.retain(|(owner, _), _| *owner != connection);
     }
 
@@ -571,6 +593,13 @@ fn correlated_response(
         Some(echoed) => PendingToolCallId::new(echoed.clone()).ok()?,
         None => record.tool_call_id.clone(),
     };
+    // The pinned baseline accepts both-present frames and rejects with the
+    // error; Task 41 expects exactly one member, so error wins here.
+    let (result, error) = match (&command.error, &command.result) {
+        (Some(error), _) => (None, Some(error.clone())),
+        (None, Some(result)) => (Some(result.clone()), None),
+        (None, None) => return None,
+    };
     Some(ExternalCallResponse {
         runtime_id: record.runtime_id.clone(),
         request_id,
@@ -578,8 +607,8 @@ fn correlated_response(
         internal_name: record.internal_name.clone(),
         model_name: record.model_name.clone(),
         scope_id: record.scope_id.clone(),
-        result: command.result.clone(),
-        error: command.error.clone(),
+        result,
+        error,
     })
 }
 

@@ -18,11 +18,21 @@ use crate::ws::ConnectionId;
 
 const AGENT: &str = "agent-1";
 const CONVERSATION: &str = "conversation-1";
+const OTHER_CONVERSATION: &str = "conversation-2";
 
 pub(super) fn scope() -> RuntimeScope {
     RuntimeScope::new(
         AgentId::accept(AGENT.to_owned()).expect("agent"),
         ConversationId::accept(CONVERSATION.to_owned()).expect("conversation"),
+        None,
+    )
+}
+
+/// Second runtime scope used for cross-scope collision coverage.
+pub(super) fn other_scope() -> RuntimeScope {
+    RuntimeScope::new(
+        AgentId::accept(AGENT.to_owned()).expect("agent"),
+        ConversationId::accept(OTHER_CONVERSATION.to_owned()).expect("conversation"),
         None,
     )
 }
@@ -45,6 +55,10 @@ pub(super) fn wire_scope() -> Value {
     json!({"agent_id": AGENT, "conversation_id": CONVERSATION})
 }
 
+pub(super) fn other_wire_scope() -> Value {
+    json!({"agent_id": AGENT, "conversation_id": OTHER_CONVERSATION})
+}
+
 pub(super) fn definition(name: &str) -> Value {
     json!({
         "name": name,
@@ -58,14 +72,28 @@ pub(super) fn definition(name: &str) -> Value {
 }
 
 pub(super) fn update_value(tools: &[Value]) -> Value {
+    update_value_for(&wire_scope(), tools)
+}
+
+pub(super) fn update_value_for(wire: &Value, tools: &[Value]) -> Value {
     json!({
         "type": "runtime_external_tools_update",
         "request_id": "update-1",
         "updates": [{
-            "runtimes": [wire_scope()],
+            "runtimes": [wire],
             "external_tools": [{"tools": tools}],
         }],
     })
+}
+
+/// Pinned result shape whose model-visible content text is `text`.
+pub(super) fn text_result(text: &str) -> Value {
+    json!({"content": [{"type": "text", "text": text}]})
+}
+
+/// Serialized model-visible pipeline content for [`text_result`].
+pub(super) fn text_result_text(text: &str) -> String {
+    text_result(text).to_string()
 }
 
 pub(super) async fn wait_for_frames(frames: &Mutex<Vec<(ConnectionId, Value)>>, count: usize) {
@@ -160,7 +188,7 @@ pub(super) fn response_value(request_id: &str, extra: &Value) -> Value {
     let mut value = json!({
         "type": "external_tool_call_response",
         "request_id": request_id,
-        "result": "ok",
+        "result": text_result("ok"),
     });
     if let (Some(target), Some(object)) = (value.as_object_mut(), extra.as_object()) {
         for (key, item) in object {

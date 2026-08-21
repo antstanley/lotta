@@ -125,5 +125,40 @@ fn find_frame(recorded: &[(ConnectionId, Value)], name: &str) -> Option<Value> {
 }
 
 fn assert_success(outcome: ToolOutcome) {
-    assert!(matches!(outcome, ToolOutcome::Success { content } if content.as_str() == "ok"));
+    assert!(matches!(outcome, ToolOutcome::Success { content }
+        if content.as_str() == text_result_text("ok")));
+}
+
+/// Decode mirrors the pinned controller guard for `external_tool_call_response`.
+#[test]
+fn call_response_result_shape_matches_pin() {
+    let accepted = [
+        json!({"type": "external_tool_call_response", "request_id": "r1",
+               "result": {"content": []}}),
+        json!({"type": "external_tool_call_response", "request_id": "r2",
+               "result": {"content": [{"type": "text", "text": "ok"}], "is_error": true}}),
+        json!({"type": "external_tool_call_response", "request_id": "r3",
+               "result": {"content": [{"type": "text"}]}, "error": "wins"}),
+        json!({"type": "external_tool_call_response", "request_id": "r4",
+               "error": "boom"}),
+    ];
+    for value in &accepted {
+        let frame = crate::framing::decode_text(&value.to_string()).expect("frame");
+        assert!(decode(&frame).is_ok(), "pin accepts: {value}");
+    }
+    let rejected = [
+        json!({"type": "external_tool_call_response", "request_id": "r5", "result": 42}),
+        json!({"type": "external_tool_call_response", "request_id": "r6",
+               "result": {"content": 42}}),
+        json!({"type": "external_tool_call_response", "request_id": "r7",
+               "result": {"content": [42]}}),
+        json!({"type": "external_tool_call_response", "request_id": "r8",
+               "result": {"content": [], "is_error": "yes"}}),
+        json!({"type": "external_tool_call_response", "request_id": "r9", "result": []}),
+        json!({"type": "external_tool_call_response", "request_id": "r10"}),
+    ];
+    for value in &rejected {
+        let frame = crate::framing::decode_text(&value.to_string()).expect("frame");
+        assert!(decode(&frame).is_err(), "pin rejects: {value}");
+    }
 }

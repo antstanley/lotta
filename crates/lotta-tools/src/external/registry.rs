@@ -33,6 +33,11 @@ use tokio::sync::oneshot;
 
 const EXTERNAL_PENDING_CALLS_PER_RUNTIME_MAX: usize = 256;
 
+/// Process-wide manager-instance salt keeping minted request IDs unique across
+/// every manager in this process, mirroring the pinned controller's globally
+/// unique `external-tool-{uuid}` wire identity.
+static NEXT_MANAGER_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
 /// Monotonic optimistic revision for one external group set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GroupRevision(u64);
@@ -158,6 +163,7 @@ enum ResponseValue {
 }
 
 pub(crate) struct ManagerCore {
+    instance: u64,
     runtime_id: RuntimeId,
     registry: Arc<ToolRegistry>,
     mutation: Mutex<()>,
@@ -175,8 +181,10 @@ impl ExternalToolManager {
     /// Production factory binding one runtime collection to its Task 32 registry.
     #[must_use]
     pub fn production(runtime_id: RuntimeId, registry: Arc<ToolRegistry>) -> Self {
+        let instance = NEXT_MANAGER_INSTANCE.fetch_add(1, Ordering::Relaxed);
         Self {
             core: Arc::new(ManagerCore {
+                instance,
                 runtime_id,
                 registry,
                 mutation: Mutex::new(()),
@@ -506,7 +514,8 @@ impl ManagerCore {
         if sequence == u64::MAX {
             return Err(ExternalCallFailure::InvalidResponse);
         }
-        let request_id = ExternalRequestId::new(format!("external-tool-{sequence}"))?;
+        let instance = self.instance;
+        let request_id = ExternalRequestId::new(format!("external-tool-{instance}-{sequence}"))?;
         let tool_call_id = ToolCallId::new(request.tool_call_id.as_str().to_owned())?;
         let correlation = CallCorrelation {
             runtime_id: self.runtime_id.clone(),
