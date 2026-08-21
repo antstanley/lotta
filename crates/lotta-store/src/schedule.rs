@@ -1,15 +1,19 @@
 //! Secure canonical schedule and append-only run-log persistence.
 
+use crate::adapter::{LOCAL_STORE_BLOCKING_MAX, run_blocking};
 use crate::atomic::{FileRevision, WriteMode};
 use crate::confinement::{backend_root, create_confined_parent, validate_existing};
 use crate::side::{SidePaths, SideRevision};
 use crate::{LottaStorageLock, StoreError, StoreErrorKind};
 use lotta_domain::Timestamp;
+use lotta_runtime::ports::{PortFuture, SchedulePersistence};
+pub use lotta_runtime::schedule::{RunLogAction, RunLogEntry, RunLogStatus};
 use lotta_runtime::schedule::{RunUpdate, ScheduleFile, apply_run_update, run_log_append_fits};
-use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 /// Maximum bytes in one canonical run-log line.
 pub const SCHEDULE_RUN_LOG_LINE_BYTES_MAX: usize = 64 * 1_024;
@@ -91,81 +95,69 @@ impl<'a> ScheduleStore<'a> {
     }
 }
 
-/// Canonical run-log status.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RunLogStatus {
-    /// Successful completion.
-    Ok,
-    /// Failed completion.
-    Error,
-    /// Intentionally skipped.
-    Skipped,
+/// Owning adapter exposing the canonical schedule file, CAS lifecycle
+/// transitions, and the append-only run log through the runtime's
+/// [`SchedulePersistence`] port.
+pub struct ScheduleService {
+    paths: Arc<SidePaths>,
+    pool: Arc<Semaphore>,
 }
 
-/// Canonical JSONL run-log record.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RunLogEntry {
-    /// Unix epoch milliseconds.
-    pub ts: i64,
-    /// Schedule identifier.
-    pub job_id: String,
-    /// Exact canonical action.
-    pub action: RunLogAction,
-    /// Optional status.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<RunLogStatus>,
-    /// Optional schedule outcome.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub outcome: Option<lotta_domain::ScheduleRunOutcome>,
-    /// Optional canonical reason.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    /// Optional scrubbed error.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    /// Optional summary.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
-    /// Optional agent identifier.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_id: Option<String>,
-    /// Optional conversation identifier.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub conversation_id: Option<String>,
-    /// Optional run identifier.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-    /// Optional planned epoch milliseconds.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub run_at_ms: Option<i64>,
-    /// Optional queue item identifier.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub queue_item_id: Option<String>,
-    /// Optional one-shot timestamp, including explicit null.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scheduled_for: Option<Option<String>>,
-    /// Optional fire timestamp.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fired_at: Option<String>,
-    /// Optional missed count.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub missed_count: Option<u64>,
-    /// Optional due-window start.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub window_start: Option<String>,
-    /// Optional due-window end.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub window_end: Option<String>,
+impl ScheduleService {
+    /// Constructs the production-bound adapter over shared side paths.
+    #[must_use]
+    pub fn new(paths: Arc<SidePaths>) -> Self {
+        Self {
+            paths,
+            pool: Arc::new(Semaphore::new(LOCAL_STORE_BLOCKING_MAX)),
+        }
+    }
 }
 
-/// Exact canonical run-log action.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RunLogAction {
-    /// Run processing finished.
-    Finished,
+impl SchedulePersistence for ScheduleService {
+    fn load(&self) -> PortFuture<'_, ScheduleFile> {
+        let paths = self.paths.clone();
+        let pool = self.pool.clone();
+        Box::pin(async move {
+            let loaded = run_blocking(pool, move || {
+                ScheduleStore::new(&paths).load().map(|loaded| loaded.file)
+            })
+            .await?;
+            Ok(loaded)
+        })
+    }
+
+    fn apply_update(
+        &self,
+        schedule_id: &str,
+        update: RunUpdate,
+        now: Timestamp,
+    ) -> PortFuture<'_, ()> {
+        let paths = self.paths.clone();
+        let pool = self.pool.clone();
+        let schedule_id = schedule_id.to_owned();
+        Box::pin(async move {
+            run_blocking(pool, move || {
+                let revision = ScheduleStore::new(&paths).load()?.revision;
+                ScheduleStore::new(&paths).apply_update(&schedule_id, &revision, update, now)
+            })
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn append_run_log(&self, entry: &RunLogEntry) -> PortFuture<'_, ()> {
+        let paths = self.paths.clone();
+        let pool = self.pool.clone();
+        let entry = entry.clone();
+        Box::pin(async move {
+            run_blocking(pool, move || {
+                RunLogStore::new(&paths).append(entry.job_id.as_str(), &entry)
+            })
+            .await?;
+            Ok(())
+        })
+    }
 }
 
 /// Secure append-and-rotate run-log adapter.
@@ -1082,5 +1074,130 @@ mod run_log {
         );
         assert_eq!(first_pass[0].outcome, Some(ScheduleRunOutcome::Queued));
         assert_eq!(first_pass[1], follow_up);
+    }
+}
+
+#[cfg(test)]
+mod scheduler_service {
+    use super::test_support::{Harness, at, seed_crons};
+    use super::{RunLogStore, ScheduleService};
+    use lotta_domain::{
+        AgentId, Clock, ConversationId, DomainError, MessageId, QueueItemKind, RunId, RuntimeScope,
+        ScheduleRunOutcome, Timestamp,
+    };
+    use lotta_runtime::ListenerRuntime;
+    use lotta_runtime::ports::{IdGenerator, PortFuture, SchedulePersistence};
+    use lotta_runtime::schedule::{ScheduleFile, ScheduleScheduler};
+    use std::sync::{Arc, Mutex};
+
+    struct FixedClock(Timestamp);
+
+    impl Clock for FixedClock {
+        fn now(&self) -> Timestamp {
+            self.0
+        }
+
+        fn parse_timestamp(&self, value: &str) -> Result<Timestamp, DomainError> {
+            Timestamp::parse_persisted_rfc3339(value)
+        }
+    }
+
+    struct FixedIds;
+
+    fn unsupported<T>() -> PortFuture<'static, T> {
+        Box::pin(async {
+            Err(lotta_runtime::RuntimeError::Unsupported {
+                context: "scheduler_service test".into(),
+            })
+        })
+    }
+
+    impl IdGenerator for FixedIds {
+        fn agent_id(&self) -> PortFuture<'_, AgentId> {
+            unsupported()
+        }
+
+        fn conversation_id(&self) -> PortFuture<'_, ConversationId> {
+            unsupported()
+        }
+
+        fn message_id(&self) -> PortFuture<'_, MessageId> {
+            unsupported()
+        }
+
+        fn run_id(&self) -> PortFuture<'_, RunId> {
+            unsupported()
+        }
+
+        fn incident_id(&self) -> PortFuture<'_, uuid::Uuid> {
+            unsupported()
+        }
+
+        fn turn_lifecycle_owner_id(&self) -> PortFuture<'_, uuid::Uuid> {
+            Box::pin(async { Ok(uuid::Uuid::from_u128(11)) })
+        }
+    }
+
+    fn recurring_seed() -> Vec<u8> {
+        let file = serde_json::from_value::<ScheduleFile>(serde_json::json!({
+            "version": 1, "scheduler_owner": null,
+            "tasks": [{
+                "id":"service-schedule", "agent_id":"agent-local-fixture",
+                "conversation_id":"conversation", "name":"name", "description":"description",
+                "cron":"* * * * *", "timezone":"UTC", "recurring":true, "prompt":"prompt",
+                "status":"active", "created_at":"2026-01-01T00:00:00Z", "expires_at":null,
+                "last_fired_at":null, "fire_count":0, "cancel_reason":null,
+                "jitter_offset_ms":0, "last_run_at":null, "last_run_outcome":null,
+                "last_run_reason":null, "last_run_error":null, "last_missed_at":null,
+                "missed_count":0, "failed_count":0, "scheduled_for":null,
+                "fired_at":null, "missed_at":null
+            }]
+        }))
+        .expect("seed file");
+        file.encode().expect("seed encode")
+    }
+
+    #[tokio::test]
+    async fn fires_due_recurring_through_real_stores() {
+        let harness = Harness::new("schedule-scheduler-service");
+        seed_crons(&harness.paths, &recurring_seed());
+        let service = Arc::new(ScheduleService::new(Arc::new(harness.paths.clone())));
+        let listener = Arc::new(Mutex::new(ListenerRuntime::new()));
+        let now = at(1_767_225_600);
+        let scheduler = ScheduleScheduler::new(
+            Arc::new(FixedClock(now)),
+            service.clone(),
+            listener.clone(),
+            Arc::new(FixedIds),
+        );
+        scheduler.tick(now).await.expect("tick");
+        let persisted = service.load().await.expect("reload");
+        assert_eq!(persisted.tasks[0].fire_count, 1);
+        assert_eq!(
+            persisted.tasks[0].last_run_reason,
+            Some(Some("scheduled_time_matched".into()))
+        );
+        let entries = RunLogStore::new(&harness.paths)
+            .read("service-schedule")
+            .expect("run log");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].outcome, Some(ScheduleRunOutcome::Queued));
+        let target = &persisted.tasks[0];
+        let scope = RuntimeScope::new(
+            target.agent_id.clone(),
+            target.conversation_id.clone(),
+            None,
+        );
+        let listener = listener.lock().expect("listener");
+        let handle = listener
+            .lookup(&lotta_runtime::registry::RuntimeKey::from(&scope))
+            .expect("scheduler-created runtime");
+        let stored: Vec<_> = listener
+            .queue(&handle)
+            .expect("queue")
+            .items()
+            .map(|item| item.kind)
+            .collect();
+        assert_eq!(stored, [QueueItemKind::CronPrompt]);
     }
 }

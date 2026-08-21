@@ -1235,6 +1235,26 @@ mod tests {
                     LoopClass::NamedBound("source.next_u64()"),
                 ),
                 (
+                    "schedule/scheduler.rs",
+                    "loop {",
+                    0,
+                    LoopClass::NamedBound("cancellation.cancelled()"),
+                ),
+                (
+                    "schedule/scheduler.rs",
+                    "for task in &file.tasks {",
+                    0,
+                    LoopClass::BoundedIterator("&file.tasks"),
+                ),
+                (
+                    "schedule/scheduler.rs",
+                    "for pending in drain_due(&self.state, now.as_utc().timestamp_millis()) {",
+                    0,
+                    LoopClass::BoundedIterator(
+                        "drain_due(&self.state, now.as_utc().timestamp_millis())",
+                    ),
+                ),
+                (
                     "schedule/store.rs",
                     "for task in &self.tasks {",
                     0,

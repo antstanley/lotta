@@ -1,13 +1,18 @@
-//! Schedule parsing, timing, jitter, lifecycle, and persistence boundary types.
+//! Schedule parsing, timing, jitter, lifecycle, persistence boundary types, and
+//! the lease-aware firing scheduler.
 
 mod cron;
 mod jitter;
 mod lifecycle;
+mod run_log;
+mod scheduler;
 mod store;
 
 pub use cron::{ParsedInterval, ScheduleExpression, parse_interval};
 pub use jitter::{JitterSource, compute_jitter};
 pub use lifecycle::{RunUpdate, apply_run_update};
+pub use run_log::{RunLogAction, RunLogEntry, RunLogStatus};
+pub use scheduler::{MISS_WINDOW_MS, ScheduleScheduler, TICK_INTERVAL_MS};
 pub use store::{ScheduleFile, ScheduleFileExtras, ScheduleStoreRevision};
 
 /// Returns whether appending a record stays within both inclusive retention bounds.
@@ -41,7 +46,7 @@ mod jitter_offset;
 mod support;
 
 #[cfg(test)]
-mod run_log {
+mod run_log_bounds {
     use super::run_log_append_fits;
 
     #[test]

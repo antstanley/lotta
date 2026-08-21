@@ -24,3 +24,4 @@ tracing.workspace = true
 [dev-dependencies]
 lotta-testkit = { version = "0.1.0", path = "../lotta-testkit" }
 tracing-subscriber.workspace = true
+uuid.workspace = true

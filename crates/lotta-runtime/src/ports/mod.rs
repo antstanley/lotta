@@ -7,6 +7,7 @@ mod process;
 #[path = "provider.rs"]
 mod provider_contract;
 mod provider_event;
+mod schedule;
 mod store;
 mod tool;
 mod transcript;
@@ -35,6 +36,7 @@ pub use provider_contract::{
     validate_provider_request_bytes,
 };
 pub use provider_event::{ProviderEvent, ProviderUsage};
+pub use schedule::SchedulePersistence;
 pub use store::{AgentStore, ConversationStore};
 pub use tool::{
     InternalToolName, ModelFacingToolName, ParallelCertificationId, ParallelSafety,

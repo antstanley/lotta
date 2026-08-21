@@ -78,6 +78,7 @@ impl<'ast> Visit<'ast> for Scanner {
                 ),
                 (Some("scope_context.rs"), Some("spawn_scoped"))
                     | (Some("worktree_watcher.rs"), Some("spawn_idle_stop"))
+                    | (Some("scheduler.rs"), Some("spawn_tick_loop"))
             );
             if is_spawn(&called) {
                 self.spawn_count += 1;
@@ -200,7 +201,7 @@ fn every_production_file_passes_structural_scan() {
             .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         spawns += scan_source(&path, &source).unwrap_or_else(|errors| panic!("{errors:?}"));
     }
-    assert_eq!(spawns, 2);
+    assert_eq!(spawns, 3);
 }
 
 #[test]
