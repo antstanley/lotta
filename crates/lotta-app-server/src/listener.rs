@@ -41,6 +41,7 @@ use crate::{
             ToolsUpdateResponseMessage, decode as decode_external_tools,
         },
         lock_router, route_command,
+        teleport::{TeleportBridge, TeleportCommand, TeleportForwarder, decode as decode_teleport},
     },
 };
 
@@ -87,6 +88,7 @@ struct ListenerState {
     turn_controller: Arc<dyn TurnController>,
     observer: Arc<dyn crate::observer::RuntimeBroadcastObserver>,
     external_tools: Arc<ExternalToolBridge>,
+    teleports: Arc<TeleportBridge>,
     next_observation: AtomicU64,
     outbound: Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
 }
@@ -282,6 +284,7 @@ async fn start_listener_with_limits(
         turn_controller,
         observer,
         external_tools: Arc::new(ExternalToolBridge::new(external_forwarder(&outbound))),
+        teleports: Arc::new(TeleportBridge::new(teleport_forwarder(&outbound))),
         next_observation: AtomicU64::new(1),
         outbound,
     });
@@ -622,6 +625,13 @@ fn external_forwarder(
     Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
 }
 
+fn teleport_forwarder(
+    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
+) -> TeleportForwarder {
+    let outbound = Arc::clone(outbound);
+    Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
+}
+
 /// Decodes and routes the external-tool command group for one frame.
 fn handle_external_frame(
     state: &Arc<ListenerState>,
@@ -630,8 +640,44 @@ fn handle_external_frame(
 ) -> bool {
     match decode_external_tools(frame) {
         Err(error) => dispatch_value(state, connection_id, &error).is_ok(),
-        Ok(None) => true,
+        Ok(None) => handle_teleport_frame(state, connection_id, frame),
         Ok(Some(command)) => route_external_command(state, connection_id, &command),
+    }
+}
+
+/// Decodes and routes the teleport command group for one frame.
+fn handle_teleport_frame(
+    state: &Arc<ListenerState>,
+    connection_id: crate::ws::ConnectionId,
+    frame: &crate::framing::DecodedFrame,
+) -> bool {
+    match decode_teleport(frame) {
+        Err(error) => dispatch_value(state, connection_id, &error).is_ok(),
+        Ok(None) => true,
+        Ok(Some(command)) => route_teleport_command(state, connection_id, &command),
+    }
+}
+
+fn route_teleport_command(
+    state: &Arc<ListenerState>,
+    connection_id: crate::ws::ConnectionId,
+    command: &TeleportCommand,
+) -> bool {
+    match command {
+        TeleportCommand::Probe(probe) => {
+            state.teleports.probe(connection_id, probe);
+            true
+        }
+        TeleportCommand::Request(request) => {
+            // The compatibility listener owns no runtime registry, so no turn
+            // can be processing through it; scopes answer ready immediately.
+            state.teleports.request(connection_id, request, false);
+            true
+        }
+        TeleportCommand::Failed(failure) => {
+            state.teleports.failed(failure);
+            true
+        }
     }
 }
 

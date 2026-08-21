@@ -15,6 +15,9 @@ pub mod external_tools;
 pub mod router;
 /// Injectable Runtime command service seam.
 pub mod service;
+/// Teleport command group bridging wire frames to pending teleport state.
+#[path = "ws/groups/teleport.rs"]
+pub mod teleport;
 
 pub use command::RuntimeCommand;
 pub use connection::{ConnectionId, EventDelivery, RuntimeConnections};

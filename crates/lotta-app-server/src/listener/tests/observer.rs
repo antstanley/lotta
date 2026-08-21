@@ -102,6 +102,9 @@ fn state(
         external_tools: Arc::new(crate::ws::external_tools::ExternalToolBridge::new(
             crate::ws::external_tools::inert_forwarder(),
         )),
+        teleports: Arc::new(crate::ws::teleport::TeleportBridge::new(
+            crate::ws::teleport::inert_forwarder(),
+        )),
         next_observation: AtomicU64::new(1),
         outbound: Arc::new(Mutex::new(outbound)),
     });

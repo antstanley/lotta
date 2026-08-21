@@ -46,6 +46,9 @@ fn router() -> axum::Router {
         external_tools: Arc::new(crate::ws::external_tools::ExternalToolBridge::new(
             crate::ws::external_tools::inert_forwarder(),
         )),
+        teleports: Arc::new(crate::ws::teleport::TeleportBridge::new(
+            crate::ws::teleport::inert_forwarder(),
+        )),
         next_observation: std::sync::atomic::AtomicU64::new(1),
         outbound: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
