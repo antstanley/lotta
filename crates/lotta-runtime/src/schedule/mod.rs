@@ -6,7 +6,7 @@ mod lifecycle;
 mod store;
 
 pub use cron::{ParsedInterval, ScheduleExpression, parse_interval};
-pub use jitter::{JitterSource, OsJitter, compute_jitter};
+pub use jitter::{JitterSource, compute_jitter};
 pub use lifecycle::{RunUpdate, apply_run_update};
 pub use store::{ScheduleFile, ScheduleFileExtras, ScheduleStoreRevision};
 

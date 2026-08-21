@@ -14,12 +14,18 @@ fn recurring_is_late_and_under_tick() {
 }
 
 #[test]
-fn exact_tick_maximum_is_59_999() {
+fn exact_tick_maximum_is_59_998() {
     let schedule = schedule(true, "30 14 * * *", "UTC", instant(0));
+    let mut source = Fixed::one(59_998);
+    assert_eq!(
+        compute_jitter(&schedule, instant(300), &mut source).unwrap(),
+        59_998
+    );
+    // The tick endpoint itself is unattainable: modulo folds 59_999 back to zero.
     let mut source = Fixed::one(59_999);
     assert_eq!(
         compute_jitter(&schedule, instant(300), &mut source).unwrap(),
-        59_999
+        0
     );
 }
 
@@ -73,10 +79,10 @@ fn one_shot_jitter_reads_the_schedule_timezone_wall_clock() {
         .with_ymd_and_hms(2025, 1, 1, 0, 30, 0)
         .single()
         .expect("fire");
-    let mut source = Fixed::one(90_000);
+    let mut source = Fixed::one(89_999);
     assert_eq!(
         compute_jitter(&kolkata, fire, &mut source).expect("jitter"),
-        -90_000
+        -89_999
     );
     // The same UTC minute is 06:15 in Asia/Kathmandu: local minute :15 earns none.
     let kathmandu = schedule(false, "15 6 * * *", "Asia/Kathmandu", instant(0));

@@ -18,26 +18,11 @@ pub trait JitterSource {
     fn next_u64(&mut self) -> Result<u64, crate::RuntimeError>;
 }
 
-/// Production operating-system cryptographic entropy source.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct OsJitter;
-
-impl JitterSource for OsJitter {
-    fn next_u64(&mut self) -> Result<u64, crate::RuntimeError> {
-        let mut bytes = [0_u8; 8];
-        getrandom::fill(&mut bytes).map_err(|_| crate::RuntimeError::AdapterFailure {
-            code: "schedule_entropy",
-            context: "schedule jitter entropy unavailable".into(),
-        })?;
-        Ok(u64::from_ne_bytes(bytes))
-    }
-}
-
 /// Computes schedule-only jitter from the schedule and exact fire instant.
 ///
 /// Recurring schedules derive recurrence from cron and receive late jitter in
 /// `[0, min(10% period, 15m, tick))`. One-shots on local minute `:00` or `:30`
-/// receive early jitter in `[-90s, 0]`, clamped to avoid preceding creation.
+/// receive early jitter in `(-90s, 0]`, clamped to avoid preceding creation.
 /// Other one-shots receive zero.
 ///
 /// # Errors
@@ -55,13 +40,13 @@ pub fn compute_jitter(
         let maximum = (period / PERCENT_DENOMINATOR)
             .min(RECURRING_CAP_MS)
             .min(SCHEDULER_TICK_MS);
-        return random_below(maximum.saturating_add(1), source).and_then(to_i64);
+        return random_below(maximum, source).and_then(to_i64);
     }
     let local = fire_time.with_timezone(&schedule.timezone.as_tz());
     if local.minute() != 0 && local.minute() != 30 {
         return Ok(0);
     }
-    let early = to_i64(random_below(ONE_SHOT_EARLY_MS + 1, source)?)?;
+    let early = to_i64(random_below(ONE_SHOT_EARLY_MS, source)?)?;
     let candidate = fire_time
         .checked_sub_signed(chrono::Duration::milliseconds(early))
         .ok_or_else(|| crate::RuntimeError::LimitExceeded {

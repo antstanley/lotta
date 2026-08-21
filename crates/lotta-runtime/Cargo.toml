@@ -17,7 +17,6 @@ tracing.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 cron.workspace = true
-getrandom.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true

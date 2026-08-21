@@ -207,11 +207,11 @@ fn schedule() -> Schedule {
         fire_count: 0,
         cancel_reason: None,
         jitter_offset_ms: -500,
-        last_run_at: None,
-        last_run_outcome: None,
-        last_run_reason: None,
-        last_run_error: None,
-        last_missed_at: None,
+        last_run_at: Some(None),
+        last_run_outcome: Some(None),
+        last_run_reason: Some(None),
+        last_run_error: Some(None),
+        last_missed_at: Some(None),
         missed_count: Some(0),
         failed_count: Some(0),
         scheduled_for: Some(timestamp()),
@@ -426,9 +426,9 @@ pub(super) fn schedule_all_canonical_fields_and_required_split() {
     let required = schedule_schema["required"].as_array().map_or(0, Vec::len);
     let encoded =
         serde_json::to_value(schedule()).unwrap_or_else(|error| panic!("serialize: {error}"));
-    assert_eq!(properties, 25);
-    assert_eq!(required, 19);
-    assert_eq!(properties - required, 6);
+    assert_eq!(properties, 26);
+    assert_eq!(required, 26);
+    assert_eq!(properties - required, 0);
     let encoded_keys = encoded
         .as_object()
         .map(|map| map.keys().map(String::as_str).collect::<BTreeSet<_>>())
