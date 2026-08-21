@@ -8,6 +8,9 @@ pub mod connection;
 pub mod envelope;
 /// Exact runtime broadcast event models.
 pub mod event;
+/// External-tool command group bridging wire frames to the Task 41 registry.
+#[path = "ws/groups/external_tools.rs"]
+pub mod external_tools;
 /// Synchronous owner-local routing and deferred input application.
 pub mod router;
 /// Injectable Runtime command service seam.

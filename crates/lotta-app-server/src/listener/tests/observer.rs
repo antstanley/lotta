@@ -99,6 +99,9 @@ fn state(
         runtime_service: Arc::new(UnsupportedRuntimeCommandService),
         turn_controller: Arc::new(UnsupportedRuntimeCommandService),
         observer,
+        external_tools: Arc::new(crate::ws::external_tools::ExternalToolBridge::new(
+            crate::ws::external_tools::inert_forwarder(),
+        )),
         next_observation: AtomicU64::new(1),
         outbound: Arc::new(Mutex::new(outbound)),
     });

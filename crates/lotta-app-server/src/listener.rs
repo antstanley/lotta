@@ -35,7 +35,12 @@ use crate::{
     ws::{
         EventDeliveryBatch, RandomEventIdGenerator, RouterEventSink, RuntimeCommandService,
         RuntimeRouter, ServiceBackedTurnController, TurnController,
-        UnsupportedRuntimeCommandService, lock_router, route_command,
+        UnsupportedRuntimeCommandService,
+        external_tools::{
+            ExternalForwarder, ExternalToolBridge, ExternalToolsCommand, ExternalToolsMessage,
+            ToolsUpdateResponseMessage, decode as decode_external_tools,
+        },
+        lock_router, route_command,
     },
 };
 
@@ -81,6 +86,7 @@ struct ListenerState {
     runtime_service: Arc<dyn RuntimeCommandService>,
     turn_controller: Arc<dyn TurnController>,
     observer: Arc<dyn crate::observer::RuntimeBroadcastObserver>,
+    external_tools: Arc<ExternalToolBridge>,
     next_observation: AtomicU64,
     outbound: Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
 }
@@ -264,6 +270,8 @@ async fn start_listener_with_limits(
     tracing::info!(base_url, websocket_url, "app server listener started");
     let shutdown = CancellationToken::new();
     let runtime_router = RuntimeRouter::new(clock.clone(), Arc::new(RandomEventIdGenerator));
+    let outbound: Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
     let state = Arc::new(ListenerState {
         auth: prepared.auth,
         clock,
@@ -273,8 +281,9 @@ async fn start_listener_with_limits(
         runtime_service,
         turn_controller,
         observer,
+        external_tools: Arc::new(ExternalToolBridge::new(external_forwarder(&outbound))),
         next_observation: AtomicU64::new(1),
-        outbound: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        outbound,
     });
     let router = build_router(&prepared.websocket_path, state);
     let server_shutdown = shutdown.clone();
@@ -436,6 +445,7 @@ fn prepare_outbound(
 }
 
 fn close_connection(state: &ListenerState, id: crate::ws::ConnectionId) {
+    state.external_tools.disconnect(id);
     if let Ok(mut outbound) = state.outbound.lock() {
         outbound.remove(&id);
     }
@@ -505,7 +515,7 @@ async fn handle_text(
     };
     let command = match crate::ws::command::decode(&frame) {
         Ok(Some(command)) => command,
-        Ok(None) => return true,
+        Ok(None) => return handle_external_frame(state, connection_id, &frame),
         Err(error) => return dispatch_value(state, connection_id, &error).is_ok(),
     };
     let routed = route_command(
@@ -585,8 +595,15 @@ fn dispatch_value(
     connection_id: crate::ws::ConnectionId,
     value: &impl serde::Serialize,
 ) -> Result<(), AppServerError> {
-    let sender = state
-        .outbound
+    send_frame(&state.outbound, connection_id, value)
+}
+
+fn send_frame(
+    outbound: &std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>,
+    connection_id: crate::ws::ConnectionId,
+    value: &impl serde::Serialize,
+) -> Result<(), AppServerError> {
+    let sender = outbound
         .lock()
         .map_err(|_| AppServerError::Internal)?
         .get(&connection_id)
@@ -596,6 +613,50 @@ fn dispatch_value(
     sender
         .try_send(body)
         .map_err(|_| AppServerError::Unavailable)
+}
+
+fn external_forwarder(
+    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
+) -> ExternalForwarder {
+    let outbound = Arc::clone(outbound);
+    Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
+}
+
+/// Decodes and routes the external-tool command group for one frame.
+fn handle_external_frame(
+    state: &Arc<ListenerState>,
+    connection_id: crate::ws::ConnectionId,
+    frame: &crate::framing::DecodedFrame,
+) -> bool {
+    match decode_external_tools(frame) {
+        Err(error) => dispatch_value(state, connection_id, &error).is_ok(),
+        Ok(None) => true,
+        Ok(Some(command)) => route_external_command(state, connection_id, &command),
+    }
+}
+
+fn route_external_command(
+    state: &Arc<ListenerState>,
+    connection_id: crate::ws::ConnectionId,
+    command: &ExternalToolsCommand,
+) -> bool {
+    match command {
+        ExternalToolsCommand::ToolsUpdate(update) => {
+            let outcome = state.external_tools.apply_update(connection_id, update);
+            let message = ExternalToolsMessage::UpdateResponse(ToolsUpdateResponseMessage {
+                request_id: update.request_id.as_str().to_owned(),
+                success: outcome.is_ok(),
+                error: outcome.err(),
+            });
+            dispatch_value(state, connection_id, &message).is_ok()
+        }
+        ExternalToolsCommand::CallResponse(response) => {
+            let _ = state
+                .external_tools
+                .handle_response(connection_id, response);
+            true
+        }
+    }
 }
 
 fn dispatch_event_batch(

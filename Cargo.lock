@@ -950,6 +950,7 @@ dependencies = [
  "lotta-protocol",
  "lotta-runtime",
  "lotta-testkit",
+ "lotta-tools",
  "serde",
  "serde_json",
  "sha2",
