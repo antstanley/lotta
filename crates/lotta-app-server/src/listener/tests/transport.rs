@@ -86,6 +86,19 @@ fn router() -> axum::Router {
             )
             .expect("schedules bridge"),
         ),
+        skills: Arc::new(crate::ws::skills::SkillsBridge::new(
+            crate::ws::skills::inert_forwarder(),
+            &files_workspace("transport-skills"),
+            Arc::new(TestClock),
+        )),
+        settings: Arc::new(
+            crate::ws::settings::SettingsBridge::new(
+                crate::ws::settings::inert_forwarder(),
+                &files_workspace("transport-settings"),
+                &files_workspace("transport"),
+            )
+            .expect("settings bridge"),
+        ),
         next_observation: std::sync::atomic::AtomicU64::new(1),
         outbound: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });

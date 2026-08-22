@@ -46,6 +46,8 @@ use crate::{
         models::{ModelsBridge, decode as decode_models},
         route_command,
         schedules::{SchedulesBridge, decode as decode_schedules},
+        settings::{SettingsBridge, decode as decode_settings},
+        skills::{SkillsBridge, decode as decode_skills},
         teleport::{TeleportBridge, TeleportCommand, TeleportForwarder, decode as decode_teleport},
         terminal::{TerminalBridge, TerminalCommand, TerminalForwarder, decode as decode_terminal},
     },
@@ -100,6 +102,8 @@ struct ListenerState {
     memories: Arc<MemoryBridge>,
     models: Arc<ModelsBridge>,
     schedules: Arc<SchedulesBridge>,
+    skills: Arc<SkillsBridge>,
+    settings: Arc<SettingsBridge>,
     next_observation: AtomicU64,
     outbound: Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
 }
@@ -324,6 +328,16 @@ async fn start_listener_with_limits(
             schedules_forwarder(&outbound),
             &prepared.storage_dir,
             Arc::clone(&clock),
+        )?),
+        skills: Arc::new(SkillsBridge::new(
+            skills_forwarder(&outbound),
+            &prepared.storage_dir,
+            Arc::clone(&clock),
+        )),
+        settings: Arc::new(SettingsBridge::new(
+            settings_forwarder(&outbound),
+            &prepared.storage_dir,
+            &prepared.workspace_dir,
         )?),
         next_observation: AtomicU64::new(1),
         outbound,
@@ -709,6 +723,20 @@ fn schedules_forwarder(
     Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
 }
 
+fn skills_forwarder(
+    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
+) -> crate::ws::skills::SkillsForwarder {
+    let outbound = Arc::clone(outbound);
+    Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
+}
+
+fn settings_forwarder(
+    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
+) -> crate::ws::settings::SettingsForwarder {
+    let outbound = Arc::clone(outbound);
+    Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
+}
+
 /// Decodes and routes the external-tool command group for one frame.
 fn handle_external_frame(
     state: &Arc<ListenerState>,
@@ -808,9 +836,45 @@ fn handle_schedules_frame(
 ) -> bool {
     match decode_schedules(frame) {
         Err(error) => dispatch_value(state, connection_id, &error).is_ok(),
-        Ok(None) => true,
+        Ok(None) => handle_skills_frame(state, connection_id, frame),
         Ok(Some(command)) => {
             state.schedules.handle(connection_id, &command);
+            true
+        }
+    }
+}
+
+/// Decodes and routes the skills command group for one frame. Handlers run in
+/// detached tasks; the skills bridge owns no per-connection resources, so
+/// connection cleanup needs no skills step.
+fn handle_skills_frame(
+    state: &Arc<ListenerState>,
+    connection_id: crate::ws::ConnectionId,
+    frame: &crate::framing::DecodedFrame,
+) -> bool {
+    match decode_skills(frame) {
+        Err(error) => dispatch_value(state, connection_id, &error).is_ok(),
+        Ok(None) => handle_settings_frame(state, connection_id, frame),
+        Ok(Some(command)) => {
+            state.skills.handle(connection_id, &command);
+            true
+        }
+    }
+}
+
+/// Decodes and routes the settings command group for one frame. Handlers run
+/// in detached tasks; the settings bridge owns no per-connection resources,
+/// so connection cleanup needs no settings step.
+fn handle_settings_frame(
+    state: &Arc<ListenerState>,
+    connection_id: crate::ws::ConnectionId,
+    frame: &crate::framing::DecodedFrame,
+) -> bool {
+    match decode_settings(frame) {
+        Err(error) => dispatch_value(state, connection_id, &error).is_ok(),
+        Ok(None) => true,
+        Ok(Some(command)) => {
+            state.settings.handle(connection_id, &command);
             true
         }
     }

@@ -177,20 +177,14 @@ async fn outbound_registry_fans_out_actual_broadcast_to_both_peers() {
     assert_ne!(one["idempotency_key"], two["idempotency_key"]);
 }
 
-#[tokio::test]
-async fn typed_runtime_failures_are_unstamped_and_sent_to_origin() {
-    let args = ServerArgs {
-        listen_enabled: true,
-        ..ServerArgs::default()
-    };
-    let prepared = args.prepare().unwrap();
-    let mut runtime_router =
-        crate::ws::RuntimeRouter::new(clock(), Arc::new(crate::ws::RandomEventIdGenerator));
-    let origin = runtime_router.connections.open().unwrap();
-    runtime_router.connections.initialize(origin).unwrap();
-    let router = Arc::new(Mutex::new(runtime_router));
-    let (sender, mut receiver) = mpsc::channel(4);
-    let state = super::ListenerState {
+/// Builds the listener state used by the typed-failure assertions.
+fn typed_failure_state(
+    prepared: crate::config::PreparedServer,
+    router: Arc<Mutex<crate::ws::RuntimeRouter>>,
+    origin: crate::ws::ConnectionId,
+    sender: mpsc::Sender<String>,
+) -> super::ListenerState {
+    super::ListenerState {
         auth: prepared.auth,
         clock: clock(),
         shutdown: tokio_util::sync::CancellationToken::new(),
@@ -241,9 +235,38 @@ async fn typed_runtime_failures_are_unstamped_and_sent_to_origin() {
             )
             .expect("schedules bridge"),
         ),
+        skills: Arc::new(crate::ws::skills::SkillsBridge::new(
+            crate::ws::skills::inert_forwarder(),
+            &prepared.storage_dir,
+            clock(),
+        )),
+        settings: Arc::new(
+            crate::ws::settings::SettingsBridge::new(
+                crate::ws::settings::inert_forwarder(),
+                &prepared.storage_dir,
+                &prepared.workspace_dir,
+            )
+            .expect("settings bridge"),
+        ),
         next_observation: std::sync::atomic::AtomicU64::new(1),
         outbound: Arc::new(Mutex::new(HashMap::from([(origin, sender)]))),
+    }
+}
+
+#[tokio::test]
+async fn typed_runtime_failures_are_unstamped_and_sent_to_origin() {
+    let args = ServerArgs {
+        listen_enabled: true,
+        ..ServerArgs::default()
     };
+    let prepared = args.prepare().unwrap();
+    let mut runtime_router =
+        crate::ws::RuntimeRouter::new(clock(), Arc::new(crate::ws::RandomEventIdGenerator));
+    let origin = runtime_router.connections.open().unwrap();
+    runtime_router.connections.initialize(origin).unwrap();
+    let router = Arc::new(Mutex::new(runtime_router));
+    let (sender, mut receiver) = mpsc::channel(4);
+    let state = typed_failure_state(prepared, router, origin, sender);
     for (wire, expected, false_field) in [
         (
             serde_json::json!({"type":"runtime_start","request_id":"r"}),

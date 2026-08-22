@@ -27,6 +27,12 @@ pub mod router;
 pub mod schedules;
 /// Injectable Runtime command service seam.
 pub mod service;
+/// Settings command group bridging wire frames to the Task 27 side store.
+#[path = "ws/groups/settings.rs"]
+pub mod settings;
+/// Skills command group bridging wire frames to Task 36 skill selection.
+#[path = "ws/groups/skills.rs"]
+pub mod skills;
 /// Teleport command group bridging wire frames to pending teleport state.
 #[path = "ws/groups/teleport.rs"]
 pub mod teleport;
