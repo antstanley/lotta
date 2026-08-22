@@ -18,6 +18,9 @@ pub mod service;
 /// Teleport command group bridging wire frames to pending teleport state.
 #[path = "ws/groups/teleport.rs"]
 pub mod teleport;
+/// Terminal command group bridging wire frames to interactive shell sessions.
+#[path = "ws/groups/terminal.rs"]
+pub mod terminal;
 
 pub use command::RuntimeCommand;
 pub use connection::{ConnectionId, EventDelivery, RuntimeConnections};

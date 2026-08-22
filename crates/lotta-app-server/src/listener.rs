@@ -42,6 +42,7 @@ use crate::{
         },
         lock_router, route_command,
         teleport::{TeleportBridge, TeleportCommand, TeleportForwarder, decode as decode_teleport},
+        terminal::{TerminalBridge, TerminalCommand, TerminalForwarder, decode as decode_terminal},
     },
 };
 
@@ -89,6 +90,7 @@ struct ListenerState {
     observer: Arc<dyn crate::observer::RuntimeBroadcastObserver>,
     external_tools: Arc<ExternalToolBridge>,
     teleports: Arc<TeleportBridge>,
+    terminals: Arc<TerminalBridge>,
     next_observation: AtomicU64,
     outbound: Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
 }
@@ -276,7 +278,7 @@ async fn start_listener_with_limits(
         Arc::new(std::sync::Mutex::new(HashMap::new()));
     let state = Arc::new(ListenerState {
         auth: prepared.auth,
-        clock,
+        clock: Arc::clone(&clock),
         shutdown: shutdown.clone(),
         limits,
         runtime_router: Arc::new(std::sync::Mutex::new(runtime_router)),
@@ -285,6 +287,7 @@ async fn start_listener_with_limits(
         observer,
         external_tools: Arc::new(ExternalToolBridge::new(external_forwarder(&outbound))),
         teleports: Arc::new(TeleportBridge::new(teleport_forwarder(&outbound))),
+        terminals: Arc::new(TerminalBridge::new(terminal_forwarder(&outbound), clock)),
         next_observation: AtomicU64::new(1),
         outbound,
     });
@@ -449,6 +452,7 @@ fn prepare_outbound(
 
 fn close_connection(state: &ListenerState, id: crate::ws::ConnectionId) {
     state.external_tools.disconnect(id);
+    state.terminals.disconnect(id);
     if let Ok(mut outbound) = state.outbound.lock() {
         outbound.remove(&id);
     }
@@ -632,6 +636,13 @@ fn teleport_forwarder(
     Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
 }
 
+fn terminal_forwarder(
+    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
+) -> TerminalForwarder {
+    let outbound = Arc::clone(outbound);
+    Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
+}
+
 /// Decodes and routes the external-tool command group for one frame.
 fn handle_external_frame(
     state: &Arc<ListenerState>,
@@ -653,8 +664,46 @@ fn handle_teleport_frame(
 ) -> bool {
     match decode_teleport(frame) {
         Err(error) => dispatch_value(state, connection_id, &error).is_ok(),
-        Ok(None) => true,
+        Ok(None) => handle_terminal_frame(state, connection_id, frame),
         Ok(Some(command)) => route_teleport_command(state, connection_id, &command),
+    }
+}
+
+/// Decodes and routes the terminal command group for one frame.
+fn handle_terminal_frame(
+    state: &Arc<ListenerState>,
+    connection_id: crate::ws::ConnectionId,
+    frame: &crate::framing::DecodedFrame,
+) -> bool {
+    match decode_terminal(frame) {
+        Err(error) => dispatch_value(state, connection_id, &error).is_ok(),
+        Ok(None) => true,
+        Ok(Some(command)) => route_terminal_command(state, connection_id, &command),
+    }
+}
+
+fn route_terminal_command(
+    state: &Arc<ListenerState>,
+    connection_id: crate::ws::ConnectionId,
+    command: &TerminalCommand,
+) -> bool {
+    match command {
+        TerminalCommand::Spawn(spawn) => {
+            state.terminals.spawn(connection_id, spawn);
+            true
+        }
+        TerminalCommand::Input(input) => {
+            state.terminals.input(connection_id, input);
+            true
+        }
+        TerminalCommand::Resize(resize) => {
+            state.terminals.resize(connection_id, resize);
+            true
+        }
+        TerminalCommand::Kill(kill) => {
+            state.terminals.kill(connection_id, kill);
+            true
+        }
     }
 }
 

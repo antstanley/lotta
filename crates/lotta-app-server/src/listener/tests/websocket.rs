@@ -22,6 +22,10 @@ fn clock() -> Arc<FakeClock> {
     Arc::new(FakeClock::new(timestamp))
 }
 
+fn inert_terminal_forwarder() -> crate::ws::terminal::TerminalForwarder {
+    Arc::new(|_, _| Ok(()))
+}
+
 async fn listener(frame_cap: usize) -> super::ListenerHandle {
     let args = ServerArgs {
         listen_enabled: true,
@@ -187,6 +191,10 @@ async fn typed_runtime_failures_are_unstamped_and_sent_to_origin() {
         )),
         teleports: Arc::new(crate::ws::teleport::TeleportBridge::new(
             crate::ws::teleport::inert_forwarder(),
+        )),
+        terminals: Arc::new(crate::ws::terminal::TerminalBridge::new(
+            inert_terminal_forwarder(),
+            clock(),
         )),
         next_observation: std::sync::atomic::AtomicU64::new(1),
         outbound: Arc::new(Mutex::new(HashMap::from([(origin, sender)]))),

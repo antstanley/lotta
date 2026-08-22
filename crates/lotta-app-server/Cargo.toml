@@ -8,12 +8,14 @@ publish.workspace = true
 [dependencies]
 axum.workspace = true
 base64.workspace = true
+chrono.workspace = true
 hmac.workspace = true
 getrandom = "0.3.4"
 lotta-domain = { version = "0.1.0", path = "../lotta-domain" }
 lotta-protocol = { version = "0.1.0", path = "../lotta-protocol" }
 lotta-runtime = { version = "0.1.0", path = "../lotta-runtime" }
 lotta-tools = { version = "0.1.0", path = "../lotta-tools" }
+rustix = { version = "1.0.8", features = ["process"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

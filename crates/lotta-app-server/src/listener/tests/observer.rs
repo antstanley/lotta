@@ -105,10 +105,18 @@ fn state(
         teleports: Arc::new(crate::ws::teleport::TeleportBridge::new(
             crate::ws::teleport::inert_forwarder(),
         )),
+        terminals: Arc::new(crate::ws::terminal::TerminalBridge::new(
+            inert_terminal_forwarder(),
+            Arc::new(TestClock),
+        )),
         next_observation: AtomicU64::new(1),
         outbound: Arc::new(Mutex::new(outbound)),
     });
     (state, id, receiver)
+}
+
+fn inert_terminal_forwarder() -> crate::ws::terminal::TerminalForwarder {
+    Arc::new(|_, _| Ok(()))
 }
 
 fn output(state: &ListenerState, event: RuntimeEvent) -> RouteOutput {
