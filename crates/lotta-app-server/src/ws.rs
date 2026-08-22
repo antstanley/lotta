@@ -14,6 +14,9 @@ pub mod external_tools;
 /// Files command group bridging wire frames to confined workspace services.
 #[path = "ws/groups/files.rs"]
 pub mod files;
+/// Memory command group bridging wire frames to the Task 29 memory repository.
+#[path = "ws/groups/memory.rs"]
+pub mod memory;
 /// Synchronous owner-local routing and deferred input application.
 pub mod router;
 /// Injectable Runtime command service seam.

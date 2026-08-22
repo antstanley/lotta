@@ -41,7 +41,9 @@ use crate::{
             ToolsUpdateResponseMessage, decode as decode_external_tools,
         },
         files::{FilesBridge, decode as decode_files},
-        lock_router, route_command,
+        lock_router,
+        memory::{MemoryBridge, decode as decode_memory},
+        route_command,
         teleport::{TeleportBridge, TeleportCommand, TeleportForwarder, decode as decode_teleport},
         terminal::{TerminalBridge, TerminalCommand, TerminalForwarder, decode as decode_terminal},
     },
@@ -93,6 +95,7 @@ struct ListenerState {
     teleports: Arc<TeleportBridge>,
     terminals: Arc<TerminalBridge>,
     files: Arc<FilesBridge>,
+    memories: Arc<MemoryBridge>,
     next_observation: AtomicU64,
     outbound: Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
 }
@@ -286,6 +289,11 @@ async fn start_listener_with_limits(
         &prepared.workspace_dir,
         &artifacts_dir,
     )?);
+    let memories = Arc::new(MemoryBridge::new(
+        memory_forwarder(&outbound),
+        &prepared.storage_dir.join("memfs"),
+        clock.clone(),
+    )?);
     let state = Arc::new(ListenerState {
         auth: prepared.auth,
         clock: Arc::clone(&clock),
@@ -299,6 +307,7 @@ async fn start_listener_with_limits(
         teleports: Arc::new(TeleportBridge::new(teleport_forwarder(&outbound))),
         terminals: Arc::new(TerminalBridge::new(terminal_forwarder(&outbound), clock)),
         files,
+        memories,
         next_observation: AtomicU64::new(1),
         outbound,
     });
@@ -662,6 +671,13 @@ fn files_forwarder(
     Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
 }
 
+fn memory_forwarder(
+    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
+) -> crate::ws::memory::MemoryForwarder {
+    let outbound = Arc::clone(outbound);
+    Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
+}
+
 /// Decodes and routes the external-tool command group for one frame.
 fn handle_external_frame(
     state: &Arc<ListenerState>,
@@ -709,9 +725,27 @@ fn handle_files_frame(
 ) -> bool {
     match decode_files(frame) {
         Err(error) => dispatch_value(state, connection_id, &error).is_ok(),
-        Ok(None) => true,
+        Ok(None) => handle_memory_frame(state, connection_id, frame),
         Ok(Some(command)) => {
             state.files.handle(connection_id, &command);
+            true
+        }
+    }
+}
+
+/// Decodes and routes the memory command group for one frame. Handlers run in
+/// detached tasks; the memory bridge owns no per-connection resources, so
+/// connection cleanup needs no memory step.
+fn handle_memory_frame(
+    state: &Arc<ListenerState>,
+    connection_id: crate::ws::ConnectionId,
+    frame: &crate::framing::DecodedFrame,
+) -> bool {
+    match decode_memory(frame) {
+        Err(error) => dispatch_value(state, connection_id, &error).is_ok(),
+        Ok(None) => true,
+        Ok(Some(command)) => {
+            state.memories.handle(connection_id, &command);
             true
         }
     }

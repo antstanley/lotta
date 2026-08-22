@@ -204,6 +204,14 @@ async fn typed_runtime_failures_are_unstamped_and_sent_to_origin() {
             )
             .expect("files bridge"),
         ),
+        memories: Arc::new(
+            crate::ws::memory::MemoryBridge::new(
+                crate::ws::memory::inert_forwarder(),
+                &prepared.storage_dir.join("memfs"),
+                clock(),
+            )
+            .expect("memory bridge"),
+        ),
         next_observation: std::sync::atomic::AtomicU64::new(1),
         outbound: Arc::new(Mutex::new(HashMap::from([(origin, sender)]))),
     };

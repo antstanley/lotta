@@ -62,6 +62,14 @@ fn router() -> axum::Router {
             )
             .expect("files bridge"),
         ),
+        memories: Arc::new(
+            crate::ws::memory::MemoryBridge::new(
+                crate::ws::memory::inert_forwarder(),
+                &files_workspace("transport-memfs"),
+                Arc::new(TestClock),
+            )
+            .expect("memory bridge"),
+        ),
         next_observation: std::sync::atomic::AtomicU64::new(1),
         outbound: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
