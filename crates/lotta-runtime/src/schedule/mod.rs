@@ -12,7 +12,7 @@ pub use cron::{ParsedInterval, ScheduleExpression, parse_interval};
 pub use jitter::{JitterSource, compute_jitter};
 pub use lifecycle::{RunUpdate, apply_run_update};
 pub use run_log::{RunLogAction, RunLogEntry, RunLogStatus};
-pub use scheduler::{MISS_WINDOW_MS, ScheduleScheduler, TICK_INTERVAL_MS};
+pub use scheduler::{MISS_WINDOW_MS, ScheduleScheduler, TICK_INTERVAL_MS, TriggerOutcome};
 pub use store::{ScheduleFile, ScheduleFileExtras, ScheduleStoreRevision};
 
 /// Returns whether appending a record stays within both inclusive retention bounds.

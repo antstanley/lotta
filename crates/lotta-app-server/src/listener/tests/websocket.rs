@@ -233,6 +233,14 @@ async fn typed_runtime_failures_are_unstamped_and_sent_to_origin() {
             )
             .expect("models bridge"),
         ),
+        schedules: Arc::new(
+            crate::ws::schedules::SchedulesBridge::new(
+                crate::ws::schedules::inert_forwarder(),
+                &prepared.storage_dir,
+                Arc::new(TestClock),
+            )
+            .expect("schedules bridge"),
+        ),
         next_observation: std::sync::atomic::AtomicU64::new(1),
         outbound: Arc::new(Mutex::new(HashMap::from([(origin, sender)]))),
     };

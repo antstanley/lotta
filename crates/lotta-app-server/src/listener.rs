@@ -45,6 +45,7 @@ use crate::{
         memory::{MemoryBridge, decode as decode_memory},
         models::{ModelsBridge, decode as decode_models},
         route_command,
+        schedules::{SchedulesBridge, decode as decode_schedules},
         teleport::{TeleportBridge, TeleportCommand, TeleportForwarder, decode as decode_teleport},
         terminal::{TerminalBridge, TerminalCommand, TerminalForwarder, decode as decode_terminal},
     },
@@ -98,6 +99,7 @@ struct ListenerState {
     files: Arc<FilesBridge>,
     memories: Arc<MemoryBridge>,
     models: Arc<ModelsBridge>,
+    schedules: Arc<SchedulesBridge>,
     next_observation: AtomicU64,
     outbound: Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
 }
@@ -315,6 +317,11 @@ async fn start_listener_with_limits(
         memories,
         models: Arc::new(ModelsBridge::new(
             models_forwarder(&outbound),
+            &prepared.storage_dir,
+            Arc::clone(&clock),
+        )?),
+        schedules: Arc::new(SchedulesBridge::new(
+            schedules_forwarder(&outbound),
             &prepared.storage_dir,
             Arc::clone(&clock),
         )?),
@@ -695,6 +702,13 @@ fn models_forwarder(
     Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
 }
 
+fn schedules_forwarder(
+    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
+) -> crate::ws::schedules::SchedulesForwarder {
+    let outbound = Arc::clone(outbound);
+    Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
+}
+
 /// Decodes and routes the external-tool command group for one frame.
 fn handle_external_frame(
     state: &Arc<ListenerState>,
@@ -776,9 +790,27 @@ fn handle_models_frame(
 ) -> bool {
     match decode_models(frame) {
         Err(error) => dispatch_value(state, connection_id, &error).is_ok(),
-        Ok(None) => true,
+        Ok(None) => handle_schedules_frame(state, connection_id, frame),
         Ok(Some(command)) => {
             state.models.handle(connection_id, &command);
+            true
+        }
+    }
+}
+
+/// Decodes and routes the schedules command group for one frame. Handlers run
+/// in detached tasks; the schedules bridge owns no per-connection resources,
+/// so connection cleanup needs no schedules step.
+fn handle_schedules_frame(
+    state: &Arc<ListenerState>,
+    connection_id: crate::ws::ConnectionId,
+    frame: &crate::framing::DecodedFrame,
+) -> bool {
+    match decode_schedules(frame) {
+        Err(error) => dispatch_value(state, connection_id, &error).is_ok(),
+        Ok(None) => true,
+        Ok(Some(command)) => {
+            state.schedules.handle(connection_id, &command);
             true
         }
     }

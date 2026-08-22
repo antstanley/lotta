@@ -22,6 +22,9 @@ pub mod memory;
 pub mod models;
 /// Synchronous owner-local routing and deferred input application.
 pub mod router;
+/// Schedules command group bridging wire frames to Tasks 60 and 61.
+#[path = "ws/groups/schedules.rs"]
+pub mod schedules;
 /// Injectable Runtime command service seam.
 pub mod service;
 /// Teleport command group bridging wire frames to pending teleport state.

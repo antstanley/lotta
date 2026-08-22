@@ -78,6 +78,14 @@ fn router() -> axum::Router {
             )
             .expect("models bridge"),
         ),
+        schedules: Arc::new(
+            crate::ws::schedules::SchedulesBridge::new(
+                crate::ws::schedules::inert_forwarder(),
+                &files_workspace("transport-schedules"),
+                Arc::new(TestClock),
+            )
+            .expect("schedules bridge"),
+        ),
         next_observation: std::sync::atomic::AtomicU64::new(1),
         outbound: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });

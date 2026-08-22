@@ -29,6 +29,15 @@ pub const MISS_WINDOW_MS: i64 = 5 * MINUTE_MS;
 /// Failure summaries are truncated to this many characters before persisting.
 pub const FAILURE_SUMMARY_CHARS_MAX: usize = 200;
 
+/// Resolution of one manual trigger request before any admission work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TriggerOutcome {
+    /// Whether the requested schedule exists in the canonical file.
+    pub found: bool,
+    /// Whether the schedule was active and therefore eligible to fire.
+    pub active: bool,
+}
+
 const MINUTE_MS: i64 = 60_000;
 const MINUTE_SECONDS: i64 = 60;
 const SECOND_MS: i64 = 1_000;
@@ -144,6 +153,48 @@ impl ScheduleScheduler {
     /// per-schedule failures are recorded as failed runs instead.
     pub async fn tick(&self, now: Timestamp) -> Result<(), RuntimeError> {
         self.core.tick(now).await
+    }
+
+    /// Fires one schedule immediately through the standard firing path.
+    ///
+    /// Mirrors the pinned send-now semantics: a missing schedule answers
+    /// `found = false`, an inactive one answers `active = false` without
+    /// touching persistence, and an active one resolves or creates its target
+    /// runtime and enqueues exactly the same `cron_prompt` admission as a
+    /// scheduled fire — never by starting a turn directly.
+    ///
+    /// # Errors
+    /// Returns a typed failure when the canonical file cannot be loaded, the
+    /// target runtime cannot be created, or the admission chain rejects.
+    pub async fn trigger(
+        &self,
+        schedule_id: &str,
+        now: Timestamp,
+    ) -> Result<TriggerOutcome, RuntimeError> {
+        let file = self.core.persistence.load().await?;
+        let Some(task) = file
+            .tasks
+            .iter()
+            .find(|task| task.id.as_str() == schedule_id)
+        else {
+            return Ok(TriggerOutcome {
+                found: false,
+                active: false,
+            });
+        };
+        if task.status != ScheduleStatus::Active {
+            return Ok(TriggerOutcome {
+                found: true,
+                active: false,
+            });
+        }
+        let occurrence_ms = intended_occurrence_ms(task, &now);
+        let handle = self.core.handle_for(task).await?;
+        self.core.fire(task, &handle, now, occurrence_ms).await?;
+        Ok(TriggerOutcome {
+            found: true,
+            active: true,
+        })
     }
 }
 
@@ -422,6 +473,18 @@ fn evaluate_one_shot(task: &Schedule, now_ms: i64) -> Evaluation {
         return Evaluation::Fire(scheduled_ms);
     }
     Evaluation::Idle
+}
+
+/// Returns the epoch-millisecond occurrence a fire at `now` represents.
+///
+/// One-shots target their persisted instant; everything else targets the
+/// wall-minute start containing `now` (pinned parity), so a manual trigger
+/// inside one minute shares the dedup identity of that minute's scheduled fire.
+fn intended_occurrence_ms(task: &Schedule, now: &Timestamp) -> i64 {
+    if let Some(scheduled) = task.scheduled_for.filter(|_| !task.recurring) {
+        return scheduled.as_utc().timestamp_millis();
+    }
+    now.as_utc().timestamp().div_euclid(MINUTE_SECONDS) * MINUTE_SECONDS * SECOND_MS
 }
 
 /// Returns the epoch-second start of the matched minute, if any.

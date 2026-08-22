@@ -134,6 +134,14 @@ fn state(
             )
             .expect("models bridge"),
         ),
+        schedules: Arc::new(
+            crate::ws::schedules::SchedulesBridge::new(
+                crate::ws::schedules::inert_forwarder(),
+                &files_workspace("observer-schedules"),
+                Arc::new(TestClock),
+            )
+            .expect("schedules bridge"),
+        ),
         next_observation: AtomicU64::new(1),
         outbound: Arc::new(Mutex::new(outbound)),
     });
