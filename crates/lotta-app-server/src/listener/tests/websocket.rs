@@ -196,6 +196,14 @@ async fn typed_runtime_failures_are_unstamped_and_sent_to_origin() {
             inert_terminal_forwarder(),
             clock(),
         )),
+        files: Arc::new(
+            crate::ws::files::FilesBridge::new(
+                crate::ws::files::inert_forwarder(),
+                &prepared.workspace_dir,
+                &prepared.storage_dir.join("artifacts"),
+            )
+            .expect("files bridge"),
+        ),
         next_observation: std::sync::atomic::AtomicU64::new(1),
         outbound: Arc::new(Mutex::new(HashMap::from([(origin, sender)]))),
     };

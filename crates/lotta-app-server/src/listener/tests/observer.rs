@@ -109,10 +109,30 @@ fn state(
             inert_terminal_forwarder(),
             Arc::new(TestClock),
         )),
+        files: Arc::new(
+            crate::ws::files::FilesBridge::with_poll_interval(
+                crate::ws::files::inert_forwarder(),
+                &files_workspace("observer"),
+                &files_workspace("observer-artifacts"),
+                60_000,
+            )
+            .expect("files bridge"),
+        ),
         next_observation: AtomicU64::new(1),
         outbound: Arc::new(Mutex::new(outbound)),
     });
     (state, id, receiver)
+}
+
+fn files_workspace(name: &str) -> std::path::PathBuf {
+    static ORDINAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let ordinal = ORDINAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!(
+        "lotta-listener-{name}-{}-{ordinal}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&path).expect("workspace directory");
+    path.canonicalize().expect("canonical workspace")
 }
 
 fn inert_terminal_forwarder() -> crate::ws::terminal::TerminalForwarder {

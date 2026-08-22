@@ -50,6 +50,54 @@ pub(super) fn execute(
     }
 }
 
+/// Raw, unformatted workspace byte read for listener file services.
+///
+/// Reuses the exact tool confinement (`workspace_relative`) and no-follow
+/// bounded read (`read_regular`) used by the `Read` tool executor.
+pub(super) fn read_raw(
+    state: &FileState,
+    value: &str,
+    byte_max: usize,
+    control: &OperationControl,
+) -> Result<Vec<u8>, FileError> {
+    let relative = workspace_relative(state, value)?;
+    read_regular(&state.workspace, &relative, byte_max, control)
+}
+
+/// Raw full-content create-or-replace write for listener file services.
+pub(super) fn write_raw(
+    state: &FileState,
+    value: &str,
+    content: &str,
+    control: &OperationControl,
+) -> Result<(), FileError> {
+    mutate::write_core(state, value, content, control)
+}
+
+/// Raw tool-`Edit`-semantics replacement for listener file services.
+///
+/// Returns `(replacements, start_line)` for the pinned response shape.
+pub(super) fn edit_raw(
+    state: &FileState,
+    value: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+    expected_replacements: Option<usize>,
+    control: &OperationControl,
+) -> Result<(usize, usize), FileError> {
+    mutate::edit_core(
+        state,
+        value,
+        old,
+        new,
+        replace_all,
+        expected_replacements,
+        control,
+    )
+    .map(|outcome| (outcome.replacements, outcome.start_line))
+}
+
 fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str, FileError> {
     value
         .get(key)

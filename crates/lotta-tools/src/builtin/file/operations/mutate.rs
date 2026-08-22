@@ -9,15 +9,30 @@ pub(super) fn write(
     input: &Value,
     control: &OperationControl,
 ) -> Result<String, FileError> {
-    let path = workspace_relative(state, string(input, "file_path")?)?;
-    let content = string(input, "content")?;
+    write_core(
+        state,
+        string(input, "file_path")?,
+        string(input, "content")?,
+        control,
+    )?;
+    Ok("File written successfully.".into())
+}
+
+/// Creates or fully replaces one workspace text file with tool `Write` semantics.
+pub(super) fn write_core(
+    state: &FileState,
+    value: &str,
+    content: &str,
+    control: &OperationControl,
+) -> Result<(), FileError> {
+    let path = workspace_relative(state, value)?;
     if content.len() > TEXT_FILE_BYTES_MAX {
         return Err(FileError::Tool);
     }
     let _guard = state.mutations.lock().map_err(|_| FileError::Tool)?;
     control.check()?;
     atomic_write(&state.workspace, &path, content.as_bytes())?;
-    Ok("File written successfully.".into())
+    Ok(())
 }
 
 pub(super) fn edit(
@@ -25,20 +40,65 @@ pub(super) fn edit(
     input: &Value,
     control: &OperationControl,
 ) -> Result<String, FileError> {
-    let path = workspace_relative(state, string(input, "file_path")?)?;
+    edit_core(
+        state,
+        string(input, "file_path")?,
+        string(input, "old_string")?,
+        string(input, "new_string")?,
+        input
+            .get("replace_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        integer(input, "expected_replacements")?,
+        control,
+    )?;
+    Ok("File edited successfully.".into())
+}
+
+/// Replacement positions of one completed core edit.
+pub(super) struct EditOutcome {
+    /// Number of replacements applied.
+    pub(super) replacements: usize,
+    /// One-based line of the first replacement.
+    pub(super) start_line: usize,
+}
+
+/// Applies tool `Edit` semantics and reports replacement positions.
+pub(super) fn edit_core(
+    state: &FileState,
+    value: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+    expected: Option<usize>,
+    control: &OperationControl,
+) -> Result<EditOutcome, FileError> {
+    let path = workspace_relative(state, value)?;
     let text = text_file(&state.workspace, &path, control)?;
-    let old = string(input, "old_string")?;
-    let new = string(input, "new_string")?;
-    let replace_all = input
-        .get("replace_all")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let expected = integer(input, "expected_replacements")?;
     let output = replace_text_controlled(&text, old, new, replace_all, expected, control)?;
+    let outcome = edit_positions(&text, old)?;
     let _guard = state.mutations.lock().map_err(|_| FileError::Tool)?;
     control.check()?;
     atomic_write(&state.workspace, &path, output.as_bytes())?;
-    Ok("File edited successfully.".into())
+    Ok(outcome)
+}
+
+/// Recounts the applied replacement positions from the already validated inputs.
+fn edit_positions(text: &str, old: &str) -> Result<EditOutcome, FileError> {
+    let normalized_text = normalize_crlf(text)?;
+    let normalized_old = normalize_crlf(old)?;
+    let replacements = normalized_text.match_indices(&normalized_old).count();
+    let start_line = normalized_text.find(&normalized_old).map_or(1, |index| {
+        normalized_text[..index]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1
+    });
+    Ok(EditOutcome {
+        replacements,
+        start_line,
+    })
 }
 
 pub(super) fn multi_edit(

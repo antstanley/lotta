@@ -11,6 +11,9 @@ pub mod event;
 /// External-tool command group bridging wire frames to the Task 41 registry.
 #[path = "ws/groups/external_tools.rs"]
 pub mod external_tools;
+/// Files command group bridging wire frames to confined workspace services.
+#[path = "ws/groups/files.rs"]
+pub mod files;
 /// Synchronous owner-local routing and deferred input application.
 pub mod router;
 /// Injectable Runtime command service seam.

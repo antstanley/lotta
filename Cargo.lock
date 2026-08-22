@@ -951,6 +951,7 @@ dependencies = [
  "lotta-runtime",
  "lotta-testkit",
  "lotta-tools",
+ "regex",
  "rustix",
  "serde",
  "serde_json",
