@@ -1,12 +1,12 @@
 use super::{ModelHandle, ModelSettings};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Canonical maximum catalog entries owned by one provider.
 pub use crate::limits::MODELS_PER_PROVIDER_MAX;
 
 /// Non-secret provider connection state projected into model readiness.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionReadiness {
     /// Connection is usable.

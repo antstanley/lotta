@@ -105,7 +105,7 @@ impl fmt::Debug for ProviderAuth {
 }
 
 /// Declarative provider authentication method.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AuthMethod {
     /// API key or no-key sentinel.
@@ -155,7 +155,7 @@ impl fmt::Debug for ProviderRecord {
 }
 
 /// Declarative connection field description.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct ConnectField {
     /// Wire key.
     pub key: String,
@@ -172,7 +172,7 @@ pub struct ConnectField {
 }
 
 /// Exact baseline declarative authentication method.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct ConnectProviderAuthMethod {
     /// Stable method identifier.
     pub id: String,

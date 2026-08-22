@@ -17,6 +17,9 @@ pub mod files;
 /// Memory command group bridging wire frames to the Task 29 memory repository.
 #[path = "ws/groups/memory.rs"]
 pub mod memory;
+/// Models/providers command group bridging wire frames to Tasks 47, 52, and 32.
+#[path = "ws/groups/models.rs"]
+pub mod models;
 /// Synchronous owner-local routing and deferred input application.
 pub mod router;
 /// Injectable Runtime command service seam.

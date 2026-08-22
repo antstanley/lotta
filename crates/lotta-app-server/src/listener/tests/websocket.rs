@@ -1,4 +1,5 @@
 use futures_util::{SinkExt, StreamExt};
+use lotta_domain::Clock;
 use lotta_domain::Timestamp;
 use lotta_testkit::clock::FakeClock;
 use serde_json::Value;
@@ -48,6 +49,18 @@ where
         .await
         .unwrap_or_else(|| panic!("socket ended"))
         .unwrap_or_else(|error| panic!("websocket receive: {error}"))
+}
+
+struct TestClock;
+
+impl Clock for TestClock {
+    fn now(&self) -> Timestamp {
+        Timestamp::parse_persisted_rfc3339("2026-08-14T12:34:56+00:00").expect("test timestamp")
+    }
+
+    fn parse_timestamp(&self, value: &str) -> Result<Timestamp, lotta_domain::DomainError> {
+        Timestamp::parse_persisted_rfc3339(value)
+    }
 }
 
 #[tokio::test]
@@ -211,6 +224,14 @@ async fn typed_runtime_failures_are_unstamped_and_sent_to_origin() {
                 clock(),
             )
             .expect("memory bridge"),
+        ),
+        models: Arc::new(
+            crate::ws::models::ModelsBridge::new(
+                crate::ws::models::inert_forwarder(),
+                &prepared.storage_dir,
+                Arc::new(TestClock),
+            )
+            .expect("models bridge"),
         ),
         next_observation: std::sync::atomic::AtomicU64::new(1),
         outbound: Arc::new(Mutex::new(HashMap::from([(origin, sender)]))),

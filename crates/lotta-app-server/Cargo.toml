@@ -14,7 +14,9 @@ getrandom = "0.3.4"
 lotta-domain = { version = "0.1.0", path = "../lotta-domain" }
 lotta-memfs = { version = "0.1.0", path = "../lotta-memfs" }
 lotta-protocol = { version = "0.1.0", path = "../lotta-protocol" }
+lotta-providers = { version = "0.1.0", path = "../lotta-providers" }
 lotta-runtime = { version = "0.1.0", path = "../lotta-runtime" }
+lotta-store = { version = "0.1.0", path = "../lotta-store" }
 lotta-tools = { version = "0.1.0", path = "../lotta-tools" }
 regex = "1.11.2"
 rustix = { version = "1.0.8", features = ["process"] }

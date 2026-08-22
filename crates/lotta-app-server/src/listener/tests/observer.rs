@@ -126,6 +126,14 @@ fn state(
             )
             .expect("memory bridge"),
         ),
+        models: Arc::new(
+            crate::ws::models::ModelsBridge::new(
+                crate::ws::models::inert_forwarder(),
+                &files_workspace("observer-models"),
+                Arc::new(TestClock),
+            )
+            .expect("models bridge"),
+        ),
         next_observation: AtomicU64::new(1),
         outbound: Arc::new(Mutex::new(outbound)),
     });
