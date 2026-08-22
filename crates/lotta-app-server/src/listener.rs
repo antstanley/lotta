@@ -291,7 +291,7 @@ async fn start_listener_with_limits(
     )?);
     let memories = Arc::new(MemoryBridge::new(
         memory_forwarder(&outbound),
-        &prepared.storage_dir.join("memfs"),
+        &prepared.storage_dir,
         clock.clone(),
     )?);
     let state = Arc::new(ListenerState {

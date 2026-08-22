@@ -550,7 +550,10 @@ fn update_branch(
 }
 
 pub(crate) fn post_commit_push(repo: &Path) {
-    drop(try_post_commit_push(repo));
+    if let Err(error) = try_post_commit_push(repo) {
+        // Warn-and-continue: a failed mirror push never undoes the commit.
+        tracing::warn!(error = %error, "memory post-commit push failed");
+    }
 }
 
 pub(crate) fn try_post_commit_push(repo: &Path) -> Result<(), RuntimeError> {

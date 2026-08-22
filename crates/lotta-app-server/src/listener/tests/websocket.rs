@@ -207,7 +207,7 @@ async fn typed_runtime_failures_are_unstamped_and_sent_to_origin() {
         memories: Arc::new(
             crate::ws::memory::MemoryBridge::new(
                 crate::ws::memory::inert_forwarder(),
-                &prepared.storage_dir.join("memfs"),
+                &prepared.storage_dir,
                 clock(),
             )
             .expect("memory bridge"),

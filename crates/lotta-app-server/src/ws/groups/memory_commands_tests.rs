@@ -81,6 +81,10 @@ async fn enable_memfs_decodes_routes_and_responds() {
     assert_eq!(value["success"], true);
     let directory = value["memory_directory"].as_str().expect("directory");
     assert!(directory.ends_with("memfs/agent-local-memory-test/memory"));
+    assert!(
+        !directory.contains("memfs/memfs/"),
+        "doubled backend segment: {directory}"
+    );
     assert!(memory.memory_root().join(".git").exists());
 }
 

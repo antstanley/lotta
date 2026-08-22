@@ -33,10 +33,12 @@
 //! Baseline degradations imposed by the Task 29 port surface, kept honest:
 //! history commits carry empty timestamps and null author names (the port
 //! streams revision + summary only), `memory_history.file_path` scoping
-//! degrades to repository-wide history (no per-path log on the port), and a
+//! degrades to repository-wide history (no per-path log on the port), a
 //! root-commit diff yields an empty patch (no parent snapshot exists to
-//! compare). Prompt recompilation after committed writes is Task 58; this
-//! group only mutates and reports.
+//! compare), and `memory_commit_diff` returns the Task 29 compact format
+//! (`path status` plus `- old`/`+ new` lines, never a unified patch) with
+//! references restricted to full 40-hex shas. Prompt recompilation after
+//! committed writes is Task 58; this group only mutates and reports.
 
 use std::{
     collections::HashSet,
@@ -750,8 +752,9 @@ impl MemoryBridge {
             self.emit(connection, diff_failure(None));
             return;
         };
-        // A root commit has no parent snapshot; the pinned `git show` likewise
-        // prints only headers there, so an empty patch stays faithful.
+        // A root commit has no parent snapshot; this port yields an empty
+        // patch where the pinned baseline returns the full add-patch — the
+        // degradation documented in the module header above.
         let text = match parent.as_ref() {
             None => Ok(String::new()),
             Some(parent) => self.diff_text(&agent, Some(parent), &revision).await,

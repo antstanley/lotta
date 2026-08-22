@@ -1031,6 +1031,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-util",
+ "tracing",
  "uuid",
 ]
 
