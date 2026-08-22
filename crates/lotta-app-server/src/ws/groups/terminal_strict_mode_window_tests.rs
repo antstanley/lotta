@@ -4,8 +4,8 @@
 
 use super::STRICT_MODE_REUSE_WINDOW_MS;
 use super::support::{
-    CONNECTION_A, advance_ms, bridge, fake_clock, kill_command, spawn_command, spawned_pids,
-    wait_pid_gone,
+    CONNECTION_A, advance_ms, bridge, exited_codes, fake_clock, input_command, kill_command,
+    spawn_command, spawned_pids, wait_pid_gone, wait_until,
 };
 
 const TERMINAL: &str = "term";
@@ -60,6 +60,33 @@ async fn spawns_new_after_window() {
 
     bridge.disconnect(CONNECTION_A);
     wait_pid_gone(second).await;
+}
+
+#[tokio::test]
+async fn exited_session_is_not_reused_inside_window() {
+    let clock = fake_clock();
+    let (bridge, messages) = bridge(clock.clone());
+
+    bridge.spawn(CONNECTION_A, &spawn_command(TERMINAL));
+    let first = wait_until_first_spawn(&bridge, &messages).await;
+
+    bridge.input(CONNECTION_A, &input_command(TERMINAL, "exit\n"));
+    wait_until(|| !exited_codes(&messages, TERMINAL).is_empty()).await;
+    assert_eq!(exited_codes(&messages, TERMINAL), [0]);
+    advance_ms(&clock, 1);
+
+    bridge.spawn(CONNECTION_A, &spawn_command(TERMINAL));
+    wait_until(|| spawned_pids(&messages, TERMINAL).len() == 2).await;
+    let pids = spawned_pids(&messages, TERMINAL);
+    assert_ne!(
+        pids[0], pids[1],
+        "repeat spawn after natural exit must not reuse the dead pid"
+    );
+    assert_eq!(bridge.sessions_len(), 1);
+    wait_pid_gone(first).await;
+
+    bridge.disconnect(CONNECTION_A);
+    wait_pid_gone(pids[1]).await;
 }
 
 #[tokio::test]

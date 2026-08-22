@@ -1,15 +1,23 @@
 //! Real interactive shell sessions backing the WebSocket terminal group.
 //!
 //! Each session owns one real child process started as a POSIX process-group
-//! leader with piped standard streams, mirroring the pinned baseline's
-//! interactive shell (the pinned handler falls back to pipes-equivalent
-//! behavior on runtimes without PTY support; `TERM` and `COLORTERM` match the
-//! pinned environment). Output chunks stream to the owning connection through
-//! an injected sink, input bytes flow through a bounded channel to the child's
-//! stdin, and termination reuses Task 38's two-stage discipline: TERM the
-//! whole process group, wait one [`SHELL_CHILD_KILL_GRACE_MS`] grace, then
-//! KILL the group and reap, so neither zombies nor orphaned descendants
-//! survive a kill or a disconnect.
+//! leader whose standard streams are OS pipes instead of a PTY. Consequences
+//! of pipes over a PTY: the kernel performs no echo or line discipline,
+//! `terminal_resize` is inert because no kernel window size exists, and exit
+//! detection rides pipe EOF. When TTY semantics are needed, swap the launch to
+//! a PTY. `TERM` and `COLORTERM` match the pinned environment.
+//!
+//! Output chunks stream to the owning connection through an injected sink:
+//! each read emits an immediate lossily decoded chunk capped at
+//! [`TERMINAL_OUTPUT_CHUNK_BYTES`]. That diverges from the pinned baseline's
+//! 16 ms / 64 KiB output coalescing, though the wire shape is unchanged; add
+//! matching coalescing here if outbound backpressure matters.
+//!
+//! Input bytes flow through a bounded channel to the child's stdin, and
+//! termination reuses Task 38's two-stage discipline: TERM the whole process
+//! group, wait one [`SHELL_CHILD_KILL_GRACE_MS`] grace, then KILL the group
+//! and reap, so neither zombies nor orphaned descendants survive a kill or a
+//! disconnect.
 
 use std::{
     path::Path,
@@ -69,7 +77,7 @@ enum GroupSignal {
 pub(super) struct SessionControl {
     stdin: Sender<Vec<u8>>,
     cancellation: CancellationToken,
-    exited: AtomicBool,
+    exited: Arc<AtomicBool>,
 }
 
 impl SessionControl {
@@ -126,10 +134,12 @@ pub(super) fn launch(
     tokio::spawn(pump_output(stdout, output_sender.clone()));
     tokio::spawn(pump_output(stderr, output_sender));
     let cancellation = CancellationToken::new();
+    let exited = Arc::new(AtomicBool::new(false));
     tokio::spawn(supervise(
         child,
         pid,
         cancellation.clone(),
+        Arc::clone(&exited),
         output_receiver,
         on_output,
         on_exit,
@@ -139,7 +149,7 @@ pub(super) fn launch(
         control: SessionControl {
             stdin: input_sender,
             cancellation,
-            exited: AtomicBool::new(false),
+            exited,
         },
     })
 }
@@ -148,6 +158,7 @@ async fn supervise(
     mut child: Child,
     pid: u32,
     cancellation: CancellationToken,
+    exited: Arc<AtomicBool>,
     mut output: Receiver<Vec<u8>>,
     on_output: OutputSink,
     on_exit: ExitSink,
@@ -163,6 +174,8 @@ async fn supervise(
         }
     }
     let exit_code = terminate_and_reap(&mut child).await;
+    // Flag exit before the callback so reuse checks observe a dead session.
+    exited.store(true, Ordering::SeqCst);
     on_exit(child.id().unwrap_or(pid), exit_code);
 }
 
