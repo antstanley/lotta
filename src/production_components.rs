@@ -12,6 +12,9 @@ use lotta_app_server::ws::service::{
     AbortOutcome, DeviceStateOutcome, InputAdmission, RuntimeCommandService, RuntimeEventBatch,
     RuntimeEventSink, RuntimeStartOutcome, ServiceFuture, SyncOutcome, TurnController,
 };
+use lotta_app_server::ws::settings::{CwdChange, SettingsBridge};
+#[cfg(test)]
+use lotta_app_server::ws::skills::SkillsBridge;
 use lotta_domain::{
     AgentId, BoundedJsonValue, Clock, InputDisposition, ModelDescriptor, NonEmptyString,
     ProviderStack, QueueItem, QueueItemKind, QueueItemSource, RuntimeScope, SessionEntry,
@@ -91,6 +94,7 @@ pub struct ProductionComponents {
     _observer: Arc<lotta_runtime::observe::RuntimeObserver>,
     reflection: Arc<Mutex<Arc<dyn lotta_store::ReflectionJob>>>,
     memory_push: Arc<Mutex<Arc<dyn lotta_store::MemoryPushJob>>>,
+    shared: lotta_app_server::listener::SharedGroupBridges,
 }
 
 struct RegisteredReflection(Arc<Mutex<Arc<dyn lotta_store::ReflectionJob>>>);
@@ -127,6 +131,9 @@ impl lotta_store::MemoryPushJob for RegisteredMemoryPush {
 
 impl ProductionComponents {
     /// Builds concrete local production dependencies before listener bind.
+    ///
+    /// The skills and settings bridges are composed here and shared with the
+    /// listener, so WebSocket group mutations reach subsequent turns.
     pub fn from_server(
         prepared: &PreparedServer,
         clock: Arc<dyn Clock + Send + Sync>,
@@ -138,6 +145,12 @@ impl ProductionComponents {
             ));
         let observer = Arc::new(lotta_runtime::observe::RuntimeObserver::new(event_sink));
         let workspace = prepared.workspace_dir.clone();
+        let shared = lotta_app_server::listener::SharedGroupBridges::new(
+            &root,
+            &workspace,
+            Arc::clone(&clock),
+        )
+        .map_err(|_| SetupError::Adapter("shared group bridge roots".into()))?;
         let store_paths = StorePaths::new(&root).map_err(adapter)?;
         let provider_runtime = production_provider_runtime(&store_paths, &root)?;
         let (models, default_model) = production_catalog(&provider_runtime)?;
@@ -191,6 +204,7 @@ impl ProductionComponents {
             Arc::clone(&runtime_state),
             Arc::clone(&approval_manager),
             Arc::clone(&brokers),
+            shared.settings(),
         ));
         let reflection: Arc<Mutex<Arc<dyn lotta_store::ReflectionJob>>> = Arc::new(Mutex::new(
             Arc::new(crate::production_setup::UnavailableReflection),
@@ -214,6 +228,8 @@ impl ProductionComponents {
             approval_manager,
             reflection_port,
             memory_port,
+            shared.skills(),
+            shared.settings(),
         ));
         let post_turn_queue = lotta_store::PostTurnQueue::new(&LocalStore::new(store_paths));
         let components = Self {
@@ -223,6 +239,7 @@ impl ProductionComponents {
             _observer: observer,
             reflection,
             memory_push,
+            shared,
         };
         components.drain_post_turn()?;
         Ok(components)
@@ -284,6 +301,13 @@ impl ProductionComponents {
     #[must_use]
     pub fn turn_controller(&self) -> Arc<dyn TurnController> {
         self.turn_controller.clone()
+    }
+
+    /// Returns a handle over the shared skills/settings bridge pair served by
+    /// the listener; the underlying Arcs stay identical across clones.
+    #[must_use]
+    pub fn shared_bridges(&self) -> lotta_app_server::listener::SharedGroupBridges {
+        self.shared.clone()
     }
 }
 
@@ -566,7 +590,9 @@ fn production_skill_roots(root: &std::path::Path, workspace: &std::path::Path) -
         project_working_root: workspace.to_path_buf(),
         agent_skills_directory: Some(root.join("agents")),
         memory_root: Some(root.join("memory")),
-        global_skills_directory: root.join("skills"),
+        // The pinned global source lives at `<storage>/.letta/skills` — the
+        // exact directory the Task 69 skills bridge links enables into.
+        global_skills_directory: root.join(".letta").join("skills"),
         bundled_skills_directory: root.join("bundled-skills"),
     }
 }
@@ -574,7 +600,7 @@ fn production_skill_roots(root: &std::path::Path, workspace: &std::path::Path) -
 fn create_production_directories(root: &std::path::Path) -> Result<(), SetupError> {
     for path in [
         root.join("artifacts"),
-        root.join("skills"),
+        root.join(".letta").join("skills"),
         root.join("bundled-skills"),
     ] {
         std::fs::create_dir_all(path).map_err(adapter)?;
@@ -790,6 +816,7 @@ pub(crate) struct ProductionRuntimeService {
     state: Arc<ProductionRuntimeState>,
     approvals: Arc<lotta_runtime::ApprovalManager>,
     brokers: Arc<ProductionTurnBrokers>,
+    settings: Arc<SettingsBridge>,
 }
 
 impl ProductionRuntimeService {
@@ -800,6 +827,7 @@ impl ProductionRuntimeService {
         state: Arc<ProductionRuntimeState>,
         approvals: Arc<lotta_runtime::ApprovalManager>,
         brokers: Arc<ProductionTurnBrokers>,
+        settings: Arc<SettingsBridge>,
     ) -> Self {
         Self {
             store: LocalStore::new(store_paths),
@@ -808,6 +836,7 @@ impl ProductionRuntimeService {
             state,
             approvals,
             brokers,
+            settings,
         }
     }
 
@@ -1828,6 +1857,33 @@ impl RuntimeCommandService for ProductionRuntimeService {
     ) -> ServiceFuture<'_, DeviceStateOutcome> {
         Box::pin(async move {
             let _ = self.ensure_runtime(&command.runtime)?;
+            // A cwd change persists into the shared settings bridge's scoped
+            // map so the next turn resolves the new directory. No websocket
+            // connection owns this service-level command, so the status
+            // snapshot targets the unowned sentinel connection and only the
+            // broadcast below reaches subscribers.
+            if let Some(cwd) = command.payload.cwd.as_deref() {
+                let agent_id = command
+                    .payload
+                    .agent_id
+                    .as_ref()
+                    .map(|id| id.as_str().to_owned())
+                    .or_else(|| Some(command.runtime.agent_id.as_str().to_owned()));
+                let conversation_id = command
+                    .payload
+                    .conversation_id
+                    .as_ref()
+                    .map(|id| id.as_str().to_owned())
+                    .unwrap_or_else(|| command.runtime.conversation_id.as_str().to_owned());
+                let change = CwdChange {
+                    agent_id,
+                    conversation_id,
+                    cwd: cwd.to_owned(),
+                };
+                // Scrubbed rejection: the broadcast still echoes the request,
+                // and the cwd map simply keeps its previous entry.
+                let _ = self.settings.apply_cwd_change(0, &change);
+            }
             let device_status = BoundedJsonValue::new(serde_json::json!({
                 "mode": command.payload.mode.map(|mode| format!("{mode:?}").to_lowercase()),
                 "cwd": command.payload.cwd,
@@ -2641,7 +2697,7 @@ mod production_tests {
         let root = std::env::temp_dir().join(format!("lotta-task54-registry-{}", unique_test_id()));
         let workspace = root.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
-        for directory in ["artifacts", "skills", "bundled-skills"] {
+        for directory in ["artifacts", ".letta/skills", "bundled-skills"] {
             std::fs::create_dir_all(root.join(directory)).unwrap();
         }
         let root = root.canonicalize().unwrap();
@@ -2912,6 +2968,69 @@ mod production_tests {
         }
     }
 
+    /// Provider variant that completes every turn immediately while recording
+    /// the compiled system prompt and signalling a permit per attempt.
+    struct CompletingProvider {
+        waiting: tokio::sync::Semaphore,
+        prompts: Mutex<Vec<String>>,
+        calls: std::sync::atomic::AtomicU64,
+    }
+
+    impl Default for CompletingProvider {
+        fn default() -> Self {
+            Self {
+                waiting: tokio::sync::Semaphore::new(0),
+                prompts: Mutex::new(Vec::new()),
+                calls: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl CompletingProvider {
+        fn last_prompt(&self) -> String {
+            self.prompts
+                .lock()
+                .expect("prompt lock")
+                .last()
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    impl ProviderPort for CompletingProvider {
+        fn stream(
+            &self,
+            request: ProviderRequest,
+            events: ProviderEventSink,
+        ) -> PortFuture<'_, ()> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Ok(mut prompts) = self.prompts.lock()
+                    && let Some(prompt) = request.system_prompt.as_ref()
+                {
+                    prompts.push(prompt.as_str().to_owned());
+                }
+                if !request.tools.is_empty() {
+                    // Persistable assistant text so later turn setups can
+                    // re-map the transcript entry written for this turn.
+                    events
+                        .send(ProviderEvent::TextDelta {
+                            text: lotta_runtime::boundary::ProviderEventText::new(
+                                "completing provider summary".into(),
+                            )?,
+                        })
+                        .await?;
+                }
+                self.waiting.add_permits(1);
+                events
+                    .send(ProviderEvent::Stop {
+                        reason: lotta_runtime::ports::StopReason::EndTurn,
+                    })
+                    .await
+            })
+        }
+    }
+
     fn service() -> ProductionRuntimeService {
         let root = std::env::temp_dir().join(format!("lotta-task54-{}", unique_test_id()));
         std::fs::create_dir_all(&root).unwrap();
@@ -2920,6 +3039,7 @@ mod production_tests {
             LocalStore::new(paths.clone()).approval_journal(),
             Arc::new(crate::production_setup::ProductionEditedInputValidator),
         ));
+        let settings = test_settings_bridge(paths.root(), paths.root());
         ProductionRuntimeService::new(
             paths,
             Arc::new(TestClock),
@@ -2929,16 +3049,27 @@ mod production_tests {
             ))),
             approvals,
             Arc::new(ProductionTurnBrokers::new()),
+            settings,
+        )
+    }
+
+    /// Builds a settings bridge over inert forwarding for fixture composition.
+    fn test_settings_bridge(storage: &Path, workspace: &Path) -> Arc<SettingsBridge> {
+        Arc::new(
+            SettingsBridge::new(Arc::new(|_, _| Ok(())), storage, workspace)
+                .expect("test settings bridge"),
         )
     }
 
     async fn production_controller_fixture(
         label: &str,
-        held: Arc<HeldProvider>,
+        provider_port: Arc<dyn ProviderPort>,
     ) -> (
         std::path::PathBuf,
         Arc<ProductionRuntimeService>,
         Arc<ProductionTurnController>,
+        Arc<SkillsBridge>,
+        Arc<SettingsBridge>,
     ) {
         use lotta_domain::{Agent, Conversation};
         use lotta_providers::connections::{
@@ -2948,7 +3079,7 @@ mod production_tests {
         let root = std::env::temp_dir().join(format!("lotta-cancel-{label}-{}", unique_test_id()));
         let workspace = root.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
-        for directory in ["artifacts", "skills", "bundled-skills"] {
+        for directory in ["artifacts", ".letta/skills", "bundled-skills"] {
             std::fs::create_dir_all(root.join(directory)).unwrap();
         }
         let root = root.canonicalize().unwrap();
@@ -3035,7 +3166,7 @@ mod production_tests {
                 NativeAdapterRegistry::default(),
                 Arc::new(UnusedConnectionFactory),
             )
-            .with_test_port(held),
+            .with_test_port(provider_port),
         );
         let tools = Arc::new(
             ProductionToolPort::new(
@@ -3066,6 +3197,12 @@ mod production_tests {
             ),
         });
         brokers.register_compaction_service(Some(compaction));
+        let skills = Arc::new(SkillsBridge::new(
+            Arc::new(|_, _| Ok(())),
+            &root,
+            Arc::new(TestClock),
+        ));
+        let settings = test_settings_bridge(&root, &workspace);
         let service = Arc::new(ProductionRuntimeService::new(
             paths,
             Arc::new(TestClock),
@@ -3073,6 +3210,7 @@ mod production_tests {
             Arc::clone(&state),
             Arc::clone(&approvals),
             Arc::clone(&brokers),
+            Arc::clone(&settings),
         ));
         let controller = Arc::new(ProductionTurnController::new(
             setup,
@@ -3086,8 +3224,10 @@ mod production_tests {
             approvals,
             Arc::new(crate::production_setup::UnavailableReflection),
             Arc::new(crate::production_setup::UnavailableMemoryPush),
+            Arc::clone(&skills),
+            Arc::clone(&settings),
         ));
-        (root, service, controller)
+        (root, service, controller, skills, settings)
     }
 
     mod production_compaction {
@@ -3097,8 +3237,8 @@ mod production_tests {
         async fn manual() {
             let label = "compaction-manual";
             let held = Arc::new(HeldProvider::default());
-            let (root, service, controller) =
-                production_controller_fixture(label, Arc::clone(&held)).await;
+            let (root, service, controller, ..) =
+                production_controller_fixture(label, held.clone() as Arc<dyn ProviderPort>).await;
             let scope = scope(label);
             let input = command(scope.clone(), "active-compaction");
             let admitted = service
@@ -3264,8 +3404,8 @@ mod production_tests {
         for repetition in 0..10 {
             let label = format!("three-aborts-{repetition}");
             let held = Arc::new(HeldProvider::default());
-            let (root, service, controller) =
-                production_controller_fixture(&label, Arc::clone(&held)).await;
+            let (root, service, controller, ..) =
+                production_controller_fixture(&label, held.clone() as Arc<dyn ProviderPort>).await;
             let scope = scope(&label);
             let observer = Arc::new(ProductionCancellationObserver::default());
             service.state.observe_cancellation(Arc::clone(&observer));
@@ -3817,5 +3957,170 @@ mod production_tests {
         let user = lotta_domain::LocalMessageRole::User;
         let assistant = lotta_domain::LocalMessageRole::Assistant;
         assert_ne!(user, assistant);
+    }
+
+    mod skills_and_cwd {
+        use super::*;
+
+        const TURN_TIMEOUT_SECS: u64 = 15;
+
+        async fn run_one_turn(
+            service: &Arc<ProductionRuntimeService>,
+            controller: &Arc<ProductionTurnController>,
+            provider: &Arc<CompletingProvider>,
+            scope: RuntimeScope,
+            message_id: &str,
+        ) {
+            let input = command(scope.clone(), message_id);
+            let admitted = service
+                .admit_input(input.clone())
+                .await
+                .expect("admit input");
+            let deferred = lotta_app_server::ws::DeferredInput {
+                scope,
+                disposition: admitted.disposition,
+                continuation: admitted.continuation,
+            };
+            let controller = Arc::clone(controller);
+            let turn = tokio::spawn(async move {
+                controller
+                    .submit_turn(
+                        input,
+                        deferred,
+                        CancellationToken::new(),
+                        Arc::new(Sink(Mutex::new(Vec::new()))),
+                    )
+                    .await
+            });
+            let timeout = std::time::Duration::from_secs(TURN_TIMEOUT_SECS);
+            // The completing provider signals its permit while streaming; the
+            // recorded prompt is captured before either observable, so a plain
+            // completion check covers both "reached the provider" and "finished".
+            let outcome = tokio::time::timeout(timeout, turn)
+                .await
+                .expect("turn completion")
+                .expect("join");
+            assert!(
+                provider.calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                "the turn must reach the provider: {outcome:?}"
+            );
+            outcome.expect("turn outcome");
+        }
+
+        fn last_prompt(provider: &Arc<CompletingProvider>) -> String {
+            provider.last_prompt()
+        }
+
+        #[tokio::test]
+        async fn enabled_skill_is_selected_next_turn_and_disable_removes_it() {
+            let provider = Arc::new(CompletingProvider::default());
+            let label = "skills-selection";
+            let (root, service, controller, skills, _settings) =
+                production_controller_fixture(label, provider.clone()).await;
+            // The same scope the fixture persisted agent/conversation for.
+            let scope = scope(label);
+            let global_skills = root.join(".letta").join("skills");
+            // The source lives inside the discovery root so Task 36's
+            // canonical confinement accepts the linked copy.
+            let source = global_skills.join("sources").join("demo-skill");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::write(
+                source.join("SKILL.md"),
+                // The explicit id keeps discovery's canonical visited-set
+                // dedup from renaming the skill to its physical source path.
+                "---\nid: demo-skill\nname: demo-skill\ndescription: Demo skill wiring marker.\n---\nBody.\n",
+            )
+            .unwrap();
+            skills.apply(
+                0,
+                &lotta_app_server::ws::skills::SkillsCommand::Enable(
+                    lotta_app_server::ws::skills::SkillEnableCommand {
+                        request_id: "en-1".to_owned(),
+                        skill_path: source.display().to_string(),
+                    },
+                ),
+            );
+            assert!(
+                global_skills.join("demo-skill").exists(),
+                "enable links into <storage>/.letta/skills"
+            );
+            let selected = skills
+                .selected_sources()
+                .lock()
+                .map(|selection| selection.ids())
+                .unwrap_or_default();
+            assert_eq!(selected, vec!["demo-skill".to_owned()]);
+
+            run_one_turn(&service, &controller, &provider, scope.clone(), "skill-on").await;
+            assert!(
+                last_prompt(&provider).contains("Demo skill wiring marker."),
+                "the enabled skill compiles into the next turn's prompt"
+            );
+
+            skills.apply(
+                0,
+                &lotta_app_server::ws::skills::SkillsCommand::Disable(
+                    lotta_app_server::ws::skills::SkillDisableCommand {
+                        request_id: "dis-1".to_owned(),
+                        name: "demo-skill".to_owned(),
+                    },
+                ),
+            );
+            assert!(!global_skills.join("demo-skill").exists());
+            run_one_turn(&service, &controller, &provider, scope, "skill-off").await;
+            assert!(
+                !last_prompt(&provider).contains("Demo skill wiring marker."),
+                "the disabled skill leaves the next turn's prompt"
+            );
+        }
+
+        #[tokio::test]
+        async fn device_state_cwd_change_applies_next_turn_and_reminds_once_when_missing() {
+            let provider = Arc::new(CompletingProvider::default());
+            let label = "device-cwd";
+            let (root, service, controller, _skills, settings) =
+                production_controller_fixture(label, provider.clone()).await;
+            // The same scope the fixture persisted agent/conversation for.
+            let scope = scope(label);
+            let gone = root.join("workspace").join("deleted-directory");
+            let gone_text = gone.display().to_string();
+
+            service
+                .change_device_state(ChangeDeviceStateCommand {
+                    runtime: scope.clone(),
+                    payload: lotta_app_server::ws::command::ChangeDeviceStatePayload {
+                        mode: None,
+                        cwd: Some(gone_text.clone()),
+                        agent_id: None,
+                        conversation_id: None,
+                    },
+                })
+                .await
+                .expect("device state accepted");
+            assert_eq!(
+                settings.cwd_override(
+                    Some(scope.agent_id.as_str()),
+                    scope.conversation_id.as_str()
+                ),
+                Some(gone_text.clone()),
+                "the change persists into the scoped cwd map"
+            );
+
+            run_one_turn(&service, &controller, &provider, scope.clone(), "cwd-1").await;
+            assert!(
+                last_prompt(&provider).contains(&gone_text),
+                "the missing changed cwd falls back with its one-time reminder"
+            );
+            // The bridge records the reminder once: the turn's setup claimed
+            // it, so no later turn re-records it without a fresh change.
+            assert_eq!(
+                settings.claim_missing_cwd_reminder(
+                    Some(scope.agent_id.as_str()),
+                    scope.conversation_id.as_str()
+                ),
+                None,
+                "the one-time reminder was consumed by the next turn"
+            );
+        }
     }
 }

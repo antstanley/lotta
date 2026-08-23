@@ -55,9 +55,10 @@ fn exists(fixture: &super::support::TestSettings, workspace_file: Option<Project
     }
 }
 
-/// The persisted per-agent reflection entry of one scoped document.
+/// The persisted per-agent reflection entry of one scoped document, keyed by
+/// the pinned camelCase container.
 fn agent_entry(document: &Value) -> &Value {
-    &document["reflection_settings_by_agent"][AGENT_ID]
+    &document["reflectionSettingsByAgent"][AGENT_ID]
 }
 
 #[test]
@@ -83,8 +84,16 @@ fn local_project_scope_writes_the_workspace_local_settings_path() {
     );
     let document = scoped_document(&fixture, Some(ProjectFile::LocalSettings));
     assert_eq!(agent_entry(&document)["trigger"], "step-count");
-    assert_eq!(agent_entry(&document)["step_count"], 25);
+    assert_eq!(agent_entry(&document)["stepCount"], 25);
     assert_eq!(agent_entry(&document)["merge"], "explicit");
+    // The pinned flat companions ride along in the same document.
+    assert_eq!(document["reflectionTrigger"], "step-count");
+    assert_eq!(document["reflectionStepCount"], 25);
+    assert_eq!(document["reflectionMerge"], "explicit");
+    assert_eq!(
+        document["reflectionMergeInstructions"],
+        "Preserve exact wording."
+    );
     assert_eq!(
         scoped_document(&fixture, None),
         json!(null),
@@ -113,8 +122,12 @@ fn global_scope_writes_the_global_settings_path() {
     let document = scoped_document(&fixture, None);
     assert_eq!(agent_entry(&document)["trigger"], "step-count");
     assert_eq!(
-        agent_entry(&document)["merge_instructions"],
+        agent_entry(&document)["mergeInstructions"],
         "Preserve exact wording."
+    );
+    assert_eq!(
+        document["reflectionMergeInstructions"], "Preserve exact wording.",
+        "the global document carries the flat companion too"
     );
     assert!(
         !exists(&fixture, Some(ProjectFile::LocalSettings)),
@@ -136,7 +149,7 @@ fn both_scope_writes_both_scoped_paths() {
         "workspace-local copy persisted"
     );
     assert_eq!(
-        agent_entry(&global)["step_count"],
+        agent_entry(&global)["stepCount"],
         25,
         "global copy persisted"
     );

@@ -79,8 +79,17 @@ const CONVERSATION_KEY_PREFIX: &str = "conversation:";
 const AGENT_DEFAULT_KEY_SUFFIX: &str = "::conversation:default";
 /// Placeholder agent segment used when no agent is attributed.
 const UNATTRIBUTED_AGENT: &str = "__unknown__";
-/// Persisted per-agent reflection entry map inside both scoped documents.
-const REFLECTION_ENTRIES_KEY: &str = "reflection_settings_by_agent";
+/// Persisted per-agent reflection entry map inside both scoped documents,
+/// using the pinned camelCase vocabulary (`settings-manager.ts`).
+const REFLECTION_ENTRIES_KEY: &str = "reflectionSettingsByAgent";
+/// Pinned flat reflection companions written alongside the per-agent entry.
+const REFLECTION_TRIGGER_KEY: &str = "reflectionTrigger";
+/// Pinned flat reflection companions written alongside the per-agent entry.
+const REFLECTION_STEP_COUNT_KEY: &str = "reflectionStepCount";
+/// Pinned flat reflection companions written alongside the per-agent entry.
+const REFLECTION_MERGE_KEY: &str = "reflectionMerge";
+/// Pinned flat reflection companions written alongside the per-agent entry.
+const REFLECTION_MERGE_INSTRUCTIONS_KEY: &str = "reflectionMergeInstructions";
 /// Persisted experiment override map inside the global document.
 const EXPERIMENTS_KEY: &str = "experiments";
 /// Persisted per-scope cwd override map inside the global document.
@@ -759,6 +768,14 @@ impl SettingsBridge {
         classify_cwd(Path::new(&requested), &boot)
     }
 
+    /// Returns the recorded scoped cwd override, if a device-state change
+    /// stored one for this scope.
+    #[must_use]
+    pub fn cwd_override(&self, agent_id: Option<&str>, conversation_id: &str) -> Option<String> {
+        let key = scope_key(agent_id, Some(conversation_id));
+        self.lock().cwd_map.get(&key).cloned()
+    }
+
     /// Claims a recorded missing-directory reminder once for this scope.
     ///
     /// Mirrors Task 54's durable one-use claim: the first call returns the
@@ -775,7 +792,9 @@ impl SettingsBridge {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, SettingsState> {
-        self.state.lock().expect("settings state lock")
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Persists one cwd-map entry into the global side-store document.
@@ -890,13 +909,13 @@ fn apply_persisted_reflection(
     if let Ok(trigger) = serde_json::from_value::<ReflectionTriggerMode>(entry["trigger"].clone()) {
         resolved.trigger = trigger;
     }
-    if let Some(step_count) = entry["step_count"].as_u64().filter(|count| *count > 0) {
+    if let Some(step_count) = entry["stepCount"].as_u64().filter(|count| *count > 0) {
         resolved.step_count = step_count;
     }
     if let Ok(merge) = serde_json::from_value::<ReflectionMergeMode>(entry["merge"].clone()) {
         resolved.merge = merge;
     }
-    if let Some(instructions) = entry["merge_instructions"].as_str() {
+    if let Some(instructions) = entry["mergeInstructions"].as_str() {
         instructions.clone_into(&mut resolved.merge_instructions);
     }
 }
@@ -987,9 +1006,9 @@ fn persist_reflection(
 ) -> Result<(), String> {
     let stored = serde_json::json!({
         "trigger": entry.trigger,
-        "step_count": entry.step_count,
+        "stepCount": entry.step_count,
         "merge": entry.merge,
-        "merge_instructions": entry.merge_instructions,
+        "mergeInstructions": entry.merge_instructions,
     });
     let mut failure = None;
     if matches!(scope, ReflectionScope::LocalProject | ReflectionScope::Both) {
@@ -997,7 +1016,7 @@ fn persist_reflection(
             read_local_document(paths, working_directory),
             |document| write_local_document(paths, working_directory, document),
             agent_id,
-            stored.clone(),
+            &stored,
         );
         if let Err(message) = outcome {
             failure = Some(message.unwrap_or_else(|| LOCAL_FAILURE.to_owned()));
@@ -1008,7 +1027,7 @@ fn persist_reflection(
             read_global_document(paths),
             |document| write_global_document(paths, document),
             agent_id,
-            stored,
+            &stored,
         );
         if let Err(message) = outcome {
             failure = Some(message.unwrap_or_else(|| GLOBAL_FAILURE.to_owned()));
@@ -1018,14 +1037,22 @@ fn persist_reflection(
 }
 
 /// Read-modify-writes one agent reflection entry into one scoped document.
+///
+/// Like the pinned `persistReflectionSettingsForAgent`, the same document also
+/// receives the flat `reflection*` companions so readers without the per-agent
+/// map observe the latest written values.
 fn upsert_agent_entry(
     read: Result<serde_json::Value, Option<String>>,
     write: impl FnOnce(&serde_json::Value) -> Result<(), Option<String>>,
     agent_id: &str,
-    entry: serde_json::Value,
+    entry: &serde_json::Value,
 ) -> Result<(), Option<String>> {
     let mut document = read?;
-    document[REFLECTION_ENTRIES_KEY][agent_id] = entry;
+    document[REFLECTION_ENTRIES_KEY][agent_id] = entry.clone();
+    document[REFLECTION_TRIGGER_KEY] = entry["trigger"].clone();
+    document[REFLECTION_STEP_COUNT_KEY] = entry["stepCount"].clone();
+    document[REFLECTION_MERGE_KEY] = entry["merge"].clone();
+    document[REFLECTION_MERGE_INSTRUCTIONS_KEY] = entry["mergeInstructions"].clone();
     write(&document)
 }
 

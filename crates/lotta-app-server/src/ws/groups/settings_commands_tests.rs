@@ -6,8 +6,7 @@ use serde_json::{Value, json};
 
 use super::support::{bridge, discriminant_of, runtime};
 use super::{
-    GetCwdMapCommand, GetExperimentsCommand, GetReflectionSettingsCommand, SetExperimentCommand,
-    SettingsCommand,
+    GetExperimentsCommand, GetReflectionSettingsCommand, SetExperimentCommand, SettingsCommand,
 };
 
 /// Fixture agent identifier.
@@ -211,7 +210,4 @@ fn unknown_frames_are_not_routed_by_this_group() {
         fixture.is_empty(),
         "nothing is emitted for foreign commands"
     );
-    let _ = GetCwdMapCommand {
-        request_id: "unused".to_owned(),
-    };
 }

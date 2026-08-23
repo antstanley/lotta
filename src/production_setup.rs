@@ -2645,6 +2645,8 @@ pub struct ProductionTurnController {
     approvals: Arc<lotta_runtime::ApprovalManager>,
     reflection: Arc<dyn ReflectionJob>,
     memory_push: Arc<dyn MemoryPushJob>,
+    skills: Arc<lotta_app_server::ws::skills::SkillsBridge>,
+    settings: Arc<lotta_app_server::ws::settings::SettingsBridge>,
     #[cfg(test)]
     cancellation_stage_observer:
         Mutex<Option<crate::production_components::CancellationStageObserver>>,
@@ -2669,6 +2671,8 @@ impl ProductionTurnController {
         approvals: Arc<lotta_runtime::ApprovalManager>,
         reflection: Arc<dyn ReflectionJob>,
         memory_push: Arc<dyn MemoryPushJob>,
+        skills: Arc<lotta_app_server::ws::skills::SkillsBridge>,
+        settings: Arc<lotta_app_server::ws::settings::SettingsBridge>,
     ) -> Self {
         Self {
             setup,
@@ -2683,6 +2687,8 @@ impl ProductionTurnController {
             approvals,
             reflection,
             memory_push,
+            skills,
+            settings,
             #[cfg(test)]
             cancellation_stage_observer: Mutex::new(None),
         }
@@ -2740,6 +2746,45 @@ impl ProductionTurnController {
         }
     }
 
+    /// Resolves the requested cwd for one upcoming turn.
+    ///
+    /// A scoped device-state cwd override wins: an existing directory serves
+    /// as requested while a missing one is handed to setup unresolved so its
+    /// durable deleted-cwd reminder machinery fires (once) against the boot
+    /// fallback. Without an override the conversation's persisted directory,
+    /// then the boot fallback, apply.
+    fn scoped_cwd(
+        &self,
+        scope: &lotta_domain::RuntimeScope,
+        conversation: &Conversation,
+    ) -> PathBuf {
+        let agent = Some(scope.agent_id.as_str());
+        let conversation_id = scope.conversation_id.as_str();
+        let has_override = self.settings.cwd_override(agent, conversation_id).is_some();
+        if !has_override {
+            return persisted_cwd(conversation).unwrap_or_else(|| self.fallback_cwd.clone());
+        }
+        match self.settings.cwd_for_next_turn(agent, conversation_id) {
+            lotta_runtime::turn::CwdResolution::Requested(path) => path,
+            lotta_runtime::turn::CwdResolution::DeletedFallback { original, .. } => {
+                let _claimed = self
+                    .settings
+                    .claim_missing_cwd_reminder(agent, conversation_id);
+                original
+            }
+        }
+    }
+
+    /// Returns the runtime-selected skill sources shared with the skills
+    /// bridge, in selection order.
+    fn selected_skill_ids(&self) -> Vec<String> {
+        self.skills
+            .selected_sources()
+            .lock()
+            .map(|selection| selection.ids())
+            .unwrap_or_default()
+    }
+
     async fn prepare_turn(
         &self,
         command: &lotta_app_server::ws::command::InputCommand,
@@ -2772,10 +2817,10 @@ impl ProductionTurnController {
         let input = SetupInput {
             agent_id: command.runtime.agent_id.clone(),
             conversation_id: command.runtime.conversation_id.clone(),
-            cwd: persisted_cwd(&conversation).unwrap_or_else(|| self.fallback_cwd.clone()),
+            cwd: self.scoped_cwd(&command.runtime, &conversation),
             fallback_cwd: self.fallback_cwd.clone(),
             user_input: text,
-            selected_skills: Vec::new(),
+            selected_skills: self.selected_skill_ids(),
             permission_mode: configured_permission_mode(&agent),
             cancellation,
             deadline: std::time::Duration::from_secs(SETUP_DEADLINE_SECONDS),

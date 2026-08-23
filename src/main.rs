@@ -9,7 +9,9 @@
 use std::{io::Write, sync::Arc};
 
 use lotta_app_server::{
-    config::parse_cli, listener::start_listener_with_runtime_service_and_controller,
+    config::parse_cli,
+    listener::start_listener_with_runtime_service_controller_observer_and_bridges,
+    observer::InertRuntimeBroadcastObserver,
 };
 use lotta_domain::{Clock, DomainError, Timestamp};
 use production_components::ProductionComponents;
@@ -54,12 +56,16 @@ async fn run_server(arguments: Vec<String>) -> Result<(), cli::CliError> {
     let args = parse_cli(arguments)?;
     let prepared = args.prepare()?;
     let clock: Arc<dyn Clock + Send + Sync> = Arc::new(SystemClock);
+    // The skills/settings bridges are composed inside ProductionComponents and
+    // shared with the listener, so group mutations apply to subsequent turns.
     let components = ProductionComponents::from_server(&prepared, Arc::clone(&clock))?;
-    let mut handle = start_listener_with_runtime_service_and_controller(
+    let mut handle = start_listener_with_runtime_service_controller_observer_and_bridges(
         prepared,
         clock,
         components.runtime_service(),
         components.turn_controller(),
+        Arc::new(InertRuntimeBroadcastObserver),
+        components.shared_bridges(),
     )
     .await?;
     println!("Base URL: {}", handle.base_url());

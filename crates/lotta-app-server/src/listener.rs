@@ -238,6 +238,7 @@ async fn start_listener_with_runtime_service_controller_and_observer(
         runtime_service,
         turn_controller,
         observer,
+        None,
     )
     .await
 }
@@ -260,6 +261,93 @@ async fn start_listener_for_test(
         Arc::new(UnsupportedRuntimeCommandService),
         Arc::new(UnsupportedRuntimeCommandService),
         Arc::new(crate::observer::InertRuntimeBroadcastObserver),
+        None,
+    )
+    .await
+}
+
+/// Command-group bridges composed once by the host process and shared with
+/// the listener state.
+///
+/// Holding the exact [`SkillsBridge`] and [`SettingsBridge`] instances the
+/// listener serves means skills enable/disable and cwd changes recorded over
+/// the WebSocket are visible to the turn controller and runtime service that
+/// prepare subsequent turns.
+#[derive(Clone)]
+pub struct SharedGroupBridges {
+    outbound: Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
+    skills: Arc<SkillsBridge>,
+    settings: Arc<SettingsBridge>,
+}
+
+impl SharedGroupBridges {
+    /// Composes the shared outbound sink plus the skills and settings bridges
+    /// over one canonical storage root and its authorized workspace root.
+    ///
+    /// # Errors
+    /// Returns a stable listener error when the settings store root is invalid.
+    pub fn new(
+        storage_dir: &std::path::Path,
+        workspace_dir: &std::path::Path,
+        clock: Arc<dyn Clock + Send + Sync>,
+    ) -> Result<Self, AppServerError> {
+        let outbound: Arc<
+            std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let skills = Arc::new(SkillsBridge::new(
+            skills_forwarder(&outbound),
+            storage_dir,
+            clock,
+        ));
+        let settings = Arc::new(SettingsBridge::new(
+            settings_forwarder(&outbound),
+            storage_dir,
+            workspace_dir,
+        )?);
+        Ok(Self {
+            outbound,
+            skills,
+            settings,
+        })
+    }
+
+    /// The shared skills bridge backing `skill_enable`/`skill_disable`.
+    #[must_use]
+    pub fn skills(&self) -> Arc<SkillsBridge> {
+        Arc::clone(&self.skills)
+    }
+
+    /// The shared settings bridge backing cwd-map persistence.
+    #[must_use]
+    pub fn settings(&self) -> Arc<SettingsBridge> {
+        Arc::clone(&self.settings)
+    }
+}
+
+/// Binds a listener over host-composed skills/settings bridges.
+///
+/// The bridges (and their shared outbound sink) are the exact instances the
+/// composition root handed to its controllers, so WebSocket group mutations
+/// apply to subsequent turns.
+///
+/// # Errors
+/// Returns a stable listener error when bind or bridge storage roots fail.
+pub async fn start_listener_with_runtime_service_controller_observer_and_bridges(
+    prepared: PreparedServer,
+    clock: Arc<dyn Clock + Send + Sync>,
+    runtime_service: Arc<dyn RuntimeCommandService>,
+    turn_controller: Arc<dyn TurnController>,
+    observer: Arc<dyn crate::observer::RuntimeBroadcastObserver>,
+    shared: SharedGroupBridges,
+) -> Result<ListenerHandle, AppServerError> {
+    start_listener_with_limits(
+        prepared,
+        clock,
+        SocketLimits::default(),
+        runtime_service,
+        turn_controller,
+        observer,
+        Some(shared),
     )
     .await
 }
@@ -271,6 +359,7 @@ async fn start_listener_with_limits(
     runtime_service: Arc<dyn RuntimeCommandService>,
     turn_controller: Arc<dyn TurnController>,
     observer: Arc<dyn crate::observer::RuntimeBroadcastObserver>,
+    shared: Option<SharedGroupBridges>,
 ) -> Result<ListenerHandle, AppServerError> {
     if !is_loopback_host(&prepared.host) && prepared.auth.is_none() {
         return Err(AppServerError::Config(
@@ -287,8 +376,24 @@ async fn start_listener_with_limits(
     tracing::info!(base_url, websocket_url, "app server listener started");
     let shutdown = CancellationToken::new();
     let runtime_router = RuntimeRouter::new(clock.clone(), Arc::new(RandomEventIdGenerator));
-    let outbound: Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>> =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let (outbound, skills, settings) = if let Some(shared) = shared {
+        (shared.outbound, shared.skills, shared.settings)
+    } else {
+        let outbound: Arc<
+            std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let skills = Arc::new(SkillsBridge::new(
+            skills_forwarder(&outbound),
+            &prepared.storage_dir,
+            Arc::clone(&clock),
+        ));
+        let settings = Arc::new(SettingsBridge::new(
+            settings_forwarder(&outbound),
+            &prepared.storage_dir,
+            &prepared.workspace_dir,
+        )?);
+        (outbound, skills, settings)
+    };
     // The artifacts root backs Task 37 tool artifact operations; the files
     // group creates it on first bind next to the canonical storage root.
     let artifacts_dir = prepared.storage_dir.join("artifacts");
@@ -329,16 +434,8 @@ async fn start_listener_with_limits(
             &prepared.storage_dir,
             Arc::clone(&clock),
         )?),
-        skills: Arc::new(SkillsBridge::new(
-            skills_forwarder(&outbound),
-            &prepared.storage_dir,
-            Arc::clone(&clock),
-        )),
-        settings: Arc::new(SettingsBridge::new(
-            settings_forwarder(&outbound),
-            &prepared.storage_dir,
-            &prepared.workspace_dir,
-        )?),
+        skills,
+        settings,
         next_observation: AtomicU64::new(1),
         outbound,
     });
