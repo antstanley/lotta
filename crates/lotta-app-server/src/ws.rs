@@ -1,5 +1,9 @@
 //! Typed, bounded Runtime WebSocket commands, events, and routing.
 
+/// Agent management command group bridging wire frames to Tasks 23, 28, 29,
+/// 30, and 54.
+#[path = "ws/groups/agents.rs"]
+pub mod agents;
 /// Runtime command wire models and decoding.
 pub mod command;
 /// Connection subscriptions and per-connection sequencing.

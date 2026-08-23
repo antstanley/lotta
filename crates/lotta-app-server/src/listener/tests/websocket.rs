@@ -219,6 +219,14 @@ fn typed_failure_state(
             )
             .expect("memory bridge"),
         ),
+        agents: Arc::new(
+            crate::ws::agents::AgentsBridge::new(
+                crate::ws::agents::inert_forwarder(),
+                &prepared.storage_dir,
+                clock(),
+            )
+            .expect("agents bridge"),
+        ),
         models: Arc::new(
             crate::ws::models::ModelsBridge::new(
                 crate::ws::models::inert_forwarder(),

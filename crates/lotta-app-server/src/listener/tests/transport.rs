@@ -70,6 +70,14 @@ fn router() -> axum::Router {
             )
             .expect("memory bridge"),
         ),
+        agents: Arc::new(
+            crate::ws::agents::AgentsBridge::new(
+                crate::ws::agents::inert_forwarder(),
+                &files_workspace("transport-agents"),
+                Arc::new(TestClock),
+            )
+            .expect("agents bridge"),
+        ),
         models: Arc::new(
             crate::ws::models::ModelsBridge::new(
                 crate::ws::models::inert_forwarder(),

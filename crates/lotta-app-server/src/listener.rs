@@ -36,6 +36,7 @@ use crate::{
         EventDeliveryBatch, RandomEventIdGenerator, RouterEventSink, RuntimeCommandService,
         RuntimeRouter, ServiceBackedTurnController, TurnController,
         UnsupportedRuntimeCommandService,
+        agents::{AgentsBridge, decode as decode_agents},
         external_tools::{
             ExternalForwarder, ExternalToolBridge, ExternalToolsCommand, ExternalToolsMessage,
             ToolsUpdateResponseMessage, decode as decode_external_tools,
@@ -95,6 +96,7 @@ struct ListenerState {
     runtime_service: Arc<dyn RuntimeCommandService>,
     turn_controller: Arc<dyn TurnController>,
     observer: Arc<dyn crate::observer::RuntimeBroadcastObserver>,
+    agents: Arc<AgentsBridge>,
     external_tools: Arc<ExternalToolBridge>,
     teleports: Arc<TeleportBridge>,
     terminals: Arc<TerminalBridge>,
@@ -407,6 +409,11 @@ async fn start_listener_with_limits(
         &prepared.storage_dir,
         clock.clone(),
     )?);
+    let agents = Arc::new(AgentsBridge::new(
+        agents_forwarder(&outbound),
+        &prepared.storage_dir,
+        Arc::clone(&clock),
+    )?);
     let state = Arc::new(ListenerState {
         auth: prepared.auth,
         clock: Arc::clone(&clock),
@@ -424,6 +431,7 @@ async fn start_listener_with_limits(
         )),
         files,
         memories,
+        agents,
         models: Arc::new(ModelsBridge::new(
             models_forwarder(&outbound),
             &prepared.storage_dir,
@@ -834,6 +842,13 @@ fn settings_forwarder(
     Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
 }
 
+fn agents_forwarder(
+    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
+) -> crate::ws::agents::AgentsForwarder {
+    let outbound = Arc::clone(outbound);
+    Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
+}
+
 /// Decodes and routes the external-tool command group for one frame.
 fn handle_external_frame(
     state: &Arc<ListenerState>,
@@ -969,9 +984,27 @@ fn handle_settings_frame(
 ) -> bool {
     match decode_settings(frame) {
         Err(error) => dispatch_value(state, connection_id, &error).is_ok(),
-        Ok(None) => true,
+        Ok(None) => handle_agents_frame(state, connection_id, frame),
         Ok(Some(command)) => {
             state.settings.handle(connection_id, &command);
+            true
+        }
+    }
+}
+
+/// Decodes and routes the agent management command group for one frame.
+/// Handlers run in detached tasks; the agents bridge owns no per-connection
+/// resources, so connection cleanup needs no agents step.
+fn handle_agents_frame(
+    state: &Arc<ListenerState>,
+    connection_id: crate::ws::ConnectionId,
+    frame: &crate::framing::DecodedFrame,
+) -> bool {
+    match decode_agents(frame) {
+        Err(error) => dispatch_value(state, connection_id, &error).is_ok(),
+        Ok(None) => true,
+        Ok(Some(command)) => {
+            state.agents.handle(connection_id, &command);
             true
         }
     }
