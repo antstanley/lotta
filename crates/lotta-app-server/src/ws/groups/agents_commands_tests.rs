@@ -4,7 +4,7 @@
 
 use serde_json::{Value, json};
 
-use super::support::{bridge, discriminant_of};
+use super::support::{TestAgents, bridge, discriminant_of};
 
 /// Extracts a `&str` field from the latest forwarded frame.
 fn text_field(frame: &Value, field: &str) -> String {
@@ -394,35 +394,50 @@ async fn compaction_settings_persist_through_creation() {
     assert_eq!(fixture.last()["agent"]["compaction_settings"], json!(null));
 }
 
+/// Sends an `agent_update` whose body carries one compaction record.
+async fn update_compaction(
+    fixture: &TestAgents,
+    request_id: &str,
+    agent_id: &str,
+    settings: Value,
+) {
+    fixture
+        .send(&json!({
+            "type": "agent_update",
+            "request_id": request_id,
+            "agent_id": agent_id,
+            "body": {"compaction_settings": settings},
+        }))
+        .await;
+}
+
+/// Sends an `agent_create` whose body carries one compaction record.
+async fn create_compaction(fixture: &TestAgents, request_id: &str, name: &str, settings: Value) {
+    fixture
+        .send(&json!({
+            "type": "agent_create",
+            "request_id": request_id,
+            "body": {
+                "name": name,
+                "compaction_settings": settings,
+            },
+        }))
+        .await;
+}
+
 #[tokio::test]
 async fn compaction_settings_follow_pinned_storage_coercion() {
     let fixture = bridge();
     let created = fixture.create_agent("Replaced Record").await;
     // Update replaces when the record carries a local key.
-    fixture
-        .send(&json!({
-            "type": "agent_update",
-            "request_id": "cmp-2",
-            "agent_id": created,
-            "body": {"compaction_settings": {"mode": "all"}},
-        }))
-        .await;
+    update_compaction(&fixture, "cmp-2", &created, json!({"mode": "all"})).await;
     assert_eq!(
         fixture.last()["agent"]["compaction_settings"],
         json!({"mode": "all"})
     );
 
     // A record without a local key reads as absent at creation...
-    fixture
-        .send(&json!({
-            "type": "agent_create",
-            "request_id": "cmp-5",
-            "body": {
-                "name": "Cleared Twice",
-                "compaction_settings": {},
-            },
-        }))
-        .await;
+    create_compaction(&fixture, "cmp-5", "Cleared Twice", json!({})).await;
     let second = fixture.last()["agent"]["id"]
         .as_str()
         .expect("second id")
@@ -433,28 +448,14 @@ async fn compaction_settings_follow_pinned_storage_coercion() {
     );
 
     // ...and leaves the stored value untouched on update.
-    fixture
-        .send(&json!({
-            "type": "agent_update",
-            "request_id": "cmp-6",
-            "agent_id": second,
-            "body": {"compaction_settings": {"unrelated": true}},
-        }))
-        .await;
+    update_compaction(&fixture, "cmp-6", &second, json!({"unrelated": true})).await;
     assert!(
         fixture.last()["agent"].get("compaction_settings").is_none(),
         "a record without local keys does not replace on update"
     );
 
     // A non-object value is treated as undefined, not a rejection.
-    fixture
-        .send(&json!({
-            "type": "agent_update",
-            "request_id": "cmp-7",
-            "agent_id": second,
-            "body": {"compaction_settings": "sliding_window"},
-        }))
-        .await;
+    update_compaction(&fixture, "cmp-7", &second, json!("sliding_window")).await;
     assert_eq!(fixture.last()["success"], true);
     assert!(
         fixture.last()["agent"].get("compaction_settings").is_none(),
@@ -462,28 +463,18 @@ async fn compaction_settings_follow_pinned_storage_coercion() {
     );
 
     // An explicit null clears the stored settings.
-    fixture
-        .send(&json!({
-            "type": "agent_update",
-            "request_id": "cmp-8",
-            "agent_id": second,
-            "body": {"compaction_settings": null},
-        }))
-        .await;
+    update_compaction(&fixture, "cmp-8", &second, json!(null)).await;
     assert_eq!(fixture.last()["agent"]["compaction_settings"], json!(null));
 
     // A record carrying a local key persists completely, extra fields
     // included.
-    fixture
-        .send(&json!({
-            "type": "agent_create",
-            "request_id": "cmp-9",
-            "body": {
-                "name": "Complete Record",
-                "compaction_settings": {"mode": "sliding_window", "prompt": null},
-            },
-        }))
-        .await;
+    create_compaction(
+        &fixture,
+        "cmp-9",
+        "Complete Record",
+        json!({"mode": "sliding_window", "prompt": null}),
+    )
+    .await;
     assert_eq!(
         fixture.last()["agent"]["compaction_settings"],
         json!({"mode": "sliding_window", "prompt": null}),

@@ -1175,7 +1175,8 @@ fn validate_compaction_record(
 
 /// Renders one JSON value exactly like the baseline's JavaScript
 /// `String(value)` for the shapes JSON can carry: strings verbatim, arrays
-/// as their elements joined with `,` (each coerced in turn), objects as
+/// as their elements joined with `,` (each coerced in turn, where null
+/// elements render empty per JavaScript element-wise `ToString`), objects as
 /// `[object Object]`, and null, booleans, and numbers per JavaScript rules.
 fn javascript_string(value: &Value) -> String {
     match value {
@@ -1185,7 +1186,13 @@ fn javascript_string(value: &Value) -> String {
         Value::String(text) => text.clone(),
         Value::Array(items) => items
             .iter()
-            .map(javascript_string)
+            .map(|item| {
+                if item.is_null() {
+                    String::new()
+                } else {
+                    javascript_string(item)
+                }
+            })
             .collect::<Vec<_>>()
             .join(","),
         Value::Object(_) => "[object Object]".to_owned(),

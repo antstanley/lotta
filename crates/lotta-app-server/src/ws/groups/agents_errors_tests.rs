@@ -300,6 +300,6 @@ async fn compaction_unknown_mode_renders_arrays_like_the_baseline_coercion() {
     assert_eq!(
         fixture.last()["error"],
         "Local backend compaction currently supports only modes \"all\" and \
-         \"sliding_window\" (received \"all,42,null\")."
+         \"sliding_window\" (received \"all,42,\")."
     );
 }
