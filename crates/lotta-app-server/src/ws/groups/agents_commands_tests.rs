@@ -395,7 +395,7 @@ async fn compaction_settings_persist_through_creation() {
 }
 
 #[tokio::test]
-async fn compaction_settings_update_replaces_but_keeps_local_keyless_records() {
+async fn compaction_settings_follow_pinned_storage_coercion() {
     let fixture = bridge();
     let created = fixture.create_agent("Replaced Record").await;
     // Update replaces when the record carries a local key.
@@ -412,7 +412,7 @@ async fn compaction_settings_update_replaces_but_keeps_local_keyless_records() {
         json!({"mode": "all"})
     );
 
-    // A record without a local key persists verbatim at creation...
+    // A record without a local key reads as absent at creation...
     fixture
         .send(&json!({
             "type": "agent_create",
@@ -427,10 +427,9 @@ async fn compaction_settings_update_replaces_but_keeps_local_keyless_records() {
         .as_str()
         .expect("second id")
         .to_owned();
-    assert_eq!(
-        fixture.last()["agent"]["compaction_settings"],
-        json!({}),
-        "an empty record persists verbatim at creation"
+    assert!(
+        fixture.last()["agent"].get("compaction_settings").is_none(),
+        "a record without local keys does not persist at creation"
     );
 
     // ...and leaves the stored value untouched on update.
@@ -442,9 +441,52 @@ async fn compaction_settings_update_replaces_but_keeps_local_keyless_records() {
             "body": {"compaction_settings": {"unrelated": true}},
         }))
         .await;
+    assert!(
+        fixture.last()["agent"].get("compaction_settings").is_none(),
+        "a record without local keys does not replace on update"
+    );
+
+    // A non-object value is treated as undefined, not a rejection.
+    fixture
+        .send(&json!({
+            "type": "agent_update",
+            "request_id": "cmp-7",
+            "agent_id": second,
+            "body": {"compaction_settings": "sliding_window"},
+        }))
+        .await;
+    assert_eq!(fixture.last()["success"], true);
+    assert!(
+        fixture.last()["agent"].get("compaction_settings").is_none(),
+        "a non-object compaction value is ignored"
+    );
+
+    // An explicit null clears the stored settings.
+    fixture
+        .send(&json!({
+            "type": "agent_update",
+            "request_id": "cmp-8",
+            "agent_id": second,
+            "body": {"compaction_settings": null},
+        }))
+        .await;
+    assert_eq!(fixture.last()["agent"]["compaction_settings"], json!(null));
+
+    // A record carrying a local key persists completely, extra fields
+    // included.
+    fixture
+        .send(&json!({
+            "type": "agent_create",
+            "request_id": "cmp-9",
+            "body": {
+                "name": "Complete Record",
+                "compaction_settings": {"mode": "sliding_window", "prompt": null},
+            },
+        }))
+        .await;
     assert_eq!(
         fixture.last()["agent"]["compaction_settings"],
-        json!({}),
-        "a record without local keys does not replace on update"
+        json!({"mode": "sliding_window", "prompt": null}),
+        "the complete sent object persists when a local key is present"
     );
 }

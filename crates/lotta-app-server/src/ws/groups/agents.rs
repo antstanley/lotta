@@ -177,6 +177,28 @@ where
         .map_err(serde::de::Error::custom)
 }
 
+/// Decodes one sent tri-state compaction key with the pinned local-backend
+/// coercion: an explicit JSON null stays distinct from absence, a JSON
+/// object carries the record, and every other value is treated as
+/// undefined (the key reads as absent instead of rejecting the command).
+fn explicit_compaction_field<'de, D>(
+    deserializer: D,
+) -> Result<Option<ExplicitField<BoundedMap<{ UNBOUNDED_MAP_FIELDS_MAX }>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let sent = Value::deserialize(deserializer)?;
+    if sent.is_null() {
+        return Ok(Some(ExplicitField::Null));
+    }
+    if !sent.is_object() {
+        return Ok(None);
+    }
+    BoundedMap::<{ UNBOUNDED_MAP_FIELDS_MAX }>::deserialize(sent)
+        .map(|value| Some(ExplicitField::Value(value)))
+        .map_err(serde::de::Error::custom)
+}
+
 /// Filter set of the pinned `agent_list` payload.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct AgentListQuery {
@@ -255,10 +277,11 @@ pub struct AgentCreateBody {
     )]
     pub hidden: Option<ExplicitField<bool>>,
     /// Optional compaction settings record with explicit-null preservation,
-    /// validated against the pinned local modes before persistence.
+    /// non-object values read as absent, and records validated against the
+    /// pinned local modes before persistence.
     #[serde(
         default,
-        deserialize_with = "explicit_field",
+        deserialize_with = "explicit_compaction_field",
         skip_serializing_if = "Option::is_none"
     )]
     pub compaction_settings: Option<ExplicitField<BoundedMap<{ UNBOUNDED_MAP_FIELDS_MAX }>>>,
@@ -308,11 +331,12 @@ pub struct AgentUpdateBody {
         skip_serializing_if = "Option::is_none"
     )]
     pub hidden: Option<ExplicitField<bool>>,
-    /// Replacement compaction settings; explicit null clears them and a
-    /// record replaces the stored value once it validates.
+    /// Replacement compaction settings; explicit null clears them, a
+    /// non-object value reads as absent, and a record replaces the stored
+    /// value once it validates.
     #[serde(
         default,
-        deserialize_with = "explicit_field",
+        deserialize_with = "explicit_compaction_field",
         skip_serializing_if = "Option::is_none"
     )]
     pub compaction_settings: Option<ExplicitField<BoundedMap<{ UNBOUNDED_MAP_FIELDS_MAX }>>>,
@@ -998,12 +1022,16 @@ fn build_new_agent(body: &AgentCreateBody) -> Result<Agent, String> {
         Some(settings) => settings.clone(),
         None => BoundedMap::new(BTreeMap::new()).map_err(|_| CREATE_FAILURE)?,
     };
-    // Creation persists any validated record verbatim; absent and explicit
-    // null stay distinct (pinned local-backend create semantics).
+    // Creation mirrors the pinned local-backend create semantics: only a
+    // record carrying at least one local key persists (verbatim), a
+    // local-keyless record reads as absent, and an explicit null stays
+    // distinct from absence.
     let compaction_settings = match &body.compaction_settings {
         Some(ExplicitField::Null) => Some(None),
-        Some(ExplicitField::Value(record)) => Some(Some(record.clone())),
-        None => None,
+        Some(ExplicitField::Value(record)) if has_local_compaction(record) => {
+            Some(Some(record.clone()))
+        }
+        Some(ExplicitField::Value(_)) | None => None,
     };
     Ok(Agent {
         id,
