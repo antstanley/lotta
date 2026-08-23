@@ -14,23 +14,31 @@
 //! repository is created, and the default conversation prompt is compiled and
 //! persisted through the Task 54 prompt cache. The handler awaits every step,
 //! so a client that observed the success response would always find all four
-//! artifacts already in place.
+//! artifacts already in place. Deletion removes them again — including the
+//! prompt-only default-conversation cache directory, which carries no
+//! conversation record and therefore needs explicit removal.
+//!
+//! The `create_agent` shortcut mirrors the pinned command end to end:
+//! requested models resolve against the embedded canonical catalog
+//! (`agents_presets`) before any side effect runs and unknown identifiers
+//! reject with the pinned detail, preset agents receive the canonical system
+//! prompt, memory-block assets, descriptions, and origin/personality tags,
+//! and the created agent is pinned in the pinned-agent side store by default
+//! before the response is emitted (`pin_global: false` opts out).
 //!
 //! Listing serves the Task 28 query behaviors: deterministic identifier
 //! ordering with name/query/tag/hidden filters compatible with the pinned
-//! local backend, which excludes hidden agents unless they are requested.
-//! Identifier lookup goes through
+//! local backend, and `after` continuation through the Task 28 item cursor;
+//! an absent or unknown cursor starts from the first page like the
+//! baseline's slice semantics. Identifier lookup goes through
 //! [`LocalStore::query_agent`](lotta_store::LocalStore), so an absent or
 //! wrong-prefix id answers one safe 404-class failure. `AGENTS_MAX` bounds
 //! creation; the cap is checked before any side effect runs.
 //!
-//! Baseline degradations, kept honest: `pin_global` is accepted but not yet
-//! persisted because no pinned-agent store exists in this version, requested
-//! models are accepted verbatim rather than resolved against a model catalog,
-//! personality presets carry canonical inline content rather than the pinned
-//! MDX template assets, creation-time compilation renders no skill sections,
-//! and the list command serves only its first page because the pinned
-//! response shape carries no cursor field.
+//! Baseline degradations, kept honest: creation-time compilation renders no
+//! skill sections, the pinned-agent side store records one global namespace
+//! rather than per-server keys, and the list response carries no cursor
+//! field because the pinned response shape has none.
 
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
@@ -49,15 +57,14 @@ use lotta_runtime::{
     ports::{AgentStore as _, MemFsPort},
 };
 use lotta_store::{
-    AGENTS_MAX, LocalStore, StoreErrorKind, StorePaths,
+    AGENTS_MAX, LocalStore, SidePaths, StoreErrorKind, StorePaths,
     query::{
-        AgentFilters, ConversationFilters, NameMatch, PageRequest, QUERY_PAGE_ITEMS_MAX, TriState,
+        AgentFilters, ConversationFilters, Cursor, NameMatch, PageRequest, QUERY_PAGE_ITEMS_MAX,
+        TriState,
     },
 };
-use serde::{
-    Deserialize, Serialize,
-    de::{DeserializeOwned, Deserializer, Error as _},
-};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -71,7 +78,7 @@ use crate::{
 pub const GIT_MEMORY_ENABLED_TAG: &str = "git-memory-enabled";
 /// Agents listed when the client omits an explicit limit (pinned parity).
 pub const AGENT_LIST_ITEMS_DEFAULT: usize = 20;
-/// Model used when neither the request nor the preset names one.
+/// Model stored when a raw `agent_create` body omits one.
 pub const DEFAULT_PERSONALITY_MODEL: &str = "auto-chat";
 /// Scrubbed 404-class detail shared by absent and wrong-prefix lookups.
 const AGENT_NOT_FOUND: &str = "agent not found";
@@ -87,10 +94,18 @@ const UPDATE_FAILURE: &str = "Failed to update agent";
 const DELETE_FAILURE: &str = "Failed to delete agent";
 /// Scrubbed rejection detail when creation would exceed `AGENTS_MAX`.
 const AGENT_LIMIT_REACHED: &str = "agent limit reached";
-/// Initial persona memory label shared by every personality preset.
-const PERSONA_MEMORY_LABEL: &str = "persona";
-/// Initial human memory label shared by every personality preset.
-const HUMAN_MEMORY_LABEL: &str = "human";
+/// Pinned settings-document key holding pinned agent identifiers.
+const PINNED_AGENTS_KEY: &str = "agents";
+/// Bounded CAS retries when the pinned-agent side store changes concurrently.
+const PIN_WRITE_ATTEMPTS: usize = 4;
+/// Compaction keys the pinned local backend recognizes.
+const COMPACTION_SETTING_KEYS: [&str; 4] =
+    ["mode", "prompt", "clip_chars", "sliding_window_percentage"];
+/// Compaction modes accepted by the pinned local backend validator.
+const COMPACTION_MODES: [&str; 2] = ["all", "sliding_window"];
+/// Rejection detail mirroring the pinned local validator message.
+const COMPACTION_MODE_REJECTED: &str =
+    "Local backend compaction currently supports only modes \"all\" and \"sliding_window\"";
 
 // ── Wire commands ───────────────────────────────────────────────────────────
 
@@ -117,15 +132,49 @@ pub struct CreateAgentCommand {
     pub request_id: String,
     /// Built-in personality preset to create.
     pub personality: PersonalityId,
-    /// Optional model override accepted verbatim.
+    /// Optional model override resolved against the canonical catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Additional tags appended after the preset tags.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
-    /// Whether to pin the agent globally; accepted but not persisted here.
+    /// Whether to pin the created agent globally; defaults to true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin_global: Option<bool>,
+}
+
+/// Explicit JSON field state preserving the absent/null/value contract.
+///
+/// The wire field is an outer option that distinguishes an omitted key from
+/// both sent states; [`ExplicitField::Null`] is a key sent as JSON null and
+/// [`ExplicitField::Value`] is a key carrying a value.
+///
+/// Tri-state fields decode through the `explicit_field` deserializer helper
+/// because the plain `Option` treatment would collapse a sent `null` into
+/// absence.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ExplicitField<T> {
+    /// The key was sent as JSON null.
+    Null,
+    /// The key carried a value.
+    Value(T),
+}
+
+/// Decodes one sent tri-state key, keeping an explicit JSON null distinct
+/// from an omitted one.
+fn explicit_field<'de, D, T>(deserializer: D) -> Result<Option<ExplicitField<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    let sent = Value::deserialize(deserializer)?;
+    if sent.is_null() {
+        return Ok(Some(ExplicitField::Null));
+    }
+    T::deserialize(sent)
+        .map(|value| Some(ExplicitField::Value(value)))
+        .map_err(serde::de::Error::custom)
 }
 
 /// Filter set of the pinned `agent_list` payload.
@@ -146,6 +195,9 @@ pub struct AgentListQuery {
     /// Maximum returned agents after the Task 28 deterministic ordering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+    /// Continue after this agent identifier (Task 28 cursor continuation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
 }
 
 /// Pinned `agent_list` payload.
@@ -169,8 +221,9 @@ pub struct AgentRetrieveCommand {
 
 /// Body of the pinned `agent_create` payload.
 ///
-/// Field names follow the canonical `Agent` schema; `description` and
-/// `hidden` preserve the absent/null/value three-state contract.
+/// Field names follow the canonical `Agent` schema; `description`,
+/// `hidden`, and `compaction_settings` preserve the absent/null/value
+/// three-state contract through [`ExplicitField`].
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AgentCreateBody {
     /// Display name.
@@ -184,10 +237,10 @@ pub struct AgentCreateBody {
     /// Optional description with explicit-null preservation.
     #[serde(
         default,
-        deserialize_with = "nullable",
+        deserialize_with = "explicit_field",
         skip_serializing_if = "Option::is_none"
     )]
-    pub description: Option<Option<String>>,
+    pub description: Option<ExplicitField<String>>,
     /// Creation tags.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
@@ -197,10 +250,18 @@ pub struct AgentCreateBody {
     /// Optional hidden flag with explicit-null preservation.
     #[serde(
         default,
-        deserialize_with = "nullable",
+        deserialize_with = "explicit_field",
         skip_serializing_if = "Option::is_none"
     )]
-    pub hidden: Option<Option<bool>>,
+    pub hidden: Option<ExplicitField<bool>>,
+    /// Optional compaction settings record with explicit-null preservation,
+    /// validated against the pinned local modes before persistence.
+    #[serde(
+        default,
+        deserialize_with = "explicit_field",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub compaction_settings: Option<ExplicitField<BoundedMap<{ UNBOUNDED_MAP_FIELDS_MAX }>>>,
     /// Initial memory files rendered into the created repository.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub memory_blocks: Vec<MemoryBlockInput>,
@@ -224,10 +285,10 @@ pub struct AgentUpdateBody {
     /// Replacement description; explicit null clears it.
     #[serde(
         default,
-        deserialize_with = "nullable",
+        deserialize_with = "explicit_field",
         skip_serializing_if = "Option::is_none"
     )]
-    pub description: Option<Option<String>>,
+    pub description: Option<ExplicitField<String>>,
     /// Replacement system-prompt source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
@@ -243,10 +304,18 @@ pub struct AgentUpdateBody {
     /// Replacement hidden flag; explicit null clears it.
     #[serde(
         default,
-        deserialize_with = "nullable",
+        deserialize_with = "explicit_field",
         skip_serializing_if = "Option::is_none"
     )]
-    pub hidden: Option<Option<bool>>,
+    pub hidden: Option<ExplicitField<bool>>,
+    /// Replacement compaction settings; explicit null clears them and a
+    /// record replaces the stored value once it validates.
+    #[serde(
+        default,
+        deserialize_with = "explicit_field",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub compaction_settings: Option<ExplicitField<BoundedMap<{ UNBOUNDED_MAP_FIELDS_MAX }>>>,
 }
 
 /// Pinned `agent_update` payload.
@@ -414,88 +483,6 @@ pub enum AgentsMessage {
 pub type AgentsForwarder =
     Arc<dyn Fn(ConnectionId, AgentsMessage) -> Result<(), AppServerError> + Send + Sync>;
 
-/// One canonical personality preset.
-struct PersonalityPreset {
-    label: &'static str,
-    description: &'static str,
-    default_model: &'static str,
-    system: &'static str,
-    persona: &'static str,
-}
-
-fn personality_preset(id: PersonalityId) -> PersonalityPreset {
-    match id {
-        PersonalityId::Memo => PersonalityPreset {
-            label: "Letta Code",
-            description: "The memory-first agent",
-            default_model: DEFAULT_PERSONALITY_MODEL,
-            system: "You are Letta Code, a memory-first coding agent.",
-            persona: "You are Letta Code. Persist durable facts about the user and workspace.",
-        },
-        PersonalityId::Tutorial => PersonalityPreset {
-            label: "Tutor",
-            description: "I help with getting started with Letta",
-            default_model: DEFAULT_PERSONALITY_MODEL,
-            system: "You are a patient Letta onboarding tutor.",
-            persona: "You teach new users how to configure and use Letta agents.",
-        },
-        PersonalityId::Blank => PersonalityPreset {
-            label: "Blank",
-            description: "Blank starter — you provide the personality",
-            default_model: DEFAULT_PERSONALITY_MODEL,
-            system: "You are a helpful assistant.",
-            persona: "The user provides the personality for this agent.",
-        },
-        PersonalityId::Linus => PersonalityPreset {
-            label: "Linus",
-            description: "Code with a stern hand",
-            default_model: DEFAULT_PERSONALITY_MODEL,
-            system: "You review and write code with blunt, exacting standards.",
-            persona: "You are a stern code reviewer who tolerates no sloppiness.",
-        },
-        PersonalityId::Kawaii => PersonalityPreset {
-            label: "Letta-Chan",
-            description: "sugoi~",
-            default_model: DEFAULT_PERSONALITY_MODEL,
-            system: "You are a cheerful, playful assistant.",
-            persona: "You answer with warmth, sparkles, and playful energy.",
-        },
-    }
-}
-
-/// Builds one validated initial memory block from static preset content.
-fn static_block(
-    label: &'static str,
-    value: String,
-    description: String,
-) -> Result<MemoryBlockInput, ()> {
-    Ok(MemoryBlockInput {
-        label: NonEmptyString::new(label).map_err(|_| ())?,
-        value,
-        description: Some(Some(description)),
-    })
-}
-
-/// Builds the two initial memory blocks every preset seeds.
-///
-/// # Errors
-/// Fails only if a static label were ever emptied, which the type system
-/// cannot express for `'static` literals.
-fn preset_memory_blocks(preset: &PersonalityPreset) -> Result<Vec<MemoryBlockInput>, ()> {
-    Ok(vec![
-        static_block(
-            PERSONA_MEMORY_LABEL,
-            preset.persona.to_owned(),
-            format!("{} persona", preset.label),
-        )?,
-        static_block(
-            HUMAN_MEMORY_LABEL,
-            "Facts about the user and their workspace.".to_owned(),
-            format!("{} human context", preset.label),
-        )?,
-    ])
-}
-
 /// Outcome class of one identifier lookup through the Task 28 boundary.
 enum Lookup {
     /// The record exists.
@@ -511,6 +498,7 @@ pub struct AgentsBridge {
     store: LocalStore,
     memfs: GitMemFs,
     backend_root: PathBuf,
+    side_paths: SidePaths,
     agents_max: usize,
     forward: AgentsForwarder,
     clock: Arc<dyn Clock + Send + Sync>,
@@ -528,10 +516,13 @@ impl AgentsBridge {
         clock: Arc<dyn Clock + Send + Sync>,
     ) -> Result<Self, AppServerError> {
         let (store, memfs, backend_root) = prepare_backend(storage_dir)?;
+        let side_paths = SidePaths::new(backend_root.clone(), None, [])
+            .map_err(|_| AppServerError::Config("agents backend unavailable"))?;
         Ok(Self {
             store,
             memfs,
             backend_root,
+            side_paths,
             agents_max: AGENTS_MAX,
             forward,
             clock,
@@ -546,6 +537,7 @@ impl AgentsBridge {
         store: LocalStore,
         memfs: GitMemFs,
         backend_root: PathBuf,
+        side_paths: SidePaths,
         agents_max: usize,
         clock: Arc<dyn Clock + Send + Sync>,
     ) -> Self {
@@ -553,6 +545,7 @@ impl AgentsBridge {
             store,
             memfs,
             backend_root,
+            side_paths,
             agents_max,
             forward,
             clock,
@@ -581,44 +574,52 @@ impl AgentsBridge {
     }
 
     async fn create_shortcut(&self, connection: ConnectionId, command: &CreateAgentCommand) {
-        let preset = personality_preset(command.personality);
-        let memory_blocks = preset_memory_blocks(&preset).unwrap_or_default();
+        let message = match self.create_shortcut_core(command).await {
+            Ok(agent) => AgentsMessage::CreateShortcut(CreateAgentResponseMessage {
+                request_id: command.request_id.clone(),
+                success: true,
+                agent_id: Some(agent.id.as_str().to_owned()),
+                name: Some(agent.name.as_str().to_owned()),
+                model: Some(agent.model.as_str().to_owned()),
+                error: None,
+            }),
+            Err(detail) => AgentsMessage::CreateShortcut(CreateAgentResponseMessage {
+                request_id: command.request_id.clone(),
+                success: false,
+                agent_id: None,
+                name: None,
+                model: None,
+                error: Some(detail),
+            }),
+        };
+        self.emit(connection, message);
+    }
+
+    async fn create_shortcut_core(&self, command: &CreateAgentCommand) -> Result<Agent, String> {
+        let preset = presets::preset(command.personality);
+        // Model resolution rejects unknown identifiers before any side effect
+        // runs, exactly like the pinned pre-validation.
+        let model = presets::resolve_request_model(command.model.as_deref(), &preset)?;
         let body = AgentCreateBody {
             name: preset.label.to_owned(),
-            model: Some(
-                command
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| preset.default_model.to_owned()),
-            ),
-            system: Some(preset.system.to_owned()),
-            description: Some(Some(preset.description.to_owned())),
-            tags: command.tags.clone(),
+            model: Some(model),
+            system: Some(presets::system_prompt()),
+            description: Some(ExplicitField::Value(preset.description.to_owned())),
+            tags: Some(presets::creation_tags(&preset, command.tags.as_deref())),
             model_settings: None,
             hidden: None,
-            memory_blocks,
+            compaction_settings: None,
+            memory_blocks: presets::memory_blocks(&preset)
+                .map_err(|()| CREATE_FAILURE.to_owned())?,
         };
-        let (success, agent_id, name, model, error) = match self.create_core(&body).await {
-            Ok(agent) => (
-                true,
-                Some(agent.id.as_str().to_owned()),
-                Some(agent.name.as_str().to_owned()),
-                Some(agent.model.as_str().to_owned()),
-                None,
-            ),
-            Err(detail) => (false, None, None, None, Some(detail)),
-        };
-        self.emit(
-            connection,
-            AgentsMessage::CreateShortcut(CreateAgentResponseMessage {
-                request_id: command.request_id.clone(),
-                success,
-                agent_id,
-                name,
-                model,
-                error,
-            }),
-        );
+        let agent = self.create_core(&body).await?;
+        // Pinned control flow pins by default before the success frame, so a
+        // pin failure fails the response even though the agent now exists.
+        if command.pin_global != Some(false) {
+            self.pin_agent(agent.id.as_str())
+                .map_err(|()| CREATE_FAILURE.to_owned())?;
+        }
+        Ok(agent)
     }
 
     async fn create(&self, connection: ConnectionId, command: &AgentCreateCommand) {
@@ -640,6 +641,9 @@ impl AgentsBridge {
     }
 
     async fn create_core(&self, body: &AgentCreateBody) -> Result<Agent, String> {
+        // Compaction validation rejects malformed records before any storage
+        // work, mirroring the pinned pre-creation validation.
+        validate_create_compaction(body)?;
         if self.count_agent_records()? >= self.agents_max {
             return Err(AGENT_LIMIT_REACHED.to_owned());
         }
@@ -659,22 +663,17 @@ impl AgentsBridge {
             .limit
             .unwrap_or(AGENT_LIST_ITEMS_DEFAULT)
             .min(QUERY_PAGE_ITEMS_MAX);
-        let page = PageRequest {
-            limit: Some(limit),
-            after: None,
-        };
         let message = match self
-            .store
-            .query_agents(filters_from_query(&query), page)
+            .list_page(filters_from_query(&query), limit, query.after.as_deref())
             .await
         {
-            Ok(page) => AgentsMessage::List(AgentListResponseMessage {
+            Ok(agents) => AgentsMessage::List(AgentListResponseMessage {
                 request_id: command.request_id.clone(),
                 success: true,
-                agents: page.items,
+                agents,
                 error: None,
             }),
-            Err(_) => AgentsMessage::List(AgentListResponseMessage {
+            Err(()) => AgentsMessage::List(AgentListResponseMessage {
                 request_id: command.request_id.clone(),
                 success: false,
                 agents: Vec::new(),
@@ -682,6 +681,32 @@ impl AgentsBridge {
             }),
         };
         self.emit(connection, message);
+    }
+
+    /// Serves one listing page; an unknown `after` cursor slices nothing in
+    /// the pinned baseline, so the request restarts from the first page.
+    async fn list_page(
+        &self,
+        filters: AgentFilters,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<Vec<Agent>, ()> {
+        let mut page = PageRequest {
+            limit: Some(limit),
+            after: after.map(|id| Cursor::from_item(id.to_owned())),
+        };
+        match self.store.query_agents(filters.clone(), page.clone()).await {
+            Ok(found) => Ok(found.items),
+            Err(error) if error.kind() == StoreErrorKind::NotFound && page.after.is_some() => {
+                page.after = None;
+                self.store
+                    .query_agents(filters, page)
+                    .await
+                    .map(|found| found.items)
+                    .map_err(|_| ())
+            }
+            Err(_) => Err(()),
+        }
     }
 
     async fn retrieve(&self, connection: ConnectionId, command: &AgentRetrieveCommand) {
@@ -717,6 +742,9 @@ impl AgentsBridge {
     }
 
     async fn update_core(&self, id: &str, body: &AgentUpdateBody) -> Result<Agent, String> {
+        // Compaction validation rejects malformed records before the lookup,
+        // mirroring the pinned pre-update validation order.
+        validate_update_compaction(body)?;
         let current = match self.lookup(id).await {
             Lookup::Found(agent) => *agent,
             Lookup::Missing => return Err(AGENT_NOT_FOUND.to_owned()),
@@ -754,6 +782,10 @@ impl AgentsBridge {
             Lookup::Missing => return Err(AGENT_NOT_FOUND.to_owned()),
             Lookup::Failed => return Err(DELETE_FAILURE.to_owned()),
         };
+        // The default prompt cache directory carries no conversation record,
+        // so query-driven removal never sees it; drop it explicitly first so
+        // no ownerless compiled prompt outlives its agent.
+        self.remove_default_prompt_cache(&agent.id)?;
         self.remove_agent_conversations(&agent.id).await?;
         self.remove_memfs_artifacts(&agent.id)?;
         // The record goes last so an interrupted delete leaves an addressable
@@ -762,6 +794,42 @@ impl AgentsBridge {
             Ok(()) => Ok(()),
             Err(_) => Err(DELETE_FAILURE.to_owned()),
         }
+    }
+
+    /// Pins one agent identifier in the pinned-agent side store with bounded
+    /// conflict retries; the document stays sorted and deduplicated.
+    fn pin_agent(&self, agent_id: &str) -> Result<(), ()> {
+        for _ in 0..PIN_WRITE_ATTEMPTS {
+            match lotta_store::side::pinned::read(&self.side_paths) {
+                Ok(file) => {
+                    let mut ids = pinned_ids(file.bytes());
+                    if !ids.iter().any(|id| id == agent_id) {
+                        ids.push(agent_id.to_owned());
+                        ids.sort();
+                    }
+                    let bytes = serde_json::to_vec(&serde_json::json!({
+                        PINNED_AGENTS_KEY: ids,
+                    }))
+                    .map_err(|_| ())?;
+                    match lotta_store::side::pinned::write_expected(&self.side_paths, &file, &bytes)
+                    {
+                        Ok(()) => return Ok(()),
+                        Err(error) if error.kind() == StoreErrorKind::StorageConflict => {}
+                        Err(_) => return Err(()),
+                    }
+                }
+                Err(error) if error.kind() == StoreErrorKind::NotFound => {
+                    let bytes = serde_json::to_vec(&serde_json::json!({
+                        PINNED_AGENTS_KEY: [agent_id],
+                    }))
+                    .map_err(|_| ())?;
+                    return lotta_store::side::pinned::write(&self.side_paths, &bytes)
+                        .map_err(|_| ());
+                }
+                Err(_) => return Err(()),
+            }
+        }
+        Err(())
     }
 
     async fn lookup(&self, id: &str) -> Lookup {
@@ -803,6 +871,16 @@ impl AgentsBridge {
 
     fn remove_memfs_artifacts(&self, agent: &AgentId) -> Result<(), String> {
         remove_path_forcing(&self.backend_root.join("memfs").join(agent.as_str()))
+    }
+
+    /// Removes one agent's prompt-only default-conversation cache directory.
+    fn remove_default_prompt_cache(&self, agent: &AgentId) -> Result<(), String> {
+        let directory = self
+            .store
+            .paths()
+            .conversation_dir(agent, &ConversationId::default_for_agent())
+            .map_err(|_| DELETE_FAILURE)?;
+        remove_path_forcing(&directory)
     }
 
     fn count_agent_records(&self) -> Result<usize, String> {
@@ -920,18 +998,33 @@ fn build_new_agent(body: &AgentCreateBody) -> Result<Agent, String> {
         Some(settings) => settings.clone(),
         None => BoundedMap::new(BTreeMap::new()).map_err(|_| CREATE_FAILURE)?,
     };
+    // Creation persists any validated record verbatim; absent and explicit
+    // null stay distinct (pinned local-backend create semantics).
+    let compaction_settings = match &body.compaction_settings {
+        Some(ExplicitField::Null) => Some(None),
+        Some(ExplicitField::Value(record)) => Some(Some(record.clone())),
+        None => None,
+    };
     Ok(Agent {
         id,
         name: NonEmptyString::new(body.name.clone()).map_err(|_| CREATE_FAILURE)?,
-        description: body.description.clone(),
+        description: body.description.clone().map(explicit_value),
         system: body.system.clone().unwrap_or_default(),
         tags: BoundedVec::new(tags).map_err(|_| CREATE_FAILURE)?,
         model: NonEmptyString::new(model).map_err(|_| CREATE_FAILURE)?,
         model_settings,
-        hidden: body.hidden,
-        compaction_settings: None,
+        hidden: body.hidden.clone().map(explicit_value),
+        compaction_settings,
         extras: EntityExtras::default(),
     })
+}
+
+/// Unwraps one sent field state onto the domain's inner option.
+fn explicit_value<T>(field: ExplicitField<T>) -> Option<T> {
+    match field {
+        ExplicitField::Null => None,
+        ExplicitField::Value(value) => Some(value),
+    }
 }
 
 /// Stamps the pinned Git-memory tag exactly once, mirroring the baseline.
@@ -964,8 +1057,8 @@ fn apply_update(current: Agent, body: &AgentUpdateBody) -> Result<Agent, String>
     if let Some(name) = &body.name {
         updated.name = NonEmptyString::new(name.clone()).map_err(|_| UPDATE_FAILURE)?;
     }
-    if let Some(description) = body.description.clone() {
-        updated.description = Some(description);
+    if let Some(field) = body.description.clone() {
+        updated.description = Some(explicit_value(field));
     }
     if let Some(system) = &body.system {
         updated.system.clone_from(system);
@@ -979,10 +1072,85 @@ fn apply_update(current: Agent, body: &AgentUpdateBody) -> Result<Agent, String>
     if let Some(settings) = &body.model_settings {
         updated.model_settings.clone_from(settings);
     }
-    if body.hidden.is_some() {
-        updated.hidden = body.hidden;
+    if let Some(field) = &body.hidden {
+        updated.hidden = Some(explicit_value(field.clone()));
+    }
+    // Explicit null clears; a record replaces only when it carries a local
+    // key, matching the pinned local-backend update semantics.
+    match &body.compaction_settings {
+        Some(ExplicitField::Null) => updated.compaction_settings = Some(None),
+        Some(ExplicitField::Value(record)) if has_local_compaction(record) => {
+            updated.compaction_settings = Some(Some(record.clone()));
+        }
+        Some(ExplicitField::Value(_)) | None => {}
     }
     Ok(updated)
+}
+
+/// Validates the create body's compaction record before any storage work.
+fn validate_create_compaction(body: &AgentCreateBody) -> Result<(), String> {
+    match &body.compaction_settings {
+        Some(ExplicitField::Value(record)) => validate_compaction_record(record),
+        _ => Ok(()),
+    }
+}
+
+/// Validates the update body's compaction record before the lookup.
+fn validate_update_compaction(body: &AgentUpdateBody) -> Result<(), String> {
+    match &body.compaction_settings {
+        Some(ExplicitField::Value(record)) => validate_compaction_record(record),
+        _ => Ok(()),
+    }
+}
+
+/// Rejects records whose `mode` is present but not a pinned local mode;
+/// an absent or null mode passes validation like the baseline guard.
+fn validate_compaction_record(
+    record: &BoundedMap<{ UNBOUNDED_MAP_FIELDS_MAX }>,
+) -> Result<(), String> {
+    let recognized = match record.get("mode") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(mode)) => COMPACTION_MODES.contains(&mode.as_str()),
+        Some(_) => false,
+    };
+    if recognized {
+        return Ok(());
+    }
+    let received = match record.get("mode") {
+        Some(Value::String(text)) => text.clone(),
+        Some(other) => other.to_string(),
+        None => "null".to_owned(),
+    };
+    Err(format!(
+        "{COMPACTION_MODE_REJECTED} (received \"{received}\")."
+    ))
+}
+
+/// Whether one compaction record carries at least one local key; records
+/// without any leave the stored value untouched on update.
+fn has_local_compaction(record: &BoundedMap<{ UNBOUNDED_MAP_FIELDS_MAX }>) -> bool {
+    COMPACTION_SETTING_KEYS
+        .iter()
+        .any(|key| record.get(key).is_some())
+}
+
+/// Parses the pinned-agent side-store document into its identifier list.
+fn pinned_ids(bytes: &[u8]) -> Vec<String> {
+    serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|document| {
+            document
+                .get(PINNED_AGENTS_KEY)
+                .and_then(Value::as_array)
+                .cloned()
+        })
+        .map_or_else(Vec::new, |entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
 }
 
 /// Removes one path tree, tolerating an already-absent target like the pinned
@@ -1003,18 +1171,6 @@ fn failed_retrieve(command: &AgentRetrieveCommand, detail: &str) -> AgentRetriev
         agent: None,
         error: Some(detail.to_owned()),
     }
-}
-
-/// Three-state JSON deserializer preserving the absent/null/value contract.
-#[allow(clippy::option_option, reason = "three-state JSON presence contract")]
-fn nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::<T>::deserialize(deserializer)
-        .map(Some)
-        .map_err(D::Error::custom)
 }
 
 /// Decodes an already bounded and classified frame without parsing text again.
@@ -1064,6 +1220,8 @@ mod fixture_round_trip;
 #[cfg(test)]
 #[path = "agents_listing_tests.rs"]
 mod listing;
+#[path = "agents_presets.rs"]
+mod presets;
 #[cfg(test)]
 #[path = "agents_support.rs"]
 mod support;

@@ -89,6 +89,12 @@ fn agent_list_round_trips() {
             "limit": 25,
         },
     }));
+    // Pagination continuation echoes the last served agent identifier.
+    round_trip(&json!({
+        "type": "agent_list",
+        "request_id": "rt-al-3",
+        "query": {"after": "agent-local-alpha-1"},
+    }));
 }
 
 #[test]
@@ -118,10 +124,21 @@ fn agent_create_round_trips() {
             "tags": ["team-a"],
             "model_settings": {"temperature": 0.2},
             "hidden": true,
+            "compaction_settings": {"mode": "sliding_window"},
             "memory_blocks": [
                 {"label": "persona", "value": "Fixture persona.", "description": "Persona"},
                 {"label": "notes", "value": "Un-described block."},
             ],
+        },
+    }));
+    round_trip(&json!({
+        "type": "agent_create",
+        "request_id": "rt-ac-3",
+        "body": {
+            "name": "Cleared Agent",
+            "description": "Described.",
+            "hidden": false,
+            "compaction_settings": null,
         },
     }));
 }
@@ -146,7 +163,14 @@ fn agent_update_round_trips() {
             "model": "model-next",
             "model_settings": {},
             "hidden": null,
+            "compaction_settings": {"mode": "all", "prompt": "Summarize."},
         },
+    }));
+    round_trip(&json!({
+        "type": "agent_update",
+        "request_id": "rt-au-3",
+        "agent_id": "agent-local-fixture",
+        "body": {"compaction_settings": null},
     }));
 }
 

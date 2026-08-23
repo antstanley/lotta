@@ -4,7 +4,7 @@
 
 use serde_json::{Value, json};
 
-use super::support::{bridge, seed_agent_record};
+use super::support::{SeedAgent, bridge, seed_agent_record};
 
 /// Runs one list command and returns the ordered identifier column.
 async fn listed_ids(fixture: &super::support::TestAgents, query: Value) -> Vec<String> {
@@ -26,30 +26,36 @@ async fn listed_ids(fixture: &super::support::TestAgents, query: Value) -> Vec<S
 fn seed_population(fixture: &super::support::TestAgents) {
     seed_agent_record(
         &fixture.root,
-        "c3-zulu",
-        "zulu",
-        &["shared"],
-        false,
-        "Trailing entry.",
-        "model-base",
+        SeedAgent {
+            suffix: "c3-zulu",
+            name: "zulu",
+            tags: &["shared"],
+            hidden: false,
+            description: "Trailing entry.",
+            model: "model-base",
+        },
     );
     seed_agent_record(
         &fixture.root,
-        "alpha-1",
-        "Archive Helper",
-        &["shared", "extra"],
-        false,
-        "Retrieves archived documents on demand.",
-        "model-base",
+        SeedAgent {
+            suffix: "alpha-1",
+            name: "Archive Helper",
+            tags: &["shared", "extra"],
+            hidden: false,
+            description: "Retrieves archived documents on demand.",
+            model: "model-base",
+        },
     );
     seed_agent_record(
         &fixture.root,
-        "mid-2",
-        "mike",
-        &["shared"],
-        false,
-        "Plain assistant.",
-        "model-gpt-9",
+        SeedAgent {
+            suffix: "mid-2",
+            name: "mike",
+            tags: &["shared"],
+            hidden: false,
+            description: "Plain assistant.",
+            model: "model-gpt-9",
+        },
     );
 }
 
@@ -109,21 +115,25 @@ async fn hidden_filter_toggles_hidden_visibility() {
     let fixture = bridge();
     seed_agent_record(
         &fixture.root,
-        "ghost-1",
-        "ghost",
-        &[],
-        true,
-        "Hidden from default listings.",
-        "model-base",
+        SeedAgent {
+            suffix: "ghost-1",
+            name: "ghost",
+            tags: &[],
+            hidden: true,
+            description: "Hidden from default listings.",
+            model: "model-base",
+        },
     );
     seed_agent_record(
         &fixture.root,
-        "open-1",
-        "open",
-        &[],
-        false,
-        "Visible.",
-        "model-base",
+        SeedAgent {
+            suffix: "open-1",
+            name: "open",
+            tags: &[],
+            hidden: false,
+            description: "Visible.",
+            model: "model-base",
+        },
     );
 
     let visible = listed_ids(&fixture, json!(null)).await;
@@ -136,4 +146,41 @@ async fn hidden_filter_toggles_hidden_visibility() {
     assert_eq!(explicit_visible, vec!["agent-local-open-1"]);
     let only_hidden = listed_ids(&fixture, json!({"hidden": true})).await;
     assert_eq!(only_hidden, vec!["agent-local-ghost-1"]);
+}
+
+#[tokio::test]
+async fn after_cursor_continues_the_page() {
+    let fixture = bridge();
+    seed_population(&fixture);
+    let first = listed_ids(&fixture, json!({"limit": 2})).await;
+    assert_eq!(first.len(), 2, "the limit bounds the page");
+    let continuation = listed_ids(
+        &fixture,
+        json!({"limit": 10, "after": first.last().expect("nonempty")}),
+    )
+    .await;
+    let mut expected: Vec<String> = Vec::new();
+    // Deterministic ascending order means the remainder is everything after
+    // the served cursor.
+    let mut all = listed_ids(&fixture, json!(null)).await;
+    all.sort();
+    for id in all {
+        if id > *first.last().expect("nonempty") {
+            expected.push(id);
+        }
+    }
+    assert_eq!(continuation, expected, "the after cursor resumes the order");
+
+    // An unknown or absent cursor restarts from the first page like the
+    // pinned slice semantics.
+    let restarted = listed_ids(
+        &fixture,
+        json!({"limit": 10, "after": "agent-local-does-not-exist"}),
+    )
+    .await;
+    assert_eq!(
+        restarted,
+        listed_ids(&fixture, json!(null)).await,
+        "an unknown cursor serves the first page again"
+    );
 }

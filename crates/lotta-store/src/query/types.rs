@@ -76,6 +76,13 @@ impl Cursor {
         Self(value)
     }
 
+    /// Creates the continuation cursor for one previously returned item
+    /// identifier, as clients echo it back on paginated requests.
+    #[must_use]
+    pub fn from_item(value: String) -> Self {
+        Self(value)
+    }
+
     /// Borrows the opaque cursor.
     #[must_use]
     pub fn as_str(&self) -> &str {

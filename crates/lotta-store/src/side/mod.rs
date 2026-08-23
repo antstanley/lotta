@@ -7,6 +7,8 @@ pub mod crons;
 mod io;
 /// Pure side-store path authority.
 pub mod paths;
+/// Pinned-agent side store.
+pub mod pinned;
 /// Scoped project-local settings.
 pub mod project;
 /// Global settings side store.

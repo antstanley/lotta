@@ -4,7 +4,7 @@
 
 use serde_json::json;
 
-use super::support::{bridge, bridge_with_limit, seed_agent_record};
+use super::support::{SeedAgent, bridge, bridge_with_limit, seed_agent_record};
 
 #[tokio::test]
 async fn retrieve_update_delete_absent_agent_answer_404_class() {
@@ -65,8 +65,28 @@ async fn wrong_local_prefix_answers_the_same_404_class() {
 #[tokio::test]
 async fn creation_below_the_cap_succeeds() {
     let fixture = bridge_with_limit(3);
-    seed_agent_record(&fixture.root, "seed-1", "Seed One", &[], false, "", "m");
-    seed_agent_record(&fixture.root, "seed-2", "Seed Two", &[], false, "", "m");
+    seed_agent_record(
+        &fixture.root,
+        SeedAgent {
+            suffix: "seed-1",
+            name: "Seed One",
+            tags: &[],
+            hidden: false,
+            description: "",
+            model: "m",
+        },
+    );
+    seed_agent_record(
+        &fixture.root,
+        SeedAgent {
+            suffix: "seed-2",
+            name: "Seed Two",
+            tags: &[],
+            hidden: false,
+            description: "",
+            model: "m",
+        },
+    );
     fixture
         .send(&json!({
             "type": "agent_create",
@@ -80,9 +100,39 @@ async fn creation_below_the_cap_succeeds() {
 #[tokio::test]
 async fn creation_at_the_cap_is_rejected() {
     let fixture = bridge_with_limit(3);
-    seed_agent_record(&fixture.root, "seed-1", "Seed One", &[], false, "", "m");
-    seed_agent_record(&fixture.root, "seed-2", "Seed Two", &[], false, "", "m");
-    seed_agent_record(&fixture.root, "seed-3", "Seed Three", &[], false, "", "m");
+    seed_agent_record(
+        &fixture.root,
+        SeedAgent {
+            suffix: "seed-1",
+            name: "Seed One",
+            tags: &[],
+            hidden: false,
+            description: "",
+            model: "m",
+        },
+    );
+    seed_agent_record(
+        &fixture.root,
+        SeedAgent {
+            suffix: "seed-2",
+            name: "Seed Two",
+            tags: &[],
+            hidden: false,
+            description: "",
+            model: "m",
+        },
+    );
+    seed_agent_record(
+        &fixture.root,
+        SeedAgent {
+            suffix: "seed-3",
+            name: "Seed Three",
+            tags: &[],
+            hidden: false,
+            description: "",
+            model: "m",
+        },
+    );
     fixture
         .send(&json!({
             "type": "agent_create",
@@ -99,9 +149,39 @@ async fn creation_at_the_cap_is_rejected() {
 #[tokio::test]
 async fn creation_above_the_cap_is_rejected_without_side_effects() {
     let fixture = bridge_with_limit(2);
-    seed_agent_record(&fixture.root, "seed-1", "Seed One", &[], false, "", "m");
-    seed_agent_record(&fixture.root, "seed-2", "Seed Two", &[], false, "", "m");
-    seed_agent_record(&fixture.root, "seed-3", "Seed Three", &[], false, "", "m");
+    seed_agent_record(
+        &fixture.root,
+        SeedAgent {
+            suffix: "seed-1",
+            name: "Seed One",
+            tags: &[],
+            hidden: false,
+            description: "",
+            model: "m",
+        },
+    );
+    seed_agent_record(
+        &fixture.root,
+        SeedAgent {
+            suffix: "seed-2",
+            name: "Seed Two",
+            tags: &[],
+            hidden: false,
+            description: "",
+            model: "m",
+        },
+    );
+    seed_agent_record(
+        &fixture.root,
+        SeedAgent {
+            suffix: "seed-3",
+            name: "Seed Three",
+            tags: &[],
+            hidden: false,
+            description: "",
+            model: "m",
+        },
+    );
     fixture
         .send(&json!({
             "type": "create_agent",
@@ -117,4 +197,67 @@ async fn creation_above_the_cap_is_rejected_without_side_effects() {
         .expect("agents dir")
         .count();
     assert_eq!(seeded, 3, "no fourth record was created");
+}
+
+#[tokio::test]
+async fn shortcut_unknown_model_rejects_with_the_pinned_detail() {
+    let fixture = bridge();
+    fixture
+        .send(&json!({
+            "type": "create_agent",
+            "request_id": "err-model-1",
+            "personality": "memo",
+            "model": "no-such-model",
+        }))
+        .await;
+    assert_eq!(fixture.last()["type"], "create_agent_response");
+    assert_eq!(fixture.last()["success"], false);
+    assert_eq!(fixture.last()["error"], "Unknown model \"no-such-model\"");
+}
+
+#[tokio::test]
+async fn compaction_settings_with_an_unknown_mode_reject_creation() {
+    let fixture = bridge();
+    fixture
+        .send(&json!({
+            "type": "agent_create",
+            "request_id": "err-cmp-1",
+            "body": {
+                "name": "Bad Compaction",
+                "compaction_settings": {"mode": "explode"},
+            },
+        }))
+        .await;
+    assert_eq!(fixture.last()["type"], "agent_create_response");
+    assert_eq!(fixture.last()["success"], false);
+    assert_eq!(
+        fixture.last()["error"],
+        "Local backend compaction currently supports only modes \"all\" and \
+         \"sliding_window\" (received \"explode\")."
+    );
+    assert!(fixture.last()["agent"].is_null());
+    // No record leaked before the rejection.
+    let seeded = std::fs::read_dir(fixture.agents_dir()).map_or(0, std::iter::Iterator::count);
+    assert_eq!(seeded, 0, "creation never touched storage");
+}
+
+#[tokio::test]
+async fn compaction_settings_with_an_unknown_mode_reject_update() {
+    let fixture = bridge();
+    let created = fixture.create_agent("Update Target").await;
+    fixture
+        .send(&json!({
+            "type": "agent_update",
+            "request_id": "err-cmp-2",
+            "agent_id": created,
+            "body": {"compaction_settings": {"mode": 42}},
+        }))
+        .await;
+    assert_eq!(fixture.last()["type"], "agent_update_response");
+    assert_eq!(fixture.last()["success"], false);
+    assert_eq!(
+        fixture.last()["error"],
+        "Local backend compaction currently supports only modes \"all\" and \
+         \"sliding_window\" (received \"42\")."
+    );
 }

@@ -126,3 +126,65 @@ async fn shortcut_creation_runs_the_same_creation_side_effects() {
         .expect("shortcut compiled the default prompt");
     assert!(!record.content.is_empty());
 }
+
+#[tokio::test]
+async fn deletion_removes_conversations_prompt_cache_memfs_and_record() {
+    let fixture = bridge();
+    fixture
+        .send(&json!({
+            "type": "agent_create",
+            "request_id": "del-1",
+            "body": {"name": "Doomed With Artifacts"},
+        }))
+        .await;
+    let agent_id = fixture.last()["agent"]["id"]
+        .as_str()
+        .expect("created id")
+        .to_owned();
+
+    // The prompt-only default-conversation cache exists after creation but
+    // carries no conversation record, so only explicit removal can clear it.
+    assert!(
+        fixture.default_conversation_dir(&agent_id).is_dir(),
+        "the prompt cache directory exists before deletion"
+    );
+
+    fixture
+        .send(&json!({
+            "type": "agent_delete",
+            "request_id": "del-2",
+            "agent_id": agent_id,
+        }))
+        .await;
+    assert_eq!(fixture.last()["type"], "agent_delete_response");
+    assert_eq!(fixture.last()["success"], true);
+
+    // Every artifact class is gone: the ownerless prompt cache, any encoded
+    // conversation directories, the MemFS repository, and the record.
+    assert!(
+        !fixture.default_conversation_dir(&agent_id).exists(),
+        "the ownerless prompt cache was removed"
+    );
+    let conversations_root = fixture.root.join("conversations");
+    let leftovers = std::fs::read_dir(&conversations_root).map_or(0, |entries| {
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(&agent_id))
+            .count()
+    });
+    assert_eq!(leftovers, 0, "no conversation directories survive");
+    assert!(
+        !fixture.root.join("memfs").join(&agent_id).exists(),
+        "the MemFS repository was removed"
+    );
+
+    // The record itself no longer resolves.
+    fixture
+        .send(&json!({
+            "type": "agent_retrieve",
+            "request_id": "del-3",
+            "agent_id": agent_id,
+        }))
+        .await;
+    assert_eq!(fixture.last()["success"], false);
+}

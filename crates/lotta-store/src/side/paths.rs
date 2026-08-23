@@ -126,6 +126,14 @@ impl SidePaths {
         join_checked(&self.letta_home, &["crons.json"])
     }
 
+    /// Returns `${LETTA_HOME}/pinned-agents.json`.
+    ///
+    /// # Errors
+    /// Returns a typed path, limit, conflict, missing, lock, or filesystem failure.
+    pub fn pinned_agents(&self) -> Result<PathBuf, StoreError> {
+        join_checked(&self.letta_home, &["pinned-agents.json"])
+    }
+
     /// Returns `${LETTA_HOME}/runs/<schedule-id>.jsonl`.
     ///
     /// # Errors

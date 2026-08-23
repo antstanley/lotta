@@ -81,6 +81,22 @@ impl TestAgents {
         cache.load().expect("prompt cache read")
     }
 
+    /// Whether the pinned-agent side store currently lists one identifier.
+    pub(super) fn is_pinned(&self, agent_id: &str) -> bool {
+        let bytes = match lotta_store::side::pinned::read(
+            &lotta_store::SidePaths::new(self.root.clone(), None, []).expect("fixture side paths"),
+        ) {
+            Ok(file) => file.bytes().to_vec(),
+            Err(_) => return false,
+        };
+        let document: Value = serde_json::from_slice(&bytes).expect("pinned document");
+        document["agents"]
+            .as_array()
+            .expect("pinned list")
+            .iter()
+            .any(|entry| entry.as_str() == Some(agent_id))
+    }
+
     /// Decodes a raw JSON command through framing and applies it inline.
     pub(super) async fn send(&self, command: &Value) {
         let text = command.to_string();
@@ -123,31 +139,39 @@ impl TestAgents {
     }
 }
 
+/// One seeded canonical agent record (fixture options bundle).
+#[derive(Clone, Copy)]
+pub(super) struct SeedAgent<'a> {
+    /// Identifier suffix producing `agent-local-<suffix>`.
+    pub(super) suffix: &'a str,
+    /// Display name.
+    pub(super) name: &'a str,
+    /// Creation tags.
+    pub(super) tags: &'a [&'a str],
+    /// Hidden flag.
+    pub(super) hidden: bool,
+    /// Description.
+    pub(super) description: &'a str,
+    /// Model handle.
+    pub(super) model: &'a str,
+}
+
 /// Writes one canonical agent record directly into the storage layout.
 ///
 /// Seeding bypasses creation so cap and listing fixtures control the exact
 /// on-disk population without running the `MemFS` side effects per record.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn seed_agent_record(
-    root: &Path,
-    suffix: &str,
-    name: &str,
-    tags: &[&str],
-    hidden: bool,
-    description: &str,
-    model: &str,
-) -> String {
-    let id_text = format!("agent-local-{suffix}");
+pub(super) fn seed_agent_record(root: &Path, seed: SeedAgent<'_>) -> String {
+    let id_text = format!("agent-local-{}", seed.suffix);
     let agent = Agent {
         id: AgentId::accept(id_text.clone()).expect("seeded agent id"),
-        name: NonEmptyString::new(name.to_owned()).expect("seeded name"),
-        description: Some(Some(description.to_owned())),
-        system: format!("System prompt for {name}."),
-        tags: BoundedVec::new(tags.iter().map(|tag| (*tag).to_owned()).collect())
+        name: NonEmptyString::new(seed.name.to_owned()).expect("seeded name"),
+        description: Some(Some(seed.description.to_owned())),
+        system: format!("System prompt for {}.", seed.name),
+        tags: BoundedVec::new(seed.tags.iter().map(|tag| (*tag).to_owned()).collect())
             .expect("seeded tags"),
-        model: NonEmptyString::new(model.to_owned()).expect("seeded model"),
+        model: NonEmptyString::new(seed.model.to_owned()).expect("seeded model"),
         model_settings: BoundedMap::new(BTreeMap::new()).expect("empty settings"),
-        hidden: Some(Some(hidden)),
+        hidden: Some(Some(seed.hidden)),
         compaction_settings: None,
         extras: EntityExtras::default(),
     };
@@ -167,6 +191,8 @@ pub(super) fn seed_agent_record(
 fn build(root: &Path, forward: AgentsForwarder, agents_max: usize) -> AgentsBridge {
     let paths = StorePaths::new(root).expect("fixture store paths");
     let memfs = lotta_memfs::GitMemFs::new(root.to_path_buf()).expect("fixture memfs backend");
+    let side_paths =
+        lotta_store::SidePaths::new(root.to_path_buf(), None, []).expect("fixture side paths");
     let clock: Arc<dyn lotta_domain::Clock + Send + Sync> =
         Arc::new(FakeClock::new(fixture_timestamp()));
     AgentsBridge::compose(
@@ -174,6 +200,7 @@ fn build(root: &Path, forward: AgentsForwarder, agents_max: usize) -> AgentsBrid
         LocalStore::new(paths),
         memfs,
         root.to_path_buf(),
+        side_paths,
         agents_max,
         clock,
     )
