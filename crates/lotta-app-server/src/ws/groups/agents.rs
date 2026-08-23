@@ -77,7 +77,7 @@ use crate::{
 /// Pinned tag marking agents whose Git memory repository is managed locally.
 pub const GIT_MEMORY_ENABLED_TAG: &str = "git-memory-enabled";
 /// Agents listed when the client omits an explicit limit (pinned parity).
-pub const AGENT_LIST_ITEMS_DEFAULT: usize = 20;
+pub const AGENT_LIST_DEFAULT_ITEMS: usize = 20;
 /// Model stored when a raw `agent_create` body omits one.
 pub const DEFAULT_PERSONALITY_MODEL: &str = "auto-chat";
 /// Scrubbed 404-class detail shared by absent and wrong-prefix lookups.
@@ -98,6 +98,13 @@ const AGENT_LIMIT_REACHED: &str = "agent limit reached";
 const PINNED_AGENTS_KEY: &str = "agents";
 /// Bounded CAS retries when the pinned-agent side store changes concurrently.
 const PIN_WRITE_ATTEMPTS: usize = 4;
+/// Pause between pinned-document retry attempts so a contended storage lock
+/// or a lost create race clears before the next bounded attempt.
+const PIN_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
+/// Serializes in-process pinned-document writers so concurrent creations do
+/// not stampede the storage file lock; cross-process races stay covered by
+/// the side store's compare-and-swap writes.
+static PIN_WRITE_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Compaction keys the pinned local backend recognizes.
 const COMPACTION_SETTING_KEYS: [&str; 4] =
     ["mode", "prompt", "clip_chars", "sliding_window_percentage"];
@@ -685,7 +692,7 @@ impl AgentsBridge {
         let query = command.query.clone().unwrap_or_default();
         let limit = query
             .limit
-            .unwrap_or(AGENT_LIST_ITEMS_DEFAULT)
+            .unwrap_or(AGENT_LIST_DEFAULT_ITEMS)
             .min(QUERY_PAGE_ITEMS_MAX);
         let message = match self
             .list_page(filters_from_query(&query), limit, query.after.as_deref())
@@ -821,16 +828,23 @@ impl AgentsBridge {
     }
 
     /// Pins one agent identifier in the pinned-agent side store with bounded
-    /// conflict retries; the document stays sorted and deduplicated.
+    /// conflict retries. Concurrent in-process writers are serialized by
+    /// [`PIN_WRITE_GATE`], every write normalizes the document (sorted,
+    /// deduplicated), and an absent document is created through
+    /// create-if-absent so concurrent first writers cannot lose each
+    /// other's pin.
     fn pin_agent(&self, agent_id: &str) -> Result<(), ()> {
-        for _ in 0..PIN_WRITE_ATTEMPTS {
+        let _gate = match PIN_WRITE_GATE.lock() {
+            Ok(gate) => gate,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for attempt in 0..PIN_WRITE_ATTEMPTS {
             match lotta_store::side::pinned::read(&self.side_paths) {
                 Ok(file) => {
                     let mut ids = pinned_ids(file.bytes());
-                    if !ids.iter().any(|id| id == agent_id) {
-                        ids.push(agent_id.to_owned());
-                        ids.sort();
-                    }
+                    ids.push(agent_id.to_owned());
+                    ids.sort();
+                    ids.dedup();
                     let bytes = serde_json::to_vec(&serde_json::json!({
                         PINNED_AGENTS_KEY: ids,
                     }))
@@ -838,7 +852,7 @@ impl AgentsBridge {
                     match lotta_store::side::pinned::write_expected(&self.side_paths, &file, &bytes)
                     {
                         Ok(()) => return Ok(()),
-                        Err(error) if error.kind() == StoreErrorKind::StorageConflict => {}
+                        Err(error) if retryable_pin_error(&error) => {}
                         Err(_) => return Err(()),
                     }
                 }
@@ -847,10 +861,17 @@ impl AgentsBridge {
                         PINNED_AGENTS_KEY: [agent_id],
                     }))
                     .map_err(|_| ())?;
-                    return lotta_store::side::pinned::write(&self.side_paths, &bytes)
-                        .map_err(|_| ());
+                    match lotta_store::side::pinned::create_if_absent(&self.side_paths, &bytes) {
+                        Ok(()) => return Ok(()),
+                        Err(error) if retryable_pin_error(&error) => {}
+                        Err(_) => return Err(()),
+                    }
                 }
+                Err(error) if retryable_pin_error(&error) => {}
                 Err(_) => return Err(()),
+            }
+            if attempt + 1 < PIN_WRITE_ATTEMPTS {
+                std::thread::sleep(PIN_RETRY_PAUSE);
             }
         }
         Err(())
@@ -1144,14 +1165,52 @@ fn validate_compaction_record(
     if recognized {
         return Ok(());
     }
-    let received = match record.get("mode") {
-        Some(Value::String(text)) => text.clone(),
-        Some(other) => other.to_string(),
-        None => "null".to_owned(),
-    };
+    let received = record
+        .get("mode")
+        .map_or_else(|| "null".to_owned(), javascript_string);
     Err(format!(
         "{COMPACTION_MODE_REJECTED} (received \"{received}\")."
     ))
+}
+
+/// Renders one JSON value exactly like the baseline's JavaScript
+/// `String(value)` for the shapes JSON can carry: strings verbatim, arrays
+/// as their elements joined with `,` (each coerced in turn), objects as
+/// `[object Object]`, and null, booleans, and numbers per JavaScript rules.
+fn javascript_string(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_owned(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Number(number) => javascript_number(number),
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(javascript_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        Value::Object(_) => "[object Object]".to_owned(),
+    }
+}
+
+/// Formats one JSON number like JavaScript `String(number)` for values parsed
+/// from JSON: fixed notation inside the digit window, exponential with an
+/// explicit positive sign outside it.
+fn javascript_number(number: &serde_json::Number) -> String {
+    let value = number.as_f64().unwrap_or_default();
+    if value == 0.0 {
+        return "0".to_owned();
+    }
+    let rendered = if (1e-6..1e21).contains(&value.abs()) {
+        value.to_string()
+    } else {
+        format!("{value:e}")
+    };
+    match rendered.split_once('e') {
+        Some((mantissa, exponent)) if !exponent.starts_with('-') => {
+            format!("{mantissa}e+{exponent}")
+        }
+        _ => rendered,
+    }
 }
 
 /// Whether one compaction record carries at least one local key; records
@@ -1160,6 +1219,15 @@ fn has_local_compaction(record: &BoundedMap<{ UNBOUNDED_MAP_FIELDS_MAX }>) -> bo
     COMPACTION_SETTING_KEYS
         .iter()
         .any(|key| record.get(key).is_some())
+}
+
+/// Transient pinned-document outcomes worth another bounded attempt: a lost
+/// compare-and-swap race or a contended storage lock.
+fn retryable_pin_error(error: &lotta_store::StoreError) -> bool {
+    matches!(
+        error.kind(),
+        StoreErrorKind::StorageConflict | StoreErrorKind::LottaLock
+    )
 }
 
 /// Parses the pinned-agent side-store document into its identifier list.

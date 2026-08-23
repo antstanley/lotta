@@ -97,6 +97,24 @@ impl TestAgents {
             .any(|entry| entry.as_str() == Some(agent_id))
     }
 
+    /// Identifier list exactly as persisted in the pinned-agent side store,
+    /// preserving stored order and duplicates for normalization assertions.
+    pub(super) fn stored_pinned_ids(&self) -> Vec<String> {
+        let bytes = lotta_store::side::pinned::read(
+            &lotta_store::SidePaths::new(self.root.clone(), None, []).expect("fixture side paths"),
+        )
+        .expect("pinned document")
+        .bytes()
+        .to_vec();
+        let document: Value = serde_json::from_slice(&bytes).expect("pinned document");
+        document["agents"]
+            .as_array()
+            .expect("pinned list")
+            .iter()
+            .map(|entry| entry.as_str().expect("string id").to_owned())
+            .collect()
+    }
+
     /// Decodes a raw JSON command through framing and applies it inline.
     pub(super) async fn send(&self, command: &Value) {
         let text = command.to_string();

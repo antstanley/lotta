@@ -102,6 +102,24 @@ pub(crate) fn write_expected(
     write_expected_mode(path, bytes, expected, WriteMode::Standard)
 }
 
+/// Commits `bytes` only while the target is still absent, so exactly one of
+/// several concurrent first writers wins and the losers can rebuild from a
+/// fresh read.
+///
+/// # Errors
+/// Returns `StorageConflict` when the target appeared concurrently, otherwise
+/// typed path, limit, lock, or filesystem failures.
+pub(crate) fn create_if_absent(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    validate_payload(path, bytes)?;
+    atomic_write_with_expected_observed(
+        path,
+        bytes,
+        WriteMode::Standard,
+        &FileRevision::absent(),
+        &SideNoopObserver,
+    )
+}
+
 /// Replaces a bounded confined file when its revision remains current.
 ///
 /// # Errors

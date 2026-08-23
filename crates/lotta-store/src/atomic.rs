@@ -368,7 +368,7 @@ impl FileRevision {
         }
     }
 
-    const fn absent() -> Self {
+    pub(crate) const fn absent() -> Self {
         Self {
             exists: false,
             modified: None,

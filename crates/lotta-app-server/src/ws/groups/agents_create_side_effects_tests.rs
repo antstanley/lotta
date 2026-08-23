@@ -188,3 +188,50 @@ async fn deletion_removes_conversations_prompt_cache_memfs_and_record() {
         .await;
     assert_eq!(fixture.last()["success"], false);
 }
+
+#[tokio::test]
+async fn pinning_normalizes_an_unsorted_document_with_duplicates() {
+    let fixture = bridge();
+    let side_paths =
+        lotta_store::SidePaths::new(fixture.root.clone(), None, []).expect("fixture side paths");
+    lotta_store::side::pinned::write(&side_paths, br#"{"agents": ["zulu", "alpha", "zulu"]}"#)
+        .expect("seeded pinned document");
+
+    // Pinning an identifier the document already carries must still rewrite
+    // it normalized, never keep stale order or duplicates.
+    fixture.bridge.pin_agent("zulu").expect("pin succeeds");
+    assert_eq!(
+        fixture.stored_pinned_ids(),
+        vec!["alpha".to_owned(), "zulu".to_owned()]
+    );
+
+    // A fresh identifier joins the same normalized ordering.
+    fixture.bridge.pin_agent("mike").expect("pin succeeds");
+    assert_eq!(
+        fixture.stored_pinned_ids(),
+        vec!["alpha".to_owned(), "mike".to_owned(), "zulu".to_owned()]
+    );
+}
+
+#[test]
+fn concurrent_first_writes_keep_every_pin() {
+    let fixture = bridge();
+    let ids: Vec<String> = (0..8)
+        .map(|index| format!("agent-local-race-{index}"))
+        .collect();
+    let handles: Vec<_> = ids
+        .iter()
+        .cloned()
+        .map(|id| {
+            let bridge = std::sync::Arc::clone(&fixture.bridge);
+            std::thread::spawn(move || bridge.pin_agent(&id))
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("pin thread").expect("pin succeeded");
+    }
+    let mut stored = fixture.stored_pinned_ids();
+    assert_eq!(stored.len(), 8, "no concurrent first write was lost");
+    stored.sort();
+    assert_eq!(stored, ids, "every racer's pin survived exactly once");
+}

@@ -38,3 +38,13 @@ pub fn write_expected(
 ) -> Result<(), StoreError> {
     super::io::write_expected(&paths.pinned_agents()?, bytes, source.revision())
 }
+
+/// Creates the document only while it is still absent.
+///
+/// # Errors
+/// Returns `StorageConflict` when another writer committed a document first,
+/// so the losing creator can rebuild from a fresh read inside its retry loop;
+/// otherwise a typed path, limit, lock, or filesystem failure.
+pub fn create_if_absent(paths: &SidePaths, bytes: &[u8]) -> Result<(), StoreError> {
+    super::io::create_if_absent(&paths.pinned_agents()?, bytes)
+}

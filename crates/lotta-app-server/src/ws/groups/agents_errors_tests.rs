@@ -261,3 +261,45 @@ async fn compaction_settings_with_an_unknown_mode_reject_update() {
          \"sliding_window\" (received \"42\")."
     );
 }
+
+#[tokio::test]
+async fn compaction_unknown_mode_renders_objects_like_the_baseline_coercion() {
+    let fixture = bridge();
+    fixture
+        .send(&json!({
+            "type": "agent_create",
+            "request_id": "err-cmp-3",
+            "body": {
+                "name": "Object Mode",
+                "compaction_settings": {"mode": {"kind": "exotic"}},
+            },
+        }))
+        .await;
+    assert_eq!(fixture.last()["type"], "agent_create_response");
+    assert_eq!(fixture.last()["success"], false);
+    assert_eq!(
+        fixture.last()["error"],
+        "Local backend compaction currently supports only modes \"all\" and \
+         \"sliding_window\" (received \"[object Object]\")."
+    );
+}
+
+#[tokio::test]
+async fn compaction_unknown_mode_renders_arrays_like_the_baseline_coercion() {
+    let fixture = bridge();
+    fixture
+        .send(&json!({
+            "type": "agent_update",
+            "request_id": "err-cmp-4",
+            "agent_id": fixture.create_agent("Array Mode").await,
+            "body": {"compaction_settings": {"mode": ["all", 42, null]}},
+        }))
+        .await;
+    assert_eq!(fixture.last()["type"], "agent_update_response");
+    assert_eq!(fixture.last()["success"], false);
+    assert_eq!(
+        fixture.last()["error"],
+        "Local backend compaction currently supports only modes \"all\" and \
+         \"sliding_window\" (received \"all,42,null\")."
+    );
+}
