@@ -232,6 +232,7 @@ fn typed_failure_state(
                 crate::ws::conversations::inert_forwarder(),
                 &prepared.storage_dir,
                 clock(),
+                None,
             )
             .expect("conversations bridge"),
         ),

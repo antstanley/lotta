@@ -103,6 +103,12 @@ impl ConversationId {
         generate_sequence(CONVERSATION_PREFIX, sequence, IdKind::Conversation).map(Self)
     }
 
+    /// Parses the canonical generated sequence form, when this identifier is one.
+    #[must_use]
+    pub fn canonical_sequence(&self) -> Option<u64> {
+        canonical_sequence(CONVERSATION_PREFIX, &self.0)
+    }
+
     /// Accepts the agent-scoped virtual default conversation value.
     #[must_use]
     pub fn default_for_agent() -> Self {
@@ -192,6 +198,18 @@ fn generate_sequence(
         return Err(DomainError::IdSequenceOutOfRange { kind });
     }
     generate_with_suffix(prefix, &sequence.to_string(), kind)
+}
+
+/// Parses a generated `<prefix><decimal>` sequence form without rewriting it.
+fn canonical_sequence(prefix: &str, value: &str) -> Option<u64> {
+    let decimal = value.strip_prefix(prefix)?;
+    if decimal.is_empty()
+        || decimal.starts_with('0')
+        || !decimal.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    decimal.parse::<u64>().ok().filter(|sequence| *sequence > 0)
 }
 
 fn generate_with_suffix(

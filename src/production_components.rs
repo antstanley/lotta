@@ -46,7 +46,7 @@ use lotta_runtime::turn::{
     TurnEvent, TurnProjection, TurnStopRecord,
 };
 use lotta_runtime::{
-    AdmissionOutcome, AdmissionRequest, AdmissionRoute, ListenerRuntime, RuntimeKey,
+    AdmissionOutcome, AdmissionRequest, AdmissionRoute, ListenerRuntime, RuntimeError, RuntimeKey,
     WorkspaceSandbox,
 };
 use lotta_store::{LocalStore, StoreErrorKind, StorePaths};
@@ -67,7 +67,9 @@ use lotta_tools::builtin::{
 use lotta_tools::sandbox::OsSandbox;
 use lotta_tools::{ToolRegistration, ToolsetId, WorkspacePolicy};
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -197,6 +199,13 @@ impl ProductionComponents {
             ),
         });
         brokers.register_compaction_service(Some(compaction));
+        // The WebSocket conversations group shares the authoritative lifecycle
+        // registry (busy-vs-idle compaction) and routes through the registered
+        // production compaction service with its real hooks and summarizer.
+        shared.register_conversations_authority(Some(Arc::new(ConversationsProductionAuthority {
+            state: Arc::clone(&runtime_state),
+            brokers: Arc::clone(&brokers),
+        })));
         let runtime_service = Arc::new(ProductionRuntimeService::new(
             store_paths.clone(),
             Arc::clone(&clock),
@@ -735,15 +744,27 @@ impl ProductionRuntimeState {
     }
 
     pub(crate) fn lease_is_current(&self, scope: &RuntimeScope, lease: &TurnLease) -> bool {
-        self.active
-            .lock()
-            .ok()
-            .and_then(|active| {
-                active
-                    .get(&RuntimeKey::from(scope))
-                    .map(|item| item.lease.clone())
-            })
-            .is_some_and(|current| current == *lease)
+        let active_current = self.active.lock().ok().and_then(|active| {
+            active
+                .get(&RuntimeKey::from(scope))
+                .map(|item| item.lease.clone())
+        });
+        if let Some(current) = active_current {
+            return current == *lease;
+        }
+        // No active admission holds this scope, so the lease can only be a
+        // management command begun directly on the authoritative lifecycle
+        // registry (for example a WebSocket conversation compaction).
+        // ponytail: try_lock only; registry contention is sub-millisecond and
+        // treated conservatively as "not current".
+        let Ok(state) = self.inner.try_lock() else {
+            return false;
+        };
+        let registry = &state.registry;
+        registry
+            .lookup(&RuntimeKey::from(scope))
+            .and_then(|handle| registry.lifecycle(&handle))
+            .is_some_and(|owner| owner.is_current(lease))
     }
 
     #[cfg(test)]
@@ -806,6 +827,80 @@ impl ProductionRuntimeState {
             self.record_cancellation("pump");
         }
         Ok(pumped)
+    }
+}
+
+/// Bridges the WebSocket conversations group to the authoritative production
+/// runtime: command leases are begun on the same lifecycle registry the turn
+/// path uses, and compaction routes through the registered production service.
+pub(crate) struct ConversationsProductionAuthority {
+    pub(crate) state: Arc<ProductionRuntimeState>,
+    pub(crate) brokers: Arc<ProductionTurnBrokers>,
+}
+
+impl ConversationsProductionAuthority {
+    fn begin_on_registry(&self, scope: &RuntimeScope) -> Result<TurnLease, ()> {
+        let mut state = self.state.inner.try_lock().map_err(|_| ())?;
+        let owner = Uuid::from_u128(state.sequence);
+        state.sequence = state.sequence.checked_add(1).ok_or(())?;
+        let handle = state.registry.get_or_create(scope, owner).map_err(|_| ())?;
+        let owner_lifecycle = state.registry.lifecycle_mut(&handle).map_err(|_| ())?;
+        owner_lifecycle.begin_command().map_err(|_| ())
+    }
+
+    fn finish_on_registry(&self, scope: &RuntimeScope, lease: &TurnLease) {
+        let Ok(mut state) = self.state.inner.try_lock() else {
+            return;
+        };
+        if let Some(handle) = state.registry.lookup(&RuntimeKey::from(scope))
+            && let Ok(owner) = state.registry.lifecycle_mut(&handle)
+        {
+            let _ = owner.finish_command(lease);
+        }
+    }
+}
+
+impl lotta_app_server::ws::conversations::ConversationAuthority
+    for ConversationsProductionAuthority
+{
+    fn begin_command(
+        &self,
+        scope: &RuntimeScope,
+    ) -> Result<TurnLease, lotta_app_server::ws::conversations::CommandLeaseUnavailable> {
+        self.begin_on_registry(scope)
+            .map_err(|()| lotta_app_server::ws::conversations::CommandLeaseUnavailable)
+    }
+
+    fn finish_command(&self, scope: &RuntimeScope, lease: &TurnLease) {
+        self.finish_on_registry(scope, lease);
+    }
+
+    fn is_current(&self, scope: &RuntimeScope, lease: &TurnLease) -> bool {
+        self.state.lease_is_current(scope, lease)
+    }
+
+    fn compact(
+        &self,
+        command: lotta_runtime::CompactionCommand,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<lotta_runtime::turn::CompactionProgress, RuntimeError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let service = self
+                .brokers
+                .compaction
+                .lock()
+                .map_err(|_| RuntimeError::Conflict {
+                    context: "compaction broker lock".into(),
+                })?
+                .clone()
+                .ok_or(RuntimeError::CompactionUnavailable)?;
+            service.compact(command).await
+        })
     }
 }
 

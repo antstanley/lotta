@@ -279,12 +279,16 @@ async fn start_listener_for_test(
 /// Holding the exact [`SkillsBridge`] and [`SettingsBridge`] instances the
 /// listener serves means skills enable/disable and cwd changes recorded over
 /// the WebSocket are visible to the turn controller and runtime service that
-/// prepare subsequent turns.
+/// prepare subsequent turns. The optional conversation lease authority is the
+/// host's production runtime state: when registered, WebSocket conversation
+/// compaction shares the turn path's authoritative lifecycle registry.
 #[derive(Clone)]
 pub struct SharedGroupBridges {
     outbound: Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
     skills: Arc<SkillsBridge>,
     settings: Arc<SettingsBridge>,
+    conversations_authority:
+        Arc<std::sync::Mutex<Option<Arc<dyn crate::ws::conversations::ConversationAuthority>>>>,
 }
 
 impl SharedGroupBridges {
@@ -315,6 +319,7 @@ impl SharedGroupBridges {
             outbound,
             skills,
             settings,
+            conversations_authority: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -328,6 +333,30 @@ impl SharedGroupBridges {
     #[must_use]
     pub fn settings(&self) -> Arc<SettingsBridge> {
         Arc::clone(&self.settings)
+    }
+
+    /// Registers the production conversation lease authority so the listener's
+    /// conversations bridge acquires its compaction command leases from the
+    /// authoritative runtime registry and routes through the production
+    /// compaction service. Idempotent; later registrations win.
+    pub fn register_conversations_authority(
+        &self,
+        authority: Option<Arc<dyn crate::ws::conversations::ConversationAuthority>>,
+    ) {
+        if let Ok(mut current) = self.conversations_authority.lock() {
+            *current = authority;
+        }
+    }
+
+    /// Snapshot of the registered conversation lease authority, if any.
+    #[must_use]
+    pub fn conversations_authority(
+        &self,
+    ) -> Option<Arc<dyn crate::ws::conversations::ConversationAuthority>> {
+        self.conversations_authority
+            .lock()
+            .ok()
+            .and_then(|current| current.clone())
     }
 }
 
@@ -380,6 +409,7 @@ fn compose_shared_bridges(
         outbound,
         skills,
         settings,
+        conversations_authority: Arc::new(std::sync::Mutex::new(None)),
     })
 }
 
@@ -407,14 +437,17 @@ async fn start_listener_with_limits(
     tracing::info!(base_url, websocket_url, "app server listener started");
     let shutdown = CancellationToken::new();
     let runtime_router = RuntimeRouter::new(clock.clone(), Arc::new(RandomEventIdGenerator));
+    let shared = match shared {
+        Some(shared) => shared,
+        None => compose_shared_bridges(&prepared, &clock)?,
+    };
+    let conversations_authority = shared.conversations_authority();
     let SharedGroupBridges {
         outbound,
         skills,
         settings,
-    } = match shared {
-        Some(shared) => shared,
-        None => compose_shared_bridges(&prepared, &clock)?,
-    };
+        ..
+    } = shared;
     // The artifacts root backs Task 37 tool artifact operations; the files
     // group creates it on first bind next to the canonical storage root.
     let artifacts_dir = prepared.storage_dir.join("artifacts");
@@ -433,7 +466,12 @@ async fn start_listener_with_limits(
         &prepared.storage_dir,
         Arc::clone(&clock),
     )?);
-    let conversations = compose_conversations_bridge(&outbound, &prepared.storage_dir, &clock)?;
+    let conversations = compose_conversations_bridge(
+        &outbound,
+        &prepared.storage_dir,
+        &clock,
+        conversations_authority,
+    )?;
     let state = Arc::new(ListenerState {
         auth: prepared.auth,
         clock: Arc::clone(&clock),
@@ -878,15 +916,21 @@ fn conversations_forwarder(
 }
 
 /// Composes the conversation management bridge over the canonical storage root.
+///
+/// The optional authoritative lease authority comes from host-composed shared
+/// bridges, so compaction commands acquire their command leases from the same
+/// lifecycle registry the production turn path uses.
 fn compose_conversations_bridge(
     outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
     storage_dir: &std::path::Path,
     clock: &Arc<dyn Clock + Send + Sync>,
+    authority: Option<Arc<dyn crate::ws::conversations::ConversationAuthority>>,
 ) -> Result<Arc<ConversationsBridge>, AppServerError> {
     Ok(Arc::new(ConversationsBridge::new(
         conversations_forwarder(outbound),
         storage_dir,
         Arc::clone(clock),
+        authority,
     )?))
 }
 

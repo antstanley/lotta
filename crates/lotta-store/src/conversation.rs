@@ -50,6 +50,37 @@ pub(crate) fn save(
     refresh_after_write(&path, value, cache)
 }
 
+/// Creates one conversation atomically under the backend writer lock.
+///
+/// The per-agent cap is enforced once and a globally unused monotonic
+/// identifier is allocated inside the same critical section, so concurrent
+/// creators always receive distinct identifiers and can never exceed the cap.
+pub(crate) fn create(
+    paths: &StorePaths,
+    agent: &AgentId,
+    limit: usize,
+    cache: &RecordCache,
+    build: impl FnOnce(ConversationId) -> Result<Conversation, StoreError>,
+) -> Result<Conversation, StoreError> {
+    let lock = LottaStorageLock::try_acquire(paths.root())?;
+    let directory = paths.conversations();
+    ensure_create_capacity(paths, agent, limit, &directory)?;
+    let sequence = crate::adapter::max_conversation_sequence(&directory)?
+        .checked_add(1)
+        .ok_or_else(|| StoreError::new(StoreErrorKind::Limit, &directory))?;
+    let id = ConversationId::generate(sequence)
+        .map_err(|_| StoreError::new(StoreErrorKind::Limit, &directory))?;
+    let value = build(id.clone())?;
+    if &value.agent_id != agent || value.id != id {
+        return Err(StoreError::new(StoreErrorKind::Parse, directory));
+    }
+    let path = record_path(paths, agent, &id)?;
+    let revision = FileRevision::sample_path(&path)?;
+    write_record_locked(&path, &value, &revision, &lock)?;
+    refresh_after_write(&path, &value, cache)?;
+    Ok(value)
+}
+
 pub(crate) fn archive(
     paths: &StorePaths,
     agent: &AgentId,

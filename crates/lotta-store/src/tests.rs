@@ -1255,3 +1255,120 @@ mod lock {
         assert!(path.is_file());
     }
 }
+
+mod conversation_creation {
+    use super::*;
+    use lotta_domain::{Agent, Conversation};
+    use lotta_runtime::ports::AgentStore;
+    use std::sync::Arc;
+
+    const RACE_THREADS: usize = 24;
+    const RACE_CAP: usize = 8;
+
+    async fn seeded_agent(paths: &StorePaths) -> AgentId {
+        let agent: Agent = serde_json::from_value(serde_json::json!({
+            "id": "agent-local-race",
+            "name": "Race Agent",
+            "description": null,
+            "system": "",
+            "tags": [],
+            "model": "openai/gpt-5",
+            "model_settings": {}
+        }))
+        .expect("agent");
+        let store = LocalStore::new(paths.clone());
+        AgentStore::save(&store, &agent)
+            .await
+            .expect("seeded agent save");
+        AgentId::accept("agent-local-race").expect("agent id")
+    }
+
+    fn blank_conversation(id: &ConversationId, agent: &AgentId) -> Conversation {
+        serde_json::from_value(serde_json::json!({
+            "id": id.as_str(),
+            "agent_id": agent.as_str(),
+            "archived": false,
+            "created_at": "2026-01-02T03:04:05Z",
+            "updated_at": "2026-01-02T03:04:05Z",
+            "in_context_message_ids": []
+        }))
+        .expect("blank conversation")
+    }
+
+    /// Concurrent creators over one agent receive globally distinct
+    /// identifiers, and the per-agent cap is enforced exactly once: with
+    /// try-lock contention resolved through bounded retries, successes stop
+    /// at the cap and every other attempt fails with the Limit kind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_creates_allocate_distinct_ids_under_the_cap() {
+        let (_owned, paths) = root("concurrent-create");
+        let agent = seeded_agent(&paths).await;
+        let store = Arc::new(LocalStore::with_limits(
+            paths.clone(),
+            crate::agent::AGENTS_MAX,
+            RACE_CAP,
+        ));
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..RACE_THREADS {
+            let store = Arc::clone(&store);
+            let agent = agent.clone();
+            tasks.spawn(async move { create_until_resolved(&store, &agent).await });
+        }
+
+        let mut allocated = Vec::new();
+        let mut limit_rejections = 0;
+        while let Some(joined) = tasks.join_next().await {
+            match joined.expect("task join") {
+                Ok(id) => allocated.push(id.into_string()),
+                Err(error) => {
+                    assert_eq!(
+                        error.kind(),
+                        StoreErrorKind::Limit,
+                        "only cap rejections survive contention retries: {error}"
+                    );
+                    limit_rejections += 1;
+                }
+            }
+        }
+
+        assert_eq!(allocated.len() + limit_rejections, RACE_THREADS);
+        assert_eq!(
+            allocated.len(),
+            RACE_CAP,
+            "successes stop exactly at the cap"
+        );
+        assert_eq!(limit_rejections, RACE_THREADS - RACE_CAP);
+        allocated.sort();
+        allocated.dedup();
+        assert_eq!(
+            allocated.len(),
+            RACE_CAP,
+            "every allocation was globally distinct"
+        );
+    }
+
+    /// One creator's attempt: advisory try-lock contention between concurrent
+    /// creators is retried within bounds until the attempt resolves.
+    async fn create_until_resolved(
+        store: &Arc<LocalStore>,
+        agent: &AgentId,
+    ) -> Result<ConversationId, crate::StoreError> {
+        for _ in 0..1_000 {
+            let builder_agent = agent.clone();
+            match store
+                .create_conversation(agent.clone(), move |conversation_id| {
+                    Ok(blank_conversation(&conversation_id, &builder_agent))
+                })
+                .await
+            {
+                Ok(created) => return Ok(created.id),
+                Err(error) if error.kind() == StoreErrorKind::LottaLock => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        panic!("lock contention never resolved");
+    }
+}

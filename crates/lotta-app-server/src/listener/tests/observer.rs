@@ -139,6 +139,7 @@ fn state(
                 crate::ws::conversations::inert_forwarder(),
                 &files_workspace("observer-conversations"),
                 Arc::new(TestClock),
+                None,
             )
             .expect("conversations bridge"),
         ),

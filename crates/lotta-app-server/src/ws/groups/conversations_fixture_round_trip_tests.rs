@@ -177,7 +177,7 @@ fn conversation_messages_list_round_trips() {
             "before": "letta-msg-9",
             "after": "letta-msg-2",
             "order": "asc",
-            "include_return_message_types": ["user", "tool_return"],
+            "include_return_message_types": ["user_message", "tool_return_message"],
         },
     }));
 }

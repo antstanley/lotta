@@ -95,6 +95,28 @@ impl LocalStore {
         .await
     }
 
+    /// Creates one conversation with an atomically allocated identifier.
+    ///
+    /// The per-agent cap and the globally unused monotonic identifier
+    /// allocation both happen inside one backend writer-lock critical section,
+    /// so concurrent creators receive distinct identifiers and the cap holds.
+    ///
+    /// # Errors
+    /// Returns typed read, validation, lock, limit, or durable-write failures.
+    pub async fn create_conversation(
+        &self,
+        agent: AgentId,
+        build: impl FnOnce(ConversationId) -> Result<Conversation, StoreError> + Send + 'static,
+    ) -> Result<Conversation, StoreError> {
+        let paths = self.paths.clone();
+        let cache = self.cache.clone();
+        let limit = self.conversations_per_agent_max;
+        run_blocking(Arc::clone(&self.blocking), move || {
+            crate::conversation::create(&paths, &agent, limit, &cache, build)
+        })
+        .await
+    }
+
     /// Archives or unarchives a conversation with explicit-null unarchive semantics.
     ///
     /// # Errors
@@ -522,6 +544,23 @@ pub(crate) fn count_conversations_for_agent(
         }
     }
     Ok(count)
+}
+
+/// Highest canonical generated conversation sequence persisted anywhere in the
+/// backend, across every agent scope; zero when none is stored yet.
+pub(crate) fn max_conversation_sequence(directory: &Path) -> Result<u64, StoreError> {
+    let mut highest = 0_u64;
+    for path in sorted_files(directory)? {
+        let record = path.join("conversation.json");
+        if !record.is_file() {
+            continue;
+        }
+        let value: Conversation = read_record(&record)?;
+        if let Some(sequence) = value.id.canonical_sequence() {
+            highest = highest.max(sequence);
+        }
+    }
+    Ok(highest)
 }
 
 fn push_bounded<T>(values: &mut Vec<T>, value: T, path: &Path) -> Result<(), StoreError> {

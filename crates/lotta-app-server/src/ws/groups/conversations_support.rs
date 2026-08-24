@@ -289,11 +289,15 @@ impl TestConversations {
 
 /// Creates a bridge over a fresh temporary storage root (production cap).
 pub(super) fn bridge() -> TestConversations {
-    bridge_with_limit(lotta_store::CONVERSATIONS_PER_AGENT_MAX)
+    bridge_with_authority(|_| None)
 }
 
-/// Creates a bridge over a fresh temporary root with an explicit small cap.
-pub(super) fn bridge_with_limit(conversations_per_agent_max: usize) -> TestConversations {
+/// Creates a bridge over a fresh temporary root whose lease authority is
+/// composed from the fixture's own store handle, so an authority can share
+/// exactly the storage the bridge serves.
+pub(super) fn bridge_with_authority(
+    compose_authority: impl FnOnce(LocalStore) -> Option<Arc<dyn super::ConversationAuthority>>,
+) -> TestConversations {
     let ordinal = ROOT_ORDINAL.fetch_add(1, Ordering::SeqCst);
     let parent = std::env::temp_dir().join(format!(
         "lotta-conversations-ws-{ordinal}-{}",
@@ -314,12 +318,13 @@ pub(super) fn bridge_with_limit(conversations_per_agent_max: usize) -> TestConve
             .push((connection, message));
         Ok(())
     });
+    let authority = compose_authority(LocalStore::new(paths.clone()));
     let bridge = Arc::new(ConversationsBridge::compose(
         forward,
         LocalStore::new(paths.clone()),
         memfs,
-        conversations_per_agent_max,
         clock,
+        authority,
     ));
     TestConversations {
         bridge,

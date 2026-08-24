@@ -2,9 +2,15 @@
 //! command proves each of the eight pinned discriminants decodes, routes, and
 //! responds with the pinned success shape.
 
-use serde_json::json;
+use serde_json::{Value, json};
 
-use super::support::{bridge, discriminant_of};
+use super::support::{TestConversations, bridge, discriminant_of};
+
+/// The minted conversation identifier of one create response frame.
+fn created_id(frame: &Value) -> lotta_domain::ConversationId {
+    lotta_domain::ConversationId::accept(frame["conversation"]["id"].as_str().expect("id"))
+        .expect("created id")
+}
 
 #[tokio::test]
 async fn conversation_list_serves_created_conversations_newest_first() {
@@ -96,6 +102,11 @@ async fn conversation_create_returns_the_created_snapshot_with_pinned_defaults()
     assert_eq!(frame["conversation"]["archived"], false);
     assert_eq!(frame["conversation"]["in_context_message_ids"], json!([]));
     assert_eq!(frame["conversation"]["tags"], json!(["team-a"]));
+    assert_eq!(
+        frame["conversation"].get("model"),
+        None,
+        "an absent model key stays absent like the canonical schema"
+    );
 
     // Creation through the wire path persists the record authoritatively.
     let created = frame["conversation"]["id"].as_str().expect("id").to_owned();
@@ -108,12 +119,54 @@ async fn conversation_create_returns_the_created_snapshot_with_pinned_defaults()
         .await;
     assert_eq!(fixture.last()["success"], true);
 
+    // A sent explicit null stays an explicit null and a sent value persists
+    // verbatim, exactly like the canonical `Conversation` schema.
+    assert_model_tri_state(&fixture, &agent).await;
+
     // Creating without any resolvable owning agent rejects safely.
     fixture
         .send(&json!({"type": "conversation_create", "request_id": "cr-3", "body": {}}))
         .await;
     assert_eq!(fixture.last()["success"], false);
     assert_eq!(fixture.last()["error"], "agent not found");
+}
+
+/// Creates one conversation per tri-state model encoding (absent / explicit
+/// null / value) and asserts the response snapshot plus the persisted record.
+async fn assert_model_tri_state(fixture: &TestConversations, agent: &lotta_domain::AgentId) {
+    fixture
+        .send(&json!({
+            "type": "conversation_create",
+            "request_id": "cr-4",
+            "body": {"agent_id": agent.as_str(), "model": null},
+        }))
+        .await;
+    assert_eq!(fixture.last()["success"], true);
+    assert_eq!(
+        fixture.last()["conversation"].get("model"),
+        Some(&json!(null)),
+        "sent explicit nulls remain explicit"
+    );
+    let created = created_id(&fixture.last());
+    let stored = fixture.conversation_value(agent, &created).await;
+    assert_eq!(
+        stored.get("model"),
+        Some(&json!(null)),
+        "the persisted record preserves the explicit null"
+    );
+
+    fixture
+        .send(&json!({
+            "type": "conversation_create",
+            "request_id": "cr-5",
+            "body": {"agent_id": agent.as_str(), "model": "custom/local-model"},
+        }))
+        .await;
+    assert_eq!(fixture.last()["success"], true);
+    assert_eq!(
+        fixture.last()["conversation"]["model"],
+        "custom/local-model"
+    );
 }
 
 #[tokio::test]
@@ -184,6 +237,85 @@ async fn conversation_recompile_responds_with_compiled_content_and_persists_cach
         result.contains("Base system prompt for Recompiled Agent."),
         "the compiled content renders the agent's raw system text"
     );
+
+    // The non-dry compile persists its cache record beside the conversation
+    // artifacts, a dry run renders afresh yet persists nothing, and only the
+    // persisting run refreshes the stale record. Proves recompilation never
+    // reuses the cache.
+    assert_recompile_renders_fresh_and_persists_only_when_not_dry(&fixture, &agent, &seeded).await;
+}
+
+/// Path of the Task 30 cache record persisted for one conversation.
+fn prompt_cache_path(
+    fixture: &TestConversations,
+    agent: &lotta_domain::AgentId,
+    conversation: &lotta_domain::ConversationId,
+) -> std::path::PathBuf {
+    fixture
+        .store
+        .paths()
+        .conversation_dir(agent, conversation)
+        .expect("scoped path")
+        .join("system-prompt.json")
+}
+
+async fn assert_recompile_renders_fresh_and_persists_only_when_not_dry(
+    fixture: &TestConversations,
+    agent: &lotta_domain::AgentId,
+    conversation: &lotta_domain::ConversationId,
+) {
+    let cache_path = prompt_cache_path(fixture, agent, conversation);
+    assert!(cache_path.exists(), "the cache record was persisted");
+
+    // Mutating the committed agent prompt makes the cached render stale, and
+    // recompilation must still render afresh (never reusing the cache).
+    let mut refreshed = lotta_runtime::ports::AgentStore::load(&fixture.store, agent)
+        .await
+        .expect("agent");
+    refreshed.system = "Replacement system prompt.".to_owned();
+    lotta_runtime::ports::AgentStore::save(&fixture.store, &refreshed)
+        .await
+        .expect("agent save");
+
+    // A dry run serves the fresh render yet persists nothing: the stale
+    // cache record survives byte-identical.
+    fixture
+        .send(&json!({
+            "type": "conversation_recompile",
+            "request_id": "rc-2",
+            "conversation_id": conversation.as_str(),
+            "body": {"agent_id": agent.as_str(), "dry_run": true},
+        }))
+        .await;
+    assert_eq!(fixture.last()["success"], true);
+    let dry_frame = fixture.last();
+    let dry_result = dry_frame["result"].as_str().expect("compiled prompt");
+    assert!(
+        dry_result.contains("Replacement system prompt."),
+        "recompilation ignores the cached render"
+    );
+    drop(dry_frame);
+    let cached_before = std::fs::read(&cache_path).expect("cache bytes");
+    assert!(
+        !String::from_utf8_lossy(&cached_before).contains("Replacement system prompt."),
+        "a dry run leaves the stale cache record untouched"
+    );
+
+    // The persisting run refreshes the cache record with the fresh render.
+    fixture
+        .send(&json!({
+            "type": "conversation_recompile",
+            "request_id": "rc-3",
+            "conversation_id": conversation.as_str(),
+            "body": {"agent_id": agent.as_str(), "dry_run": false},
+        }))
+        .await;
+    assert_eq!(fixture.last()["success"], true);
+    let cached_after = std::fs::read_to_string(&cache_path).expect("cache bytes");
+    assert!(
+        cached_after.contains("Replacement system prompt."),
+        "the persisting run refreshes the cache record"
+    );
 }
 
 #[tokio::test]
@@ -232,9 +364,17 @@ async fn conversation_messages_list_serves_the_projected_page() {
     let frame = fixture.last();
     let messages = frame["messages"].as_array().expect("page");
     assert_eq!(messages.len(), 4);
-    // Default order serves newest-first like the pinned backend.
-    let first = messages[0]["timestamp_ms"].as_f64().expect("stamp");
-    let second = messages[1]["timestamp_ms"].as_f64().expect("stamp");
+    // Default order serves newest-first like the pinned backend, and every
+    // served message carries the flattened pinned stored-message identity.
+    assert!(
+        messages
+            .iter()
+            .all(|message| message["message_type"] == "user_message"
+                || message["message_type"] == "assistant_message"),
+        "text-only seeds project to user and assistant categories"
+    );
+    let first = messages[0]["date"].as_str().expect("date");
+    let second = messages[1]["date"].as_str().expect("date");
     assert!(first >= second, "descending order by default");
     assert_eq!(fixture.last()["has_more"], false);
     let oldest = fixture

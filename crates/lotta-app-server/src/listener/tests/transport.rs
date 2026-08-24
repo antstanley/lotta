@@ -83,6 +83,7 @@ fn router() -> axum::Router {
                 crate::ws::conversations::inert_forwarder(),
                 &files_workspace("transport-conversations"),
                 Arc::new(TestClock),
+                None,
             )
             .expect("conversations bridge"),
         ),

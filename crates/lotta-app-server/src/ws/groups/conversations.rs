@@ -50,6 +50,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use chrono::SecondsFormat;
 use lotta_domain::{
     AgentId, BoundedMap, BoundedVec, Clock, CompactionEntry, CompactionEntryType, Conversation,
     ConversationId, EntityExtras, InContextMessageIds, LocalMessage, LocalMessageRole,
@@ -58,13 +59,14 @@ use lotta_domain::{
     TranscriptMessageFormat, TurnLease, TurnLifecycle, bounds::UNBOUNDED_MAP_FIELDS_MAX,
 };
 use lotta_memfs::{
-    CacheRoot, DeliveryCapability, GitMemFs, PromptCompiler, PromptInputs, PromptSections,
+    CacheRoot, CompiledPromptRecord, GitMemFs, PromptCompiler, PromptInputs, PromptSections,
     PromptText,
 };
 use lotta_protocol::{DecodeOutcome, WsProtocolCommand as Tag};
 use lotta_runtime::{
-    CompactionCommand, CompactionEffects, CompactionMode, CompactionRecovery, CompactionService,
-    CompactionSummary, CompactionTrigger, RuntimeError,
+    COMPACTION_RECENT_PERCENT_DEFAULT, COMPACTION_RECENT_PERCENT_MAX, CompactionCommand,
+    CompactionEffects, CompactionMode, CompactionRecovery, CompactionService, CompactionSummary,
+    CompactionTrigger, RuntimeError,
     boundary::ProviderText,
     ports::{
         AgentStore, ConversationStore, ImagePolicy, ProviderContent, ProviderContentPart,
@@ -74,8 +76,8 @@ use lotta_runtime::{
     },
 };
 use lotta_store::{
-    CONVERSATIONS_PER_AGENT_MAX, CompactionProjection, CompactionTransaction,
-    CompactionTransactionState, LocalStore, StorePaths,
+    CompactionProjection, CompactionTransaction, CompactionTransactionState, LocalStore,
+    StorePaths,
     query::{
         ConversationFilters, MessageListOptions, MessageOrder, PageRequest, QUERY_PAGE_ITEMS_MAX,
         ReturnMessageType, TriState,
@@ -85,7 +87,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::future::Future;
 use tokio_util::sync::CancellationToken;
 
-use super::agents::ExplicitField;
+use super::agents::{COMPACTION_MODE_REJECTED, ExplicitField};
 use crate::{
     bounds::WS_FRAME_BYTES_MAX,
     errors::{AppServerError, ProtocolErrorEnvelope},
@@ -97,8 +99,6 @@ use crate::{
 pub const CONVERSATION_LIST_DEFAULT_ITEMS: usize = 20;
 /// Messages listed when the client omits an explicit limit (pinned parity).
 pub const MESSAGE_LIST_DEFAULT_ITEMS: usize = 50;
-/// Bounded attempts to mint an unused sequential conversation identifier.
-const NEW_ID_ATTEMPTS_MAX: usize = 4;
 /// Fallback context-window ceiling used for token estimates in estimates-only detail.
 const COMPACTION_CONTEXT_WINDOW_FALLBACK_TOKENS: u64 = 128_000;
 /// Longest per-part excerpt carried into a deterministic summary.
@@ -183,9 +183,14 @@ pub struct ConversationCreateBody {
     /// Initial summary; absent reads as an explicit null like the baseline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
-    /// Conversation-level model override.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    /// Conversation-level model override; explicit null stays distinct from
+    /// absence like the canonical `Conversation` schema.
+    #[serde(
+        default,
+        deserialize_with = "super::agents::explicit_field",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub model: Option<ExplicitField<String>>,
     /// Provider model settings for the override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_settings: Option<BoundedMap<{ UNBOUNDED_MAP_FIELDS_MAX }>>,
@@ -318,9 +323,10 @@ pub struct ConversationMessagesQuery {
     /// `asc` serves oldest-first; everything else serves newest-first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order: Option<String>,
-    /// Included return-message categories; absence includes all.
+    /// Included return-message categories as pinned message-type strings;
+    /// absence includes all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub include_return_message_types: Option<Vec<ReturnMessageType>>,
+    pub include_return_message_types: Option<Vec<PinnedMessageType>>,
 }
 
 /// Pinned `conversation_messages_list` payload.
@@ -341,6 +347,10 @@ pub struct ConversationCompactBody {
     /// Optional owning-agent scope hint checked first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// Optional compaction settings record; sent keys override the owning
+    /// agent's stored settings when selecting the compaction strategy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_settings: Option<BoundedMap<{ UNBOUNDED_MAP_FIELDS_MAX }>>,
 }
 
 /// Pinned `conversation_compact` payload.
@@ -383,6 +393,128 @@ pub enum ConversationsCommand {
     /// Lease-serialized Task 58 compaction.
     #[serde(rename = "conversation_compact")]
     Compact(ConversationCompactCommand),
+}
+
+// ── Pinned stored-message wire models ───────────────────────────────────────
+
+/// Return-message categories spelled exactly like the pinned protocol's
+/// `message_type` strings.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PinnedMessageType {
+    /// User content.
+    UserMessage,
+    /// Assistant text content.
+    AssistantMessage,
+    /// Assistant reasoning content.
+    ReasoningMessage,
+    /// Assistant tool call awaiting its result.
+    ApprovalRequestMessage,
+    /// Completed tool result.
+    ToolReturnMessage,
+    /// Compaction summary.
+    SummaryMessage,
+}
+
+impl PinnedMessageType {
+    fn category(self) -> ReturnMessageType {
+        match self {
+            Self::UserMessage => ReturnMessageType::User,
+            Self::AssistantMessage => ReturnMessageType::Assistant,
+            Self::ReasoningMessage => ReturnMessageType::Reasoning,
+            Self::ApprovalRequestMessage => ReturnMessageType::ApprovalRequest,
+            Self::ToolReturnMessage => ReturnMessageType::ToolReturn,
+            Self::SummaryMessage => ReturnMessageType::Summary,
+        }
+    }
+}
+
+/// Type-specific pinned payload flattened into one stored-message object.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "message_type")]
+pub enum PinnedMessageKind {
+    /// `user_message` — user turn with canonical content parts.
+    #[serde(rename = "user_message")]
+    User {
+        /// Sender role label.
+        role: &'static str,
+        /// Canonical content parts.
+        content: serde_json::Value,
+    },
+    /// `assistant_message` — assistant text parts.
+    #[serde(rename = "assistant_message")]
+    Assistant {
+        /// Sender role label.
+        role: &'static str,
+        /// Text content parts.
+        content: Vec<PinnedTextPart>,
+    },
+    /// `reasoning_message` — joined assistant reasoning text.
+    #[serde(rename = "reasoning_message")]
+    Reasoning {
+        /// Joined reasoning text.
+        reasoning: String,
+    },
+    /// `approval_request_message` — one pending tool call.
+    #[serde(rename = "approval_request_message")]
+    ApprovalRequest {
+        /// The pending tool call record.
+        tool_call: PinnedToolCall,
+    },
+    /// `tool_return_message` — one completed tool result.
+    #[serde(rename = "tool_return_message")]
+    ToolReturn {
+        /// Identifier of the answered tool call.
+        tool_call_id: Option<String>,
+        /// Delivery status label.
+        status: &'static str,
+        /// Raw returned payload.
+        tool_return: serde_json::Value,
+    },
+    /// `summary_message` — compaction summary text.
+    #[serde(rename = "summary_message")]
+    Summary {
+        /// Recorded summary text.
+        summary: String,
+    },
+}
+
+/// One pinned text content part.
+#[derive(Clone, Debug, Serialize)]
+pub struct PinnedTextPart {
+    /// Part discriminator.
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    /// Text bytes.
+    pub text: String,
+}
+
+/// One pinned pending-tool-call record.
+#[derive(Clone, Debug, Serialize)]
+pub struct PinnedToolCall {
+    /// Identifier of the call.
+    pub tool_call_id: Option<String>,
+    /// Invoked tool name.
+    pub name: Option<String>,
+    /// JSON-encoded arguments object.
+    pub arguments: String,
+}
+
+/// One projected conversation message rendered in the exact pinned
+/// stored-message shape: flattened identity fields plus a typed payload.
+#[derive(Clone, Debug, Serialize)]
+pub struct PinnedStoredMessage {
+    /// Generated API projection ID.
+    pub id: String,
+    /// ISO-8601 UTC instant of the source message.
+    pub date: String,
+    /// Owning agent identifier.
+    pub agent_id: String,
+    /// Owning conversation identifier.
+    pub conversation_id: String,
+    /// Type-specific payload carrying the `message_type` tag.
+    #[serde(flatten)]
+    pub kind: PinnedMessageKind,
 }
 
 // ── Wire responses ──────────────────────────────────────────────────────────
@@ -468,8 +600,8 @@ pub struct ConversationMessagesListResponseMessage {
     pub request_id: String,
     /// Operation success.
     pub success: bool,
-    /// Projected messages in the requested order.
-    pub messages: Vec<lotta_store::query::ProjectedMessage>,
+    /// Projected messages in the requested order, in the pinned shape.
+    pub messages: Vec<PinnedStoredMessage>,
     /// Oldest served message ID for loading older history.
     pub next_before: Option<String>,
     /// Whether messages beyond the page remain.
@@ -539,6 +671,48 @@ enum Lookup {
 
 type LeaseRegistry = Arc<Mutex<HashMap<RuntimeScope, Arc<Mutex<TurnLifecycle>>>>>;
 
+/// Why one authoritative command lease could not begin on its scope.
+#[derive(Clone, Copy, Debug)]
+pub struct CommandLeaseUnavailable;
+
+/// Authoritative turn-lifecycle port shared between this group and the
+/// production turn pipeline.
+///
+/// When injected, manual compactions acquire their command lease from the same
+/// lifecycle registry the turn path uses — so an active production turn blocks
+/// compaction with the busy failure — and execute through the registered
+/// production compaction service with its real lifecycle hooks and provider
+/// summarization instead of a standalone service.
+pub trait ConversationAuthority: Send + Sync {
+    /// Begins a command on the authoritative lifecycle for `scope`.
+    ///
+    /// # Errors
+    /// Returns [`CommandLeaseUnavailable`] when a turn or another command
+    /// currently owns the scope.
+    fn begin_command(&self, scope: &RuntimeScope) -> Result<TurnLease, CommandLeaseUnavailable>;
+
+    /// Releases one previously begun command lease.
+    fn finish_command(&self, scope: &RuntimeScope, lease: &TurnLease);
+
+    /// Returns whether `lease` remains the authoritative current lease.
+    fn is_current(&self, scope: &RuntimeScope, lease: &TurnLease) -> bool;
+
+    /// Runs one compaction through the registered production service.
+    ///
+    /// # Errors
+    /// Returns the production compaction failure verbatim.
+    fn compact(
+        &self,
+        command: CompactionCommand,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<lotta_runtime::turn::CompactionProgress, RuntimeError>>
+                + Send
+                + '_,
+        >,
+    >;
+}
+
 /// Applies wire commands to the Task 23/24 store, Task 28 queries, the Task 30
 /// prompt compiler, and the Task 58 compaction service.
 pub struct ConversationsBridge {
@@ -546,8 +720,8 @@ pub struct ConversationsBridge {
     memfs: GitMemFs,
     forward: ConversationsForwarder,
     clock: Arc<dyn Clock + Send + Sync>,
-    conversations_per_agent_max: usize,
     compaction_leases: LeaseRegistry,
+    authority: Option<Arc<dyn ConversationAuthority>>,
 }
 
 impl ConversationsBridge {
@@ -560,6 +734,7 @@ impl ConversationsBridge {
         forward: ConversationsForwarder,
         storage_dir: &std::path::Path,
         clock: Arc<dyn Clock + Send + Sync>,
+        authority: Option<Arc<dyn ConversationAuthority>>,
     ) -> Result<Self, AppServerError> {
         let (store, memfs) = prepare_backend(storage_dir)?;
         Ok(Self {
@@ -567,28 +742,28 @@ impl ConversationsBridge {
             memfs,
             forward,
             clock,
-            conversations_per_agent_max: CONVERSATIONS_PER_AGENT_MAX,
             compaction_leases: Arc::new(Mutex::new(HashMap::new())),
+            authority,
         })
     }
 
-    /// Composes a bridge from explicit parts (test seam for the cap bound).
+    /// Composes a bridge from explicit parts (test seam).
     #[must_use]
     #[cfg(test)]
     pub(crate) fn compose(
         forward: ConversationsForwarder,
         store: LocalStore,
         memfs: GitMemFs,
-        conversations_per_agent_max: usize,
         clock: Arc<dyn Clock + Send + Sync>,
+        authority: Option<Arc<dyn ConversationAuthority>>,
     ) -> Self {
         Self {
             store,
             memfs,
             forward,
             clock,
-            conversations_per_agent_max,
             compaction_leases: Arc::new(Mutex::new(HashMap::new())),
+            authority,
         }
     }
 
@@ -706,20 +881,25 @@ impl ConversationsBridge {
     async fn create_core(&self, body: &ConversationCreateBody) -> Result<Conversation, String> {
         let agent_id = parse_agent(body.agent_id.as_deref())?;
         self.require_agent(&agent_id).await?;
-        if self.count_conversations(&agent_id, CREATE_FAILURE).await?
-            >= self.conversations_per_agent_max
-        {
-            return Err(CONVERSATIONS_LIMIT_REACHED.to_owned());
-        }
-        let conversation = self.build_new_conversation(&agent_id, body).await?;
-        ConversationStore::save(&self.store, &conversation)
-            .await
-            .map_err(|_| CREATE_FAILURE.to_owned())?;
+        let snapshot = body.clone();
+        let now = self.clock.now();
+        // The store allocates a globally unused identifier, enforces the
+        // per-agent cap, and inserts the record inside one locked operation.
+        let created = {
+            let agent = agent_id.clone();
+            self.store
+                .create_conversation(agent_id.clone(), move |conversation_id| {
+                    build_new_conversation(conversation_id, &agent, &snapshot, now)
+                        .map_err(|()| bounded_input_failure())
+                })
+                .await
+                .map_err(|error| create_store_failure(&error))?
+        };
         // The pinned backend persists the compiled prompt before returning, so
         // a client that observed success would always find the cache record.
-        self.compile_prompt(&agent_id, &conversation.id, false, CREATE_FAILURE)
+        self.compile_prompt(&agent_id, &created.id, false, CREATE_FAILURE)
             .await?;
-        Ok(conversation)
+        Ok(created)
     }
 
     async fn update_core(
@@ -779,13 +959,6 @@ impl ConversationsBridge {
             None => source_agent.clone(),
         };
         self.require_agent(&target_agent).await?;
-        if self
-            .count_conversations(&target_agent, FORK_FAILURE)
-            .await?
-            >= self.conversations_per_agent_max
-        {
-            return Err(CONVERSATIONS_LIMIT_REACHED.to_owned());
-        }
         let kept = self
             .fork_history(
                 &source_agent,
@@ -794,12 +967,22 @@ impl ConversationsBridge {
                 FORK_FAILURE,
             )
             .await?;
-        let forked = self
-            .build_forked_record(&source, &target_agent, &kept, body.hidden)
-            .await?;
-        ConversationStore::save(&self.store, &forked)
-            .await
-            .map_err(|_| FORK_FAILURE.to_owned())?;
+        // The store allocates the fork identifier, enforces the per-agent cap,
+        // and inserts the record inside one locked operation.
+        let now = self.clock.now();
+        let forked = {
+            let agent = target_agent.clone();
+            let source = source.clone();
+            let kept = kept.clone();
+            let agent_for_call = target_agent.clone();
+            self.store
+                .create_conversation(agent_for_call, move |conversation_id| {
+                    build_forked_record(conversation_id, &source, &agent, &kept, body.hidden, now)
+                        .map_err(|()| bounded_input_failure())
+                })
+                .await
+                .map_err(|error| fork_store_failure(&error))?
+        };
         self.write_fork_transcript(&target_agent, &forked.id, &kept)
             .await?;
         Ok(ForkedConversationReference {
@@ -843,41 +1026,6 @@ impl ConversationsBridge {
             .ok_or_else(|| MESSAGE_NOT_FOUND.to_owned())?;
         let source_ordinal = projected[cursor].source.source_ordinal;
         Ok(messages[..=source_ordinal.min(messages.len().saturating_sub(1))].to_vec())
-    }
-
-    async fn build_forked_record(
-        &self,
-        source: &Conversation,
-        target_agent: &AgentId,
-        kept: &[LocalMessage],
-        hidden: Option<bool>,
-    ) -> Result<Conversation, String> {
-        let now = self.clock.now();
-        let id = self
-            .next_conversation_id(target_agent, FORK_FAILURE)
-            .await?;
-        let context_ids = kept
-            .iter()
-            .map(|message| message.id.clone())
-            .collect::<Vec<_>>();
-        Ok(Conversation {
-            id,
-            agent_id: target_agent.clone(),
-            archived: false,
-            archived_at: Some(None),
-            created_at: now,
-            updated_at: now,
-            last_message_at: source.last_message_at,
-            summary: source.summary.clone(),
-            in_context_message_ids: BoundedVec::new(context_ids)
-                .map_err(|_| FORK_FAILURE.to_owned())?,
-            model: source.model.clone(),
-            model_settings: source.model_settings.clone(),
-            context_window_limit: source.context_window_limit,
-            hidden: hidden.or(source.hidden),
-            tags: source.tags.clone(),
-            extras: EntityExtras::default(),
-        })
     }
 
     /// Writes the fork target's own key-form directory: a fresh manifest and
@@ -955,54 +1103,140 @@ impl ConversationsBridge {
         command: &ConversationCompactCommand,
     ) -> Result<CompactionOutcome, String> {
         let conversation_id = parse_conversation(&command.conversation_id, COMPACT_FAILURE)?;
-        let hint = command.body.as_ref().and_then(|body| body.agent_id.clone());
-        let agent_id = match self.resolve(hint.as_deref(), &conversation_id).await {
+        let body = command.body.clone().unwrap_or_default();
+        let agent_id = match self
+            .resolve(body.agent_id.as_deref(), &conversation_id)
+            .await
+        {
             Lookup::Found(found) => found.agent_id,
             Lookup::Missing => return Err(CONVERSATION_NOT_FOUND.to_owned()),
             Lookup::Failed => return Err(COMPACT_FAILURE.to_owned()),
         };
-        let scope = RuntimeScope::new(agent_id, conversation_id, None);
-        let lifecycle = self.acquire_lifecycle(&scope);
-        let lease = lock_lifecycle(&lifecycle)
-            .start_command()
-            .map_err(|_| CONVERSATION_BUSY.to_owned())?;
-        let outcome = self.run_service_compact(&scope, &lease).await;
-        let _release = lock_lifecycle(&lifecycle).finish_command(&lease);
-        outcome
+        let scope = RuntimeScope::new(agent_id.clone(), conversation_id, None);
+        let mode = self
+            .compaction_mode(&agent_id, body.compaction_settings.as_ref())
+            .await?;
+        if let Some(authority) = self.authority.as_ref() {
+            // The authoritative lifecycle rejects the command while a
+            // production turn owns the scope; otherwise the registered
+            // production compaction service runs with real hooks.
+            let lease = authority
+                .begin_command(&scope)
+                .map_err(|CommandLeaseUnavailable| CONVERSATION_BUSY.to_owned())?;
+            let outcome = self
+                .run_authority_compact(authority, &scope, &lease, mode)
+                .await;
+            authority.finish_command(&scope, &lease);
+            outcome
+        } else {
+            let lifecycle = self.acquire_lifecycle(&scope);
+            let lease = lock_lifecycle(&lifecycle)
+                .start_command()
+                .map_err(|_| CONVERSATION_BUSY.to_owned())?;
+            let outcome = self.run_standalone_compact(&scope, &lease, mode).await;
+            let _release = lock_lifecycle(&lifecycle).finish_command(&lease);
+            outcome
+        }
     }
 
-    /// Runs one manual compaction through the Task 58 lease-serialized
-    /// service; the transcript is never written outside its effects.
-    async fn run_service_compact(
+    /// Routes one manual compaction through the injected authoritative
+    /// production service.
+    async fn run_authority_compact(
+        &self,
+        authority: &Arc<dyn ConversationAuthority>,
+        scope: &RuntimeScope,
+        lease: &TurnLease,
+        mode: CompactionMode,
+    ) -> Result<CompactionOutcome, String> {
+        let command = self.build_compaction_command(scope, lease, mode).await?;
+        let progress = authority
+            .compact(command.clone())
+            .await
+            .map_err(|_| COMPACT_FAILURE.to_owned())?;
+        self.outcome_of(&command, progress)
+    }
+
+    /// Runs one manual compaction through the standalone Task 58
+    /// lease-serialized service; the transcript is never written outside its
+    /// effects. Used only when no production runtime is reachable.
+    async fn run_standalone_compact(
         &self,
         scope: &RuntimeScope,
         lease: &TurnLease,
+        mode: CompactionMode,
     ) -> Result<CompactionOutcome, String> {
-        let summary = Arc::new(Mutex::new(None));
         let effects = StoreCompactionEffects {
             store: self.store.clone(),
             leases: Arc::clone(&self.compaction_leases),
-            summary: Arc::clone(&summary),
             clock: Arc::clone(&self.clock),
         };
         let service = CompactionService::new(TranscriptSummarizer, effects);
-        let command = self.build_compaction_command(scope, lease).await?;
+        let command = self.build_compaction_command(scope, lease, mode).await?;
         let progress = service
-            .compact(command)
+            .compact(command.clone())
             .await
             .map_err(|_| COMPACT_FAILURE.to_owned())?;
-        let recorded = lock_summary(&summary).clone().unwrap_or_default();
+        self.outcome_of(&command, progress)
+    }
+
+    /// Builds the pinned compaction outcome from the durable journal projection.
+    fn outcome_of(
+        &self,
+        command: &CompactionCommand,
+        progress: lotta_runtime::turn::CompactionProgress,
+    ) -> Result<CompactionOutcome, String> {
+        let summary = self
+            .store
+            .compaction_transaction(&command.scope, &command.request_id)
+            .map_err(|_| COMPACT_FAILURE.to_owned())?
+            .and_then(|transaction| transaction.projection)
+            .map(|projection| projection.summary)
+            .ok_or_else(|| COMPACT_FAILURE.to_owned())?;
         Ok(CompactionOutcome {
             num_messages_before: progress.messages_before,
             num_messages_after: progress.messages_after,
-            summary: recorded,
+            summary,
         })
+    }
+
+    /// Resolves the pinned compaction strategy: optional sent settings merged
+    /// over the owning agent's stored settings, then mapped onto the Task 58
+    /// modes (`all`, or `sliding_window` with a retained percentage).
+    async fn compaction_mode(
+        &self,
+        agent_id: &AgentId,
+        sent: Option<&BoundedMap<{ UNBOUNDED_MAP_FIELDS_MAX }>>,
+    ) -> Result<CompactionMode, String> {
+        let stored = AgentStore::load(&self.store, agent_id)
+            .await
+            .ok()
+            .and_then(|agent| agent.compaction_settings.flatten());
+        let setting = |key: &str| -> Option<serde_json::Value> {
+            sent.and_then(|settings| settings.get(key))
+                .cloned()
+                .or_else(|| {
+                    stored
+                        .as_ref()
+                        .and_then(|settings| settings.get(key))
+                        .cloned()
+                })
+        };
+        let mode = setting("mode").and_then(|value| value.as_str().map(str::to_owned));
+        match mode.as_deref() {
+            Some("all") => Ok(CompactionMode::All),
+            Some("sliding_window") | None => {
+                let percent = sliding_window_percent(setting("sliding_window_percentage"))?;
+                CompactionMode::sliding_window(percent).map_err(|_| COMPACT_FAILURE.to_owned())
+            }
+            Some(_) => Err(COMPACTION_MODE_REJECTED.to_owned()),
+        }
     }
 
     async fn build_compaction_command(
         &self,
         scope: &RuntimeScope,
         lease: &TurnLease,
+        mode: CompactionMode,
     ) -> Result<CompactionCommand, String> {
         let loaded = self
             .store
@@ -1034,7 +1268,7 @@ impl ConversationsBridge {
             .map_err(|_| COMPACT_FAILURE.to_owned())?,
             scope: scope.clone(),
             lease: lease.clone(),
-            mode: CompactionMode::default(),
+            mode,
             trigger: CompactionTrigger::Manual,
             request,
             detail,
@@ -1072,17 +1306,6 @@ impl ConversationsBridge {
             Err(lotta_runtime::RuntimeError::NotFound { .. }) => Err(AGENT_NOT_FOUND.to_owned()),
             Err(_) => Err(CREATE_FAILURE.to_owned()),
         }
-    }
-
-    async fn count_conversations(
-        &self,
-        agent_id: &AgentId,
-        failure: &'static str,
-    ) -> Result<usize, String> {
-        let mut collected = Vec::new();
-        self.collect_agent_conversations(agent_id, Some(true), failure, &mut collected)
-            .await?;
-        Ok(collected.len())
     }
 
     /// Resolves one bare conversation identifier across candidate agent
@@ -1133,62 +1356,12 @@ impl ConversationsBridge {
         Ok(agents)
     }
 
-    async fn next_conversation_id(
-        &self,
-        agent: &AgentId,
-        failure: &'static str,
-    ) -> Result<ConversationId, String> {
-        let base = self.count_conversations(agent, failure).await?;
-        for offset in 0..NEW_ID_ATTEMPTS_MAX {
-            let sequence = u64::try_from(base + offset + 1).map_err(|_| failure.to_owned())?;
-            if let Ok(id) = ConversationId::generate(sequence)
-                && !self.conversation_exists(agent, &id)
-            {
-                return Ok(id);
-            }
-        }
-        Err(failure.to_owned())
-    }
-
-    fn conversation_exists(&self, agent: &AgentId, conversation_id: &ConversationId) -> bool {
-        self.store
-            .paths()
-            .conversation_dir(agent, conversation_id)
-            .is_ok_and(|directory| directory.join("conversation.json").exists())
-    }
-
-    async fn build_new_conversation(
-        &self,
-        agent_id: &AgentId,
-        body: &ConversationCreateBody,
-    ) -> Result<Conversation, String> {
-        let now = self.clock.now();
-        let id = self.next_conversation_id(agent_id, CREATE_FAILURE).await?;
-        let tags = match &body.tags {
-            Some(tags) => Some(BoundedVec::new(tags.clone()).map_err(|_| CREATE_FAILURE)?),
-            None => None,
-        };
-        Ok(Conversation {
-            id,
-            agent_id: agent_id.clone(),
-            archived: false,
-            archived_at: Some(None),
-            created_at: now,
-            updated_at: now,
-            last_message_at: Some(None),
-            summary: Some(body.summary.clone()),
-            in_context_message_ids: BoundedVec::new(Vec::new()).map_err(|_| CREATE_FAILURE)?,
-            model: body.model.clone().map(Some),
-            model_settings: body.model_settings.clone(),
-            context_window_limit: body.context_window_limit,
-            hidden: body.hidden,
-            tags,
-            extras: EntityExtras::default(),
-        })
-    }
-
-    /// Renders the conversation prompt through the Task 30 compiler, either
-    /// touching the Task 54 cache record or rendering a dry-run copy only.
+    /// Renders the conversation prompt through the Task 30 compiler.
+    ///
+    /// Recompilation always renders committed memory afresh — the Task 54
+    /// cache record is only written back, never reused — and a dry run skips
+    /// the persistence step entirely. The previous-message count reflects the
+    /// conversation's current projected history instead of a hard-coded zero.
     async fn compile_prompt(
         &self,
         agent_id: &AgentId,
@@ -1199,34 +1372,36 @@ impl ConversationsBridge {
         let agent = AgentStore::load(&self.store, agent_id)
             .await
             .map_err(|_| failure.to_owned())?;
+        let previous_message_count = self
+            .store
+            .query_messages_for_conversation(
+                agent_id,
+                conversation_id,
+                MessageListOptions::default(),
+            )
+            .await
+            .map_err(|_| failure.to_owned())?
+            .len();
         let inputs = PromptInputs::new(
             PromptText::new(agent.system.clone()).map_err(|_| failure.to_owned())?,
             agent_id.clone(),
             conversation_id.clone(),
-            0,
+            previous_message_count,
             self.clock.now(),
             PromptSections::default(),
         )
         .map_err(|_| failure.to_owned())?;
         let compiler = PromptCompiler::new(&self.memfs);
+        let record = compiler
+            .compile(&inputs, CancellationToken::new())
+            .await
+            .map_err(|_| failure.to_owned())?;
         if dry_run {
-            let record = compiler
-                .compile(&inputs, CancellationToken::new())
-                .await
-                .map_err(|_| failure.to_owned())?;
             return Ok(record.content);
         }
         let directory = self.prompt_cache_root(agent_id, conversation_id, failure)?;
-        let delivery = directory
-            .get_or_compile(
-                &compiler,
-                &inputs,
-                DeliveryCapability::RequestBoundaryOnly,
-                CancellationToken::new(),
-            )
-            .await
-            .map_err(|_| failure.to_owned())?;
-        Ok(delivery.persisted.content)
+        persist_prompt_record(&directory, &record).map_err(|_| failure.to_owned())?;
+        Ok(record.content)
     }
 
     fn prompt_cache_root(
@@ -1388,7 +1563,14 @@ impl ConversationsBridge {
             String,
         >,
     ) {
-        let (success, messages, next_before, has_more, error) = match outcome {
+        let mapped = outcome.and_then(|(projected, next_before, has_more)| {
+            let messages = projected
+                .iter()
+                .map(pinned_message)
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok((messages, next_before, has_more))
+        });
+        let (success, messages, next_before, has_more, error) = match mapped {
             Ok((messages, next_before, has_more)) => (true, messages, next_before, has_more, None),
             Err(detail) => (false, Vec::new(), None, false, Some(detail)),
         };
@@ -1458,19 +1640,11 @@ fn lock_lifecycle(lifecycle: &Mutex<TurnLifecycle>) -> std::sync::MutexGuard<'_,
     }
 }
 
-fn lock_summary(summary: &Mutex<Option<String>>) -> std::sync::MutexGuard<'_, Option<String>> {
-    match summary.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
 /// Per-scope command lease holder backing the Task 58 `lease_is_current`
 /// checks while a manual management compaction executes.
 struct StoreCompactionEffects {
     store: LocalStore,
     leases: LeaseRegistry,
-    summary: Arc<Mutex<Option<String>>>,
     clock: Arc<dyn Clock + Send + Sync>,
 }
 
@@ -1505,11 +1679,8 @@ impl CompactionEffects for StoreCompactionEffects {
     ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + '_>> {
         let store = self.store.clone();
         let command = command.clone();
-        let sink = Arc::clone(&self.summary);
         Box::pin(async move {
-            record_projection_inner(&store, &command, &summary, retained.len(), progress).await?;
-            *lock_summary(&sink) = Some(summary.0);
-            Ok(())
+            record_projection_inner(&store, &command, &summary, retained.len(), progress).await
         })
     }
 
@@ -1944,6 +2115,122 @@ fn explicit_value<T>(field: ExplicitField<T>) -> Option<T> {
     }
 }
 
+/// Maps one store create failure onto the pinned scrubbed wire detail: the cap
+/// rejection keeps its own message while every other failure stays generic.
+fn create_store_failure(error: &lotta_store::StoreError) -> String {
+    store_failure(error, CREATE_FAILURE)
+}
+
+/// Fork twin of [`create_store_failure`].
+fn fork_store_failure(error: &lotta_store::StoreError) -> String {
+    store_failure(error, FORK_FAILURE)
+}
+
+fn store_failure(error: &lotta_store::StoreError, failure: &'static str) -> String {
+    if error.kind() == lotta_store::StoreErrorKind::Limit {
+        CONVERSATIONS_LIMIT_REACHED.to_owned()
+    } else {
+        failure.to_owned()
+    }
+}
+
+/// Synthetic store error for bounded-collection rejections inside a builder.
+///
+/// The bridge immediately scrubs this into its generic wire detail; the value
+/// never outlives the create call.
+fn bounded_input_failure() -> lotta_store::StoreError {
+    lotta_store::StoreError::new(
+        lotta_store::StoreErrorKind::Parse,
+        std::path::Path::new("."),
+    )
+}
+
+/// Builds one canonical new conversation record around an allocated identifier.
+fn build_new_conversation(
+    conversation_id: ConversationId,
+    agent_id: &AgentId,
+    body: &ConversationCreateBody,
+    now: Timestamp,
+) -> Result<Conversation, ()> {
+    let tags = body
+        .tags
+        .as_ref()
+        .map(|tags| BoundedVec::new(tags.clone()).map_err(|_| ()))
+        .transpose()?;
+    Ok(Conversation {
+        id: conversation_id,
+        agent_id: agent_id.clone(),
+        archived: false,
+        archived_at: Some(None),
+        created_at: now,
+        updated_at: now,
+        last_message_at: Some(None),
+        summary: Some(body.summary.clone()),
+        in_context_message_ids: BoundedVec::new(Vec::new()).map_err(|_| ())?,
+        // A sent explicit null stays distinct from an absent key like the
+        // canonical `Conversation` schema.
+        model: body.model.clone().map(explicit_value),
+        model_settings: body.model_settings.clone(),
+        context_window_limit: body.context_window_limit,
+        hidden: body.hidden,
+        tags,
+        extras: EntityExtras::default(),
+    })
+}
+
+/// Builds one forked conversation record around an allocated identifier.
+fn build_forked_record(
+    conversation_id: ConversationId,
+    source: &Conversation,
+    target_agent: &AgentId,
+    kept: &[LocalMessage],
+    hidden: Option<bool>,
+    now: Timestamp,
+) -> Result<Conversation, ()> {
+    let context_ids = kept.iter().map(|message| message.id.clone()).collect();
+    Ok(Conversation {
+        id: conversation_id,
+        agent_id: target_agent.clone(),
+        archived: false,
+        archived_at: Some(None),
+        created_at: now,
+        updated_at: now,
+        last_message_at: source.last_message_at,
+        summary: source.summary.clone(),
+        in_context_message_ids: BoundedVec::new(context_ids).map_err(|_| ())?,
+        model: source.model.clone(),
+        model_settings: source.model_settings.clone(),
+        context_window_limit: source.context_window_limit,
+        hidden: hidden.or(source.hidden),
+        tags: source.tags.clone(),
+        extras: EntityExtras::default(),
+    })
+}
+
+/// Converts one pinned sliding-window percentage (a fraction in `0..=1`) into
+/// the Task 58 retained-percentage bound, defaulting like the pinned backend.
+fn sliding_window_percent(sent: Option<serde_json::Value>) -> Result<u8, String> {
+    let Some(fraction) = sent.and_then(|value| value.as_f64()) else {
+        return Ok(COMPACTION_RECENT_PERCENT_DEFAULT);
+    };
+    let scaled = fraction * f64::from(COMPACTION_RECENT_PERCENT_MAX);
+    if !(0.0..=f64::from(COMPACTION_RECENT_PERCENT_MAX)).contains(&scaled) {
+        return Err(COMPACT_FAILURE.to_owned());
+    }
+    let whole = format!("{:.0}", scaled.round())
+        .parse::<u64>()
+        .map_err(|_| COMPACT_FAILURE.to_owned())?;
+    u8::try_from(whole).map_err(|_| COMPACT_FAILURE.to_owned())
+}
+
+/// Persists one freshly rendered prompt record into the conversation cache root.
+fn persist_prompt_record(
+    directory: &CacheRoot,
+    record: &CompiledPromptRecord,
+) -> Result<(), RuntimeError> {
+    directory.persist(record)
+}
+
 fn message_options(
     query: &ConversationMessagesQuery,
     wanted: usize,
@@ -1960,7 +2247,10 @@ fn message_options(
         return_types: query
             .include_return_message_types
             .clone()
-            .unwrap_or_default(),
+            .unwrap_or_default()
+            .into_iter()
+            .map(PinnedMessageType::category)
+            .collect(),
     })
 }
 
@@ -1975,6 +2265,130 @@ fn oldest_message_id(
         MessageOrder::Descending => messages.last()?,
     };
     Some(oldest.id.as_str().to_owned())
+}
+
+/// Renders one projected millisecond stamp as the pinned ISO-8601 UTC date.
+fn iso_date(timestamp_ms: f64) -> Result<String, String> {
+    let invalid = || MESSAGES_FAILURE.to_owned();
+    let rounded = timestamp_ms.round();
+    if !rounded.is_finite() || rounded < 0.0 {
+        return Err(invalid());
+    }
+    let millis = format!("{rounded:.0}")
+        .parse::<i64>()
+        .map_err(|_| invalid())?;
+    let seconds = millis.div_euclid(1_000);
+    let sub_milli = millis.rem_euclid(1_000);
+    let nanos = sub_milli.checked_mul(1_000_000).ok_or_else(invalid)?;
+    let stamp_nanos = u32::try_from(nanos).map_err(|_| invalid())?;
+    chrono::DateTime::from_timestamp(seconds, stamp_nanos)
+        .map(|value| value.to_rfc3339_opts(SecondsFormat::Millis, true))
+        .ok_or_else(invalid)
+}
+
+/// Translates one Task 28 projection into the exact pinned stored-message
+/// object: flattened identity fields plus the tagged typed payload.
+fn pinned_message(
+    projected: &lotta_store::query::ProjectedMessage,
+) -> Result<PinnedStoredMessage, String> {
+    Ok(PinnedStoredMessage {
+        id: projected.id.as_str().to_owned(),
+        date: iso_date(projected.timestamp_ms)?,
+        agent_id: projected.source.agent_id.as_str().to_owned(),
+        conversation_id: projected.source.conversation_id.as_str().to_owned(),
+        kind: pinned_kind(projected.message_type, &projected.value)?,
+    })
+}
+
+/// Builds the pinned typed payload for one projected category.
+fn pinned_kind(
+    category: ReturnMessageType,
+    value: &serde_json::Value,
+) -> Result<PinnedMessageKind, String> {
+    let missing = || MESSAGES_FAILURE.to_owned();
+    Ok(match category {
+        ReturnMessageType::User => PinnedMessageKind::User {
+            role: "user",
+            content: value.get("content").cloned().ok_or_else(missing)?,
+        },
+        ReturnMessageType::Assistant => PinnedMessageKind::Assistant {
+            role: "assistant",
+            content: text_parts(value.get("content").ok_or_else(missing)?)?,
+        },
+        ReturnMessageType::Reasoning => PinnedMessageKind::Reasoning {
+            reasoning: value
+                .get("reasoning")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(missing)?
+                .to_owned(),
+        },
+        ReturnMessageType::ApprovalRequest => PinnedMessageKind::ApprovalRequest {
+            tool_call: pinned_tool_call(value)?,
+        },
+        ReturnMessageType::ToolReturn => PinnedMessageKind::ToolReturn {
+            tool_call_id: value
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            status: if value
+                .get("is_error")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                "error"
+            } else {
+                "success"
+            },
+            tool_return: value.get("tool_return").cloned().ok_or_else(missing)?,
+        },
+        ReturnMessageType::Summary => PinnedMessageKind::Summary {
+            summary: value
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(missing)?
+                .to_owned(),
+        },
+    })
+}
+
+/// Converts projected plain-text entries into pinned `{type,text}` parts.
+fn text_parts(value: &serde_json::Value) -> Result<Vec<PinnedTextPart>, String> {
+    value
+        .as_array()
+        .ok_or_else(|| MESSAGES_FAILURE.to_owned())?
+        .iter()
+        .map(|entry| {
+            Ok(PinnedTextPart {
+                kind: "text",
+                text: entry
+                    .as_str()
+                    .ok_or_else(|| MESSAGES_FAILURE.to_owned())?
+                    .to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// Converts one projected raw `toolCall` part into the pinned record with a
+/// JSON-stringified arguments object like the pinned backend.
+fn pinned_tool_call(value: &serde_json::Value) -> Result<PinnedToolCall, String> {
+    let arguments = match value.get("arguments") {
+        Some(arguments) if !arguments.is_null() => {
+            serde_json::to_string(arguments).map_err(|_| MESSAGES_FAILURE.to_owned())?
+        }
+        _ => "{}".to_owned(),
+    };
+    Ok(PinnedToolCall {
+        tool_call_id: value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        name: value
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        arguments,
+    })
 }
 
 fn parse_conversation(value: &str, failure: &'static str) -> Result<ConversationId, String> {

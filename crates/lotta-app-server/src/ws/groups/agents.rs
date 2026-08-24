@@ -111,7 +111,7 @@ const COMPACTION_SETTING_KEYS: [&str; 4] =
 /// Compaction modes accepted by the pinned local backend validator.
 const COMPACTION_MODES: [&str; 2] = ["all", "sliding_window"];
 /// Rejection detail mirroring the pinned local validator message.
-const COMPACTION_MODE_REJECTED: &str =
+pub(crate) const COMPACTION_MODE_REJECTED: &str =
     "Local backend compaction currently supports only modes \"all\" and \"sliding_window\"";
 
 // ── Wire commands ───────────────────────────────────────────────────────────

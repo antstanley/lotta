@@ -55,8 +55,9 @@ pub use approval::{
 };
 pub use bounds::APPROVAL_WAIT_MS_MAX;
 pub use compaction::{
-    CompactionCommand, CompactionEffects, CompactionMode, CompactionPlan, CompactionRecovery,
-    CompactionService, CompactionSummarizer, CompactionSummary, CompactionTrigger,
+    COMPACTION_RECENT_PERCENT_DEFAULT, COMPACTION_RECENT_PERCENT_MAX, CompactionCommand,
+    CompactionEffects, CompactionMode, CompactionPlan, CompactionRecovery, CompactionService,
+    CompactionSummarizer, CompactionSummary, CompactionTrigger,
 };
 pub use lease::{
     CancellationClaim, CancellationPolicy, CancellationReceipt, LeaseEffect, LeaseGuard,
