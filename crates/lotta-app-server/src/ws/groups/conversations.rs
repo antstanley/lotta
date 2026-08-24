@@ -692,10 +692,18 @@ pub trait ConversationAuthority: Send + Sync {
     fn begin_command(&self, scope: &RuntimeScope) -> Result<TurnLease, CommandLeaseUnavailable>;
 
     /// Releases one previously begun command lease.
-    fn finish_command(&self, scope: &RuntimeScope, lease: &TurnLease);
-
-    /// Returns whether `lease` remains the authoritative current lease.
-    fn is_current(&self, scope: &RuntimeScope, lease: &TurnLease) -> bool;
+    ///
+    /// The release awaits the authoritative registry, so it completes
+    /// deterministically even while an unrelated operation holds the registry
+    /// busy; the scope always returns to idle once this resolves.
+    ///
+    /// # Errors
+    /// Returns the production release failure verbatim.
+    fn finish_command<'a>(
+        &'a self,
+        scope: &'a RuntimeScope,
+        lease: &'a TurnLease,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + 'a>>;
 
     /// Runs one compaction through the registered production service.
     ///
@@ -1126,7 +1134,12 @@ impl ConversationsBridge {
             let outcome = self
                 .run_authority_compact(authority, &scope, &lease, mode)
                 .await;
-            authority.finish_command(&scope, &lease);
+            // The release awaits the authoritative registry, so a failed
+            // release is real: reporting success would strand the scope busy.
+            authority
+                .finish_command(&scope, &lease)
+                .await
+                .map_err(|_| COMPACT_FAILURE.to_owned())?;
             outcome
         } else {
             let lifecycle = self.acquire_lifecycle(&scope);

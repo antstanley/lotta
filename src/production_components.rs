@@ -848,15 +848,23 @@ impl ConversationsProductionAuthority {
         owner_lifecycle.begin_command().map_err(|_| ())
     }
 
-    fn finish_on_registry(&self, scope: &RuntimeScope, lease: &TurnLease) {
-        let Ok(mut state) = self.state.inner.try_lock() else {
-            return;
-        };
-        if let Some(handle) = state.registry.lookup(&RuntimeKey::from(scope))
-            && let Ok(owner) = state.registry.lifecycle_mut(&handle)
-        {
-            let _ = owner.finish_command(lease);
-        }
+    /// Awaits the authoritative registry so the release completes even while
+    /// an unrelated operation holds it busy; a skipped release would strand
+    /// the conversation in the command state forever.
+    async fn finish_on_registry(
+        &self,
+        scope: &RuntimeScope,
+        lease: &TurnLease,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.state.inner.lock().await;
+        let handle =
+            state
+                .registry
+                .lookup(&RuntimeKey::from(scope))
+                .ok_or(RuntimeError::NotFound {
+                    context: "conversation lifecycle registry lookup".into(),
+                })?;
+        state.registry.lifecycle_mut(&handle)?.finish_command(lease)
     }
 }
 
@@ -871,12 +879,12 @@ impl lotta_app_server::ws::conversations::ConversationAuthority
             .map_err(|()| lotta_app_server::ws::conversations::CommandLeaseUnavailable)
     }
 
-    fn finish_command(&self, scope: &RuntimeScope, lease: &TurnLease) {
-        self.finish_on_registry(scope, lease);
-    }
-
-    fn is_current(&self, scope: &RuntimeScope, lease: &TurnLease) -> bool {
-        self.state.lease_is_current(scope, lease)
+    fn finish_command<'a>(
+        &'a self,
+        scope: &'a RuntimeScope,
+        lease: &'a TurnLease,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        Box::pin(self.finish_on_registry(scope, lease))
     }
 
     fn compact(
@@ -2722,7 +2730,7 @@ fn adapter(error: impl std::fmt::Display) -> SetupError {
 mod production_tests {
     use super::*;
     use lotta_app_server::ws::service::{RuntimeCommandService, RuntimeEventSink, TurnController};
-    use lotta_domain::{ConversationId, DomainError, RunId, Timestamp};
+    use lotta_domain::{ConversationId, DomainError, RunId, Timestamp, TurnStateKind};
 
     struct TestClock;
     impl Clock for TestClock {
@@ -3488,6 +3496,186 @@ mod production_tests {
             );
             cancellation.cancel();
             let _ = turn.await.expect("turn task");
+        }
+
+        fn provider_message(
+            role: lotta_runtime::ports::ProviderMessageRole,
+            text: &str,
+        ) -> lotta_runtime::ports::ProviderMessage {
+            lotta_runtime::ports::ProviderMessage {
+                role,
+                content: lotta_domain::BoundedVec::new(vec![
+                    lotta_runtime::ports::ProviderContentPart::Text(
+                        lotta_runtime::boundary::ProviderText::new(text.into()).unwrap(),
+                    ),
+                ])
+                .unwrap(),
+                tool_call_id: None,
+            }
+        }
+
+        fn compaction_request() -> lotta_runtime::ports::ProviderRequest {
+            use lotta_runtime::ports::{
+                ImagePolicy, ProviderToolChoice, ReasoningControls, TokenLimit,
+            };
+            let model = |handle: &'static str| NonEmptyString::new(handle).unwrap();
+            lotta_runtime::ports::ProviderRequest {
+                model: lotta_domain::ModelDescriptor {
+                    handle: model("openai/gpt-5.4"),
+                    provider_id: model("openai"),
+                    available: true,
+                    context_window: Some(128_000),
+                    model_settings: None,
+                },
+                system_prompt: Some(
+                    lotta_runtime::boundary::ProviderText::new("contention prompt".into()).unwrap(),
+                ),
+                messages: lotta_domain::BoundedVec::new(vec![
+                    provider_message(lotta_runtime::ports::ProviderMessageRole::User, "old"),
+                    provider_message(lotta_runtime::ports::ProviderMessageRole::Assistant, "new"),
+                ])
+                .unwrap(),
+                tools: lotta_domain::BoundedVec::new(Vec::new()).unwrap(),
+                tool_choice: ProviderToolChoice::Auto,
+                image_policy: ImagePolicy::Strict,
+                context_tokens_max: TokenLimit::new(128_000).unwrap(),
+                output_tokens_max: TokenLimit::new(64).unwrap(),
+                reasoning: ReasoningControls {
+                    enabled: false,
+                    effort: None,
+                    tier: None,
+                },
+                cancellation: CancellationToken::new(),
+                context: None,
+                deadline: lotta_runtime::ports::ProviderDeadline::default(),
+            }
+        }
+
+        async fn seed_transcript(store: &LocalStore, scope: &RuntimeScope) {
+            let now = Timestamp::parse_persisted_rfc3339("2026-08-18T00:00:00Z").unwrap();
+            let manifest = lotta_domain::TranscriptManifest {
+                schema_version: 2,
+                message_format: lotta_domain::TranscriptMessageFormat::PiSessionEntryJsonl,
+                provider_stack: lotta_domain::ProviderStack::PiAi,
+                created_at: now,
+                migrated_from: None,
+                migrated_at: None,
+                backup_path: None,
+            };
+            let session = lotta_domain::TranscriptEntry::Session(lotta_domain::SessionEntry {
+                entry_type: lotta_domain::SessionEntryType::Session,
+                id: NonEmptyString::new(format!("session-{}", scope.conversation_id.as_str()))
+                    .unwrap(),
+                version: 3,
+                timestamp: now,
+                cwd: "/".into(),
+            });
+            let directory = store
+                .paths()
+                .conversation_dir(&scope.agent_id, &scope.conversation_id)
+                .unwrap();
+            std::fs::create_dir_all(&directory).unwrap();
+            store
+                .initialize_transcript(&scope.agent_id, &scope.conversation_id, &manifest, &session)
+                .await
+                .unwrap();
+        }
+
+        fn contention_command(
+            scope: &RuntimeScope,
+            lease: &TurnLease,
+        ) -> lotta_runtime::CompactionCommand {
+            let request = compaction_request();
+            let detail = lotta_runtime::ports::ProviderContextOverflowDetail {
+                measured: None,
+                estimated: lotta_runtime::ports::estimate_request_tokens(&request),
+                limit: request.context_tokens_max.get(),
+                provider: request.model.provider_id.as_str().to_owned(),
+                model: request.model.handle.as_str().to_owned(),
+                attempt: 1,
+                compactions_completed: 0,
+            };
+            lotta_runtime::CompactionCommand {
+                request_id: NonEmptyString::new("release-contention").unwrap(),
+                scope: scope.clone(),
+                lease: lease.clone(),
+                request,
+                detail,
+                trigger: lotta_runtime::CompactionTrigger::Manual,
+                mode: lotta_runtime::CompactionMode::All,
+                cancellation: CancellationToken::new(),
+            }
+        }
+
+        fn registered_owner<'a>(
+            state: &'a RuntimeServiceState,
+            scope: &RuntimeScope,
+        ) -> &'a lotta_runtime::LifecycleOwner {
+            state
+                .registry
+                .lookup(&RuntimeKey::from(scope))
+                .and_then(|handle| state.registry.lifecycle(&handle))
+                .expect("registered owner")
+        }
+
+        /// While an unrelated operation holds the authoritative registry, the
+        /// authority release waits for the lock and then finishes the command:
+        /// the lifecycle lands idle instead of being silently stranded busy.
+        #[tokio::test]
+        async fn authority_release_awaits_registry_contention_then_finishes_idle() {
+            use lotta_app_server::ws::conversations::ConversationAuthority as _;
+            let label = "compaction-release-contention";
+            let held = Arc::new(HeldProvider::default());
+            let (root, service, ..) =
+                production_controller_fixture(label, held.clone() as Arc<dyn ProviderPort>).await;
+            let authority = Arc::new(ConversationsProductionAuthority {
+                state: Arc::clone(&service.state),
+                brokers: Arc::clone(&service.brokers),
+            });
+            let scope = scope(label);
+            let store = LocalStore::new(StorePaths::new(root.clone()).unwrap());
+            seed_transcript(&store, &scope).await;
+
+            let lease = authority.begin_command(&scope).expect("command begins");
+            let settled = lease.clone();
+            let progress = authority.compact(contention_command(&scope, &lease)).await;
+            assert_eq!(progress.expect("compaction runs").messages_before, 2);
+
+            // An unrelated operation holds the authoritative registry…
+            let guard = service.state.inner.lock().await;
+            let mut releaser = {
+                let authority = Arc::clone(&authority);
+                let scope = scope.clone();
+                tokio::spawn(async move { authority.finish_command(&scope, &lease).await })
+            };
+            // …so the deterministic release must wait instead of skipping.
+            if tokio::time::timeout(std::time::Duration::from_millis(250), &mut releaser)
+                .await
+                .is_ok()
+            {
+                panic!("release completed while the registry lock was still held");
+            }
+            drop(guard);
+            tokio::time::timeout(std::time::Duration::from_secs(5), releaser)
+                .await
+                .expect("release settles once the lock frees")
+                .expect("release task")
+                .expect("deterministic release");
+
+            // The lifecycle returned to idle once the lock freed.
+            {
+                let state = service.state.inner.lock().await;
+                let owner = registered_owner(&state, &scope);
+                assert_eq!(owner.projection().state(), TurnStateKind::Idle);
+                assert!(!owner.is_current(&settled));
+            }
+
+            // The idle scope admits a fresh command lease again.
+            let probe = authority.begin_command(&scope).expect("idle again");
+            let state = service.state.inner.lock().await;
+            assert!(registered_owner(&state, &scope).is_current(&probe));
+            drop(state);
+            assert!(authority.finish_command(&scope, &probe).await.is_ok());
         }
     }
 

@@ -16,7 +16,7 @@ use std::{
 use lotta_domain::{
     AgentId, ConversationId, RunId, RuntimeScope, StopReason, TurnLease, TurnLifecycle,
 };
-use lotta_runtime::CompactionCommand;
+use lotta_runtime::{CompactionCommand, RuntimeError};
 use lotta_store::LocalStore;
 use lotta_testkit::clock::FakeClock;
 
@@ -225,23 +225,17 @@ impl super::ConversationAuthority for RuntimeAuthority {
             .map_err(|_| super::CommandLeaseUnavailable)
     }
 
-    fn finish_command(&self, scope: &RuntimeScope, lease: &TurnLease) {
-        if let Some(lifecycle) = self
-            .leases
-            .lock()
-            .ok()
-            .and_then(|registry| registry.get(scope).cloned())
-        {
-            let _ = super::lock_lifecycle(&lifecycle).finish_command(lease);
-        }
-    }
-
-    fn is_current(&self, scope: &RuntimeScope, lease: &TurnLease) -> bool {
-        self.leases
-            .lock()
-            .ok()
-            .and_then(|registry| registry.get(scope).cloned())
-            .is_some_and(|lifecycle| lifecycle.lock().is_ok_and(|owner| owner.is_current(lease)))
+    fn finish_command<'a>(
+        &'a self,
+        scope: &'a RuntimeScope,
+        lease: &'a TurnLease,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + 'a>> {
+        let lifecycle = self.lifecycle(scope);
+        Box::pin(async move {
+            super::lock_lifecycle(&lifecycle)
+                .finish_command(lease)
+                .map_err(|_| super::adapter_error("authority lease release"))
+        })
     }
 
     fn compact(
