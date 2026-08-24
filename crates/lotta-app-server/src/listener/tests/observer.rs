@@ -134,6 +134,14 @@ fn state(
             )
             .expect("agents bridge"),
         ),
+        conversations: Arc::new(
+            crate::ws::conversations::ConversationsBridge::new(
+                crate::ws::conversations::inert_forwarder(),
+                &files_workspace("observer-conversations"),
+                Arc::new(TestClock),
+            )
+            .expect("conversations bridge"),
+        ),
         models: Arc::new(
             crate::ws::models::ModelsBridge::new(
                 crate::ws::models::inert_forwarder(),

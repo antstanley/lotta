@@ -8,6 +8,10 @@ pub mod agents;
 pub mod command;
 /// Connection subscriptions and per-connection sequencing.
 pub mod connection;
+/// Conversation management command group bridging wire frames to Tasks 23/24,
+/// 28, 30, and 58.
+#[path = "ws/groups/conversations.rs"]
+pub mod conversations;
 /// Runtime event lifecycle envelopes.
 pub mod envelope;
 /// Exact runtime broadcast event models.

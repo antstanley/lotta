@@ -37,6 +37,7 @@ use crate::{
         RuntimeRouter, ServiceBackedTurnController, TurnController,
         UnsupportedRuntimeCommandService,
         agents::{AgentsBridge, decode as decode_agents},
+        conversations::{ConversationsBridge, decode as decode_conversations},
         external_tools::{
             ExternalForwarder, ExternalToolBridge, ExternalToolsCommand, ExternalToolsMessage,
             ToolsUpdateResponseMessage, decode as decode_external_tools,
@@ -73,6 +74,9 @@ mod websocket;
 /// Compatibility re-export of the canonical WebSocket frame ceiling.
 pub use crate::bounds::WS_FRAME_BYTES_MAX as FRAME_BYTES_MAX;
 
+/// Shared outbound frame sink keyed by connection identity.
+type SharedOutbound = Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>;
+
 struct SocketLimits {
     frame_bytes: usize,
     ping_interval_ms: u64,
@@ -97,6 +101,7 @@ struct ListenerState {
     turn_controller: Arc<dyn TurnController>,
     observer: Arc<dyn crate::observer::RuntimeBroadcastObserver>,
     agents: Arc<AgentsBridge>,
+    conversations: Arc<ConversationsBridge>,
     external_tools: Arc<ExternalToolBridge>,
     teleports: Arc<TeleportBridge>,
     terminals: Arc<TerminalBridge>,
@@ -354,6 +359,30 @@ pub async fn start_listener_with_runtime_service_controller_observer_and_bridges
     .await
 }
 
+/// Composes the shared skills/settings bridges plus their outbound sink when
+/// the host process did not hand in its own instances.
+fn compose_shared_bridges(
+    prepared: &PreparedServer,
+    clock: &Arc<dyn Clock + Send + Sync>,
+) -> Result<SharedGroupBridges, AppServerError> {
+    let outbound: SharedOutbound = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let skills = Arc::new(SkillsBridge::new(
+        skills_forwarder(&outbound),
+        &prepared.storage_dir,
+        Arc::clone(clock),
+    ));
+    let settings = Arc::new(SettingsBridge::new(
+        settings_forwarder(&outbound),
+        &prepared.storage_dir,
+        &prepared.workspace_dir,
+    )?);
+    Ok(SharedGroupBridges {
+        outbound,
+        skills,
+        settings,
+    })
+}
+
 async fn start_listener_with_limits(
     prepared: PreparedServer,
     clock: Arc<dyn Clock + Send + Sync>,
@@ -378,23 +407,13 @@ async fn start_listener_with_limits(
     tracing::info!(base_url, websocket_url, "app server listener started");
     let shutdown = CancellationToken::new();
     let runtime_router = RuntimeRouter::new(clock.clone(), Arc::new(RandomEventIdGenerator));
-    let (outbound, skills, settings) = if let Some(shared) = shared {
-        (shared.outbound, shared.skills, shared.settings)
-    } else {
-        let outbound: Arc<
-            std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>,
-        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let skills = Arc::new(SkillsBridge::new(
-            skills_forwarder(&outbound),
-            &prepared.storage_dir,
-            Arc::clone(&clock),
-        ));
-        let settings = Arc::new(SettingsBridge::new(
-            settings_forwarder(&outbound),
-            &prepared.storage_dir,
-            &prepared.workspace_dir,
-        )?);
-        (outbound, skills, settings)
+    let SharedGroupBridges {
+        outbound,
+        skills,
+        settings,
+    } = match shared {
+        Some(shared) => shared,
+        None => compose_shared_bridges(&prepared, &clock)?,
     };
     // The artifacts root backs Task 37 tool artifact operations; the files
     // group creates it on first bind next to the canonical storage root.
@@ -414,6 +433,7 @@ async fn start_listener_with_limits(
         &prepared.storage_dir,
         Arc::clone(&clock),
     )?);
+    let conversations = compose_conversations_bridge(&outbound, &prepared.storage_dir, &clock)?;
     let state = Arc::new(ListenerState {
         auth: prepared.auth,
         clock: Arc::clone(&clock),
@@ -432,6 +452,7 @@ async fn start_listener_with_limits(
         files,
         memories,
         agents,
+        conversations,
         models: Arc::new(ModelsBridge::new(
             models_forwarder(&outbound),
             &prepared.storage_dir,
@@ -849,6 +870,26 @@ fn agents_forwarder(
     Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
 }
 
+fn conversations_forwarder(
+    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
+) -> crate::ws::conversations::ConversationsForwarder {
+    let outbound = Arc::clone(outbound);
+    Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
+}
+
+/// Composes the conversation management bridge over the canonical storage root.
+fn compose_conversations_bridge(
+    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
+    storage_dir: &std::path::Path,
+    clock: &Arc<dyn Clock + Send + Sync>,
+) -> Result<Arc<ConversationsBridge>, AppServerError> {
+    Ok(Arc::new(ConversationsBridge::new(
+        conversations_forwarder(outbound),
+        storage_dir,
+        Arc::clone(clock),
+    )?))
+}
+
 /// Decodes and routes the external-tool command group for one frame.
 fn handle_external_frame(
     state: &Arc<ListenerState>,
@@ -1002,9 +1043,28 @@ fn handle_agents_frame(
 ) -> bool {
     match decode_agents(frame) {
         Err(error) => dispatch_value(state, connection_id, &error).is_ok(),
-        Ok(None) => true,
+        Ok(None) => handle_conversations_frame(state, connection_id, frame),
         Ok(Some(command)) => {
             state.agents.handle(connection_id, &command);
+            true
+        }
+    }
+}
+
+/// Decodes and routes the conversation management command group for one
+/// frame. Handlers run in detached tasks; the conversations bridge owns no
+/// per-connection resources, so connection cleanup needs no conversations
+/// step. This is the final group of the decode chain.
+fn handle_conversations_frame(
+    state: &Arc<ListenerState>,
+    connection_id: crate::ws::ConnectionId,
+    frame: &crate::framing::DecodedFrame,
+) -> bool {
+    match decode_conversations(frame) {
+        Err(error) => dispatch_value(state, connection_id, &error).is_ok(),
+        Ok(None) => true,
+        Ok(Some(command)) => {
+            state.conversations.handle(connection_id, &command);
             true
         }
     }

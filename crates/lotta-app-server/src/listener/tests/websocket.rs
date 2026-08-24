@@ -227,6 +227,14 @@ fn typed_failure_state(
             )
             .expect("agents bridge"),
         ),
+        conversations: Arc::new(
+            crate::ws::conversations::ConversationsBridge::new(
+                crate::ws::conversations::inert_forwarder(),
+                &prepared.storage_dir,
+                clock(),
+            )
+            .expect("conversations bridge"),
+        ),
         models: Arc::new(
             crate::ws::models::ModelsBridge::new(
                 crate::ws::models::inert_forwarder(),

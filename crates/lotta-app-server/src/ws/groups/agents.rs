@@ -170,7 +170,9 @@ pub enum ExplicitField<T> {
 
 /// Decodes one sent tri-state key, keeping an explicit JSON null distinct
 /// from an omitted one.
-fn explicit_field<'de, D, T>(deserializer: D) -> Result<Option<ExplicitField<T>>, D::Error>
+pub(crate) fn explicit_field<'de, D, T>(
+    deserializer: D,
+) -> Result<Option<ExplicitField<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,
