@@ -4599,6 +4599,30 @@ mod production_tests {
         }
     }
 
+    struct TempRoot(std::path::PathBuf);
+
+    impl TempRoot {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("{label}-{}", next_test_root()));
+            std::fs::create_dir_all(root.join("workspace")).unwrap();
+            Self(root)
+        }
+    }
+
+    impl std::ops::Deref for TempRoot {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// Builds one production service over a fresh store with its shared
     /// authoritative state exposed for queue-authority composition.
     fn device_queue_service(
@@ -4648,8 +4672,7 @@ mod production_tests {
 
     #[tokio::test]
     async fn ws_removal_syncs_with_the_production_registry() {
-        let root = std::env::temp_dir().join(format!("lotta-device-prod-{}", next_test_root()));
-        std::fs::create_dir_all(root.join("workspace")).unwrap();
+        let root = TempRoot::new("lotta-device-prod");
         let (service, state) = device_queue_service(&root);
 
         // Admit through the production service: turn start plus one queued input.
@@ -4755,6 +4778,53 @@ mod production_tests {
         (turn, cancellation)
     }
 
+    struct HeldRemovalFixture {
+        _root: TempRoot,
+        service: Arc<ProductionRuntimeService>,
+        controller: Arc<ProductionTurnController>,
+        held: Arc<HeldProvider>,
+        target: RuntimeScope,
+        observer: Arc<ProductionCancellationObserver>,
+    }
+
+    async fn held_removal_fixture() -> HeldRemovalFixture {
+        let held = Arc::new(HeldProvider::default());
+        let label = "device-held";
+        let (fixture_root, service, controller, ..) =
+            production_controller_fixture(label, held.clone() as Arc<dyn ProviderPort>).await;
+        let root = TempRoot(fixture_root);
+        let target = scope(label);
+        let observer = Arc::new(ProductionCancellationObserver::default());
+        service.state.observe_cancellation(Arc::clone(&observer));
+        HeldRemovalFixture {
+            _root: root,
+            service,
+            controller,
+            held,
+            target,
+            observer,
+        }
+    }
+
+    async fn assert_removed_item_stays_absent(
+        service: &ProductionRuntimeService,
+        target: &RuntimeScope,
+    ) {
+        let state = service.state.inner.lock().await;
+        let handle = state
+            .registry
+            .lookup(&RuntimeKey::from(target))
+            .expect("held-turn registry entry");
+        assert!(
+            state
+                .registry
+                .queue(&handle)
+                .expect("held-turn queue")
+                .is_empty(),
+            "removed item stays absent after release"
+        );
+    }
+
     /// A WS removal issued while a turn executes cancels the item on the
     /// active admission's private queue: the post-turn transfer never carries
     /// it, the pump never runs it, and the removed disposition plus snapshot
@@ -4763,18 +4833,18 @@ mod production_tests {
     async fn ws_removal_during_held_turn_cancels_before_pump() {
         use std::sync::atomic::Ordering;
 
-        let held = Arc::new(HeldProvider::default());
-        let label = "device-held";
-        let (root, service, controller, ..) =
-            production_controller_fixture(label, held.clone() as Arc<dyn ProviderPort>).await;
-        let target = scope(label);
-        let observer = Arc::new(ProductionCancellationObserver::default());
-        service.state.observe_cancellation(Arc::clone(&observer));
+        let fixture = held_removal_fixture().await;
+        let HeldRemovalFixture {
+            service,
+            controller,
+            held,
+            target,
+            observer,
+            ..
+        } = &fixture;
 
-        // Start a real turn: it holds the authoritative registry lock while
-        // the provider stays parked inside stream().
         let (turn, connection_cancellation) =
-            start_held_turn(&controller, &service, &held, &target, "cm-start").await;
+            start_held_turn(controller, service, held, target, "cm-start").await;
 
         // The next ordinary input queues onto the active admission queue.
         assert_eq!(
@@ -4787,17 +4857,16 @@ mod production_tests {
             "the input rides the active admission queue while the lock is held"
         );
 
-        // WS-remove it through the device bridge while the registry stays held.
         let messages: Arc<Mutex<Vec<(u64, DeviceMessage)>>> = Arc::default();
         let queue_events = Arc::new(Sink::default());
         let bridge = device_bridge_with_authority(
-            &root,
+            &fixture._root,
             &service.state,
             Arc::clone(&messages),
             Arc::clone(&queue_events),
         );
         bridge
-            .apply(1, &decode_remove_queue_item(&target, "queue-cm-remove"))
+            .apply(1, &decode_remove_queue_item(target, "queue-cm-remove"))
             .await;
 
         assert_removed_answer(&messages);
@@ -4809,8 +4878,7 @@ mod production_tests {
             "registry stays held through the real removal and snapshot"
         );
 
-        // Release the turn: the transfer pumps nothing because the removed
-        // item was already deleted from the active queue.
+        // Release the turn after deleting its only queued successor.
         held.release();
         connection_cancellation.cancel();
         let settled = tokio::time::timeout(std::time::Duration::from_secs(5), turn)
@@ -4828,22 +4896,8 @@ mod production_tests {
             1,
             "no successor turn starts for the removed item"
         );
-        let state = service.state.inner.lock().await;
-        let handle = state
-            .registry
-            .lookup(&RuntimeKey::from(&target))
-            .expect("held-turn registry entry");
-        assert!(
-            state
-                .registry
-                .queue(&handle)
-                .expect("held-turn queue")
-                .is_empty(),
-            "removed item stays absent after release"
-        );
-        drop(state);
+        assert_removed_item_stays_absent(service, target).await;
         drop(bridge);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Asserts the direct `remove_queue_item` answer reported success.
