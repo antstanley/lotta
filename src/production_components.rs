@@ -3200,6 +3200,7 @@ mod production_tests {
 
     struct HeldProvider {
         waiting: tokio::sync::Semaphore,
+        release: tokio::sync::Notify,
         calls: std::sync::atomic::AtomicU64,
     }
 
@@ -3207,8 +3208,15 @@ mod production_tests {
         fn default() -> Self {
             Self {
                 waiting: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Notify::new(),
                 calls: std::sync::atomic::AtomicU64::new(0),
             }
+        }
+    }
+
+    impl HeldProvider {
+        fn release(&self) {
+            self.release.notify_waiters();
         }
     }
 
@@ -3237,14 +3245,17 @@ mod production_tests {
                 self.waiting.add_permits(1);
                 tokio::select! {
                     () = request.cancellation.cancelled() => {
-                        Err(lotta_runtime::RuntimeError::Cancelled {
+                        return Err(lotta_runtime::RuntimeError::Cancelled {
                             context: "production held provider".into(),
-                        })
+                        });
                     },
-                    result = events.send(ProviderEvent::Stop {
-                        reason: lotta_runtime::ports::StopReason::EndTurn,
-                    }) => result,
+                    () = self.release.notified() => {},
                 }
+                events
+                    .send(ProviderEvent::Stop {
+                        reason: lotta_runtime::ports::StopReason::EndTurn,
+                    })
+                    .await
             })
         }
     }
@@ -4736,6 +4747,11 @@ mod production_tests {
             .expect("provider wait entered")
             .expect("provider wait semaphore")
             .forget();
+        assert!(!turn.is_finished(), "provider release gate holds the turn");
+        assert!(
+            service.state.inner.try_lock().is_err(),
+            "executing turn holds the production registry mutex"
+        );
         (turn, cancellation)
     }
 
@@ -4787,8 +4803,15 @@ mod production_tests {
         assert_removed_answer(&messages);
         assert_cancelled_broadcast(&queue_events);
 
+        assert!(!turn.is_finished(), "removal leaves the held turn parked");
+        assert!(
+            service.state.inner.try_lock().is_err(),
+            "registry stays held through the real removal and snapshot"
+        );
+
         // Release the turn: the transfer pumps nothing because the removed
         // item was already deleted from the active queue.
+        held.release();
         connection_cancellation.cancel();
         let settled = tokio::time::timeout(std::time::Duration::from_secs(5), turn)
             .await
@@ -4805,6 +4828,20 @@ mod production_tests {
             1,
             "no successor turn starts for the removed item"
         );
+        let state = service.state.inner.lock().await;
+        let handle = state
+            .registry
+            .lookup(&RuntimeKey::from(&target))
+            .expect("held-turn registry entry");
+        assert!(
+            state
+                .registry
+                .queue(&handle)
+                .expect("held-turn queue")
+                .is_empty(),
+            "removed item stays absent after release"
+        );
+        drop(state);
         drop(bridge);
         let _ = std::fs::remove_dir_all(root);
     }
