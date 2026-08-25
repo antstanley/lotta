@@ -33,9 +33,53 @@ pub(super) fn scope(index: usize) -> RuntimeScope {
 pub(super) fn events(values: Vec<RuntimeEvent>) -> RuntimeEventBatch {
     BoundedVec::new(values).unwrap_or_else(|error| panic!("events: {error}"))
 }
-pub(super) fn status_event(name: &str) -> RuntimeEvent {
+pub(super) fn approval_request() -> event::ApprovalRequest {
+    event::ApprovalRequest {
+        subtype: event::ApprovalSubtype::CanUseTool,
+        tool_name: text("read_file"),
+        input: bounded(json!({})),
+        tool_call_id: text("tool-call"),
+        permission_suggestions: Vec::new(),
+        blocked_path: None,
+        diffs: None,
+    }
+}
+pub(super) fn device_status() -> event::DeviceStatus {
+    event::DeviceStatus {
+        current_connection_id: None,
+        connection_name: None,
+        is_online: true,
+        is_processing: false,
+        current_permission_mode: event::DevicePermissionMode::Standard,
+        current_working_directory: None,
+        cwd_revision: None,
+        git_context: None,
+        letta_code_version: None,
+        current_toolset: None,
+        current_toolset_preference: event::ToolsetPreference::Auto,
+        current_loaded_tools: Vec::new(),
+        current_available_skills: Vec::new(),
+        background_processes: Vec::new(),
+        pending_control_requests: Vec::new(),
+        experiments: Vec::new(),
+        memory_directory: None,
+        cwd_map: None,
+        boot_working_directory: None,
+        should_doctor: None,
+        reflection_settings: None,
+        supported_commands: Vec::new(),
+    }
+}
+pub(super) fn loop_state(status: event::LoopStatus) -> event::LoopState {
+    event::LoopState {
+        status,
+        active_run_ids: Vec::new(),
+        executing_tool_call_ids: Vec::new(),
+    }
+}
+pub(super) fn status_event(_: &str) -> RuntimeEvent {
     RuntimeEvent::UpdateLoopStatus {
-        loop_status: bounded(json!({"status": name})),
+        loop_status: loop_state(event::LoopStatus::WaitingOnInput),
     }
 }
 
@@ -117,8 +161,8 @@ impl RuntimeCommandService for RecordingService {
                 error: None,
                 continuation: Some(bounded(json!({"continue":true}))),
                 after_ack: events(vec![RuntimeEvent::UpdateQueue {
-                    queue: bounded(json!([])),
-                    removed: bounded(json!([])),
+                    queue: Vec::new(),
+                    removed: Vec::new(),
                 }]),
             })
         })
@@ -134,7 +178,9 @@ impl RuntimeCommandService for RecordingService {
             sink.emit(
                 &scope,
                 RuntimeEvent::StreamDelta {
-                    delta: bounded(json!({"message_type":"status","message":"done"})),
+                    delta: crate::ws::event::StreamDelta::Other(bounded(
+                        json!({"message_type":"status","message":"done"}),
+                    )),
                     subagent_id: None,
                 },
             )
@@ -169,7 +215,7 @@ impl RuntimeCommandService for RecordingService {
         Box::pin(async {
             Ok(DeviceStateOutcome {
                 broadcasts: events(vec![RuntimeEvent::UpdateDeviceStatus {
-                    device_status: bounded(json!({"mode":"strict"})),
+                    device_status: Box::new(device_status()),
                 }]),
             })
         })

@@ -226,8 +226,8 @@ impl Harness {
         assert_eq!(event.discriminant(), "update_queue");
         match event {
             RuntimeEvent::UpdateQueue { queue, removed } => json!({
-                "queue": queue.as_value(),
-                "removed": removed.as_value(),
+                "queue": queue,
+                "removed": removed,
             }),
             other => panic!("unexpected event discriminant {}", other.discriminant()),
         }

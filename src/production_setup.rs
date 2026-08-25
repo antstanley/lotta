@@ -3063,12 +3063,11 @@ impl ProductionTurnController {
         sink.emit(
             &command.runtime,
             lotta_app_server::ws::RuntimeEvent::UpdateLoopStatus {
-                loop_status: BoundedJsonValue::new(serde_json::json!({
-                    "status": "WAITING_ON_INPUT",
-                    "active_run_ids": [],
-                    "executing_tool_call_ids": [],
-                }))
-                .map_err(|_| lotta_app_server::error::AppServerError::Internal)?,
+                loop_status: lotta_app_server::ws::event::LoopState {
+                    status: lotta_app_server::ws::event::LoopStatus::WaitingOnInput,
+                    active_run_ids: Vec::new(),
+                    executing_tool_call_ids: Vec::new(),
+                },
             },
         )?;
         Ok(())
@@ -3289,12 +3288,15 @@ struct WebSocketStatusSink {
 
 impl SetupStatusSink for WebSocketStatusSink {
     fn emit(&self, status: SetupStatus) -> Result<(), SetupError> {
-        let value = match status {
-            SetupStatus::Sending => "sending",
-            SetupStatus::Waiting => "waiting",
+        let status = match status {
+            SetupStatus::Sending => lotta_app_server::ws::event::LoopStatus::SendingApiRequest,
+            SetupStatus::Waiting => lotta_app_server::ws::event::LoopStatus::WaitingForApiResponse,
         };
-        let loop_status =
-            BoundedJsonValue::new(serde_json::json!({"status": value})).map_err(adapter)?;
+        let loop_status = lotta_app_server::ws::event::LoopState {
+            status,
+            active_run_ids: Vec::new(),
+            executing_tool_call_ids: Vec::new(),
+        };
         self.sink
             .emit(
                 &self.scope,

@@ -150,8 +150,8 @@ async fn outbound_registry_fans_out_actual_broadcast_to_both_peers() {
         .broadcast(
             &scope,
             &RuntimeEvent::UpdateQueue {
-                queue: lotta_domain::BoundedJsonValue::new(serde_json::json!(["queued"])).unwrap(),
-                removed: lotta_domain::BoundedJsonValue::new(serde_json::json!([])).unwrap(),
+                queue: Vec::new(),
+                removed: Vec::new(),
             },
         )
         .unwrap();
@@ -171,7 +171,7 @@ async fn outbound_registry_fans_out_actual_broadcast_to_both_peers() {
     let two: Value = serde_json::from_str(&rx2.recv().await.unwrap()).unwrap();
     for value in [&one, &two] {
         assert_eq!(value["type"], "update_queue");
-        assert_eq!(value["queue"], serde_json::json!(["queued"]));
+        assert_eq!(value["queue"], serde_json::json!([]));
         assert_eq!(value["event_seq"], 1);
     }
     assert_ne!(one["idempotency_key"], two["idempotency_key"]);

@@ -1,5 +1,9 @@
 use super::super::test_support::*;
 use super::super::*;
+use crate::ws::event::{
+    ApprovalRequest, ApprovalSubtype, DevicePermissionMode, DeviceStatus, LoopState, LoopStatus,
+    ToolsetPreference,
+};
 use serde_json::json;
 use std::sync::{Arc, Mutex, atomic::Ordering};
 use uuid::Uuid;
@@ -16,26 +20,69 @@ impl EventIdGenerator for FailSecondId {
     }
 }
 
+fn approval_request() -> ApprovalRequest {
+    ApprovalRequest {
+        subtype: ApprovalSubtype::CanUseTool,
+        tool_name: text("read_file"),
+        input: bounded(json!({})),
+        tool_call_id: text("tool-call"),
+        permission_suggestions: Vec::new(),
+        blocked_path: None,
+        diffs: None,
+    }
+}
+
+fn device_status() -> DeviceStatus {
+    DeviceStatus {
+        current_connection_id: None,
+        connection_name: None,
+        is_online: false,
+        is_processing: false,
+        current_permission_mode: DevicePermissionMode::Standard,
+        current_working_directory: None,
+        cwd_revision: None,
+        git_context: None,
+        letta_code_version: None,
+        current_toolset: None,
+        current_toolset_preference: ToolsetPreference::Auto,
+        current_loaded_tools: Vec::new(),
+        current_available_skills: Vec::new(),
+        background_processes: Vec::new(),
+        pending_control_requests: Vec::new(),
+        experiments: Vec::new(),
+        memory_directory: None,
+        cwd_map: None,
+        boot_working_directory: None,
+        should_doctor: None,
+        reflection_settings: None,
+        supported_commands: Vec::new(),
+    }
+}
+
 fn event(index: usize) -> RuntimeEvent {
     match index {
         0 => RuntimeEvent::ControlRequest {
             request_id: text("req"),
-            request: bounded(json!({"subtype":"can_use_tool"})),
+            request: approval_request(),
             agent_id: None,
             conversation_id: None,
         },
         1 => RuntimeEvent::UpdateDeviceStatus {
-            device_status: bounded(json!({})),
+            device_status: Box::new(device_status()),
         },
         2 => RuntimeEvent::UpdateLoopStatus {
-            loop_status: bounded(json!({})),
+            loop_status: LoopState {
+                status: LoopStatus::WaitingOnInput,
+                active_run_ids: Vec::new(),
+                executing_tool_call_ids: Vec::new(),
+            },
         },
         3 => RuntimeEvent::UpdateQueue {
-            queue: bounded(json!([])),
-            removed: bounded(json!([])),
+            queue: Vec::new(),
+            removed: Vec::new(),
         },
         4 => RuntimeEvent::StreamDelta {
-            delta: bounded(json!({})),
+            delta: crate::ws::event::StreamDelta::Other(bounded(json!({}))),
             subagent_id: Some(text("sub")),
         },
         5 => RuntimeEvent::TurnFinished {
@@ -45,7 +92,7 @@ fn event(index: usize) -> RuntimeEvent {
             error: None,
         },
         _ => RuntimeEvent::UpdateSubagentState {
-            subagents: bounded(json!([])),
+            subagents: Vec::new(),
         },
     }
 }
@@ -54,17 +101,24 @@ fn assert_specific(value: &serde_json::Value, index: usize) {
         0 => {
             assert_eq!(value["type"], "control_request");
             assert_eq!(value["request_id"], "req");
-            assert_eq!(value["request"], json!({"subtype":"can_use_tool"}));
+            assert_eq!(value["request"]["subtype"], "can_use_tool");
+            assert_eq!(value["request"]["tool_name"], "read_file");
+            assert_eq!(value["request"]["tool_call_id"], "tool-call");
             assert!(value.get("agent_id").is_none());
             assert!(value.get("conversation_id").is_none());
         }
         1 => {
             assert_eq!(value["type"], "update_device_status");
-            assert_eq!(value["device_status"], json!({}));
+            assert_eq!(value["device_status"]["is_online"], false);
+            assert_eq!(
+                value["device_status"]["current_permission_mode"],
+                "standard"
+            );
         }
         2 => {
             assert_eq!(value["type"], "update_loop_status");
-            assert_eq!(value["loop_status"], json!({}));
+            assert_eq!(value["loop_status"]["status"], "WAITING_ON_INPUT");
+            assert_eq!(value["loop_status"]["active_run_ids"], json!([]));
         }
         3 => {
             assert_eq!(value["type"], "update_queue");

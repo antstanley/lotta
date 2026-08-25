@@ -4,7 +4,10 @@ use lotta_app_server::observer::{RuntimeBroadcastObservation, RuntimeBroadcastOb
 use lotta_app_server::ws::command::{
     AbortMessageCommand, ChangeDeviceStateCommand, InputCommand, RuntimeStartCommand, SyncCommand,
 };
-use lotta_app_server::ws::event::RuntimeEvent;
+use lotta_app_server::ws::event::{
+    DevicePermissionMode, DeviceStatus, LoopState, LoopStatus, RuntimeEvent, StreamDelta,
+    ToolsetPreference,
+};
 use lotta_app_server::ws::service::{
     AbortOutcome, DeviceStateOutcome, InputAdmission, RuntimeCommandService, RuntimeEventBatch,
     RuntimeEventSink, RuntimeStartOutcome, ServiceFuture, SyncOutcome,
@@ -146,7 +149,7 @@ enum AuthorityObservation {
         lease: String,
     },
     Broadcast {
-        observation: RuntimeBroadcastObservation,
+        observation: Box<RuntimeBroadcastObservation>,
         active: Option<ActiveObservation>,
     },
 }
@@ -209,7 +212,7 @@ impl RuntimeBroadcastObserver for ObservationLog {
             }
         };
         self.record(AuthorityObservation::Broadcast {
-            observation,
+            observation: Box::new(observation),
             active,
         });
     }
@@ -285,21 +288,41 @@ impl RuntimeCommandService for Service {
                 conversation: None,
                 broadcasts: events(vec![
                     RuntimeEvent::UpdateDeviceStatus {
-                        device_status: BoundedJsonValue::new(
-                            json!({"mode":"standard","cwd":"/synthetic/workspace"}),
-                        )
-                        .unwrap(),
+                        device_status: Box::new(DeviceStatus {
+                            current_connection_id: None,
+                            connection_name: None,
+                            is_online: true,
+                            is_processing: false,
+                            current_permission_mode: DevicePermissionMode::Standard,
+                            current_working_directory: Some("/synthetic/workspace".into()),
+                            cwd_revision: None,
+                            git_context: None,
+                            letta_code_version: None,
+                            current_toolset: None,
+                            current_toolset_preference: ToolsetPreference::Auto,
+                            current_loaded_tools: Vec::new(),
+                            current_available_skills: Vec::new(),
+                            background_processes: Vec::new(),
+                            pending_control_requests: Vec::new(),
+                            experiments: Vec::new(),
+                            memory_directory: None,
+                            cwd_map: None,
+                            boot_working_directory: None,
+                            should_doctor: None,
+                            reflection_settings: None,
+                            supported_commands: Vec::new(),
+                        }),
                     },
                     RuntimeEvent::UpdateLoopStatus {
-                        loop_status: BoundedJsonValue::new(json!({
-                            "status":"IDLE", "active_run_ids":[],
-                            "executing_tool_call_ids":[]
-                        }))
-                        .unwrap(),
+                        loop_status: LoopState {
+                            status: LoopStatus::WaitingOnInput,
+                            active_run_ids: Vec::new(),
+                            executing_tool_call_ids: Vec::new(),
+                        },
                     },
                     RuntimeEvent::UpdateQueue {
-                        queue: BoundedJsonValue::new(json!([])).unwrap(),
-                        removed: BoundedJsonValue::new(json!([])).unwrap(),
+                        queue: Vec::new(),
+                        removed: Vec::new(),
                     },
                 ]),
             })
@@ -449,12 +472,14 @@ impl TurnEffectPort for Effects<'_> {
     fn emit(&self, event: TurnEvent) -> Result<(), lotta_runtime::RuntimeError> {
         let wire = match event {
             TurnEvent::StreamDelta(_) => RuntimeEvent::StreamDelta {
-                delta: BoundedJsonValue::new(json!({
-                    "id":"00000000-0000-4000-8000-000000000022",
-                    "date":"2000-01-01T00:00:12.000Z",
-                    "message_type":"message"
-                }))
-                .unwrap(),
+                delta: StreamDelta::Other(
+                    BoundedJsonValue::new(json!({
+                        "id":"00000000-0000-4000-8000-000000000022",
+                        "date":"2000-01-01T00:00:12.000Z",
+                        "message_type":"message"
+                    }))
+                    .unwrap(),
+                ),
                 subagent_id: None,
             },
             TurnEvent::Finished { reason } => {

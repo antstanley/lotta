@@ -18,7 +18,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use lotta_domain::{BoundedJsonValue, Clock};
+use lotta_domain::Clock;
 use tokio::{
     net::TcpListener,
     sync::mpsc,
@@ -674,7 +674,7 @@ fn register_device_runtime_ports(state: &Arc<ListenerState>) {
             let device = snapshot_devices
                 .upgrade()
                 .ok_or(AppServerError::Unavailable)?;
-            BoundedJsonValue::new(device.status_snapshot(scope))
+            serde_json::from_value(device.status_snapshot(scope))
                 .map_err(|_| AppServerError::Internal)
         }));
     state.devices.register_event_sink(event_sink(state));

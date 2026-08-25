@@ -88,7 +88,7 @@ fn control_row_emits_control_request() {
     let members = members_in_fixture(&CONTROL_ROW).expect("pinned row resolves");
     let emitted = emitted_broadcast_discriminant(&RuntimeEvent::ControlRequest {
         request_id: text("approval-1"),
-        request: bounded(json!({"kind": "permission"})),
+        request: crate::ws::test_support::approval_request(),
         agent_id: None,
         conversation_id: None,
     });
@@ -142,7 +142,7 @@ async fn admission_row_emits_input_accepted() {
 fn state_row_emits_device_snapshot() {
     let members = members_in_fixture(&STATE_ROW).expect("pinned row resolves");
     let emitted = emitted_broadcast_discriminant(&RuntimeEvent::UpdateDeviceStatus {
-        device_status: bounded(json!({"is_processing": false})),
+        device_status: Box::new(crate::ws::test_support::device_status()),
     });
     assert_eq!(emitted, "update_device_status");
     assert!(
@@ -155,7 +155,7 @@ fn state_row_emits_device_snapshot() {
 fn stream_row_emits_stream_delta() {
     let members = members_in_fixture(&STREAM_ROW).expect("pinned row resolves");
     let emitted = emitted_broadcast_discriminant(&RuntimeEvent::StreamDelta {
-        delta: bounded(json!({"type": "text", "text": "hi"})),
+        delta: crate::ws::event::StreamDelta::Other(bounded(json!({"type": "text", "text": "hi"}))),
         subagent_id: None,
     });
     assert!(

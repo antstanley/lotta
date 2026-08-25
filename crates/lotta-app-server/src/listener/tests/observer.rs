@@ -2,10 +2,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, atomic::AtomicU64};
 
 use lotta_domain::{
-    AgentId, BoundedJsonValue, BoundedVec, Clock, ConversationId, DomainError, RuntimeScope,
-    Timestamp,
+    AgentId, BoundedVec, Clock, ConversationId, DomainError, RuntimeScope, Timestamp,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::mpsc;
 
 use super::{ListenerState, SocketLimits, dispatch_output, event_sink};
@@ -14,6 +13,7 @@ use crate::observer::{RuntimeBroadcastObservation, RuntimeBroadcastObserver};
 use crate::ws::{
     RandomEventIdGenerator, RouteOutput, RoutedEventBatch, RuntimeEvent, RuntimeRouter,
     UnsupportedRuntimeCommandService,
+    event::{LoopState, LoopStatus},
 };
 
 const OBSERVATIONS_MAX: usize = 4;
@@ -71,8 +71,17 @@ fn scope(index: usize) -> RuntimeScope {
 }
 
 fn event(name: &str) -> RuntimeEvent {
+    let status = match name {
+        "WAITING_ON_INPUT" => LoopStatus::WaitingOnInput,
+        "WAITING_ON_APPROVAL" => LoopStatus::WaitingOnApproval,
+        _ => LoopStatus::ProcessingApiResponse,
+    };
     RuntimeEvent::UpdateLoopStatus {
-        loop_status: BoundedJsonValue::new(json!({"status": name})).unwrap(),
+        loop_status: LoopState {
+            status,
+            active_run_ids: Vec::new(),
+            executing_tool_call_ids: Vec::new(),
+        },
     }
 }
 

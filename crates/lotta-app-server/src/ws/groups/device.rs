@@ -749,12 +749,9 @@ impl DeviceBridge {
         let Some(sink) = lock(&self.event_sink).clone() else {
             return;
         };
-        let queue = json!(snapshot.items());
-        let (Ok(queue), Ok(removed)) = (
-            lotta_domain::BoundedJsonValue::new(queue),
-            lotta_domain::BoundedJsonValue::new(removed),
-        ) else {
-            tracing::warn!("bounded update_queue encoding failed");
+        let queue = snapshot.items().to_vec();
+        let Ok(removed) = serde_json::from_value(removed) else {
+            tracing::warn!("typed update_queue encoding failed");
             return;
         };
         if let Err(error) = sink.emit(runtime, RuntimeEvent::UpdateQueue { queue, removed }) {
@@ -879,8 +876,8 @@ impl DeviceBridge {
     }
 
     fn emit_device_status(sink: &Arc<dyn RuntimeEventSink>, scope: &RuntimeScope, status: Value) {
-        let Ok(status) = lotta_domain::BoundedJsonValue::new(status) else {
-            tracing::warn!("bounded update_device_status encoding failed");
+        let Ok(status) = serde_json::from_value(status) else {
+            tracing::warn!("typed update_device_status encoding failed");
             return;
         };
         if let Err(error) = sink.emit(

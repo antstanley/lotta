@@ -115,7 +115,7 @@ fn recorded_status(fixture: &BackgroundFixture) -> Value {
     assert_eq!(events.len(), 1, "one listener state event");
     match &events[0] {
         RuntimeEvent::UpdateDeviceStatus { device_status } => {
-            serde_json::to_value(device_status.as_value()).expect("bounded encodes")
+            serde_json::to_value(device_status).expect("device status encodes")
         }
         other => panic!(
             "expected update_device_status, got {}",

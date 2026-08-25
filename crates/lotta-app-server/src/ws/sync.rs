@@ -1,4 +1,4 @@
-//! Authoritative full-snapshot sync behavior.
+//! Full-state reconnect synchronization.
 //!
 //! Sync has no cursor or delta semantics. Every invocation emits device, loop,
 //! queue, and subagent snapshots followed by unresolved approval requests; the
@@ -6,31 +6,26 @@
 
 #[cfg(test)]
 mod replays_snapshots {
-    use crate::ws::{RuntimeEvent, service::SyncOutcome, test_support::events};
-    use serde_json::json;
-
-    use crate::ws::test_support::bounded;
+    use crate::ws::{RuntimeEvent, service::SyncOutcome, test_support::*};
 
     #[test]
     fn pinned_order_is_full_and_cursor_free() {
         let outcome = SyncOutcome {
             broadcasts: events(vec![
                 RuntimeEvent::UpdateDeviceStatus {
-                    device_status: bounded(json!({"online": true})),
+                    device_status: Box::new(device_status()),
                 },
-                RuntimeEvent::UpdateLoopStatus {
-                    loop_status: bounded(json!({"status": "idle"})),
-                },
+                status_event("WAITING_ON_INPUT"),
                 RuntimeEvent::UpdateQueue {
-                    queue: bounded(json!([])),
-                    removed: bounded(json!([])),
+                    queue: Vec::new(),
+                    removed: Vec::new(),
                 },
                 RuntimeEvent::UpdateSubagentState {
-                    subagents: bounded(json!([])),
+                    subagents: Vec::new(),
                 },
                 RuntimeEvent::ControlRequest {
-                    request_id: super::super::test_support::text("approval-1"),
-                    request: bounded(json!({"state": "pending"})),
+                    request_id: text("approval-1"),
+                    request: approval_request(),
                     agent_id: None,
                     conversation_id: None,
                 },
@@ -57,34 +52,61 @@ mod replays_snapshots {
 
 #[cfg(test)]
 mod snapshot_semantics {
-    use crate::ws::{RuntimeEvent, test_support::bounded};
+    use crate::ws::{RuntimeEvent, event::*, test_support::*};
+    use lotta_domain::{QueueItem, QueueRemovalDisposition};
     use serde_json::{Value, json};
 
     fn apply(current: &mut Value, event: &RuntimeEvent) {
         *current = match event {
-            RuntimeEvent::UpdateDeviceStatus { device_status } => device_status.as_value().clone(),
-            RuntimeEvent::UpdateLoopStatus { loop_status } => loop_status.as_value().clone(),
-            RuntimeEvent::UpdateQueue { queue, .. } => queue.as_value().clone(),
-            RuntimeEvent::UpdateSubagentState { subagents } => subagents.as_value().clone(),
-            _ => current.clone(),
-        };
+            RuntimeEvent::UpdateDeviceStatus { device_status } => {
+                serde_json::to_value(device_status)
+            }
+            RuntimeEvent::UpdateLoopStatus { loop_status } => serde_json::to_value(loop_status),
+            RuntimeEvent::UpdateQueue { queue, .. } => serde_json::to_value(queue),
+            RuntimeEvent::UpdateSubagentState { subagents } => serde_json::to_value(subagents),
+            _ => Ok(current.clone()),
+        }
+        .expect("typed DTO encodes");
+    }
+
+    fn subagent() -> SubagentState {
+        SubagentState {
+            subagent_id: "child".into(),
+            subagent_type: "worker".into(),
+            description: "fixture".into(),
+            prompt: None,
+            status: SubagentStatus::Pending,
+            agent_url: None,
+            conversation_id: None,
+            model: None,
+            is_background: None,
+            silent: None,
+            tool_call_id: None,
+            parent_agent_id: None,
+            parent_conversation_id: None,
+            start_time: 0,
+            tool_calls: Vec::new(),
+            total_tokens: 0,
+            duration_ms: 0,
+            error: None,
+        }
     }
 
     #[test]
     fn every_state_type_replaces_prior_state() {
         let cases = [
             RuntimeEvent::UpdateDeviceStatus {
-                device_status: bounded(json!({"new": 1})),
+                device_status: Box::new(device_status()),
             },
             RuntimeEvent::UpdateLoopStatus {
-                loop_status: bounded(json!({"status": "idle"})),
+                loop_status: loop_state(LoopStatus::WaitingOnInput),
             },
             RuntimeEvent::UpdateQueue {
-                queue: bounded(json!([{"id": "new"}])),
-                removed: bounded(json!([])),
+                queue: Vec::<QueueItem>::new(),
+                removed: Vec::new(),
             },
             RuntimeEvent::UpdateSubagentState {
-                subagents: bounded(json!([{"id": "child"}])),
+                subagents: vec![subagent()],
             },
         ];
         for event in cases {
@@ -97,21 +119,24 @@ mod snapshot_semantics {
     #[test]
     fn queue_removal_transitions_remain_ordered() {
         let event = RuntimeEvent::UpdateQueue {
-            queue: bounded(json!([])),
-            removed: bounded(json!([
-                {"client_message_id": "first", "disposition": "dequeued"},
-                {"client_message_id": "second", "disposition": "cancelled"}
-            ])),
+            queue: Vec::new(),
+            removed: vec![
+                QueueRemovalTransition {
+                    client_message_id: text("first"),
+                    disposition: QueueRemovalDisposition::Dequeued,
+                },
+                QueueRemovalTransition {
+                    client_message_id: text("second"),
+                    disposition: QueueRemovalDisposition::Cancelled,
+                },
+            ],
         };
         let RuntimeEvent::UpdateQueue { removed, .. } = event else {
-            unreachable!();
+            unreachable!()
         };
         let ids: Vec<_> = removed
-            .as_value()
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|row| row.get("client_message_id").and_then(Value::as_str))
+            .iter()
+            .map(|row| row.client_message_id.as_str())
             .collect();
         assert_eq!(ids, ["first", "second"]);
     }

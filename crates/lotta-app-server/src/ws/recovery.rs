@@ -57,7 +57,7 @@ mod reconnect {
         let (mut router, connection) = resumed();
         let event = RuntimeEvent::ControlRequest {
             request_id: text("approval-1"),
-            request: bounded(serde_json::json!({"state": "pending"})),
+            request: approval_request(),
             agent_id: None,
             conversation_id: None,
         };
@@ -107,21 +107,17 @@ mod repairs_missing_tool_end {
             .subscribe(connection, scope(1))
             .expect("subscribe");
         let start = RuntimeEvent::StreamDelta {
-            delta: bounded(json!({
+            delta: crate::ws::event::StreamDelta::Other(bounded(json!({
                 "message_type": "client_tool_start",
                 "tool_call_id": "tool-1"
-            })),
+            }))),
             subagent_id: None,
         };
         let started = router.broadcast(&scope(1), &start).expect("tool start");
         assert_eq!(started.as_slice()[0].frame.event_seq, 1);
 
         let repair = RuntimeEvent::UpdateLoopStatus {
-            loop_status: bounded(json!({
-                "status": "WAITING_ON_INPUT",
-                "active_run_ids": [],
-                "executing_tool_call_ids": []
-            })),
+            loop_status: loop_state(crate::ws::event::LoopStatus::WaitingOnInput),
         };
         let repaired = router
             .broadcast(&scope(1), &repair)
@@ -131,7 +127,10 @@ mod repairs_missing_tool_end {
         else {
             panic!("loop snapshot");
         };
-        assert_eq!(loop_status.as_value()["status"], "WAITING_ON_INPUT");
-        assert_eq!(loop_status.as_value()["executing_tool_call_ids"], json!([]));
+        assert_eq!(
+            loop_status.status,
+            crate::ws::event::LoopStatus::WaitingOnInput
+        );
+        assert!(loop_status.executing_tool_call_ids.is_empty());
     }
 }

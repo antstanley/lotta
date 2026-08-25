@@ -9,7 +9,7 @@ use super::{
         AbortMessageCommand, ChangeDeviceStateCommand, InputCommand, RuntimeStartCommand,
         SyncCommand,
     },
-    event::RuntimeEvent,
+    event::{DeviceStatus, RuntimeEvent},
 };
 
 /// Maximum events returned by one Runtime service phase.
@@ -20,9 +20,8 @@ pub type RuntimeEventBatch = BoundedVec<RuntimeEvent, WS_RUNTIME_ROUTE_EVENTS_MA
 pub type ServiceFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, crate::error::AppServerError>> + Send + 'a>>;
 /// Narrow scope-aware authoritative device snapshot port.
-pub type DeviceSnapshotSource = Arc<
-    dyn Fn(&RuntimeScope) -> Result<BoundedJsonValue, crate::error::AppServerError> + Send + Sync,
->;
+pub type DeviceSnapshotSource =
+    Arc<dyn Fn(&RuntimeScope) -> Result<DeviceStatus, crate::error::AppServerError> + Send + Sync>;
 
 /// Successful runtime resolution and initial snapshots.
 pub struct RuntimeStartOutcome {

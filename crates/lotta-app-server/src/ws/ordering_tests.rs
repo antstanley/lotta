@@ -188,7 +188,9 @@ fn client_tool_start_before_same_id_end() {
         sink.emit(
             &scope(1),
             RuntimeEvent::StreamDelta {
-                delta: bounded(json!({"message_type":message_type,"tool_call_id":"tool-1"})),
+                delta: crate::ws::event::StreamDelta::Other(bounded(
+                    json!({"message_type":message_type,"tool_call_id":"tool-1"}),
+                )),
                 subagent_id: None,
             },
         )
@@ -217,7 +219,9 @@ fn exactly_one_finished_after_final_delta() {
     sink.emit(
         &scope(1),
         RuntimeEvent::StreamDelta {
-            delta: bounded(json!({"message_type":"status","message":"done"})),
+            delta: crate::ws::event::StreamDelta::Other(bounded(
+                json!({"message_type":"status","message":"done"}),
+            )),
             subagent_id: None,
         },
     )

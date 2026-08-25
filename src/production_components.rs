@@ -80,8 +80,11 @@ const DEFAULT_OUTPUT_TOKENS: u64 = 4_096;
 const TRANSCRIPT_MANIFEST_SCHEMA_VERSION: u8 = 2;
 const TRANSCRIPT_SESSION_SCHEMA_VERSION: u8 = 3;
 
-type DeviceSnapshotSource =
-    Arc<dyn Fn(&RuntimeScope) -> Result<BoundedJsonValue, AppServerError> + Send + Sync>;
+type DeviceSnapshotSource = Arc<
+    dyn Fn(&RuntimeScope) -> Result<lotta_app_server::ws::event::DeviceStatus, AppServerError>
+        + Send
+        + Sync,
+>;
 
 #[cfg(test)]
 pub(crate) type CancellationStageObserver =
@@ -1160,7 +1163,10 @@ impl ProductionRuntimeService {
             })
     }
 
-    fn device_snapshot(&self, scope: &RuntimeScope) -> Result<BoundedJsonValue, AppServerError> {
+    fn device_snapshot(
+        &self,
+        scope: &RuntimeScope,
+    ) -> Result<lotta_app_server::ws::event::DeviceStatus, AppServerError> {
         let source = self
             .device_snapshot
             .lock()
@@ -1874,7 +1880,7 @@ async fn sync_outcome(
     let status = authoritative_status_snapshot(service, &key, active.as_ref()).await?;
     let device = service.device_snapshot(&command.runtime)?;
     let mut broadcasts = vec![lotta_app_server::ws::RuntimeEvent::UpdateDeviceStatus {
-        device_status: device,
+        device_status: Box::new(device),
     }];
     let executing_tools = service.executing_tool_snapshot(&key)?;
     broadcasts.extend(sync_status_broadcasts(status, executing_tools)?);
@@ -1896,13 +1902,13 @@ async fn sync_outcome(
 async fn task_snapshot(
     service: &ProductionRuntimeService,
     scope: &RuntimeScope,
-) -> Result<BoundedJsonValue, AppServerError> {
+) -> Result<Vec<lotta_app_server::ws::event::SubagentState>, AppServerError> {
     let tasks = service
         .tasks
         .snapshot(scope)
         .await
         .map_err(|_| AppServerError::Internal)?;
-    BoundedJsonValue::new(serde_json::to_value(tasks).map_err(|_| AppServerError::Internal)?)
+    serde_json::from_value(serde_json::to_value(tasks).map_err(|_| AppServerError::Internal)?)
         .map_err(|_| AppServerError::Internal)
 }
 
@@ -1994,22 +2000,21 @@ fn loop_event(
     active_run_ids: Vec<String>,
     executing_tool_call_ids: Vec<String>,
 ) -> Result<lotta_app_server::ws::RuntimeEvent, AppServerError> {
-    let loop_status = BoundedJsonValue::new(serde_json::json!({
-        "status": status,
-        "active_run_ids": active_run_ids,
-        "executing_tool_call_ids": executing_tool_call_ids,
-    }))
-    .map_err(|_| AppServerError::Internal)?;
+    let status = serde_json::from_value(serde_json::Value::String(status.to_owned()))
+        .map_err(|_| AppServerError::Internal)?;
+    let loop_status = lotta_app_server::ws::event::LoopState {
+        status,
+        active_run_ids,
+        executing_tool_call_ids,
+    };
     Ok(lotta_app_server::ws::RuntimeEvent::UpdateLoopStatus { loop_status })
 }
 
 fn queue_event(items: &[QueueItem]) -> Result<lotta_app_server::ws::RuntimeEvent, AppServerError> {
-    let queue =
-        BoundedJsonValue::new(serde_json::to_value(items).map_err(|_| AppServerError::Internal)?)
-            .map_err(|_| AppServerError::Internal)?;
-    let removed =
-        BoundedJsonValue::new(serde_json::json!([])).map_err(|_| AppServerError::Internal)?;
-    Ok(lotta_app_server::ws::RuntimeEvent::UpdateQueue { queue, removed })
+    Ok(lotta_app_server::ws::RuntimeEvent::UpdateQueue {
+        queue: items.to_vec(),
+        removed: Vec::new(),
+    })
 }
 
 fn sync_approval_broadcasts(
@@ -2023,15 +2028,16 @@ fn sync_approval_broadcasts(
         .pending_snapshot(scope, lease_generation)
         .map_err(runtime_service_error)?
     {
-        let payload = BoundedJsonValue::new(serde_json::json!({
-            "subtype": "can_use_tool",
-            "tool_call_id": request.tool_call_id.as_str(),
-            "tool_name": request.tool_name.as_str(),
-            "input": request.original_input.as_value(),
-            "permission_suggestions": [],
-            "blocked_path": null,
-        }))
-        .map_err(|_| AppServerError::Internal)?;
+        let payload = lotta_app_server::ws::event::ApprovalRequest {
+            subtype: lotta_app_server::ws::event::ApprovalSubtype::CanUseTool,
+            tool_call_id: request.tool_call_id,
+            tool_name: request.tool_name,
+            input: BoundedJsonValue::new(request.original_input.as_value().clone())
+                .map_err(|_| AppServerError::Internal)?,
+            permission_suggestions: Vec::new(),
+            blocked_path: None,
+            diffs: None,
+        };
         broadcasts.push(lotta_app_server::ws::RuntimeEvent::ControlRequest {
             request_id: request.request_id,
             request: payload,
@@ -2302,16 +2308,12 @@ impl RuntimeCommandService for ProductionRuntimeService {
                 // and the cwd map simply keeps its previous entry.
                 let _ = self.settings.apply_cwd_change(0, &change);
             }
-            let device_status = BoundedJsonValue::new(serde_json::json!({
-                "mode": command.payload.mode.map(|mode| format!("{mode:?}").to_lowercase()),
-                "cwd": command.payload.cwd,
-                "agent_id": command.payload.agent_id,
-                "conversation_id": command.payload.conversation_id,
-            }))
-            .map_err(|_| AppServerError::Internal)?;
+            let device_status = self.device_snapshot(&command.runtime)?;
             Ok(DeviceStateOutcome {
                 broadcasts: RuntimeEventBatch::new(vec![
-                    lotta_app_server::ws::RuntimeEvent::UpdateDeviceStatus { device_status },
+                    lotta_app_server::ws::RuntimeEvent::UpdateDeviceStatus {
+                        device_status: Box::new(device_status),
+                    },
                 ])
                 .map_err(|_| AppServerError::Internal)?,
             })
@@ -2848,15 +2850,16 @@ impl ProductionEffects {
         &self,
         request: lotta_runtime::turn::ControlRequest,
     ) -> Result<lotta_app_server::ws::RuntimeEvent, lotta_runtime::RuntimeError> {
-        let payload = BoundedJsonValue::new(serde_json::json!({
-            "subtype": "can_use_tool",
-            "tool_call_id": request.call_id.as_str(),
-            "tool_name": request.tool_name.as_str(),
-            "input": request.input.as_value(),
-            "permission_suggestions": [],
-            "blocked_path": null,
-        }))
-        .map_err(effect_error)?;
+        let payload = lotta_app_server::ws::event::ApprovalRequest {
+            subtype: lotta_app_server::ws::event::ApprovalSubtype::CanUseTool,
+            tool_call_id: NonEmptyString::new(request.call_id.as_str().to_owned())
+                .map_err(effect_error)?,
+            tool_name: request.tool_name,
+            input: BoundedJsonValue::new(request.input.as_value().clone()).map_err(effect_error)?,
+            permission_suggestions: Vec::new(),
+            blocked_path: None,
+            diffs: None,
+        };
         Ok(lotta_app_server::ws::RuntimeEvent::ControlRequest {
             request_id: request.request_id,
             request: payload,
@@ -2877,7 +2880,7 @@ impl ProductionEffects {
         }))
         .map_err(effect_error)?;
         Ok(lotta_app_server::ws::RuntimeEvent::StreamDelta {
-            delta,
+            delta: lotta_app_server::ws::event::StreamDelta::Other(delta),
             subagent_id: None,
         })
     }
@@ -2912,7 +2915,7 @@ impl ProductionEffects {
         }))
         .map_err(effect_error)?;
         Ok(lotta_app_server::ws::RuntimeEvent::StreamDelta {
-            delta,
+            delta: lotta_app_server::ws::event::StreamDelta::Other(delta),
             subagent_id: None,
         })
     }
@@ -2960,7 +2963,7 @@ impl TurnEffectPort for ProductionEffects {
             .emit(
                 &self.scope,
                 lotta_app_server::ws::RuntimeEvent::StreamDelta {
-                    delta,
+                    delta: lotta_app_server::ws::event::StreamDelta::Other(delta),
                     subagent_id: None,
                 },
             )
@@ -3205,11 +3208,7 @@ mod production_tests {
             .iter()
             .any(|event| match event {
                 lotta_app_server::ws::RuntimeEvent::UpdateLoopStatus { loop_status } => {
-                    loop_status
-                        .as_value()
-                        .get("status")
-                        .and_then(serde_json::Value::as_str)
-                        == Some("WAITING_ON_INPUT")
+                    loop_status.status == lotta_app_server::ws::event::LoopStatus::WaitingOnInput
                 }
                 _ => false,
             })
@@ -3602,8 +3601,31 @@ mod production_tests {
             },
         );
         service.register_device_snapshot_source(Arc::new(|_| {
-            BoundedJsonValue::new(serde_json::json!({"is_online": true}))
-                .map_err(|_| AppServerError::Internal)
+            Ok(lotta_app_server::ws::event::DeviceStatus {
+                current_connection_id: None,
+                connection_name: None,
+                is_online: true,
+                is_processing: false,
+                current_permission_mode:
+                    lotta_app_server::ws::event::DevicePermissionMode::Standard,
+                current_working_directory: None,
+                cwd_revision: None,
+                git_context: None,
+                letta_code_version: None,
+                current_toolset: None,
+                current_toolset_preference: lotta_app_server::ws::event::ToolsetPreference::Auto,
+                current_loaded_tools: Vec::new(),
+                current_available_skills: Vec::new(),
+                background_processes: Vec::new(),
+                pending_control_requests: Vec::new(),
+                experiments: Vec::new(),
+                memory_directory: None,
+                cwd_map: None,
+                boot_working_directory: None,
+                should_doctor: None,
+                reflection_settings: None,
+                supported_commands: Vec::new(),
+            })
         }));
         service
     }
@@ -3771,6 +3793,33 @@ mod production_tests {
                 tasks: Arc::new(TaskLifecyclePort::new()),
             },
         ));
+        service.register_device_snapshot_source(Arc::new(|_| {
+            Ok(lotta_app_server::ws::event::DeviceStatus {
+                current_connection_id: None,
+                connection_name: None,
+                is_online: true,
+                is_processing: false,
+                current_permission_mode:
+                    lotta_app_server::ws::event::DevicePermissionMode::Standard,
+                current_working_directory: None,
+                cwd_revision: None,
+                git_context: None,
+                letta_code_version: None,
+                current_toolset: None,
+                current_toolset_preference: lotta_app_server::ws::event::ToolsetPreference::Auto,
+                current_loaded_tools: Vec::new(),
+                current_available_skills: Vec::new(),
+                background_processes: Vec::new(),
+                pending_control_requests: Vec::new(),
+                experiments: Vec::new(),
+                memory_directory: None,
+                cwd_map: None,
+                boot_working_directory: None,
+                should_doctor: None,
+                reflection_settings: None,
+                supported_commands: Vec::new(),
+            })
+        }));
         let controller = Arc::new(ProductionTurnController::new(
             setup,
             provider,
@@ -4278,7 +4327,8 @@ mod production_tests {
                     matches!(
                         event,
                         lotta_app_server::ws::RuntimeEvent::UpdateLoopStatus { loop_status }
-                            if loop_status.as_value()["status"] == "WAITING_ON_INPUT"
+                            if loop_status.status
+                                == lotta_app_server::ws::event::LoopStatus::WaitingOnInput
                     )
                 })
                 .count();
@@ -4982,15 +5032,11 @@ mod production_tests {
         assert_eq!(events[0].0, target);
         match &events[0].1 {
             RuntimeEvent::UpdateQueue { queue, removed } => {
-                assert_eq!(queue.as_value().as_array().map(Vec::len), Some(0));
-                let transitions = removed.as_value().as_array().unwrap();
+                assert!(queue.is_empty());
+                assert_eq!(removed[0].client_message_id.as_str(), "cm-remove");
                 assert_eq!(
-                    transitions[0]["client_message_id"],
-                    serde_json::json!("cm-remove")
-                );
-                assert_eq!(
-                    transitions[0]["disposition"],
-                    serde_json::json!("cancelled")
+                    removed[0].disposition,
+                    lotta_domain::QueueRemovalDisposition::Cancelled
                 );
             }
             other => panic!("unexpected runtime event {}", other.discriminant()),
@@ -5190,15 +5236,11 @@ mod production_tests {
         assert_eq!(events.len(), 1, "one listener state event");
         match &events[0].1 {
             RuntimeEvent::UpdateQueue { queue, removed } => {
-                assert_eq!(queue.as_value().as_array().map(Vec::len), Some(0));
-                let transitions = removed.as_value().as_array().unwrap();
+                assert!(queue.is_empty());
+                assert_eq!(removed[0].client_message_id.as_str(), "cm-remove");
                 assert_eq!(
-                    transitions[0]["client_message_id"],
-                    serde_json::json!("cm-remove")
-                );
-                assert_eq!(
-                    transitions[0]["disposition"],
-                    serde_json::json!("cancelled")
+                    removed[0].disposition,
+                    lotta_domain::QueueRemovalDisposition::Cancelled
                 );
             }
             other => panic!("unexpected runtime event {}", other.discriminant()),
