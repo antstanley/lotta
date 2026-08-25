@@ -1,6 +1,7 @@
 //! `ws::device::background_snapshot_is_state` — background-process snapshots
-//! travel inside the `update_device_status` listener state message and never
-//! appear in the canonical model-facing tool inventory.
+//! travel as `RuntimeEvent::UpdateDeviceStatus` listener state with the pinned
+//! `device_status` envelope body, and never appear in the canonical
+//! model-facing tool inventory.
 
 use std::{
     path::PathBuf,
@@ -17,7 +18,7 @@ use serde_json::{Value, json};
 use super::{
     BackgroundProcessSource, DeviceBridge, DeviceForwarder, DeviceMessage, NoRunningProcesses,
 };
-use crate::ws::ConnectionId;
+use crate::{ws::ConnectionId, ws::event::RuntimeEvent, ws::service::RuntimeEventSink};
 
 const CONNECTION: ConnectionId = 91;
 
@@ -45,6 +46,23 @@ fn git(workspace: &std::path::Path, args: &[&str]) {
     assert!(output.status.success(), "git {args:?} failed");
 }
 
+/// Records every runtime event routed to scope subscribers.
+#[derive(Default)]
+struct RecordingSink {
+    events: Mutex<Vec<RuntimeEvent>>,
+}
+
+impl RuntimeEventSink for RecordingSink {
+    fn emit(
+        &self,
+        _scope: &lotta_domain::RuntimeScope,
+        event: RuntimeEvent,
+    ) -> Result<(), crate::error::AppServerError> {
+        self.events.lock().expect("sink lock").push(event);
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn emits_update_device_status_and_no_tool_entry() {
     // One real repository so a successful checkout triggers the pinned
@@ -58,14 +76,24 @@ async fn emits_update_device_status_and_no_tool_entry() {
     git(&workspace, &["commit", "--allow-empty", "-m", "init"]);
 
     let messages: Arc<Mutex<Vec<(ConnectionId, DeviceMessage)>>> = Arc::default();
-    let sink = Arc::clone(&messages);
+    let sink_messages = Arc::clone(&messages);
     let forward: DeviceForwarder = Arc::new(move |connection, message| {
-        sink.lock()
+        sink_messages
+            .lock()
             .expect("message lock")
             .push((connection, message));
         Ok(())
     });
-    let bridge = DeviceBridge::new(forward, &workspace, &storage).expect("bridge");
+    let bridge = Arc::new(DeviceBridge::new(forward, &workspace, &storage).expect("bridge"));
+    let sink = Arc::new(RecordingSink::default());
+    bridge.register_event_sink(Arc::clone(&sink) as Arc<dyn RuntimeEventSink>);
+    bridge.register_scope_gate(Arc::new(|_| {
+        vec![lotta_domain::RuntimeScope::new(
+            lotta_domain::AgentId::accept("agent-bg").expect("agent"),
+            lotta_domain::ConversationId::accept("conversation-bg").expect("conversation"),
+            None,
+        )]
+    }));
 
     let command: Value = json!({
         "type": "checkout_branch",
@@ -81,17 +109,38 @@ async fn emits_update_device_status_and_no_tool_entry() {
     bridge.apply(CONNECTION, &decoded).await;
 
     let captured = messages.lock().expect("message lock").clone();
-    assert_eq!(captured.len(), 2, "response plus one state refresh");
-    let state = serde_json::to_value(captured[1].1.clone()).expect("encodes");
+    assert_eq!(captured.len(), 1, "the direct answer only");
+    assert_eq!(captured[0].1.discriminant_of(), "checkout_branch_response");
+
+    // The state refresh rides RuntimeEvent::UpdateDeviceStatus with the
+    // complete scoped device_status body including background processes.
+    let events = sink.events.lock().expect("sink lock");
+    assert_eq!(events.len(), 1, "one listener state event");
+    let status = match &events[0] {
+        RuntimeEvent::UpdateDeviceStatus { device_status } => {
+            serde_json::to_value(device_status.as_value()).expect("bounded encodes")
+        }
+        other => panic!(
+            "expected update_device_status, got {}",
+            other.discriminant()
+        ),
+    };
     assert_eq!(
-        state["type"], "update_device_status",
-        "background snapshots ride the update_device_status listener state message"
-    );
-    assert_eq!(
-        state["background_processes"],
+        status["background_processes"],
         json!([]),
         "no host-registered processes means an empty summary section"
     );
+    assert_eq!(status["is_online"], json!(true));
+    assert_eq!(
+        status["current_working_directory"],
+        json!(workspace.to_string_lossy())
+    );
+    assert_eq!(
+        status["boot_working_directory"],
+        status["current_working_directory"]
+    );
+    assert!(status["letta_code_version"].is_string());
+    assert!(status["supported_commands"].as_array().is_some());
 
     // The default source stays inert and typed.
     let source: Arc<dyn BackgroundProcessSource> = Arc::new(NoRunningProcesses);
@@ -104,5 +153,23 @@ async fn emits_update_device_status_and_no_tool_entry() {
         assert_ne!(row.model, "process_manager");
         assert_ne!(row.internal, "background_process_snapshot");
         assert_ne!(row.model, "background_process_snapshot");
+    }
+}
+
+/// Small local mirror of the wire discriminant for direct answers.
+trait DiscriminantOf {
+    fn discriminant_of(&self) -> &'static str;
+}
+
+impl DiscriminantOf for DeviceMessage {
+    fn discriminant_of(&self) -> &'static str {
+        match self {
+            DeviceMessage::ExecuteCommand(_) => "execute_command_response",
+            DeviceMessage::RemoveQueueItem(_) => "remove_queue_item_response",
+            DeviceMessage::SearchBranches(_) => "search_branches_response",
+            DeviceMessage::CheckoutBranch(_) => "checkout_branch_response",
+            DeviceMessage::SecretList(_) => "secret_list_response",
+            DeviceMessage::SecretApply(_) => "secret_apply_response",
+        }
     }
 }

@@ -1,7 +1,9 @@
 //! `ws::device::commands` — one case per §WebSocket command groups Device-row
-//! command: slash/mod execution routes through the Task 45 registry, queue
-//! removal answers and broadcasts, branches search and switch under confined
-//! git, and secrets round-trip through the Task 52 store surface by name only.
+//! command: slash/mod execution routes through the Task 45 registry behind the
+//! runtime-scope gate, queue removal answers and broadcasts through the
+//! authoritative port, branches search and switch under confined git, and
+//! secrets round-trip through the Task 52 store surface with pinned `{key,
+//! value}` list entries.
 
 use std::{
     path::{Path, PathBuf},
@@ -24,7 +26,7 @@ use lotta_tools::registry::ToolRegistry;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::{DeviceBridge, DeviceForwarder, DeviceMessage};
+use super::{DeviceBridge, DeviceForwarder, DeviceMessage, ScopeGate};
 use crate::{framing, ws::ConnectionId};
 
 const CONNECTION: ConnectionId = 81;
@@ -84,8 +86,6 @@ fn discriminant(message: &DeviceMessage) -> &'static str {
         DeviceMessage::CheckoutBranch(_) => "checkout_branch_response",
         DeviceMessage::SecretList(_) => "secret_list_response",
         DeviceMessage::SecretApply(_) => "secret_apply_response",
-        DeviceMessage::QueueUpdate(_) => "update_queue",
-        DeviceMessage::StatusUpdate(_) => "update_device_status",
     }
 }
 
@@ -114,14 +114,20 @@ fn harness(tag: &str) -> Harness {
             .push((connection, message));
         Ok(())
     });
+    let bridge = Arc::new(DeviceBridge::new(forward, &workspace, &storage).expect("bridge"));
+    let scope = RuntimeScope::new(
+        AgentId::accept("agent-device-cmd").expect("agent"),
+        ConversationId::accept("conversation-device-cmd").expect("conversation"),
+        None,
+    );
+    // Every connection subscribes to this fixture's scope by default.
+    let subscribed = scope.clone();
+    let gate: ScopeGate = Arc::new(move |_| vec![subscribed.clone()]);
+    bridge.register_scope_gate(gate);
     Harness {
-        bridge: Arc::new(DeviceBridge::new(forward, &workspace, &storage).expect("bridge")),
-        workspace: workspace.clone(),
-        scope: RuntimeScope::new(
-            AgentId::accept("agent-device-cmd").expect("agent"),
-            ConversationId::accept("conversation-device-cmd").expect("conversation"),
-            None,
-        ),
+        bridge,
+        workspace,
+        scope,
         messages,
     }
 }
@@ -165,18 +171,41 @@ fn git(repo: &Path, args: &[&str], environment: &mut [(&str, &str)]) {
     assert!(output.status.success(), "git {args:?} failed");
 }
 
-/// A mod host answering every command call with the fixed `cleared` output.
-struct EchoHost;
+/// A mod host answering every command call with the fixed `cleared` output and
+/// recording the argument bodies it received for scoped-context assertions.
+struct EchoHost {
+    received: Mutex<Vec<Value>>,
+}
+
+impl EchoHost {
+    fn new() -> Self {
+        Self {
+            received: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn last_received(&self) -> Value {
+        self.received
+            .lock()
+            .expect("received lock")
+            .last()
+            .cloned()
+            .expect("one recorded call")
+    }
+}
 
 impl ModHost for EchoHost {
     fn call(
         &self,
         _owner: &ModOwner,
         method: RpcMethod,
-        _params: RpcParams,
+        params: RpcParams,
         _cancellation: CancellationToken,
     ) -> HostFuture<'_> {
         assert!(matches!(method, RpcMethod::CommandCall));
+        if let RpcParams::CommandCall { arguments, .. } = params {
+            self.received.lock().expect("received lock").push(arguments);
+        }
         Box::pin(async {
             Ok(RpcResult::Value {
                 value: json!("cleared"),
@@ -193,7 +222,7 @@ impl ModHost for EchoHost {
     }
 }
 
-fn published_echo_registry() -> Arc<ModRegistries> {
+fn published_echo_registry() -> (Arc<ModRegistries>, Arc<EchoHost>) {
     let tools = Arc::new(ToolRegistry::new(Vec::new()).expect("empty tool registry"));
     let registries = ModRegistries::new(tools);
     let owner = ModOwner {
@@ -202,8 +231,8 @@ fn published_echo_registry() -> Arc<ModRegistries> {
     };
     let batch = RegistrationBatch {
         commands: vec![CommandRegistration {
-            id: RegistrationName::new("clear".to_owned()).expect("command name"),
-            description: "clears the conversation view".to_owned(),
+            id: RegistrationName::new("echo-command".to_owned()).expect("command name"),
+            description: "echoes its scoped context".to_owned(),
             args: None,
             owner: owner.clone(),
         }],
@@ -211,27 +240,27 @@ fn published_echo_registry() -> Arc<ModRegistries> {
     };
     let snapshot =
         ModRegistrationSnapshot::from_batch(&owner, batch).expect("valid registration batch");
+    let host = Arc::new(EchoHost::new());
     let publication = ModPublication {
         owner: owner.clone(),
         registrations: Arc::new(snapshot),
-        host: Arc::new(EchoHost),
+        host: Arc::clone(&host) as Arc<dyn ModHost>,
     };
     registries
         .commit(&[publication])
         .expect("publication commits");
-    Arc::new(registries)
+    (Arc::new(registries), host)
 }
 
 #[tokio::test]
 async fn execute_command_runs_through_mod_registry() {
     let fixture = harness("exec");
-    fixture
-        .bridge
-        .register_mod_commands(published_echo_registry());
+    let (registries, host) = published_echo_registry();
+    fixture.bridge.register_mod_commands(registries);
     fixture
         .send(&json!({
             "type": "execute_command",
-            "command_id": "clear",
+            "command_id": "echo-command",
             "request_id": "ec-1",
             "runtime": fixture.scope_json(),
             "args": "--all",
@@ -246,6 +275,15 @@ async fn execute_command_runs_through_mod_registry() {
     assert_eq!(encoded[0]["success"], true, "the mod command resolved");
     assert_eq!(encoded[0]["output"], "cleared", "host output is relayed");
 
+    // The call carries scoped context: parsed args plus cwd/conversation.
+    let context = host.last_received();
+    assert_eq!(context["args"], json!("--all"));
+    assert_eq!(context["command"], json!("echo-command"));
+    assert_eq!(
+        context["runtime"]["conversation_id"],
+        json!(fixture.scope.conversation_id.as_str())
+    );
+
     // An identifier no mod published answers the failure shape without effects.
     fixture
         .send(&json!({
@@ -257,32 +295,38 @@ async fn execute_command_runs_through_mod_registry() {
         .await;
     assert_eq!(fixture.kinds(), vec!["execute_command_response"; 2]);
     assert_eq!(fixture.encoded()[1]["success"], false);
-    assert_eq!(fixture.encoded()[1]["output"], "unknown command");
+    assert_eq!(
+        fixture.encoded()[1]["output"],
+        "Unknown command: absent_command"
+    );
 }
 
+/// A connection subscribed to a different scope gets no dispatch at all.
 #[tokio::test]
-async fn queued_item_removal_answers_and_broadcasts() {
-    let fixture = harness("queue");
-    fixture.bridge.enqueue_for_test(&fixture.scope, "item-7");
+async fn execute_command_rejects_unsubscribed_scopes() {
+    let fixture = harness("scope-gate");
+    let (registries, _host) = published_echo_registry();
+    fixture.bridge.register_mod_commands(registries);
+    let other_scope = RuntimeScope::new(
+        AgentId::accept("other-agent").expect("other agent"),
+        ConversationId::accept("other-conversation").expect("other conversation"),
+        None,
+    );
     fixture
         .send(&json!({
-            "type": "remove_queue_item",
-            "request_id": "rq-7",
-            "runtime": fixture.scope_json(),
-            "item_id": "item-7",
+            "type": "execute_command",
+            "command_id": "echo-command",
+            "request_id": "ec-gate",
+            "runtime": {
+                "agent_id": other_scope.agent_id.as_str(),
+                "conversation_id": other_scope.conversation_id.as_str(),
+            },
         }))
         .await;
-    assert_eq!(
-        fixture.kinds(),
-        vec!["remove_queue_item_response", "update_queue"],
-        "answer first, authoritative state broadcast second"
-    );
     let encoded = fixture.encoded();
-    assert_eq!(encoded[0]["success"], true);
-    assert_eq!(encoded[0]["item_id"], "item-7");
-    let removed = encoded[1]["removed"].as_array().expect("transitions");
-    assert_eq!(removed.len(), 1);
-    assert_eq!(removed[0]["disposition"], json!("cancelled"));
+    assert_eq!(fixture.kinds(), vec!["execute_command_response"]);
+    assert_eq!(encoded[0]["success"], false, "unsubscribed scope rejected");
+    assert_eq!(encoded[0]["output"], "Unknown command: echo-command");
 }
 
 #[tokio::test]
@@ -336,7 +380,7 @@ async fn branch_search_filters_by_substring() {
 }
 
 #[tokio::test]
-async fn checkout_branch_switches_head() {
+async fn checkout_branch_reports_the_checked_out_head() {
     let fixture = harness("checkout");
     let repo = git_repo(&fixture.workspace);
     let cwd = repo.to_str().expect("utf-8 repo path").to_owned();
@@ -353,27 +397,24 @@ async fn checkout_branch_switches_head() {
     let encoded = fixture.encoded();
     assert_eq!(
         fixture.kinds(),
-        vec!["checkout_branch_response", "update_device_status"],
-        "answer first, then the pinned post-checkout device-status refresh"
+        vec!["checkout_branch_response"],
+        "answer only; the status refresh travels as a runtime event"
     );
     assert_eq!(encoded[0]["success"], true);
     assert_eq!(encoded[0]["branch"], "topic/next");
 
-    // The new branch is now the checked-out HEAD visible to searches. Captured
-    // sequence so far: checkout answer, status refresh, then this answer.
-    fixture
-        .send(&json!({
-            "type": "search_branches",
-            "request_id": "cb-2",
-            "query": "topic/next",
-            "cwd": cwd,
-        }))
-        .await;
-    let found = &fixture.encoded()[2];
-    assert_eq!(found["branches"][0]["is_current"], true);
+    // The reported branch matches the actual checked-out HEAD on disk.
+    let head = StdCommand::new("git")
+        .current_dir(&repo)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .expect("head query");
+    assert_eq!(
+        String::from_utf8_lossy(&head.stdout).trim(),
+        encoded[0]["branch"].as_str().expect("branch text")
+    );
 
-    // Checking out a nonexistent branch without create fails scrubbed. The
-    // captured sequence so far: checkout answer, status refresh, search answer.
+    // Checking out a nonexistent branch without create fails scrubbed.
     fixture
         .send(&json!({
             "type": "checkout_branch",
@@ -382,14 +423,78 @@ async fn checkout_branch_switches_head() {
             "cwd": cwd,
         }))
         .await;
-    let failed = &fixture.encoded()[3];
+    let failed = &fixture.encoded()[1];
     assert_eq!(failed["type"], "checkout_branch_response");
     assert_eq!(failed["success"], false);
     assert!(failed["error"].is_string());
 }
 
+/// Option-looking names and invalid ref characters are rejected fail-closed
+/// before any git invocation runs.
 #[tokio::test]
-async fn secret_list_and_apply_round_trip_names_only() {
+async fn checkout_branch_validates_names() {
+    let fixture = harness("validate");
+    let repo = git_repo(&fixture.workspace);
+    let cwd = repo.to_str().expect("utf-8 repo path").to_owned();
+
+    for (request_id, branch) in [("cb-bad-1", "--amend"), ("cb-bad-2", "bad name")] {
+        fixture
+            .send(&json!({
+                "type": "checkout_branch",
+                "request_id": request_id,
+                "branch": branch,
+                "create": true,
+                "cwd": cwd,
+            }))
+            .await;
+    }
+    let encoded = fixture.encoded();
+    for answer in &encoded {
+        assert_eq!(answer["success"], false, "{answer} must be rejected");
+        assert_eq!(answer["error"], json!("invalid branch name"));
+    }
+    // HEAD never moved off main despite the injected-looking arguments.
+    let head = StdCommand::new("git")
+        .current_dir(&repo)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .expect("head query");
+    assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "main");
+}
+
+/// An unresolvable cwd is rejected instead of accepted as-is.
+#[tokio::test]
+async fn search_branches_fail_closed_on_unresolvable_cwd() {
+    let fixture = harness("fail-closed");
+    git_repo(&fixture.workspace);
+    let missing = fixture
+        .workspace
+        .join("missing-dir")
+        .join("deeper")
+        .to_str()
+        .expect("utf-8 path")
+        .to_owned();
+
+    fixture
+        .send(&json!({
+            "type": "search_branches",
+            "request_id": "fc-1",
+            "query": "",
+            "cwd": missing,
+        }))
+        .await;
+    let encoded = fixture.encoded();
+    assert_eq!(encoded[0]["success"], false, "unresolvable cwd rejected");
+    assert!(
+        encoded[0]["error"]
+            .as_str()
+            .is_some_and(|detail| !detail.is_empty()),
+        "scrubbed failure detail present"
+    );
+}
+
+#[tokio::test]
+async fn secret_list_and_apply_round_trip_with_pinned_entries() {
     let fixture = harness("secrets");
     fixture
         .send(&json!({
@@ -418,11 +523,11 @@ async fn secret_list_and_apply_round_trip_names_only() {
         .await;
     let listed = &fixture.encoded()[1];
     assert_eq!(listed["success"], true);
-    assert_eq!(listed["secrets"], json!([{"key": "API_KEY"}]));
-    let wire = listed.to_string();
-    assert!(
-        !wire.contains("s3cret-value"),
-        "plaintext never crosses the wire: {wire}"
+    // Pinned contract: sorted {key, value} entries; the authenticated modal
+    // reads plaintext values back.
+    assert_eq!(
+        listed["secrets"],
+        json!([{"key": "API_KEY", "value": "s3cret-value"}])
     );
 
     fixture

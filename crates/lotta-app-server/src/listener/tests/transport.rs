@@ -30,7 +30,118 @@ impl Clock for TestClock {
     }
 }
 
+/// Storage-rooted bridges returned by [`inert_storage_bridges`].
+struct StorageBridges {
+    files: Arc<crate::ws::files::FilesBridge>,
+    memories: Arc<crate::ws::memory::MemoryBridge>,
+    agents: Arc<crate::ws::agents::AgentsBridge>,
+    conversations: Arc<crate::ws::conversations::ConversationsBridge>,
+    models: Arc<crate::ws::models::ModelsBridge>,
+    schedules: Arc<crate::ws::schedules::SchedulesBridge>,
+    skills: Arc<crate::ws::skills::SkillsBridge>,
+    settings: Arc<crate::ws::settings::SettingsBridge>,
+    devices: Arc<crate::ws::device::DeviceBridge>,
+}
+
+/// Workspace-content bridges (files, memory, agents) over their own roots.
+fn inert_workspace_bridges() -> (
+    Arc<crate::ws::files::FilesBridge>,
+    Arc<crate::ws::memory::MemoryBridge>,
+    Arc<crate::ws::agents::AgentsBridge>,
+) {
+    (
+        Arc::new(
+            crate::ws::files::FilesBridge::with_poll_interval(
+                crate::ws::files::inert_forwarder(),
+                &files_workspace("transport"),
+                &files_workspace("transport-artifacts"),
+                60_000,
+            )
+            .expect("files bridge"),
+        ),
+        Arc::new(
+            crate::ws::memory::MemoryBridge::new(
+                crate::ws::memory::inert_forwarder(),
+                &files_workspace("transport-memfs"),
+                Arc::new(TestClock),
+            )
+            .expect("memory bridge"),
+        ),
+        Arc::new(
+            crate::ws::agents::AgentsBridge::new(
+                crate::ws::agents::inert_forwarder(),
+                &files_workspace("transport-agents"),
+                Arc::new(TestClock),
+            )
+            .expect("agents bridge"),
+        ),
+    )
+}
+
+/// Composes every storage-backed bridge over its own per-component root.
+fn inert_storage_bridges() -> StorageBridges {
+    let (files, memories, agents) = inert_workspace_bridges();
+    let conversations = Arc::new(
+        crate::ws::conversations::ConversationsBridge::new(
+            crate::ws::conversations::inert_forwarder(),
+            &files_workspace("transport-conversations"),
+            Arc::new(TestClock),
+            None,
+        )
+        .expect("conversations bridge"),
+    );
+    let models = Arc::new(
+        crate::ws::models::ModelsBridge::new(
+            crate::ws::models::inert_forwarder(),
+            &files_workspace("transport-models"),
+            Arc::new(TestClock),
+        )
+        .expect("models bridge"),
+    );
+    let schedules = Arc::new(
+        crate::ws::schedules::SchedulesBridge::new(
+            crate::ws::schedules::inert_forwarder(),
+            &files_workspace("transport-schedules"),
+            Arc::new(TestClock),
+        )
+        .expect("schedules bridge"),
+    );
+    let skills = Arc::new(crate::ws::skills::SkillsBridge::new(
+        crate::ws::skills::inert_forwarder(),
+        &files_workspace("transport-skills"),
+        Arc::new(TestClock),
+    ));
+    let settings = Arc::new(
+        crate::ws::settings::SettingsBridge::new(
+            crate::ws::settings::inert_forwarder(),
+            &files_workspace("transport-settings"),
+            &files_workspace("transport"),
+        )
+        .expect("settings bridge"),
+    );
+    let devices = Arc::new(
+        crate::ws::device::DeviceBridge::new(
+            crate::ws::device::inert_forwarder(),
+            &files_workspace("transport-device-workspace"),
+            &files_workspace("transport-device-storage"),
+        )
+        .expect("device bridge"),
+    );
+    StorageBridges {
+        files,
+        memories,
+        agents,
+        conversations,
+        models,
+        schedules,
+        skills,
+        settings,
+        devices,
+    }
+}
+
 fn router() -> axum::Router {
+    let storage = inert_storage_bridges();
     let state = Arc::new(ListenerState {
         auth: AuthPolicy::None,
         clock: Arc::new(TestClock),
@@ -53,77 +164,15 @@ fn router() -> axum::Router {
             inert_terminal_forwarder(),
             Arc::new(TestClock),
         )),
-        files: Arc::new(
-            crate::ws::files::FilesBridge::with_poll_interval(
-                crate::ws::files::inert_forwarder(),
-                &files_workspace("transport"),
-                &files_workspace("transport-artifacts"),
-                60_000,
-            )
-            .expect("files bridge"),
-        ),
-        memories: Arc::new(
-            crate::ws::memory::MemoryBridge::new(
-                crate::ws::memory::inert_forwarder(),
-                &files_workspace("transport-memfs"),
-                Arc::new(TestClock),
-            )
-            .expect("memory bridge"),
-        ),
-        agents: Arc::new(
-            crate::ws::agents::AgentsBridge::new(
-                crate::ws::agents::inert_forwarder(),
-                &files_workspace("transport-agents"),
-                Arc::new(TestClock),
-            )
-            .expect("agents bridge"),
-        ),
-        conversations: Arc::new(
-            crate::ws::conversations::ConversationsBridge::new(
-                crate::ws::conversations::inert_forwarder(),
-                &files_workspace("transport-conversations"),
-                Arc::new(TestClock),
-                None,
-            )
-            .expect("conversations bridge"),
-        ),
-        models: Arc::new(
-            crate::ws::models::ModelsBridge::new(
-                crate::ws::models::inert_forwarder(),
-                &files_workspace("transport-models"),
-                Arc::new(TestClock),
-            )
-            .expect("models bridge"),
-        ),
-        schedules: Arc::new(
-            crate::ws::schedules::SchedulesBridge::new(
-                crate::ws::schedules::inert_forwarder(),
-                &files_workspace("transport-schedules"),
-                Arc::new(TestClock),
-            )
-            .expect("schedules bridge"),
-        ),
-        skills: Arc::new(crate::ws::skills::SkillsBridge::new(
-            crate::ws::skills::inert_forwarder(),
-            &files_workspace("transport-skills"),
-            Arc::new(TestClock),
-        )),
-        settings: Arc::new(
-            crate::ws::settings::SettingsBridge::new(
-                crate::ws::settings::inert_forwarder(),
-                &files_workspace("transport-settings"),
-                &files_workspace("transport"),
-            )
-            .expect("settings bridge"),
-        ),
-        devices: Arc::new(
-            crate::ws::device::DeviceBridge::new(
-                crate::ws::device::inert_forwarder(),
-                &files_workspace("transport-device-workspace"),
-                &files_workspace("transport-device-storage"),
-            )
-            .expect("device bridge"),
-        ),
+        files: storage.files,
+        memories: storage.memories,
+        agents: storage.agents,
+        conversations: storage.conversations,
+        models: storage.models,
+        schedules: storage.schedules,
+        skills: storage.skills,
+        settings: storage.settings,
+        devices: storage.devices,
         introspection: Arc::new(crate::ws::introspection::IntrospectionBridge::new(
             crate::ws::introspection::inert_forwarder(),
         )),

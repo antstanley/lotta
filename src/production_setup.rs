@@ -221,6 +221,7 @@ impl ProductionSetupPorts {
         >,
     ) -> Result<TurnRunOutcome, RuntimeError> {
         let cancellation = input.cancellation.clone();
+        let turn_agent_id = input.agent_id.clone();
         let setup = SetupOrchestrator::new(self);
         let prepared = setup.prepare(input).await.map_err(setup_failure_runtime)?;
         debug_assert_eq!(prepared.status, SetupStatus::Sending);
@@ -232,7 +233,7 @@ impl ProductionSetupPorts {
             sink: prepared.status_sink.as_ref(),
         };
         let fallback_providers = self.fallback_providers(&prepared, provider)?;
-        let scoped_tools = self.scoped_tools(&prepared, tools)?;
+        let scoped_tools = self.scoped_tools(&prepared, tools, &turn_agent_id)?;
         refresh.seed(&prepared).map_err(runtime_adapter)?;
         let refreshed = prepared.request.clone();
         let ports = TurnPorts::new(provider, &scoped_tools, &prepared.tools, effects)
@@ -298,6 +299,7 @@ impl ProductionSetupPorts {
         &self,
         prepared: &SetupOutput,
         tools: &crate::production_components::ProductionToolPort,
+        agent_id: &lotta_domain::AgentId,
     ) -> Result<crate::production_components::ScopedProductionToolPort, RuntimeError> {
         let scope = self
             .scope_snapshot(prepared.scope)
@@ -313,6 +315,14 @@ impl ProductionSetupPorts {
             snapshot,
             Arc::new(scope.permissions),
             Arc::new(self.workspace_policy.clone()),
+            // WS-applied agent secrets resolve for tool pipelines running on
+            // this exact agent's behalf (Task 52 side-store record).
+            Some(Arc::new(
+                lotta_app_server::ws::device_support::AgentSecretResolver::over_storage(
+                    self.store.paths().root(),
+                    agent_id.as_str(),
+                ),
+            )),
             scope.cwd,
         ))
     }
@@ -333,6 +343,12 @@ impl ProductionSetupPorts {
     #[must_use]
     pub fn registry(&self) -> Arc<ToolRegistry> {
         Arc::clone(&self.registry)
+    }
+
+    /// Returns the shared Task 45 mod registry backing device commands.
+    #[must_use]
+    pub fn mod_registries(&self) -> Arc<ModRegistries> {
+        Arc::clone(&self.mod_registries)
     }
 
     fn take_tool_snapshot(

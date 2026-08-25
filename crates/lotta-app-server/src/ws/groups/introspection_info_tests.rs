@@ -61,11 +61,12 @@ fn reports_protocol_version_1() {
             "conversation_management": true,
             "memory_management": true,
             "runtime_start": true,
-            "runtime_workspace_sandbox": true,
+            "runtime_workspace_sandbox": false,
             "runtime_external_tools_update": true,
             "split_channels": false,
         }),
-        "pinned capability flag set"
+        "capability flag set audited against actual implemented behavior: the \
+         production runtime_start path ignores client workspace-sandbox extensions"
     );
 }
 

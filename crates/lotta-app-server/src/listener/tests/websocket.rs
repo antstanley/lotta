@@ -177,32 +177,23 @@ async fn outbound_registry_fans_out_actual_broadcast_to_both_peers() {
     assert_ne!(one["idempotency_key"], two["idempotency_key"]);
 }
 
-/// Builds the listener state used by the typed-failure assertions.
-fn typed_failure_state(
-    prepared: crate::config::PreparedServer,
-    router: Arc<Mutex<crate::ws::RuntimeRouter>>,
-    origin: crate::ws::ConnectionId,
-    sender: mpsc::Sender<String>,
-) -> super::ListenerState {
-    super::ListenerState {
-        auth: prepared.auth,
-        clock: clock(),
-        shutdown: tokio_util::sync::CancellationToken::new(),
-        limits: super::SocketLimits::default(),
-        runtime_router: router,
-        runtime_service: Arc::new(crate::ws::UnsupportedRuntimeCommandService),
-        turn_controller: Arc::new(crate::ws::UnsupportedRuntimeCommandService),
-        observer: Arc::new(crate::observer::InertRuntimeBroadcastObserver),
-        external_tools: Arc::new(crate::ws::external_tools::ExternalToolBridge::new(
-            crate::ws::external_tools::inert_forwarder(),
-        )),
-        teleports: Arc::new(crate::ws::teleport::TeleportBridge::new(
-            crate::ws::teleport::inert_forwarder(),
-        )),
-        terminals: Arc::new(crate::ws::terminal::TerminalBridge::new(
-            inert_terminal_forwarder(),
-            clock(),
-        )),
+/// Storage-root-backed bridges shared by the typed-failure state builder.
+struct StorageBridges {
+    files: Arc<crate::ws::files::FilesBridge>,
+    memories: Arc<crate::ws::memory::MemoryBridge>,
+    agents: Arc<crate::ws::agents::AgentsBridge>,
+    conversations: Arc<crate::ws::conversations::ConversationsBridge>,
+    models: Arc<crate::ws::models::ModelsBridge>,
+    schedules: Arc<crate::ws::schedules::SchedulesBridge>,
+    skills: Arc<crate::ws::skills::SkillsBridge>,
+    settings: Arc<crate::ws::settings::SettingsBridge>,
+    devices: Arc<crate::ws::device::DeviceBridge>,
+}
+
+/// Composes every storage-backed bridge over one prepared root set.
+fn storage_bridges(prepared: &crate::config::PreparedServer) -> StorageBridges {
+    let catalog = inert_catalog_bridges(&prepared.storage_dir);
+    StorageBridges {
         files: Arc::new(
             crate::ws::files::FilesBridge::new(
                 crate::ws::files::inert_forwarder(),
@@ -236,22 +227,8 @@ fn typed_failure_state(
             )
             .expect("conversations bridge"),
         ),
-        models: Arc::new(
-            crate::ws::models::ModelsBridge::new(
-                crate::ws::models::inert_forwarder(),
-                &prepared.storage_dir,
-                Arc::new(TestClock),
-            )
-            .expect("models bridge"),
-        ),
-        schedules: Arc::new(
-            crate::ws::schedules::SchedulesBridge::new(
-                crate::ws::schedules::inert_forwarder(),
-                &prepared.storage_dir,
-                Arc::new(TestClock),
-            )
-            .expect("schedules bridge"),
-        ),
+        models: catalog.0,
+        schedules: catalog.1,
         skills: Arc::new(crate::ws::skills::SkillsBridge::new(
             crate::ws::skills::inert_forwarder(),
             &prepared.storage_dir,
@@ -273,6 +250,72 @@ fn typed_failure_state(
             )
             .expect("device bridge"),
         ),
+    }
+}
+
+/// Catalog-side bridges over one storage root.
+fn inert_catalog_bridges(
+    storage_dir: &std::path::Path,
+) -> (
+    Arc<crate::ws::models::ModelsBridge>,
+    Arc<crate::ws::schedules::SchedulesBridge>,
+) {
+    (
+        Arc::new(
+            crate::ws::models::ModelsBridge::new(
+                crate::ws::models::inert_forwarder(),
+                storage_dir,
+                Arc::new(TestClock),
+            )
+            .expect("models bridge"),
+        ),
+        Arc::new(
+            crate::ws::schedules::SchedulesBridge::new(
+                crate::ws::schedules::inert_forwarder(),
+                storage_dir,
+                Arc::new(TestClock),
+            )
+            .expect("schedules bridge"),
+        ),
+    )
+}
+
+/// Builds the listener state used by the typed-failure assertions.
+fn typed_failure_state(
+    prepared: crate::config::PreparedServer,
+    router: Arc<Mutex<crate::ws::RuntimeRouter>>,
+    origin: crate::ws::ConnectionId,
+    sender: mpsc::Sender<String>,
+) -> super::ListenerState {
+    let storage = storage_bridges(&prepared);
+    super::ListenerState {
+        auth: prepared.auth,
+        clock: clock(),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        limits: super::SocketLimits::default(),
+        runtime_router: router,
+        runtime_service: Arc::new(crate::ws::UnsupportedRuntimeCommandService),
+        turn_controller: Arc::new(crate::ws::UnsupportedRuntimeCommandService),
+        observer: Arc::new(crate::observer::InertRuntimeBroadcastObserver),
+        external_tools: Arc::new(crate::ws::external_tools::ExternalToolBridge::new(
+            crate::ws::external_tools::inert_forwarder(),
+        )),
+        teleports: Arc::new(crate::ws::teleport::TeleportBridge::new(
+            crate::ws::teleport::inert_forwarder(),
+        )),
+        terminals: Arc::new(crate::ws::terminal::TerminalBridge::new(
+            inert_terminal_forwarder(),
+            clock(),
+        )),
+        files: storage.files,
+        memories: storage.memories,
+        agents: storage.agents,
+        conversations: storage.conversations,
+        models: storage.models,
+        schedules: storage.schedules,
+        skills: storage.skills,
+        settings: storage.settings,
+        devices: storage.devices,
         introspection: Arc::new(crate::ws::introspection::IntrospectionBridge::new(
             crate::ws::introspection::inert_forwarder(),
         )),

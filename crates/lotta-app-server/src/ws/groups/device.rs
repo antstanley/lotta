@@ -6,21 +6,27 @@
 //! the pinned listener handlers. Routing rules this server keeps:
 //!
 //! * `remove_queue_item` never mutates queue storage directly: it resolves the
-//!   scope's Task 18
-//!   [`lotta_runtime::ConversationQueue`] and calls its removal operation, so
-//!   every answer carries the wire disposition (`dequeued`/`cancelled`) and an
-//!   authoritative post-mutation snapshot that is rebroadcast as an
-//!   `update_queue` listener state message.
-//! * `execute_command` resolves slash/mod command identifiers through the
-//!   Task 45 mod command registry when one is registered; identifiers no mod
-//!   published answer the pinned failure shape without side effects.
+//!   registered [`crate::ws::device::QueueAuthority`] — the production port
+//!   over the same
+//!   [`lotta_runtime::ListenerRuntime`] instance turns use — and calls its
+//!   removal operation, so every answer carries the wire disposition and the
+//!   authoritative post-mutation state rebroadcast as a `RuntimeEvent::
+//!   UpdateQueue` through the runtime router to scope subscribers.
+//! * `execute_command` first dispatches the pinned built-in slash commands,
+//!   then resolves remaining identifiers through the Task 45 mod command
+//!   registry when one is registered; identifiers no mod published answer the
+//!   pinned failure shape without side effects. Commands resolve per runtime
+//!   scope: the requesting connection must subscribe to the payload's scope,
+//!   and the mod call receives scoped cwd/conversation/cancellation context.
 //! * Branch operations run bounded `git` invocations confined to this server's
 //!   workspace root (see [`crate::ws::device_support`]).
-//! * Secret list/apply persist through the Task 52 local-backend secrets file,
-//!   and responses carry names only — plaintext is write-only.
+//! * Secret list/apply persist through the Task 52 local-backend secrets side
+//!   store; `secret_list` returns the pinned `{key, value}` entries whose
+//!   plaintext values are intentionally exposed to the authenticated secrets
+//!   modal (see the pinned `protocol_v2.ts` secret-list contract).
 //!
-//! Background-process snapshots ride inside `update_device_status` listener
-//! state messages (re-emitted after a successful checkout, like the pinned
+//! Background-process snapshots ride inside `RuntimeEvent::UpdateDeviceStatus`
+//! (re-emitted after a successful checkout and `/reload`, like the pinned
 //! baseline) and are deliberately not model-facing tools; see
 //! [`crate::ws::device::BackgroundProcessSource`].
 
@@ -30,10 +36,11 @@ use std::sync::{Arc, Mutex};
 
 use lotta_domain::{NonEmptyString, RuntimeScope};
 use lotta_protocol::{DecodeOutcome, WsProtocolCommand as Tag};
-use lotta_runtime::ConversationQueue;
+use lotta_runtime::QueueMutation;
 use lotta_runtime::queue_snapshot::{QueueMutationEvent, QueueSnapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -44,20 +51,44 @@ use crate::{
     ws::device_support::{
         AgentSecretsStore, BRANCH_CHECKOUT_TIMEOUT_MS, BRANCH_QUERY_BYTES_MAX,
         BRANCH_RESULTS_DEFAULT_MAX, BRANCH_RESULTS_MAX, BRANCH_SEARCH_TIMEOUT_MS, GitBranchInfo,
-        normalize_secret_name, parse_branches, run_git, valid_secret_name,
+        normalize_secret_name, parse_branches, run_git, valid_branch_name, valid_secret_name,
     },
+    ws::event::RuntimeEvent,
+    ws::service::RuntimeEventSink,
 };
 
 /// Scrubbed failure detail for a rejected slash/mod dispatch.
-const COMMAND_UNKNOWN: &str = "unknown command";
+const COMMAND_UNKNOWN_PREFIX: &str = "Unknown command: ";
 /// Scrubbed failure detail when git cannot complete a branch operation.
 const BRANCH_FAILURE_SEARCH: &str = "Failed to search branches";
 /// Scrubbed failure detail when git cannot complete a branch operation.
 const BRANCH_FAILURE_CHECKOUT: &str = "Failed to checkout branch";
+/// Scrubbed failure detail for a rejected branch reference name.
+const BRANCH_NAME_INVALID: &str = "invalid branch name";
 /// Pinned rejection text prefix for invalid secret names.
 const SECRET_NAME_INVALID_PREFIX: &str = "Invalid secret name '";
 /// Pinned rejection text suffix for invalid secret names.
 const SECRET_NAME_INVALID_SUFFIX: &str = "'. Use uppercase letters, numbers, and underscores only.";
+
+/// The built-in slash commands dispatched by this server's `execute_command`.
+///
+/// Mirrors the pinned `SUPPORTED_REMOTE_COMMANDS` list plus the two aliases
+/// its switch statement accepts (`reflect`, `set-max-context`). Built-ins
+/// backed by real server ports run; the rest answer the pinned failure shape
+/// rather than pretending success.
+pub const BUILTIN_COMMANDS: [&str; 11] = [
+    "clear",
+    "doctor",
+    "init",
+    "remember",
+    "compact",
+    "reload",
+    "reflect",
+    "context-limit",
+    "set-max-context",
+    "channels",
+    "upgrade-letta-code",
+];
 
 /// Pinned `execute_command` payload.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -119,12 +150,15 @@ pub struct CheckoutBranchPayload {
 pub struct SecretListPayload {
     /// Response correlation identifier.
     pub request_id: String,
-    /// Agent whose stored secret names to list.
+    /// Agent whose stored secret entries to list.
     pub agent_id: String,
 }
 
 /// Pinned `secret_apply` payload.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+///
+/// Values are plaintext by contract; the explicit [`Debug`] impl redacts them
+/// so diagnostics never capture secret material.
+#[derive(Clone, Deserialize, Serialize)]
 pub struct SecretApplyPayload {
     /// Response correlation identifier.
     pub request_id: String,
@@ -138,6 +172,20 @@ pub struct SecretApplyPayload {
     pub unset: Vec<String>,
 }
 
+impl std::fmt::Debug for SecretApplyPayload {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted: BTreeMap<&String, &str> =
+            self.set.keys().map(|key| (key, "[redacted]")).collect();
+        formatter
+            .debug_struct("SecretApplyPayload")
+            .field("request_id", &self.request_id)
+            .field("agent_id", &self.agent_id)
+            .field("set", &redacted)
+            .field("unset", &self.unset)
+            .finish()
+    }
+}
+
 /// The six concrete Device-row commands.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type")]
@@ -145,7 +193,7 @@ pub enum DeviceCommand {
     /// Runs one slash or mod command for a runtime.
     #[serde(rename = "execute_command")]
     ExecuteCommand(Box<ExecuteCommandPayload>),
-    /// Removes one queued input through the Task 18 queue.
+    /// Removes one queued input through the authoritative Task 18 queue.
     #[serde(rename = "remove_queue_item")]
     RemoveQueueItem(RemoveQueueItemPayload),
     /// Lists branches filtered by substring under the workspace root.
@@ -154,7 +202,7 @@ pub enum DeviceCommand {
     /// Checks out (optionally creating) one branch under the workspace root.
     #[serde(rename = "checkout_branch")]
     CheckoutBranch(CheckoutBranchPayload),
-    /// Lists stored secret names for one agent.
+    /// Lists stored secret entries for one agent.
     #[serde(rename = "secret_list")]
     SecretList(SecretListPayload),
     /// Applies one atomic batch of secret mutations for one agent.
@@ -203,7 +251,7 @@ pub struct SearchBranchesResponseMessage {
 pub struct CheckoutBranchResponseMessage {
     /// Command correlation identifier.
     pub request_id: String,
-    /// The requested branch now checked out.
+    /// The branch now checked out, queried from HEAD after the mutation.
     pub branch: String,
     /// Whether the checkout completed.
     pub success: bool,
@@ -212,21 +260,26 @@ pub struct CheckoutBranchResponseMessage {
     pub error: Option<String>,
 }
 
-/// One name-only stored secret entry; values never cross the wire.
+/// One stored secret entry carrying the pinned `{key, value}` pair.
+///
+/// Plaintext values are intentionally exposed to the authenticated secrets
+/// modal per the pinned protocol contract; they are write-only everywhere else.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SecretEntry {
     /// Stored secret name.
     pub key: String,
+    /// Stored secret plaintext.
+    pub value: String,
 }
 
-/// Pinned-arity `secret_list_response` message carrying names only.
+/// Pinned-arity `secret_list_response` message.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SecretListResponseMessage {
     /// Command correlation identifier.
     pub request_id: String,
     /// Whether the listing completed.
     pub success: bool,
-    /// Sorted stored secret names for the agent.
+    /// Sorted stored secret entries for the agent.
     pub secrets: Vec<SecretEntry>,
     /// Scrubbed failure detail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -247,30 +300,7 @@ pub struct SecretApplyResponseMessage {
     pub error: Option<String>,
 }
 
-/// Authoritative queue state rebroadcast after a routed removal.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct QueueUpdateMessage {
-    /// Owning agent identifier.
-    pub agent_id: String,
-    /// Owning conversation identifier.
-    pub conversation_id: String,
-    /// Authoritative snapshot: revision plus remaining items.
-    pub queue: Value,
-    /// Ordered explicit removal transitions with wire dispositions.
-    pub removed: Value,
-}
-
-/// Listener device-status state refresh carrying background-process summaries.
-///
-/// Like the pinned baseline, background-process snapshots travel as listener
-/// state inside `update_device_status`; they never become model tools.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct DeviceStatusUpdateMessage {
-    /// Current background-process snapshot section.
-    pub background_processes: Vec<BackgroundProcessSummary>,
-}
-
-/// All outbound device group messages, including listener state updates.
+/// All outbound device group response messages.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type")]
 pub enum DeviceMessage {
@@ -286,18 +316,66 @@ pub enum DeviceMessage {
     /// Branch-checkout result.
     #[serde(rename = "checkout_branch_response")]
     CheckoutBranch(CheckoutBranchResponseMessage),
-    /// Secret-name listing result.
+    /// Secret-entry listing result.
     #[serde(rename = "secret_list_response")]
     SecretList(SecretListResponseMessage),
     /// Secret-batch result.
     #[serde(rename = "secret_apply_response")]
     SecretApply(SecretApplyResponseMessage),
-    /// Authoritative queue state after a routed removal.
-    #[serde(rename = "update_queue")]
-    QueueUpdate(QueueUpdateMessage),
-    /// Listener device-status refresh carrying background processes.
-    #[serde(rename = "update_device_status")]
-    StatusUpdate(DeviceStatusUpdateMessage),
+}
+
+/// Authoritative queue-removal port shared between this group and the
+/// production runtime.
+///
+/// When injected, removals mutate the exact [`lotta_runtime::ListenerRuntime`]
+/// instance the turn pipeline uses — so a removed item can never be pumped by
+/// an active turn afterward, and answers carry the real wire transition.
+pub trait QueueAuthority: Send + Sync {
+    /// Cancels one queued item on the authoritative queue for `scope`.
+    ///
+    /// # Errors
+    /// Returns the production registry failure verbatim.
+    fn remove_queued<'a>(
+        &'a self,
+        scope: &'a RuntimeScope,
+        item_id: &'a NonEmptyString,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Option<QueueMutation>, lotta_runtime::RuntimeError>,
+                > + Send
+                + 'a,
+        >,
+    >;
+}
+
+/// Resolves the runtime scopes one connection currently subscribes to.
+///
+/// Backs both the `execute_command` scope check and the per-connection
+/// device-status refresh fan-out.
+pub type ScopeGate = Arc<dyn Fn(ConnectionId) -> Vec<RuntimeScope> + Send + Sync>;
+
+/// Resolves the scoped working directory feeding command context.
+pub type CwdResolver = Arc<dyn Fn(&RuntimeScope) -> PathBuf + Send + Sync>;
+
+/// Future returned by one built-in command run.
+pub type BuiltinRun =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>;
+
+/// Runs one built-in slash command.
+///
+/// Composed by the host over bridges the device group cannot see directly
+/// (conversation compaction, status re-advertisement); failures carry the
+/// scrubbed output text of the pinned failure shape.
+pub type BuiltinRunner =
+    Arc<dyn Fn(ConnectionId, ExecuteCommandPayload, CancellationToken) -> BuiltinRun + Send + Sync>;
+
+/// Source of the background-process section of device-status snapshots.
+///
+/// This stays a protocol service: nothing registers these names as model tools.
+pub trait BackgroundProcessSource: Send + Sync {
+    /// Returns the current running-process summary list.
+    fn snapshot(&self) -> Vec<BackgroundProcessSummary>;
 }
 
 /// Pinned bash background-process summary.
@@ -315,71 +393,13 @@ pub struct BashBackgroundProcessSummary {
     pub exit_code: Option<i32>,
 }
 
-/// Pinned monitor background-process summary.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct MonitorBackgroundProcessSummary {
-    /// Stable process identity.
-    pub process_id: String,
-    /// Human description.
-    pub description: String,
-    /// What opened the monitor.
-    pub source: MonitorSource,
-    /// Start instant in epoch milliseconds.
-    pub started_at_ms: i64,
-    /// Always running while listed.
-    pub status: String,
-    /// Whether the monitor survives its session.
-    pub persistent: bool,
-}
-
-/// Origin of one monitor background process.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MonitorSource {
-    /// Opened by a shell command.
-    Command,
-    /// Opened over the WebSocket control surface.
-    Websocket,
-}
-
-/// Pinned agent-task background-process summary.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct AgentTaskBackgroundProcessSummary {
-    /// Stable task identity.
-    pub process_id: String,
-    /// Display type of the delegated task.
-    pub task_type: String,
-    /// Human description.
-    pub description: String,
-    /// Start instant in epoch milliseconds.
-    pub started_at_ms: i64,
-    /// Lifecycle status.
-    pub status: String,
-    /// Originating subagent, when attributed.
-    pub subagent_id: Option<String>,
-    /// Scrubbed failure detail.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-/// Pinned `BackgroundProcessSummary` union.
+/// Pinned `BackgroundProcessSummary` union over the process kinds this server
+/// tracks; shell sessions are the one kind with a live production source.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BackgroundProcessSummary {
     /// A launched shell process.
     Bash(BashBackgroundProcessSummary),
-    /// A long-lived monitor.
-    Monitor(MonitorBackgroundProcessSummary),
-    /// A delegated agent task.
-    AgentTask(AgentTaskBackgroundProcessSummary),
-}
-
-/// Source of the background-process section of device-status snapshots.
-///
-/// This stays a protocol service: nothing registers these names as model tools.
-pub trait BackgroundProcessSource: Send + Sync {
-    /// Returns the current running-process summary list.
-    fn snapshot(&self) -> Vec<BackgroundProcessSummary>;
 }
 
 /// Default source reporting an empty snapshot until a host registers one.
@@ -407,14 +427,26 @@ fn lock<T>(state: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Applies wire device commands against queues, the mod registry, git, and the
-/// secrets store, emitting responses and listener state through the forwarder.
+/// Per-connection detached work bound to a cancellation token and joins.
+struct ConnectionWorkers {
+    cancellation: CancellationToken,
+    joins: Vec<JoinHandle<()>>,
+}
+
+/// Applies wire device commands against the authoritative queue, the mod
+/// registry, git, and the secrets store, emitting responses through the
+/// forwarder and listener state through the runtime event sink.
 pub struct DeviceBridge {
     workspace_root: PathBuf,
     secrets: AgentSecretsStore,
-    queues: Mutex<HashMap<RuntimeScope, ConversationQueue>>,
+    queue_authority: Mutex<Option<Arc<dyn QueueAuthority>>>,
     mod_commands: Mutex<Option<Arc<lotta_extensions::mods::registry::ModRegistries>>>,
-    background: Arc<dyn BackgroundProcessSource>,
+    background: Mutex<Arc<dyn BackgroundProcessSource>>,
+    event_sink: Mutex<Option<Arc<dyn RuntimeEventSink>>>,
+    scopes: Mutex<Option<ScopeGate>>,
+    cwd_of: Mutex<Option<CwdResolver>>,
+    builtins: Mutex<Option<BuiltinRunner>>,
+    workers: Mutex<HashMap<ConnectionId, ConnectionWorkers>>,
     forward: DeviceForwarder,
 }
 
@@ -435,11 +467,21 @@ impl DeviceBridge {
         Ok(Self {
             workspace_root: workspace_root.to_path_buf(),
             secrets: AgentSecretsStore::new(storage_dir),
-            queues: Mutex::new(HashMap::new()),
+            queue_authority: Mutex::new(None),
             mod_commands: Mutex::new(None),
-            background: Arc::new(NoRunningProcesses),
+            background: Mutex::new(Arc::new(NoRunningProcesses)),
+            event_sink: Mutex::new(None),
+            scopes: Mutex::new(None),
+            cwd_of: Mutex::new(None),
+            builtins: Mutex::new(None),
+            workers: Mutex::new(HashMap::new()),
             forward,
         })
+    }
+
+    /// Registers the authoritative queue port backing `remove_queue_item`.
+    pub fn register_queue_authority(&self, authority: Arc<dyn QueueAuthority>) {
+        *lock(&self.queue_authority) = Some(authority);
     }
 
     /// Registers the Task 45 mod command registry backing `execute_command`.
@@ -450,26 +492,106 @@ impl DeviceBridge {
         *lock(&self.mod_commands) = Some(registries);
     }
 
-    /// Replaces the background-process source feeding status snapshots.
-    pub fn register_background_processes(&mut self, source: Arc<dyn BackgroundProcessSource>) {
-        self.background = source;
+    /// Registers a mod registry when the host supplied one.
+    pub fn register_mod_commands_if_set(
+        &self,
+        registries: Option<Arc<lotta_extensions::mods::registry::ModRegistries>>,
+    ) {
+        if let Some(registries) = registries {
+            self.register_mod_commands(registries);
+        }
     }
 
-    /// Routes one decoded command in a detached task, like the pinned listener.
+    /// Registers the sink broadcasting listener state (`update_queue`,
+    /// `update_device_status`) to runtime-scope subscribers.
+    pub fn register_event_sink(&self, sink: Arc<dyn RuntimeEventSink>) {
+        *lock(&self.event_sink) = Some(sink);
+    }
+
+    /// Registers the subscription gate validating `execute_command` targets.
+    pub fn register_scope_gate(&self, gate: ScopeGate) {
+        *lock(&self.scopes) = Some(gate);
+    }
+
+    /// Registers the resolver supplying scoped working directories.
+    pub fn register_cwd_resolver(&self, resolver: CwdResolver) {
+        *lock(&self.cwd_of) = Some(resolver);
+    }
+
+    /// Registers the runner dispatching pinned built-in slash commands.
+    pub fn register_builtin_runner(&self, runner: BuiltinRunner) {
+        *lock(&self.builtins) = Some(runner);
+    }
+
+    /// Replaces the background-process source feeding status snapshots.
+    pub fn register_background_processes(&self, source: Arc<dyn BackgroundProcessSource>) {
+        *lock(&self.background) = source;
+    }
+
+    /// Registers a background source when the host supplied one.
+    pub fn register_background_processes_if_set(
+        &self,
+        source: Option<Arc<dyn BackgroundProcessSource>>,
+    ) {
+        if let Some(source) = source {
+            self.register_background_processes(source);
+        }
+    }
+
+    /// Routes one decoded command as tracked work bound to the connection.
+    ///
+    /// Like the pinned listener the work runs detached, but it stays owned:
+    /// each task selects on its connection's cancellation token and its join
+    /// handle is retained until [`Self::disconnect`] reaps it.
     pub fn handle(self: &Arc<Self>, connection: ConnectionId, command: &DeviceCommand) {
         let this = Arc::clone(self);
         let command = command.clone();
-        tokio::spawn(async move { this.apply(connection, &command).await });
+        let cancellation = {
+            let mut workers = lock(&self.workers);
+            workers
+                .entry(connection)
+                .or_insert_with(|| ConnectionWorkers {
+                    cancellation: CancellationToken::new(),
+                    joins: Vec::new(),
+                })
+                .cancellation
+                .clone()
+        };
+        let join = tokio::spawn(async move {
+            let work = this.apply(connection, &command);
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {},
+                () = work => {},
+            }
+        });
+        if let Some(entry) = lock(&self.workers).get_mut(&connection) {
+            entry.joins.push(join);
+        }
+    }
+
+    /// Cancels one connection's detached device work and reaps its tasks.
+    pub async fn disconnect(&self, connection: ConnectionId) {
+        let mut joins = Vec::new();
+        if let Ok(mut workers) = self.workers.lock()
+            && let Some(mut entry) = workers.remove(&connection)
+        {
+            entry.cancellation.cancel();
+            joins.append(&mut entry.joins);
+        }
+        for join in joins.drain(..) {
+            let _ = join.await;
+        }
     }
 
     /// Applies one command inline, emitting messages through the forwarder.
     pub async fn apply(&self, connection: ConnectionId, command: &DeviceCommand) {
         match command {
             DeviceCommand::ExecuteCommand(payload) => {
-                self.execute_command(connection, payload).await;
+                Box::pin(self.execute_command(connection, payload)).await;
             }
             DeviceCommand::RemoveQueueItem(payload) => {
-                self.remove_queue_item(connection, payload);
+                self.remove_queue_item(connection, payload).await;
             }
             DeviceCommand::SearchBranches(payload) => {
                 self.search_branches(connection, payload).await;
@@ -483,11 +605,11 @@ impl DeviceBridge {
     }
 
     async fn execute_command(&self, connection: ConnectionId, command: &ExecuteCommandPayload) {
-        let outcome = self.run_mod_command(&command.command_id, command.args.as_deref());
-        let (success, output) = match outcome.await {
+        let outcome = match self.command_outcome(connection, command).await {
             Ok(output) => (true, output),
             Err(output) => (false, output),
         };
+        let (success, output) = outcome;
         self.emit(
             connection,
             DeviceMessage::ExecuteCommand(ExecuteCommandResponseMessage {
@@ -498,39 +620,88 @@ impl DeviceBridge {
         );
     }
 
+    /// Validates the command target, then runs the pinned built-in table or a
+    /// mod-published command with scoped context.
+    async fn command_outcome(
+        &self,
+        connection: ConnectionId,
+        command: &ExecuteCommandPayload,
+    ) -> Result<String, String> {
+        let unknown = || format!("{COMMAND_UNKNOWN_PREFIX}{}", command.command_id);
+        if let Some(gate) = lock(&self.scopes).as_ref()
+            && !gate(connection).contains(&command.runtime)
+        {
+            tracing::warn!(
+                request_id = %command.request_id,
+                "execute_command rejected for unsubscribed scope"
+            );
+            return Err(unknown());
+        }
+        // Detached commands run under their own token: no live connection is
+        // attributable at inline-application time, so nothing cancels early.
+        let cancellation = CancellationToken::new();
+        if BUILTIN_COMMANDS.contains(&command.command_id.as_str()) {
+            let runner = lock(&self.builtins).clone();
+            return match runner {
+                Some(runner) => runner(connection, command.clone(), cancellation).await,
+                None => Err(unknown()),
+            };
+        }
+        self.run_mod_command(command, cancellation).await
+    }
+
     async fn run_mod_command(
         &self,
-        command_id: &str,
-        args: Option<&str>,
+        command: &ExecuteCommandPayload,
+        cancellation: CancellationToken,
     ) -> Result<String, String> {
         use lotta_extensions::mods::types::RegistrationName;
+        let unknown = || format!("{COMMAND_UNKNOWN_PREFIX}{}", command.command_id);
         let registry = lock(&self.mod_commands).clone();
         let Some(registry) = registry else {
-            return Err(COMMAND_UNKNOWN.to_owned());
+            return Err(unknown());
         };
-        let runtime = registry.runtime().map_err(|_| COMMAND_UNKNOWN.to_owned())?;
-        let name =
-            RegistrationName::new(command_id.to_owned()).map_err(|_| COMMAND_UNKNOWN.to_owned())?;
-        let handle = runtime
-            .command(&name)
-            .map_err(|_| COMMAND_UNKNOWN.to_owned())?;
+        let runtime = registry.runtime().map_err(|_| unknown())?;
+        let name = RegistrationName::new(command.command_id.clone()).map_err(|_| unknown())?;
+        let handle = runtime.command(&name).map_err(|_| unknown())?;
         let value = handle
-            .call(
-                json!({ "args": args.unwrap_or_default() }),
-                CancellationToken::new(),
-            )
+            .call(self.scoped_context(command), cancellation)
             .await
-            .map_err(|_| COMMAND_UNKNOWN.to_owned())?;
+            .map_err(|_| unknown())?;
         Ok(match value {
             Value::String(text) => text,
             other => other.to_string(),
         })
     }
 
-    fn remove_queue_item(&self, connection: ConnectionId, command: &RemoveQueueItemPayload) {
-        let removal = NonEmptyString::new(command.item_id.clone())
-            .ok()
-            .and_then(|item_id| self.remove_from_queue(&command.runtime, &item_id));
+    /// Builds the scoped argument body handed to one mod command call:
+    /// parsed args plus conversation/cwd/cancellation context, mirroring the
+    /// pinned listener `ModCommandContext`.
+    fn scoped_context(&self, command: &ExecuteCommandPayload) -> Value {
+        let cwd = lock(&self.cwd_of).as_ref().map_or_else(
+            || self.workspace_root.clone(),
+            |resolve| resolve(&command.runtime),
+        );
+        json!({
+            "args": command.args.clone().unwrap_or_default(),
+            "command": command.command_id,
+            "runtime": {
+                "agent_id": command.runtime.agent_id.as_str(),
+                "conversation_id": command.runtime.conversation_id.as_str(),
+            },
+            "conversation": {
+                "agent_id": command.runtime.agent_id.as_str(),
+                "id": command.runtime.conversation_id.as_str(),
+            },
+            "cwd": cwd.to_string_lossy(),
+        })
+    }
+
+    async fn remove_queue_item(&self, connection: ConnectionId, command: &RemoveQueueItemPayload) {
+        let removal = match NonEmptyString::new(command.item_id.clone()) {
+            Ok(item_id) => self.remove_from_queue(&command.runtime, &item_id).await,
+            Err(_) => None,
+        };
         self.emit(
             connection,
             DeviceMessage::RemoveQueueItem(RemoveQueueItemResponseMessage {
@@ -540,29 +711,55 @@ impl DeviceBridge {
             }),
         );
         if let Some((removed, snapshot)) = removal {
-            self.emit(
-                connection,
-                DeviceMessage::QueueUpdate(QueueUpdateMessage {
-                    agent_id: command.runtime.agent_id.as_str().to_owned(),
-                    conversation_id: command.runtime.conversation_id.as_str().to_owned(),
-                    queue: queue_snapshot_json(&snapshot),
-                    removed,
-                }),
-            );
+            self.broadcast_queue_update(&command.runtime, &snapshot, removed);
         }
     }
 
-    fn remove_from_queue(
+    async fn remove_from_queue(
         &self,
         runtime: &RuntimeScope,
         item_id: &NonEmptyString,
     ) -> Option<(Value, QueueSnapshot)> {
-        let mut queues = lock(&self.queues);
-        let mutation = queues.get_mut(runtime)?.cancel(item_id).ok()??;
-        Some((
-            transition_json(mutation.event()),
-            mutation.snapshot().clone(),
-        ))
+        let authority = lock(&self.queue_authority).clone()?;
+        match authority.remove_queued(runtime, item_id).await {
+            Ok(Some(mutation)) => Some((
+                transition_json(mutation.event()),
+                mutation.snapshot().clone(),
+            )),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(
+                    scope = %runtime.conversation_id.as_str(),
+                    error = %error,
+                    "authoritative queue removal failed"
+                );
+                None
+            }
+        }
+    }
+
+    /// Rebroadcasts one authoritative queue mutation to scope subscribers as
+    /// a pinned-shape `update_queue` listener state message.
+    fn broadcast_queue_update(
+        &self,
+        runtime: &RuntimeScope,
+        snapshot: &QueueSnapshot,
+        removed: Value,
+    ) {
+        let Some(sink) = lock(&self.event_sink).clone() else {
+            return;
+        };
+        let queue = json!(snapshot.items());
+        let (Ok(queue), Ok(removed)) = (
+            lotta_domain::BoundedJsonValue::new(queue),
+            lotta_domain::BoundedJsonValue::new(removed),
+        ) else {
+            tracing::warn!("bounded update_queue encoding failed");
+            return;
+        };
+        if let Err(error) = sink.emit(runtime, RuntimeEvent::UpdateQueue { queue, removed }) {
+            tracing::warn!(error = %error, "update_queue broadcast failed");
+        }
     }
 
     async fn search_branches(&self, connection: ConnectionId, command: &SearchBranchesPayload) {
@@ -594,55 +791,127 @@ impl DeviceBridge {
     }
 
     async fn checkout_branch(&self, connection: ConnectionId, command: &CheckoutBranchPayload) {
+        let response = if valid_branch_name(&command.branch) {
+            self.run_checkout(command).await
+        } else {
+            failed_checkout(&command.request_id, BRANCH_NAME_INVALID)
+        };
+        let success = response.success;
+        self.emit(connection, DeviceMessage::CheckoutBranch(response));
+        if success {
+            self.refresh_device_status(connection);
+        }
+    }
+
+    async fn run_checkout(&self, command: &CheckoutBranchPayload) -> CheckoutBranchResponseMessage {
         let create = command.create.unwrap_or(false);
         let args: Vec<&str> = if create {
             vec!["checkout", "-b", &command.branch]
         } else {
             vec!["checkout", &command.branch]
         };
-        let outcome = run_git(
+        match run_git(
             &self.workspace_root,
             command.cwd.as_ref(),
             &args,
             BRANCH_CHECKOUT_TIMEOUT_MS,
         )
-        .await;
-        let (success, error) = match outcome {
-            Ok(_) => (true, None),
-            Err(error) => (
-                false,
-                Some(if error.trim().is_empty() {
-                    BRANCH_FAILURE_CHECKOUT.to_owned()
-                } else {
-                    error
-                }),
+        .await
+        {
+            Ok(_) => self.checkout_answer(command).await,
+            Err(error) => failed_checkout(
+                &command.request_id,
+                &non_empty_or(&error, BRANCH_FAILURE_CHECKOUT),
             ),
-        };
-        self.emit(
-            connection,
-            DeviceMessage::CheckoutBranch(CheckoutBranchResponseMessage {
-                request_id: command.request_id.clone(),
-                branch: command.branch.clone(),
-                success,
-                error,
-            }),
-        );
-        if success {
-            self.emit(
-                connection,
-                DeviceMessage::StatusUpdate(DeviceStatusUpdateMessage {
-                    background_processes: self.background.snapshot(),
-                }),
-            );
         }
     }
 
+    /// Queries the actual checked-out branch from HEAD so the answer reports
+    /// reality instead of echoing the request.
+    async fn checkout_answer(
+        &self,
+        command: &CheckoutBranchPayload,
+    ) -> CheckoutBranchResponseMessage {
+        let head = run_git(
+            &self.workspace_root,
+            command.cwd.as_ref(),
+            &["rev-parse", "--abbrev-ref", "HEAD"],
+            BRANCH_SEARCH_TIMEOUT_MS,
+        )
+        .await;
+        let branch = head
+            .ok()
+            .map(|stdout| stdout.trim().to_owned())
+            .filter(|branch| !branch.is_empty())
+            .unwrap_or_else(|| command.branch.clone());
+        CheckoutBranchResponseMessage {
+            request_id: command.request_id.clone(),
+            branch,
+            success: true,
+            error: None,
+        }
+    }
+
+    /// Re-advertises the device-status snapshot to one connection's scopes.
+    ///
+    /// Backs the pinned `/reload` behavior: refreshed registrations reach
+    /// clients through a fresh `update_device_status` listener state message.
+    pub fn refresh_status_for(&self, connection: ConnectionId) {
+        self.refresh_device_status(connection);
+    }
+
+    /// Emits the complete scoped device-status snapshot as listener state to
+    /// every runtime scope the requesting connection subscribes to.
+    fn refresh_device_status(&self, connection: ConnectionId) {
+        let Some(sink) = lock(&self.event_sink).clone() else {
+            return;
+        };
+        let scopes = lock(&self.scopes)
+            .as_ref()
+            .map_or_else(Vec::new, |gate| gate(connection));
+        if scopes.is_empty() {
+            return;
+        }
+        let status = self.device_status_json();
+        let Ok(status) = lotta_domain::BoundedJsonValue::new(status) else {
+            tracing::warn!("bounded update_device_status encoding failed");
+            return;
+        };
+        for scope in scopes {
+            if let Err(error) = sink.emit(
+                &scope,
+                RuntimeEvent::UpdateDeviceStatus {
+                    device_status: status.clone(),
+                },
+            ) {
+                tracing::warn!(error = %error, "update_device_status broadcast failed");
+            }
+        }
+    }
+
+    fn device_status_json(&self) -> Value {
+        json!({
+            "is_online": true,
+            "current_working_directory": self.workspace_root.to_string_lossy(),
+            "boot_working_directory": self.workspace_root.to_string_lossy(),
+            "letta_code_version": env!("CARGO_PKG_VERSION"),
+            "background_processes": lock(&self.background).snapshot(),
+            "supported_commands": builtin_and_registered_commands(self),
+            "pending_control_requests": [],
+            "current_loaded_tools": [],
+            "current_available_skills": [],
+        })
+    }
+
     fn secret_list(&self, connection: ConnectionId, command: &SecretListPayload) {
-        let message = match self.secrets.names(&command.agent_id) {
-            Ok(names) => SecretListResponseMessage {
+        let message = match self.secrets.entries(&command.agent_id) {
+            Ok(entries) => SecretListResponseMessage {
                 request_id: command.request_id.clone(),
                 success: true,
-                secrets: names.into_iter().map(|key| SecretEntry { key }).collect(),
+                secrets: entries
+                    .into_iter()
+                    .map(|(key, value)| SecretEntry { key, value })
+                    .collect(),
                 error: None,
             },
             Err(error) => SecretListResponseMessage {
@@ -709,28 +978,26 @@ impl DeviceBridge {
     fn emit(&self, connection: ConnectionId, message: DeviceMessage) {
         let _ = (self.forward)(connection, message);
     }
+}
 
-    #[cfg(test)]
-    pub(crate) fn enqueue_for_test(&self, scope: &RuntimeScope, item_id: &str) {
-        let item = lotta_domain::QueueItem {
-            id: NonEmptyString::new(item_id.to_owned()).expect("test item id"),
-            client_message_id: NonEmptyString::new(format!("client-{item_id}"))
-                .expect("test client id"),
-            kind: lotta_domain::QueueItemKind::Message,
-            source: lotta_domain::QueueItemSource::User,
-            content: lotta_domain::BoundedJsonValue::new(json!({"text": "queued"}))
-                .expect("test content"),
-            enqueued_at: lotta_domain::Timestamp::parse_persisted_rfc3339("2026-08-14T00:00:00Z")
-                .expect("test timestamp"),
-            extras: lotta_domain::EntityExtras::default(),
-        };
-        lock(&self.queues)
-            .entry(scope.clone())
-            .or_default()
-            .enqueue(item)
-            .map(|_mutation| ())
-            .expect("bounded queue");
+fn builtin_and_registered_commands(bridge: &DeviceBridge) -> Vec<String> {
+    let mut commands: Vec<String> = BUILTIN_COMMANDS
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    if let Some(registries) = lock(&bridge.mod_commands).as_ref()
+        && let Ok(snapshot) = registries.snapshot()
+    {
+        commands.extend(
+            snapshot
+                .commands
+                .keys()
+                .map(|name| name.as_str().to_owned()),
+        );
     }
+    commands.sort();
+    commands.dedup();
+    commands
 }
 
 fn failed_search(request_id: &str, error: &str) -> SearchBranchesResponseMessage {
@@ -738,6 +1005,16 @@ fn failed_search(request_id: &str, error: &str) -> SearchBranchesResponseMessage
     SearchBranchesResponseMessage {
         request_id: request_id.to_owned(),
         branches: Vec::new(),
+        success: false,
+        error: Some(error),
+    }
+}
+
+fn failed_checkout(request_id: &str, error: &str) -> CheckoutBranchResponseMessage {
+    let error = non_empty_or(error, BRANCH_FAILURE_CHECKOUT);
+    CheckoutBranchResponseMessage {
+        request_id: request_id.to_owned(),
+        branch: String::new(),
         success: false,
         error: Some(error),
     }
@@ -760,17 +1037,10 @@ fn non_empty_or(value: &str, fallback: &str) -> String {
     }
 }
 
-fn queue_snapshot_json(snapshot: &QueueSnapshot) -> Value {
-    json!({
-        "revision": snapshot.revision(),
-        "items": snapshot.items(),
-    })
-}
-
 fn transition_json(event: &QueueMutationEvent) -> Value {
     match event {
         QueueMutationEvent::Removed(item, disposition) => json!([{
-            "item_id": item.id.as_str(),
+            "client_message_id": item.client_message_id.as_str(),
             "disposition": disposition,
         }]),
         _ => json!([]),

@@ -62,40 +62,40 @@ pub const MANAGEMENT_ROW: [&str; 14] = [
 
 /// Loads the pinned fixture's full outbound message discriminant list.
 ///
-/// # Panics
-/// Panics if the checked-in fixture fails to parse or lacks its messages
-/// list, which would mean the pinned-protocol contract drifted.
-#[must_use]
-pub fn fixture_message_discriminants() -> Vec<String> {
+/// # Errors
+/// Returns [`crate::error::AppServerError::Internal`] when the checked-in fixture fails to
+/// parse or lacks its messages list, which would mean the pinned-protocol
+/// contract drifted.
+pub fn fixture_message_discriminants() -> Result<Vec<String>, crate::error::AppServerError> {
     let raw = include_str!("../../../../fixtures/protocol/discriminants.json");
-    let fixture: Value = serde_json::from_str(raw).expect("checked-in fixture parses");
-    fixture["messages"]["discriminants"]
+    let fixture: Value =
+        serde_json::from_str(raw).map_err(|_| crate::error::AppServerError::Internal)?;
+    let discriminants = fixture["messages"]["discriminants"]
         .as_array()
-        .expect("fixture carries a messages list")
+        .ok_or(crate::error::AppServerError::Internal)?;
+    Ok(discriminants
         .iter()
         .filter_map(Value::as_str)
         .map(ToOwned::to_owned)
-        .collect()
+        .collect())
 }
 
 /// Intersects one row's named members with the fixture message list.
 ///
-/// # Panics
-/// Panics when no row member survives the intersection, which means the spec
-/// row and the pinned fixture have drifted apart.
-#[must_use]
-pub fn members_in_fixture(row: &[&str]) -> Vec<String> {
-    let fixture = fixture_message_discriminants();
+/// # Errors
+/// Returns [`crate::error::AppServerError::Internal`] when no row member survives the
+/// intersection, meaning the spec row and the pinned fixture drifted apart.
+pub fn members_in_fixture(row: &[&str]) -> Result<Vec<String>, crate::error::AppServerError> {
+    let fixture = fixture_message_discriminants()?;
     let resolved: Vec<String> = row
         .iter()
         .filter(|member| fixture.iter().any(|entry| entry == *member))
         .map(|member| (*member).to_owned())
         .collect();
-    assert!(
-        !resolved.is_empty(),
-        "§Outbound message groups row {row:?} must resolve against the pinned fixture"
-    );
-    resolved
+    if resolved.is_empty() {
+        return Err(crate::error::AppServerError::Internal);
+    }
+    Ok(resolved)
 }
 
 #[cfg(test)]

@@ -293,6 +293,11 @@ pub struct SharedGroupBridges {
     settings: Arc<SettingsBridge>,
     conversations_authority:
         Arc<std::sync::Mutex<Option<Arc<dyn crate::ws::conversations::ConversationAuthority>>>>,
+    queue_authority: Arc<std::sync::Mutex<Option<Arc<dyn crate::ws::device::QueueAuthority>>>>,
+    mod_commands:
+        Arc<std::sync::Mutex<Option<Arc<lotta_extensions::mods::registry::ModRegistries>>>>,
+    background_processes:
+        Arc<std::sync::Mutex<Option<Arc<dyn crate::ws::device::BackgroundProcessSource>>>>,
 }
 
 impl SharedGroupBridges {
@@ -324,6 +329,9 @@ impl SharedGroupBridges {
             skills,
             settings,
             conversations_authority: Arc::new(std::sync::Mutex::new(None)),
+            queue_authority: Arc::new(std::sync::Mutex::new(None)),
+            mod_commands: Arc::new(std::sync::Mutex::new(None)),
+            background_processes: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -358,6 +366,65 @@ impl SharedGroupBridges {
         &self,
     ) -> Option<Arc<dyn crate::ws::conversations::ConversationAuthority>> {
         self.conversations_authority
+            .lock()
+            .ok()
+            .and_then(|current| current.clone())
+    }
+
+    /// Registers the authoritative queue port backing device removals.
+    pub fn register_queue_authority(
+        &self,
+        authority: Option<Arc<dyn crate::ws::device::QueueAuthority>>,
+    ) {
+        if let Ok(mut current) = self.queue_authority.lock() {
+            *current = authority;
+        }
+    }
+
+    /// Snapshot of the registered queue authority, if any.
+    #[must_use]
+    pub fn queue_authority(&self) -> Option<Arc<dyn crate::ws::device::QueueAuthority>> {
+        self.queue_authority
+            .lock()
+            .ok()
+            .and_then(|current| current.clone())
+    }
+
+    /// Registers the Task 45 mod command registry backing `execute_command`.
+    pub fn register_mod_commands(
+        &self,
+        registries: Option<Arc<lotta_extensions::mods::registry::ModRegistries>>,
+    ) {
+        if let Ok(mut current) = self.mod_commands.lock() {
+            *current = registries;
+        }
+    }
+
+    /// Snapshot of the registered mod command registry, if any.
+    #[must_use]
+    pub fn mod_commands(&self) -> Option<Arc<lotta_extensions::mods::registry::ModRegistries>> {
+        self.mod_commands
+            .lock()
+            .ok()
+            .and_then(|current| current.clone())
+    }
+
+    /// Registers the background-process source feeding status snapshots.
+    pub fn register_background_processes(
+        &self,
+        source: Option<Arc<dyn crate::ws::device::BackgroundProcessSource>>,
+    ) {
+        if let Ok(mut current) = self.background_processes.lock() {
+            *current = source;
+        }
+    }
+
+    /// Snapshot of the registered background-process source, if any.
+    #[must_use]
+    pub fn background_processes(
+        &self,
+    ) -> Option<Arc<dyn crate::ws::device::BackgroundProcessSource>> {
+        self.background_processes
             .lock()
             .ok()
             .and_then(|current| current.clone())
@@ -414,6 +481,9 @@ fn compose_shared_bridges(
         skills,
         settings,
         conversations_authority: Arc::new(std::sync::Mutex::new(None)),
+        queue_authority: Arc::new(std::sync::Mutex::new(None)),
+        mod_commands: Arc::new(std::sync::Mutex::new(None)),
+        background_processes: Arc::new(std::sync::Mutex::new(None)),
     })
 }
 
@@ -440,12 +510,75 @@ async fn start_listener_with_limits(
     let (base_url, websocket_url, openai_url) = resolved_urls(&prepared, address);
     tracing::info!(base_url, websocket_url, "app server listener started");
     let shutdown = CancellationToken::new();
-    let runtime_router = RuntimeRouter::new(clock.clone(), Arc::new(RandomEventIdGenerator));
+    let websocket_path = prepared.websocket_path.clone();
+    let endpoints = RuntimeEndpoints::from_parts(runtime_service, turn_controller, observer);
+    let state = compose_listener_state(
+        prepared,
+        &clock,
+        limits,
+        endpoints,
+        shared,
+        shutdown.clone(),
+    )?;
+
+    register_device_runtime_ports(&state);
+    let router = build_router(&websocket_path, Arc::clone(&state));
+    let server_shutdown = state.shutdown.clone();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(server_shutdown.cancelled_owned())
+            .await
+            .map_err(|_| AppServerError::Listener)
+    });
+    Ok(ListenerHandle {
+        address,
+        base_url,
+        websocket_url,
+        openai_url,
+        shutdown,
+        task,
+    })
+}
+
+/// Runtime command endpoints handed to every composed listener state.
+struct RuntimeEndpoints {
+    service: Arc<dyn RuntimeCommandService>,
+    turn_controller: Arc<dyn TurnController>,
+    observer: Arc<dyn crate::observer::RuntimeBroadcastObserver>,
+}
+
+impl RuntimeEndpoints {
+    fn from_parts(
+        runtime_service: Arc<dyn RuntimeCommandService>,
+        turn_controller: Arc<dyn TurnController>,
+        observer: Arc<dyn crate::observer::RuntimeBroadcastObserver>,
+    ) -> Self {
+        Self {
+            service: runtime_service,
+            turn_controller,
+            observer,
+        }
+    }
+}
+
+/// Composes the full per-listener routing state over host-provided bridges.
+///
+/// The bridges handed in through `shared` are the exact instances the host's
+/// controllers serve, so WebSocket group mutations reach subsequent turns.
+fn compose_listener_state(
+    prepared: PreparedServer,
+    clock: &Arc<dyn Clock + Send + Sync>,
+    limits: SocketLimits,
+    endpoints: RuntimeEndpoints,
+    shared: Option<SharedGroupBridges>,
+    shutdown: CancellationToken,
+) -> Result<Arc<ListenerState>, AppServerError> {
     let shared = match shared {
         Some(shared) => shared,
-        None => compose_shared_bridges(&prepared, &clock)?,
+        None => compose_shared_bridges(&prepared, clock)?,
     };
     let conversations_authority = shared.conversations_authority();
+    let device_ports = DevicePorts::from_shared(&shared);
     let SharedGroupBridges {
         outbound,
         skills,
@@ -458,21 +591,25 @@ async fn start_listener_with_limits(
     let storage = compose_storage_bridges(
         &outbound,
         &prepared,
-        &clock,
+        clock,
         &artifacts_dir,
         conversations_authority,
     )?;
-    let (devices, introspection) =
-        compose_device_bridges(&outbound, &prepared.workspace_dir, &prepared.storage_dir);
-    let state = Arc::new(ListenerState {
+    let devices = compose_device_bridges(&outbound, &prepared, device_ports.queue_authority)?;
+    devices.register_mod_commands_if_set(device_ports.mod_commands);
+    devices.register_background_processes_if_set(device_ports.background);
+    Ok(Arc::new(ListenerState {
         auth: prepared.auth,
-        clock: Arc::clone(&clock),
-        shutdown: shutdown.clone(),
+        clock: Arc::clone(clock),
+        shutdown,
         limits,
-        runtime_router: Arc::new(std::sync::Mutex::new(runtime_router)),
-        runtime_service,
-        turn_controller,
-        observer,
+        runtime_router: Arc::new(std::sync::Mutex::new(RuntimeRouter::new(
+            clock.clone(),
+            Arc::new(RandomEventIdGenerator),
+        ))),
+        runtime_service: endpoints.service,
+        turn_controller: endpoints.turn_controller,
+        observer: endpoints.observer,
         external_tools: Arc::new(ExternalToolBridge::new(external_forwarder(&outbound))),
         teleports: Arc::new(TeleportBridge::new(teleport_forwarder(&outbound))),
         terminals: Arc::new(TerminalBridge::new(
@@ -488,25 +625,96 @@ async fn start_listener_with_limits(
         skills,
         settings,
         devices,
-        introspection,
+        introspection: Arc::new(IntrospectionBridge::new(introspection_forwarder(&outbound))),
         next_observation: AtomicU64::new(1),
         outbound,
-    });
-    let router = build_router(&prepared.websocket_path, state);
-    let server_shutdown = shutdown.clone();
-    let task = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .with_graceful_shutdown(server_shutdown.cancelled_owned())
-            .await
-            .map_err(|_| AppServerError::Listener)
-    });
-    Ok(ListenerHandle {
-        address,
-        base_url,
-        websocket_url,
-        openai_url,
-        shutdown,
-        task,
+    }))
+}
+
+/// Device-group ports registered by the production composition root.
+struct DevicePorts {
+    queue_authority: Option<Arc<dyn crate::ws::device::QueueAuthority>>,
+    mod_commands: Option<Arc<lotta_extensions::mods::registry::ModRegistries>>,
+    background: Option<Arc<dyn crate::ws::device::BackgroundProcessSource>>,
+}
+
+impl DevicePorts {
+    fn from_shared(shared: &SharedGroupBridges) -> Self {
+        Self {
+            queue_authority: shared.queue_authority(),
+            mod_commands: shared.mod_commands(),
+            background: shared.background_processes(),
+        }
+    }
+}
+
+/// Wires the late-bound device ports that need listener-owned state: the
+/// router-backed event sink and subscription gate, the settings-backed cwd
+/// resolver, and the built-in slash-command runner over live bridges.
+fn register_device_runtime_ports(state: &Arc<ListenerState>) {
+    let devices = Arc::downgrade(&state.devices);
+    state.devices.register_event_sink(event_sink(state));
+    state.devices.register_scope_gate(Arc::new({
+        let runtime_router = Arc::clone(&state.runtime_router);
+        move |connection| {
+            lock_router(&runtime_router)
+                .map(|router| router.connections.subscriptions_of(connection))
+                .unwrap_or_default()
+        }
+    }));
+    state.devices.register_cwd_resolver(Arc::new({
+        let settings = Arc::clone(&state.settings);
+        move |scope| {
+            settings
+                .cwd_for_next_turn(
+                    Some(scope.agent_id.as_str()),
+                    scope.conversation_id.as_str(),
+                )
+                .effective()
+                .to_path_buf()
+        }
+    }));
+    state
+        .devices
+        .register_builtin_runner(builtin_runner(Arc::clone(&state.conversations), devices));
+}
+
+/// Builds the pinned built-in slash-command runner over live bridges.
+///
+/// `/compact` routes through the real conversation compaction flow;
+/// `/reload` re-advertises device status so refreshed registrations reach
+/// clients. The remaining pinned ids have no server-side port yet and answer
+/// the pinned failure shape instead of pretending success.
+fn builtin_runner(
+    conversations: Arc<ConversationsBridge>,
+    devices: std::sync::Weak<DeviceBridge>,
+) -> crate::ws::device::BuiltinRunner {
+    Arc::new(move |connection, command, _cancellation| {
+        let conversations = Arc::clone(&conversations);
+        let devices = devices.clone();
+        Box::pin(async move {
+            match command.command_id.as_str() {
+                "compact" => {
+                    conversations
+                        .compact_runtime_text(&command.runtime, command.args.as_deref())
+                        .await
+                }
+                "reload" => {
+                    if let Some(devices) = devices.upgrade() {
+                        devices.refresh_status_for(connection);
+                    }
+                    Ok("Reloaded".to_owned())
+                }
+                other if crate::ws::device::BUILTIN_COMMANDS.contains(&other) => {
+                    // Honest failure: these pinned ids have no server port yet.
+                    Err(format!(
+                        "Failed: /{other} requires listener-local capabilities \
+                         this server does not provide"
+                    ))
+                }
+                _ => Err(format!("Unknown command: {}", command.command_id)),
+            }
+        })
     })
 }
 
@@ -615,7 +823,7 @@ async fn serve_socket(mut socket: WebSocket, state: Arc<ListenerState>) {
     }
     connection_cancellation.cancel();
     while turns.join_next().await.is_some() {}
-    close_connection(&state, connection_id);
+    close_connection(&state, connection_id).await;
 }
 
 fn open_connection(
@@ -652,11 +860,13 @@ fn prepare_outbound(
     Ok(())
 }
 
-fn close_connection(state: &ListenerState, id: crate::ws::ConnectionId) {
+async fn close_connection(state: &ListenerState, id: crate::ws::ConnectionId) {
     state.external_tools.disconnect(id);
     state.terminals.disconnect(id);
     state.files.disconnect(id);
     state.introspection.unregister(id);
+    // Device work is cancellation-bound: cancel first, then reap its joins.
+    state.devices.disconnect(id).await;
     if let Ok(mut outbound) = state.outbound.lock() {
         outbound.remove(&id);
     }
@@ -991,18 +1201,25 @@ fn compose_storage_bridges(
     })
 }
 
-/// Composes the device and introspection bridges over canonical roots.
+/// Composes the device bridge over canonical roots with the host-registered
+/// queue authority, and returns it alongside its introspection sibling.
+///
+/// # Errors
+/// Returns a stable listener error when the workspace root is not absolute.
 fn compose_device_bridges(
     outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
-    workspace_dir: &std::path::Path,
-    storage_dir: &std::path::Path,
-) -> (Arc<DeviceBridge>, Arc<IntrospectionBridge>) {
-    let devices = Arc::new(
-        DeviceBridge::new(device_forwarder(outbound), workspace_dir, storage_dir)
-            .expect("workspace root validated at startup"),
-    );
-    let introspection = Arc::new(IntrospectionBridge::new(introspection_forwarder(outbound)));
-    (devices, introspection)
+    prepared: &PreparedServer,
+    queue_authority: Option<Arc<dyn crate::ws::device::QueueAuthority>>,
+) -> Result<Arc<DeviceBridge>, AppServerError> {
+    let devices = Arc::new(DeviceBridge::new(
+        device_forwarder(outbound),
+        &prepared.workspace_dir,
+        &prepared.storage_dir,
+    )?);
+    if let Some(authority) = queue_authority {
+        devices.register_queue_authority(authority);
+    }
+    Ok(devices)
 }
 
 /// Decodes and routes the external-tool command group for one frame.

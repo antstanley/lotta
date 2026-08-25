@@ -31,12 +31,21 @@ pub struct AppServerInfoCommand {
 }
 
 /// Typed capability flag; serializes exactly like a JSON boolean so the wire
-/// shape stays pinned while the struct avoids raw-bool field sprawl.
+/// shape stays pinned to the baseline's capability record. The newtype also
+/// deliberately keeps raw `bool` fields out of [`ServerCapabilities`], which
+/// would otherwise trip `clippy::struct_excessive_bools` (seven flags).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct CapabilityFlag(pub bool);
 
 /// Capability flags reported by `app_server_info_response`.
+///
+/// Each flag reflects actual implemented behavior audited against this
+/// server's command groups and production runtime start path:
+/// agent/conversation/memory management and runtime start are served;
+/// runtime start ignores client workspace-sandbox extensions (the server
+/// always runs its own prepared sandbox policy); external-tool updates are
+/// applied per runtime through the Task 41 bridge; split channels are absent.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ServerCapabilities {
     /// Agent management command group is served.
@@ -47,7 +56,7 @@ pub struct ServerCapabilities {
     pub memory_management: CapabilityFlag,
     /// Runtime start lifecycle is served.
     pub runtime_start: CapabilityFlag,
-    /// Runtime start accepts workspace sandboxes.
+    /// Runtime start accepts workspace sandboxes (not implemented).
     pub runtime_workspace_sandbox: CapabilityFlag,
     /// Runtime external-tool updates are accepted.
     pub runtime_external_tools_update: CapabilityFlag,
@@ -129,7 +138,10 @@ impl IntrospectionBridge {
     /// authenticated; otherwise rejects it silently without any response.
     pub fn handle(&self, connection: ConnectionId, command: &AppServerInfoCommand) -> bool {
         if !lock(&self.authenticated).contains(&connection) {
-            tracing::warn!(request_id = %command.request_id, "unauthenticated app_server_info rejected");
+            tracing::warn!(
+                request_id = %command.request_id,
+                "unauthenticated app_server_info rejected"
+            );
             return false;
         }
         let _ = (self.forward)(connection, self.response(&command.request_id));
@@ -148,7 +160,7 @@ impl IntrospectionBridge {
                 conversation_management: CapabilityFlag(true),
                 memory_management: CapabilityFlag(true),
                 runtime_start: CapabilityFlag(true),
-                runtime_workspace_sandbox: CapabilityFlag(true),
+                runtime_workspace_sandbox: CapabilityFlag(false),
                 runtime_external_tools_update: CapabilityFlag(true),
                 split_channels: CapabilityFlag(false),
             },

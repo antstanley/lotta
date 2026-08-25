@@ -46,8 +46,8 @@ use lotta_runtime::turn::{
     TurnEvent, TurnProjection, TurnStopRecord,
 };
 use lotta_runtime::{
-    AdmissionOutcome, AdmissionRequest, AdmissionRoute, ListenerRuntime, RuntimeError, RuntimeKey,
-    WorkspaceSandbox,
+    AdmissionOutcome, AdmissionRequest, AdmissionRoute, ListenerRuntime, QueueMutation,
+    RuntimeError, RuntimeKey, WorkspaceSandbox,
 };
 use lotta_store::{LocalStore, StoreErrorKind, StorePaths};
 use lotta_tools::builtin::{
@@ -179,7 +179,7 @@ impl ProductionComponents {
             setup.registry(),
             setup.hook_runtime(),
             root.join("artifacts"),
-            shell,
+            Arc::clone(&shell),
         )?);
         let approval_manager = Arc::new(lotta_runtime::ApprovalManager::new(
             LocalStore::new(store_paths.clone()).approval_journal(),
@@ -206,6 +206,7 @@ impl ProductionComponents {
             state: Arc::clone(&runtime_state),
             brokers: Arc::clone(&brokers),
         })));
+        register_device_authority_ports(&shared, &runtime_state, setup.mod_registries(), &shell);
         let runtime_service = Arc::new(ProductionRuntimeService::new(
             store_paths.clone(),
             Arc::clone(&clock),
@@ -909,6 +910,79 @@ impl lotta_app_server::ws::conversations::ConversationAuthority
                 .ok_or(RuntimeError::CompactionUnavailable)?;
             service.compact(command).await
         })
+    }
+}
+
+/// Registers the device-group authority ports on the shared bridges: queue
+/// removals route through the authoritative runtime registry, `execute_command`
+/// resolves through the canonical Task 45 registries, and background snapshots
+/// reflect real shell sessions.
+fn register_device_authority_ports(
+    shared: &lotta_app_server::listener::SharedGroupBridges,
+    state: &Arc<ProductionRuntimeState>,
+    mod_registries: Arc<ModRegistries>,
+    shell: &Arc<ShellToolBundle>,
+) {
+    shared.register_queue_authority(Some(Arc::new(ProductionQueueAuthority {
+        state: Arc::clone(state),
+    })));
+    shared.register_mod_commands(Some(mod_registries));
+    shared.register_background_processes(Some(Arc::new(ShellBackgroundProcesses {
+        shell: Arc::clone(shell),
+    })));
+}
+
+/// Bridges the WebSocket device group to the authoritative production runtime:
+/// queue removals mutate the exact `ListenerRuntime` registry the turn path
+/// uses, so a WS-removed item can never be pumped by an active turn afterward.
+pub(crate) struct ProductionQueueAuthority {
+    pub(crate) state: Arc<ProductionRuntimeState>,
+}
+
+impl lotta_app_server::ws::device::QueueAuthority for ProductionQueueAuthority {
+    fn remove_queued<'a>(
+        &'a self,
+        scope: &'a RuntimeScope,
+        item_id: &'a NonEmptyString,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<QueueMutation>, RuntimeError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut state = self.state.inner.lock().await;
+            let handle =
+                state
+                    .registry
+                    .lookup(&RuntimeKey::from(scope))
+                    .ok_or(RuntimeError::NotFound {
+                        context: "device queue registry lookup".into(),
+                    })?;
+            state.registry.cancel_queued(&handle, item_id)
+        })
+    }
+}
+
+/// Device-status source over the production shell process manager: snapshots
+/// reflect actual background sessions instead of a hardcoded empty list.
+pub(crate) struct ShellBackgroundProcesses {
+    pub(crate) shell: Arc<ShellToolBundle>,
+}
+
+impl lotta_app_server::ws::device::BackgroundProcessSource for ShellBackgroundProcesses {
+    fn snapshot(&self) -> Vec<lotta_app_server::ws::device::BackgroundProcessSummary> {
+        self.shell
+            .background_snapshot()
+            .into_iter()
+            .map(|session| {
+                lotta_app_server::ws::device::BackgroundProcessSummary::Bash(
+                    lotta_app_server::ws::device::BashBackgroundProcessSummary {
+                        process_id: session.process_id,
+                        command: session.command,
+                        started_at_ms: Some(session.started_at_ms),
+                        status: session.status.to_owned(),
+                        exit_code: session.exit_code,
+                    },
+                )
+            })
+            .collect()
     }
 }
 
@@ -2187,6 +2261,7 @@ pub(crate) struct ScopedProductionToolPort {
     overflow: Arc<lotta_tools::clamp::FileOverflowWriter>,
     permissions: Arc<lotta_tools::PermissionPolicy>,
     workspace: Arc<lotta_tools::WorkspacePolicy>,
+    secrets: Option<Arc<dyn lotta_tools::SecretResolver>>,
     cwd: PathBuf,
 }
 
@@ -2210,6 +2285,7 @@ impl ProductionToolPort {
         snapshot: Arc<lotta_tools::RegistrySnapshot>,
         permissions: Arc<lotta_tools::PermissionPolicy>,
         workspace: Arc<lotta_tools::WorkspacePolicy>,
+        secrets: Option<Arc<dyn lotta_tools::SecretResolver>>,
         cwd: PathBuf,
     ) -> ScopedProductionToolPort {
         ScopedProductionToolPort {
@@ -2218,6 +2294,7 @@ impl ProductionToolPort {
             overflow: Arc::clone(&self.overflow),
             permissions,
             workspace,
+            secrets,
             cwd,
         }
     }
@@ -2232,6 +2309,17 @@ impl ToolPort for ScopedProductionToolPort {
             let permissions = lotta_tools::PolicyGate::new(self.permissions.as_ref(), &[], &[]);
             let sandbox =
                 lotta_tools::WorkspaceSandboxGate::new(self.workspace.as_ref(), &self.cwd);
+            // Applied agent secrets resolve here: the WS-applied record feeds
+            // tool pipelines running for that exact agent. No registered
+            // resolver (standalone surfaces) keeps the inert default.
+            let fallback;
+            let secrets: &dyn lotta_tools::SecretResolver = match self.secrets.as_deref() {
+                Some(resolver) => resolver,
+                None => {
+                    fallback = NoSecrets;
+                    &fallback
+                }
+            };
             lotta_tools::execute(lotta_tools::PipelineRequest {
                 tool_call_id: request.tool_call_id,
                 approval_grant: request.approval_grant,
@@ -2242,7 +2330,7 @@ impl ToolPort for ScopedProductionToolPort {
                 hook_runtime: self.hook_runtime.as_ref(),
                 permissions: &permissions,
                 sandbox: &sandbox,
-                secrets: &NoSecrets,
+                secrets,
                 trace: &NoTrace,
                 overflow: self.overflow.as_ref(),
                 persistence: &NoOutcome,
@@ -2729,6 +2817,10 @@ fn adapter(error: impl std::fmt::Display) -> SetupError {
 #[cfg(test)]
 mod production_tests {
     use super::*;
+    use lotta_app_server::ws::RuntimeEvent;
+    use lotta_app_server::ws::device::{
+        BackgroundProcessSource, DeviceBridge, DeviceForwarder, DeviceMessage,
+    };
     use lotta_app_server::ws::service::{RuntimeCommandService, RuntimeEventSink, TurnController};
     use lotta_domain::{ConversationId, DomainError, RunId, Timestamp, TurnStateKind};
 
@@ -2982,7 +3074,13 @@ mod production_tests {
             shell,
         )
         .unwrap()
-        .scoped(Arc::clone(&snapshot), policy, workspace_policy, workspace);
+        .scoped(
+            Arc::clone(&snapshot),
+            policy,
+            workspace_policy,
+            None,
+            workspace,
+        );
         ApprovedExecutionFixture {
             root,
             port,
@@ -4405,5 +4503,156 @@ mod production_tests {
                 "the one-time reminder was consumed by the next turn"
             );
         }
+    }
+
+    /// Builds one production service over a fresh store with its shared
+    /// authoritative state exposed for queue-authority composition.
+    fn device_queue_service(
+        root: &std::path::Path,
+    ) -> (Arc<ProductionRuntimeService>, Arc<ProductionRuntimeState>) {
+        let paths = StorePaths::new(root.to_path_buf()).unwrap();
+        let state = Arc::new(ProductionRuntimeState::new(Arc::new(
+            lotta_runtime::observe::RuntimeObserver::default(),
+        )));
+        let approvals = Arc::new(lotta_runtime::ApprovalManager::new(
+            LocalStore::new(paths.clone()).approval_journal(),
+            Arc::new(crate::production_setup::ProductionEditedInputValidator),
+        ));
+        let settings = test_settings_bridge(paths.root(), paths.root());
+        let service = ProductionRuntimeService::new(
+            paths,
+            Arc::new(TestClock),
+            Arc::new(lotta_runtime::hooks::NoopHookRuntime),
+            Arc::clone(&state),
+            approvals,
+            Arc::new(ProductionTurnBrokers::new()),
+            settings,
+        );
+        (Arc::new(service), state)
+    }
+
+    /// Composes the WS device surface over one production authority and sink.
+    fn device_bridge_with_authority(
+        root: &std::path::Path,
+        state: &Arc<ProductionRuntimeState>,
+        messages: Arc<Mutex<Vec<(u64, DeviceMessage)>>>,
+        sink: Arc<Sink>,
+    ) -> Arc<DeviceBridge> {
+        let sink_messages = Arc::clone(&messages);
+        let forward: DeviceForwarder = Arc::new(move |connection, message| {
+            sink_messages.lock().unwrap().push((connection, message));
+            Ok(())
+        });
+        let workspace = root.join("workspace");
+        let bridge = Arc::new(DeviceBridge::new(forward, &workspace, root).unwrap());
+        bridge.register_queue_authority(Arc::new(ProductionQueueAuthority {
+            state: Arc::clone(state),
+        }));
+        bridge.register_event_sink(sink as Arc<dyn RuntimeEventSink>);
+        bridge
+    }
+
+    #[tokio::test]
+    async fn ws_removal_syncs_with_the_production_registry() {
+        let root = std::env::temp_dir().join(format!("lotta-device-prod-{}", next_test_root()));
+        std::fs::create_dir_all(root.join("workspace")).unwrap();
+        let (service, state) = device_queue_service(&root);
+
+        // Admit through the production service: turn start plus one queued input.
+        let target = scope("device");
+        let started = service
+            .admit_input(command(target.clone(), "cm-start"))
+            .await
+            .unwrap();
+        assert_eq!(started.disposition, InputDisposition::Started);
+        let queued = service
+            .admit_input(command(target.clone(), "cm-remove"))
+            .await
+            .unwrap();
+        assert_eq!(queued.disposition, InputDisposition::Queued);
+
+        // WS removal routed through the same authoritative registry.
+        let messages: Arc<Mutex<Vec<(u64, DeviceMessage)>>> = Arc::default();
+        let sink = Arc::new(Sink::default());
+        let bridge =
+            device_bridge_with_authority(&root, &state, Arc::clone(&messages), Arc::clone(&sink));
+        bridge
+            .apply(1, &decode_remove_queue_item(&target, "queue-cm-remove"))
+            .await;
+
+        // The direct answer reports success.
+        let captured = messages.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1);
+        match &captured[0].1 {
+            DeviceMessage::RemoveQueueItem(answer) => assert!(answer.success),
+            other => panic!("unexpected device answer {other:?}"),
+        }
+
+        // The authoritative broadcast carries the cancelled transition keyed
+        // by client_message_id and the remaining (empty) queue.
+        let events = sink.0.lock().unwrap().clone();
+        assert_eq!(events.len(), 1, "one listener state event to subscribers");
+        assert_eq!(events[0].0, target);
+        match &events[0].1 {
+            RuntimeEvent::UpdateQueue { queue, removed } => {
+                assert_eq!(queue.as_value().as_array().map(Vec::len), Some(0));
+                let transitions = removed.as_value().as_array().unwrap();
+                assert_eq!(
+                    transitions[0]["client_message_id"],
+                    serde_json::json!("cm-remove")
+                );
+                assert_eq!(
+                    transitions[0]["disposition"],
+                    serde_json::json!("cancelled")
+                );
+            }
+            other => panic!("unexpected runtime event {}", other.discriminant()),
+        }
+
+        // Sync: the production registry's queue is empty after WS removal.
+        let guard = state.inner.lock().await;
+        let handle = guard.registry.lookup(&RuntimeKey::from(&target)).unwrap();
+        assert!(guard.registry.queue(&handle).expect("entry").is_empty());
+    }
+
+    fn decode_remove_queue_item(
+        scope: &RuntimeScope,
+        item_id: &str,
+    ) -> lotta_app_server::ws::device::DeviceCommand {
+        lotta_app_server::ws::device::DeviceCommand::RemoveQueueItem(
+            lotta_app_server::ws::device::RemoveQueueItemPayload {
+                request_id: "rq-prod".to_owned(),
+                runtime: scope.clone(),
+                item_id: item_id.to_owned(),
+            },
+        )
+    }
+
+    /// The shell-bundle background source maps real manager sessions into the
+    /// pinned bash summary union; an unused bundle reports an empty list.
+    #[test]
+    fn shell_background_source_maps_session_summaries() {
+        let root = std::env::temp_dir().join(format!("lotta-bg-src-{}", next_test_root()));
+        std::fs::create_dir_all(root.join("workspace")).unwrap();
+        let workspace = root.join("workspace");
+        let sandbox: Arc<dyn lotta_tools::builtin::shell::ShellSandbox> = Arc::new(
+            OsSandbox::detect(workspace_policy(&root, &workspace).unwrap()),
+        );
+        let shell =
+            ShellToolBundle::new(&workspace.canonicalize().unwrap(), scope("bg"), sandbox).unwrap();
+        let source = ShellBackgroundProcesses {
+            shell: Arc::new(shell),
+        };
+        assert!(source.snapshot().is_empty());
+    }
+
+    fn next_test_root() -> u128 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        u128::from(COUNTER.fetch_add(1, Ordering::SeqCst))
+            + std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_millis())
+                .unwrap_or(0)
     }
 }

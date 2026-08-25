@@ -85,7 +85,7 @@ fn emitted_broadcast_discriminant(event: &RuntimeEvent) -> String {
 
 #[test]
 fn control_row_emits_control_request() {
-    let members = members_in_fixture(&CONTROL_ROW);
+    let members = members_in_fixture(&CONTROL_ROW).expect("pinned row resolves");
     let emitted = emitted_broadcast_discriminant(&RuntimeEvent::ControlRequest {
         request_id: text("approval-1"),
         request: bounded(json!({"kind": "permission"})),
@@ -100,7 +100,7 @@ fn control_row_emits_control_request() {
 
 #[tokio::test]
 async fn admission_row_emits_input_accepted() {
-    let members = members_in_fixture(&ADMISSION_ROW);
+    let members = members_in_fixture(&ADMISSION_ROW).expect("pinned row resolves");
     let clock = Arc::new(lotta_testkit::clock::FakeClock::new(
         lotta_domain::Timestamp::parse_persisted_rfc3339("2026-08-14T00:00:00Z")
             .expect("fixture instant"),
@@ -140,7 +140,7 @@ async fn admission_row_emits_input_accepted() {
 
 #[test]
 fn state_row_emits_device_snapshot() {
-    let members = members_in_fixture(&STATE_ROW);
+    let members = members_in_fixture(&STATE_ROW).expect("pinned row resolves");
     let emitted = emitted_broadcast_discriminant(&RuntimeEvent::UpdateDeviceStatus {
         device_status: bounded(json!({"is_processing": false})),
     });
@@ -153,7 +153,7 @@ fn state_row_emits_device_snapshot() {
 
 #[test]
 fn stream_row_emits_stream_delta() {
-    let members = members_in_fixture(&STREAM_ROW);
+    let members = members_in_fixture(&STREAM_ROW).expect("pinned row resolves");
     let emitted = emitted_broadcast_discriminant(&RuntimeEvent::StreamDelta {
         delta: bounded(json!({"type": "text", "text": "hi"})),
         subagent_id: None,
@@ -166,7 +166,7 @@ fn stream_row_emits_stream_delta() {
 
 #[test]
 fn terminal_row_emits_turn_finished() {
-    let members = members_in_fixture(&TERMINAL_ROW);
+    let members = members_in_fixture(&TERMINAL_ROW).expect("pinned row resolves");
     let emitted = emitted_broadcast_discriminant(&RuntimeEvent::TurnFinished {
         turn_id: text("turn-1"),
         run_id: Some(RunId::generate_sequence(1).expect("run id")),
@@ -181,7 +181,7 @@ fn terminal_row_emits_turn_finished() {
 
 #[test]
 fn management_row_emits_app_server_info() {
-    let members = members_in_fixture(&MANAGEMENT_ROW);
+    let members = members_in_fixture(&MANAGEMENT_ROW).expect("pinned row resolves");
     let captured: Arc<Mutex<Vec<Value>>> = Arc::default();
     let sink = Arc::clone(&captured);
     let forward = Arc::new(

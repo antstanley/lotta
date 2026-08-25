@@ -45,7 +45,7 @@
 //! wired only on the production turn path.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     pin::Pin,
     sync::{Arc, Mutex},
 };
@@ -1150,6 +1150,44 @@ impl ConversationsBridge {
             let _release = lock_lifecycle(&lifecycle).finish_command(&lease);
             outcome
         }
+    }
+
+    /// Runs one `/compact` slash command for a runtime scope through the exact
+    /// conversation compaction flow, returning pinned output text.
+    ///
+    /// The optional argument carries the pinned mode word (`all`,
+    /// `sliding_window`, or `help`); unknown modes fail like any rejected
+    /// compaction.
+    ///
+    /// # Errors
+    /// Returns the scrubbed compaction failure text on rejection.
+    pub async fn compact_runtime_text(
+        &self,
+        scope: &RuntimeScope,
+        args: Option<&str>,
+    ) -> Result<String, String> {
+        if args.map(str::trim) == Some("help") {
+            return Ok(compact_help_output().to_owned());
+        }
+        let mut settings = BTreeMap::new();
+        if let Some(mode) = args.map(str::trim).filter(|mode| !mode.is_empty()) {
+            settings.insert("mode".to_owned(), serde_json::json!(mode));
+        }
+        let command = ConversationCompactCommand {
+            request_id: format!("device-compact-{}", scope.conversation_id.as_str()),
+            conversation_id: scope.conversation_id.as_str().to_owned(),
+            body: Some(ConversationCompactBody {
+                agent_id: None,
+                compaction_settings: Some(
+                    BoundedMap::new(settings).map_err(|_| COMPACT_FAILURE.to_owned())?,
+                ),
+            }),
+        };
+        let outcome = self.compact_core(&command).await?;
+        Ok(format!(
+            "Compacted {} messages into {}",
+            outcome.num_messages_before, outcome.num_messages_after
+        ))
     }
 
     /// Routes one manual compaction through the injected authoritative
@@ -2484,6 +2522,16 @@ fn prepare_backend(
     let memfs = GitMemFs::new(root)
         .map_err(|_| AppServerError::Config("conversations backend unavailable"))?;
     Ok((LocalStore::new(paths), memfs))
+}
+
+/// The pinned `/compact help` text, mirroring the baseline listener verbatim.
+fn compact_help_output() -> &'static str {
+    "/compact help\n\
+     \nSummarize conversation history (compaction).\n\
+     \nUSAGE\n  \
+     /compact                   — compact with default mode\n  \
+     /compact all               — compact all messages\n  \
+     /compact sliding_window    — compact with sliding window\n"
 }
 
 /// Generates one random UUID v4 using the shared secure randomness source.

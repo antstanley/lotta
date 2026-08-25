@@ -3,12 +3,17 @@
 //!
 //! Branch operations run the pinned baseline's exact `git` invocations inside
 //! the workspace root only: a caller-supplied cwd is canonicalized and must
-//! remain under that root, output is byte-bounded, and every command carries
-//! the pinned timeout budget. Secrets persist through the Task 52 local-backend
-//! store family — one JSON side file written with the same restrictive
-//! provider-auth file mode and optimistic-revision discipline as
-//! `providers/auth.json`. Secret plaintext is write-only here: list and apply
-//! responses carry secret names, never values.
+//! remain under that root, output capture is byte-bounded, and every command
+//! carries the pinned timeout budget. Secrets persist through the Task 52
+//! local-backend store family — one JSON side file beside `providers/auth.json`,
+//! written with the same restrictive provider-auth file mode and optimistic-
+//! revision discipline. The location is a deliberate side-store: spec 04 keeps
+//! "JSON, JSONL, `auth.json`, side stores, and Git" as the canonical store
+//! family and does not name a secrets file, so this one sits in the same
+//! mode-0700/0600 credential directory instead of inventing an unlisted
+//! `.letta` layout entry. List responses carry `{key, value}` entries whose
+//! plaintext values are intentionally exposed to the authenticated secrets
+//! modal per the pinned protocol contract.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -28,6 +33,8 @@ pub(crate) const BRANCH_SEARCH_TIMEOUT_MS: u64 = 5_000;
 pub(crate) const BRANCH_CHECKOUT_TIMEOUT_MS: u64 = 10_000;
 /// Maximum accepted branch-query bytes.
 pub(crate) const BRANCH_QUERY_BYTES_MAX: usize = 1_024;
+/// Maximum captured stdout/stderr bytes per bounded git invocation.
+pub(crate) const GIT_OUTPUT_BYTES_MAX: usize = 1_048_576;
 /// Maximum retained secrets per agent record.
 pub(crate) const SECRETS_PER_AGENT_MAX: usize = 128;
 /// Maximum agents holding at least one secret.
@@ -48,8 +55,8 @@ pub struct GitBranchInfo {
 ///
 /// # Errors
 /// Returns a scrubbed failure text when the cwd escapes the workspace root,
-/// the command exceeds its deadline, or git exits non-zero or overflows the
-/// bounded output buffer.
+/// the command exceeds its deadline, git exits non-zero, or either output
+/// stream overflows the bounded capture buffer.
 pub(crate) async fn run_git(
     workspace_root: &Path,
     cwd: Option<&String>,
@@ -57,24 +64,68 @@ pub(crate) async fn run_git(
     timeout_ms: u64,
 ) -> Result<String, String> {
     let dir = confined_dir(workspace_root, cwd)?;
-    let child = Command::new("git")
+    let mut child = Command::new("git")
         .current_dir(&dir)
         .args(args)
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
-        .output();
-    let wait = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), child);
-    let output = wait
-        .await
-        .map_err(|_| "git command timed out".to_owned())?
+        .spawn()
         .map_err(|_| "failed to run git".to_owned())?;
-    if !output.status.success() {
+    let stdout = child.stdout.take().ok_or("git output unavailable")?;
+    let stderr = child.stderr.take().ok_or("git output unavailable")?;
+    // Each stream drains to EOF under its own explicit byte bound; both
+    // readers finish at or before process exit closes the pipes.
+    let stdout_reader = tokio::spawn(bounded_stream(stdout));
+    let stderr_reader = tokio::spawn(bounded_stream(stderr));
+    let wait = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), async {
+        let status = child.wait().await.map_err(|_| "failed to run git")?;
+        let _stderr = stderr_reader
+            .await
+            .map_err(|_| "failed to run git".to_owned())??;
+        let stdout = stdout_reader
+            .await
+            .map_err(|_| "failed to run git".to_owned())??;
+        Ok::<_, String>((status, stdout))
+    });
+    // kill_on_drop reaps the child when the timed-out future drops.
+    let (status, stdout_bytes) = wait
+        .await
+        .map_err(|_| "git command timed out".to_owned())??;
+    if !status.success() {
         return Err("git command failed".to_owned());
     }
-    String::from_utf8(output.stdout).map_err(|_| "git produced invalid utf-8".to_owned())
+    String::from_utf8(stdout_bytes).map_err(|_| "git produced invalid utf-8".to_owned())
+}
+
+/// Reads one output stream to EOF, refusing anything past the capture bound.
+async fn bounded_stream(
+    mut pipe: impl tokio::io::AsyncRead + Unpin + Send,
+) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    loop {
+        let mut chunk = [0_u8; 8192];
+        let read = pipe
+            .read(&mut chunk)
+            .await
+            .map_err(|_| "failed to run git".to_owned())?;
+        if read == 0 {
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.len() > GIT_OUTPUT_BYTES_MAX {
+            return Err("git output exceeded the capture bound".to_owned());
+        }
+    }
 }
 
 /// Resolves the effective working directory, refusing anything outside the root.
+///
+/// Canonicalization is fail-closed: a cwd that cannot be resolved on disk
+/// (missing path or broken symlink) is rejected rather than accepted as-is,
+/// so no unverified path ever reaches git.
 fn confined_dir(root: &Path, cwd: Option<&String>) -> Result<PathBuf, String> {
     let Some(raw) = cwd else {
         return Ok(root.to_path_buf());
@@ -83,11 +134,44 @@ fn confined_dir(root: &Path, cwd: Option<&String>) -> Result<PathBuf, String> {
     if !candidate.is_absolute() {
         return Err("cwd must be absolute".to_owned());
     }
-    let resolved = candidate.canonicalize().unwrap_or(candidate);
+    let resolved = candidate
+        .canonicalize()
+        .map_err(|_| "cwd unavailable".to_owned())?;
     if !resolved.starts_with(root) || resolved == root.parent().unwrap_or(root) {
         return Err("cwd escapes the workspace".to_owned());
     }
     Ok(resolved)
+}
+
+/// Validates one branch reference name before handing it to git.
+///
+/// Rejects option-looking leading dashes and any character outside the
+/// git-check-ref-format alphabet (`A-Za-z0-9._/-`), plus the known dangerous
+/// sequences: empty components (`..`, `//`, leading/trailing `/`),
+/// `.lock` suffixes, leading `.`, trailing `.`, and `@{`.
+pub(crate) fn valid_branch_name(branch: &str) -> bool {
+    if branch.starts_with('-') || branch.is_empty() || branch.len() > BRANCH_QUERY_BYTES_MAX {
+        return false;
+    }
+    if !branch.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '/' | '-')
+    }) {
+        return false;
+    }
+    // Every byte is ASCII from here, so suffix slicing stays boundary-safe.
+    !branch.starts_with('.')
+        && !branch.ends_with('.')
+        && !branch.ends_with('/')
+        && !has_lock_suffix(branch)
+        && !branch.contains("..")
+        && !branch.contains("//")
+        && !branch.contains("@{")
+}
+
+/// Case-insensitive `.lock` suffix probe over already-validated ASCII input.
+fn has_lock_suffix(branch: &str) -> bool {
+    const LOCK: &str = ".lock";
+    branch.len() >= LOCK.len() && branch[branch.len() - LOCK.len()..].eq_ignore_ascii_case(LOCK)
 }
 
 /// Parses bounded `git branch -a --format=%(refname:short)\t%(HEAD)` output.
@@ -115,12 +199,14 @@ fn parse_branch_line(line: &str) -> Option<GitBranchInfo> {
     })
 }
 
-/// Per-agent named secrets persisted beside the Task 52 provider auth store.
+/// Per-agent named secrets persisted in the Task 52 local-backend credential
+/// directory.
 ///
 /// The on-disk form is `{ "<agent_id>": { "<NAME>": "<plaintext>" } }`; the
-/// wire surface built above it exposes names only.
+/// wire `secret_list` surface exposes the pinned `{key, value}` entries to
+/// authenticated secrets modals, while apply responses carry names only.
 #[derive(Clone)]
-pub(crate) struct AgentSecretsStore {
+pub struct AgentSecretsStore {
     path: PathBuf,
 }
 
@@ -131,10 +217,16 @@ struct StoredSecrets {
 }
 
 impl AgentSecretsStore {
-    /// Creates the store over `<storage>/.letta/secrets.json`.
-    pub(crate) fn new(storage_dir: &Path) -> Self {
+    /// Creates the store over `<storage>/providers/secrets.json`.
+    ///
+    /// The file is a documented side-store beside `providers/auth.json`:
+    /// spec 04 names no dedicated secrets path, so the store reuses the exact
+    /// credential-directory discipline (mode 0700 dir, 0600 file,
+    /// provider-auth write mode) already sanctioned for secret material.
+    #[must_use]
+    pub fn new(storage_dir: &Path) -> Self {
         Self {
-            path: storage_dir.join(".letta").join("secrets.json"),
+            path: storage_dir.join("providers").join("secrets.json"),
         }
     }
 
@@ -182,18 +274,18 @@ impl AgentSecretsStore {
         Ok(names)
     }
 
-    /// Returns the sorted secret names held for one agent.
+    /// Returns sorted `{key, value}` entries held for one agent.
     ///
     /// # Errors
     /// Returns a scrubbed failure text when the store cannot be read.
-    pub(crate) fn names(&self, agent_id: &str) -> Result<Vec<String>, String> {
+    pub(crate) fn entries(&self, agent_id: &str) -> Result<Vec<(String, String)>, String> {
         let stored = self.load()?;
         Ok(stored
             .agents
             .get(agent_id)
             .into_iter()
-            .flat_map(BTreeMap::keys)
-            .cloned()
+            .flat_map(BTreeMap::iter)
+            .map(|(key, value)| (key.clone(), value.clone()))
             .collect())
     }
 
@@ -234,6 +326,43 @@ impl AgentSecretsStore {
             None => atomic_write(&self.path, &bytes, WriteMode::ProviderAuth),
         };
         outcome.map_err(|_| "secrets store write conflicted".to_owned())
+    }
+}
+
+/// Agent-scoped [`lotta_tools::pipeline::SecretResolver`] over one
+/// [`AgentSecretsStore`]: resolves applied secret plaintext for tool
+/// pipelines executing on that agent's behalf.
+pub struct AgentSecretResolver {
+    store: AgentSecretsStore,
+    agent_id: String,
+}
+
+impl AgentSecretResolver {
+    /// Creates a resolver reading the secret record of exactly one agent.
+    #[must_use]
+    pub fn new(store: AgentSecretsStore, agent_id: impl Into<String>) -> Self {
+        Self {
+            store,
+            agent_id: agent_id.into(),
+        }
+    }
+
+    /// Creates a resolver over `<storage>/providers/secrets.json` for one agent.
+    #[must_use]
+    pub fn over_storage(storage_dir: &Path, agent_id: impl Into<String>) -> Self {
+        Self::new(AgentSecretsStore::new(storage_dir), agent_id)
+    }
+}
+
+impl lotta_tools::pipeline::SecretResolver for AgentSecretResolver {
+    fn resolve(&self, name: &str) -> Result<Option<String>, lotta_tools::PipelineError> {
+        match self.store.entries(&self.agent_id) {
+            Ok(entries) => Ok(entries
+                .into_iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value)),
+            Err(_) => Err(lotta_tools::PipelineError::SecretDelivery),
+        }
     }
 }
 

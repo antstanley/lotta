@@ -52,6 +52,7 @@ pub(super) enum SessionStatus {
 struct Session {
     owner: Option<TurnOwner>,
     status: SessionStatus,
+    command: String,
     output: VecDeque<u8>,
     aggregate_output_bytes: usize,
     peak_retained_bytes: usize,
@@ -65,7 +66,33 @@ struct Session {
     notify: Arc<Notify>,
     read_offset: usize,
     started: tokio::time::Instant,
+    started_epoch_ms: i64,
     ordinal: u64,
+}
+
+/// Wire-safe lifecycle label for one session status.
+fn status_label(status: SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Running => "running",
+        SessionStatus::Completed => "completed",
+        SessionStatus::Failed => "failed",
+        SessionStatus::Stopped => "stopped",
+    }
+}
+
+/// One bounded background-session summary for device-status snapshots.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShellSessionSummary {
+    /// Stable process identity assigned at launch.
+    pub process_id: String,
+    /// Launched command line.
+    pub command: String,
+    /// Start instant in epoch milliseconds.
+    pub started_at_ms: i64,
+    /// Lifecycle status: `running`, `completed`, `failed`, or `stopped`.
+    pub status: &'static str,
+    /// Exit code, once settled.
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -370,7 +397,7 @@ impl ProcessManager {
     fn reserve(
         &self,
         id: &str,
-        _command: &str,
+        command: &str,
         cancellation: CancellationToken,
         _interactive: bool,
     ) -> Result<(), ManagerError> {
@@ -390,6 +417,11 @@ impl ProcessManager {
                 return Err(ManagerError::Limit);
             }
         }
+        let started_epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+            });
         guard.insert(
             id.to_owned(),
             Session {
@@ -399,6 +431,7 @@ impl ProcessManager {
                     .ok()
                     .and_then(|owner| owner.clone()),
                 status: SessionStatus::Running,
+                command: command.to_owned(),
                 output: VecDeque::new(),
                 aggregate_output_bytes: 0,
                 peak_retained_bytes: 0,
@@ -412,6 +445,7 @@ impl ProcessManager {
                 notify: Arc::new(Notify::new()),
                 read_offset: 0,
                 started: tokio::time::Instant::now(),
+                started_epoch_ms,
                 ordinal: self.next_id.load(Ordering::Relaxed),
             },
         );
@@ -490,6 +524,27 @@ impl ProcessManager {
     #[cfg(test)]
     pub(super) fn session_count(&self) -> usize {
         self.sessions.lock().map_or(0, |guard| guard.len())
+    }
+
+    /// Summaries of every tracked background session, oldest first.
+    ///
+    /// Backs the device-status `background_processes` section: the snapshot
+    /// reflects actual sessions this manager owns, including settled ones
+    /// still retained for output reads.
+    pub(super) fn background_snapshot(&self) -> Vec<ShellSessionSummary> {
+        let Ok(guard) = self.sessions.lock() else {
+            return Vec::new();
+        };
+        guard
+            .iter()
+            .map(|(id, session)| ShellSessionSummary {
+                process_id: id.clone(),
+                command: session.command.clone(),
+                started_at_ms: session.started_epoch_ms,
+                status: status_label(session.status),
+                exit_code: session.exit_code,
+            })
+            .collect()
     }
 
     #[cfg(test)]

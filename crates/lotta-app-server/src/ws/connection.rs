@@ -123,6 +123,15 @@ impl RuntimeConnections {
         self.entries.get(&id).map(|entry| entry.subscriptions.len())
     }
 
+    /// Returns the exact runtime scopes one connection subscribes to.
+    #[must_use]
+    pub fn subscriptions_of(&self, id: ConnectionId) -> Vec<RuntimeScope> {
+        self.entries
+            .get(&id)
+            .map(|entry| entry.subscriptions.as_slice().to_vec())
+            .unwrap_or_default()
+    }
+
     /// Stamps one logical event independently for subscribers in ordinal order.
     ///
     /// # Errors

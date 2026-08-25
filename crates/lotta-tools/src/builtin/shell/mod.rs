@@ -80,6 +80,15 @@ impl ShellToolBundle {
         self.manager.has_operations()
     }
 
+    /// Summaries of every background session this bundle's manager tracks.
+    ///
+    /// Backs the device-status `background_processes` section, so snapshots
+    /// reflect actual sessions instead of a hardcoded empty list.
+    #[must_use]
+    pub fn background_snapshot(&self) -> Vec<manager::ShellSessionSummary> {
+        self.manager.background_snapshot()
+    }
+
     /// Returns a stable identity for the exact shared process manager.
     #[must_use]
     pub fn manager_id(&self) -> usize {
