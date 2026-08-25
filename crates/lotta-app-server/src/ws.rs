@@ -12,6 +12,14 @@ pub mod connection;
 /// 28, 30, and 58.
 #[path = "ws/groups/conversations.rs"]
 pub mod conversations;
+/// Device command group bridging wire frames to Tasks 18 and 45 plus git and
+/// secrets surfaces.
+#[path = "ws/groups/device.rs"]
+pub mod device;
+/// Confined git operations and the local-backend secrets store behind the
+/// device command group.
+#[path = "ws/groups/device_support.rs"]
+pub mod device_support;
 /// Runtime event lifecycle envelopes.
 pub mod envelope;
 /// Exact runtime broadcast event models.
@@ -22,12 +30,17 @@ pub mod external_tools;
 /// Files command group bridging wire frames to confined workspace services.
 #[path = "ws/groups/files.rs"]
 pub mod files;
+/// Introspection command group serving authenticated capability discovery.
+#[path = "ws/groups/introspection.rs"]
+pub mod introspection;
 /// Memory command group bridging wire frames to the Task 29 memory repository.
 #[path = "ws/groups/memory.rs"]
 pub mod memory;
 /// Models/providers command group bridging wire frames to Tasks 47, 52, and 32.
 #[path = "ws/groups/models.rs"]
 pub mod models;
+/// §Outbound message groups coverage model over the pinned protocol fixture.
+pub mod outbound;
 /// Synchronous owner-local routing and deferred input application.
 pub mod router;
 /// Schedules command group bridging wire frames to Tasks 60 and 61.

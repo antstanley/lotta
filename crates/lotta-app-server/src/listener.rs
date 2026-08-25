@@ -38,11 +38,13 @@ use crate::{
         UnsupportedRuntimeCommandService,
         agents::{AgentsBridge, decode as decode_agents},
         conversations::{ConversationsBridge, decode as decode_conversations},
+        device::{DeviceBridge, decode as decode_device},
         external_tools::{
             ExternalForwarder, ExternalToolBridge, ExternalToolsCommand, ExternalToolsMessage,
             ToolsUpdateResponseMessage, decode as decode_external_tools,
         },
         files::{FilesBridge, decode as decode_files},
+        introspection::{IntrospectionBridge, decode as decode_introspection},
         lock_router,
         memory::{MemoryBridge, decode as decode_memory},
         models::{ModelsBridge, decode as decode_models},
@@ -111,6 +113,8 @@ struct ListenerState {
     schedules: Arc<SchedulesBridge>,
     skills: Arc<SkillsBridge>,
     settings: Arc<SettingsBridge>,
+    devices: Arc<DeviceBridge>,
+    introspection: Arc<IntrospectionBridge>,
     next_observation: AtomicU64,
     outbound: Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
 }
@@ -451,27 +455,15 @@ async fn start_listener_with_limits(
     // The artifacts root backs Task 37 tool artifact operations; the files
     // group creates it on first bind next to the canonical storage root.
     let artifacts_dir = prepared.storage_dir.join("artifacts");
-    let files = Arc::new(FilesBridge::new(
-        files_forwarder(&outbound),
-        &prepared.workspace_dir,
-        &artifacts_dir,
-    )?);
-    let memories = Arc::new(MemoryBridge::new(
-        memory_forwarder(&outbound),
-        &prepared.storage_dir,
-        clock.clone(),
-    )?);
-    let agents = Arc::new(AgentsBridge::new(
-        agents_forwarder(&outbound),
-        &prepared.storage_dir,
-        Arc::clone(&clock),
-    )?);
-    let conversations = compose_conversations_bridge(
+    let storage = compose_storage_bridges(
         &outbound,
-        &prepared.storage_dir,
+        &prepared,
         &clock,
+        &artifacts_dir,
         conversations_authority,
     )?;
+    let (devices, introspection) =
+        compose_device_bridges(&outbound, &prepared.workspace_dir, &prepared.storage_dir);
     let state = Arc::new(ListenerState {
         auth: prepared.auth,
         clock: Arc::clone(&clock),
@@ -487,22 +479,16 @@ async fn start_listener_with_limits(
             terminal_forwarder(&outbound),
             clock.clone(),
         )),
-        files,
-        memories,
-        agents,
-        conversations,
-        models: Arc::new(ModelsBridge::new(
-            models_forwarder(&outbound),
-            &prepared.storage_dir,
-            Arc::clone(&clock),
-        )?),
-        schedules: Arc::new(SchedulesBridge::new(
-            schedules_forwarder(&outbound),
-            &prepared.storage_dir,
-            Arc::clone(&clock),
-        )?),
+        files: storage.files,
+        memories: storage.memories,
+        agents: storage.agents,
+        conversations: storage.conversations,
+        models: storage.models,
+        schedules: storage.schedules,
         skills,
         settings,
+        devices,
+        introspection,
         next_observation: AtomicU64::new(1),
         outbound,
     });
@@ -642,6 +628,7 @@ fn open_connection(
         router.connections.initialize(id)?;
         id
     };
+    state.introspection.register_authenticated(id);
     let inserted = prepare_outbound(state, id, sender);
     if inserted.is_err() {
         lock_router(&state.runtime_router)?.connections.close(id);
@@ -669,6 +656,7 @@ fn close_connection(state: &ListenerState, id: crate::ws::ConnectionId) {
     state.external_tools.disconnect(id);
     state.terminals.disconnect(id);
     state.files.disconnect(id);
+    state.introspection.unregister(id);
     if let Ok(mut outbound) = state.outbound.lock() {
         outbound.remove(&id);
     }
@@ -901,6 +889,20 @@ fn settings_forwarder(
     Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
 }
 
+fn device_forwarder(
+    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
+) -> crate::ws::device::DeviceForwarder {
+    let outbound = Arc::clone(outbound);
+    Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
+}
+
+fn introspection_forwarder(
+    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
+) -> crate::ws::introspection::IntrospectionForwarder {
+    let outbound = Arc::clone(outbound);
+    Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
+}
+
 fn agents_forwarder(
     outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
 ) -> crate::ws::agents::AgentsForwarder {
@@ -932,6 +934,75 @@ fn compose_conversations_bridge(
         Arc::clone(clock),
         authority,
     )?))
+}
+
+/// Storage-root-backed command-group bridges composed once at startup.
+struct StorageBridges {
+    files: Arc<FilesBridge>,
+    memories: Arc<MemoryBridge>,
+    agents: Arc<AgentsBridge>,
+    conversations: Arc<ConversationsBridge>,
+    models: Arc<ModelsBridge>,
+    schedules: Arc<SchedulesBridge>,
+}
+
+/// Composes the storage-root-backed command-group bridges once at startup.
+fn compose_storage_bridges(
+    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
+    prepared: &PreparedServer,
+    clock: &Arc<dyn Clock + Send + Sync>,
+    artifacts_dir: &std::path::Path,
+    authority: Option<Arc<dyn crate::ws::conversations::ConversationAuthority>>,
+) -> Result<StorageBridges, AppServerError> {
+    let files = Arc::new(FilesBridge::new(
+        files_forwarder(outbound),
+        &prepared.workspace_dir,
+        artifacts_dir,
+    )?);
+    let memories = Arc::new(MemoryBridge::new(
+        memory_forwarder(outbound),
+        &prepared.storage_dir,
+        Arc::clone(clock),
+    )?);
+    let agents = Arc::new(AgentsBridge::new(
+        agents_forwarder(outbound),
+        &prepared.storage_dir,
+        Arc::clone(clock),
+    )?);
+    let conversations =
+        compose_conversations_bridge(outbound, &prepared.storage_dir, clock, authority)?;
+    let models = Arc::new(ModelsBridge::new(
+        models_forwarder(outbound),
+        &prepared.storage_dir,
+        Arc::clone(clock),
+    )?);
+    let schedules = Arc::new(SchedulesBridge::new(
+        schedules_forwarder(outbound),
+        &prepared.storage_dir,
+        Arc::clone(clock),
+    )?);
+    Ok(StorageBridges {
+        files,
+        memories,
+        agents,
+        conversations,
+        models,
+        schedules,
+    })
+}
+
+/// Composes the device and introspection bridges over canonical roots.
+fn compose_device_bridges(
+    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
+    workspace_dir: &std::path::Path,
+    storage_dir: &std::path::Path,
+) -> (Arc<DeviceBridge>, Arc<IntrospectionBridge>) {
+    let devices = Arc::new(
+        DeviceBridge::new(device_forwarder(outbound), workspace_dir, storage_dir)
+            .expect("workspace root validated at startup"),
+    );
+    let introspection = Arc::new(IntrospectionBridge::new(introspection_forwarder(outbound)));
+    (devices, introspection)
 }
 
 /// Decodes and routes the external-tool command group for one frame.
@@ -1097,8 +1168,7 @@ fn handle_agents_frame(
 
 /// Decodes and routes the conversation management command group for one
 /// frame. Handlers run in detached tasks; the conversations bridge owns no
-/// per-connection resources, so connection cleanup needs no conversations
-/// step. This is the final group of the decode chain.
+/// per-connection resources, so connection cleanup needs no conversations step.
 fn handle_conversations_frame(
     state: &Arc<ListenerState>,
     connection_id: crate::ws::ConnectionId,
@@ -1106,11 +1176,43 @@ fn handle_conversations_frame(
 ) -> bool {
     match decode_conversations(frame) {
         Err(error) => dispatch_value(state, connection_id, &error).is_ok(),
-        Ok(None) => true,
+        Ok(None) => handle_device_frame(state, connection_id, frame),
         Ok(Some(command)) => {
             state.conversations.handle(connection_id, &command);
             true
         }
+    }
+}
+
+/// Decodes and routes the device command group for one frame. Handlers run in
+/// detached tasks; the device bridge owns no per-connection resources, so
+/// connection cleanup needs no device step.
+fn handle_device_frame(
+    state: &Arc<ListenerState>,
+    connection_id: crate::ws::ConnectionId,
+    frame: &crate::framing::DecodedFrame,
+) -> bool {
+    match decode_device(frame) {
+        Err(error) => dispatch_value(state, connection_id, &error).is_ok(),
+        Ok(None) => handle_introspection_frame(state, connection_id, frame),
+        Ok(Some(command)) => {
+            state.devices.handle(connection_id, &command);
+            true
+        }
+    }
+}
+
+/// Decodes and routes the introspection group for one frame. This is the
+/// final group of the decode chain.
+fn handle_introspection_frame(
+    state: &Arc<ListenerState>,
+    connection_id: crate::ws::ConnectionId,
+    frame: &crate::framing::DecodedFrame,
+) -> bool {
+    match decode_introspection(frame) {
+        Err(error) => dispatch_value(state, connection_id, &error).is_ok(),
+        Ok(None) => true,
+        Ok(Some(command)) => state.introspection.handle(connection_id, &command),
     }
 }
 

@@ -90,6 +90,7 @@ fn state(
     let (sender, receiver) = mpsc::channel(4);
     let mut outbound = HashMap::new();
     outbound.insert(id, sender);
+    let group = compose_group_bridges();
     let state = Arc::new(ListenerState {
         auth: AuthPolicy::None,
         clock,
@@ -109,56 +110,12 @@ fn state(
             inert_terminal_forwarder(),
             Arc::new(TestClock),
         )),
-        files: Arc::new(
-            crate::ws::files::FilesBridge::with_poll_interval(
-                crate::ws::files::inert_forwarder(),
-                &files_workspace("observer"),
-                &files_workspace("observer-artifacts"),
-                60_000,
-            )
-            .expect("files bridge"),
-        ),
-        memories: Arc::new(
-            crate::ws::memory::MemoryBridge::new(
-                crate::ws::memory::inert_forwarder(),
-                &files_workspace("observer-memfs"),
-                Arc::new(TestClock),
-            )
-            .expect("memory bridge"),
-        ),
-        agents: Arc::new(
-            crate::ws::agents::AgentsBridge::new(
-                crate::ws::agents::inert_forwarder(),
-                &files_workspace("observer-agents"),
-                Arc::new(TestClock),
-            )
-            .expect("agents bridge"),
-        ),
-        conversations: Arc::new(
-            crate::ws::conversations::ConversationsBridge::new(
-                crate::ws::conversations::inert_forwarder(),
-                &files_workspace("observer-conversations"),
-                Arc::new(TestClock),
-                None,
-            )
-            .expect("conversations bridge"),
-        ),
-        models: Arc::new(
-            crate::ws::models::ModelsBridge::new(
-                crate::ws::models::inert_forwarder(),
-                &files_workspace("observer-models"),
-                Arc::new(TestClock),
-            )
-            .expect("models bridge"),
-        ),
-        schedules: Arc::new(
-            crate::ws::schedules::SchedulesBridge::new(
-                crate::ws::schedules::inert_forwarder(),
-                &files_workspace("observer-schedules"),
-                Arc::new(TestClock),
-            )
-            .expect("schedules bridge"),
-        ),
+        files: group.files,
+        memories: group.memories,
+        agents: group.agents,
+        conversations: group.conversations,
+        models: group.models,
+        schedules: group.schedules,
         skills: Arc::new(crate::ws::skills::SkillsBridge::new(
             crate::ws::skills::inert_forwarder(),
             &files_workspace("observer-skills"),
@@ -172,6 +129,17 @@ fn state(
             )
             .expect("settings bridge"),
         ),
+        devices: Arc::new(
+            crate::ws::device::DeviceBridge::new(
+                crate::ws::device::inert_forwarder(),
+                &files_workspace("observer-device-workspace"),
+                &files_workspace("observer-device-storage"),
+            )
+            .expect("device bridge"),
+        ),
+        introspection: Arc::new(crate::ws::introspection::IntrospectionBridge::new(
+            crate::ws::introspection::inert_forwarder(),
+        )),
         next_observation: AtomicU64::new(1),
         outbound: Arc::new(Mutex::new(outbound)),
     });
@@ -292,4 +260,71 @@ fn exhausted_observation_ordinal_skips_observer_after_dispatch() {
         .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
     assert!(dispatch_output(&state, id, &output(&state, event("SATURATED"))).is_ok());
     assert!(observer.values().is_empty());
+}
+
+/// One storage-backed bridge bundle for observer fixtures.
+struct GroupBridges {
+    files: Arc<crate::ws::files::FilesBridge>,
+    memories: Arc<crate::ws::memory::MemoryBridge>,
+    agents: Arc<crate::ws::agents::AgentsBridge>,
+    conversations: Arc<crate::ws::conversations::ConversationsBridge>,
+    models: Arc<crate::ws::models::ModelsBridge>,
+    schedules: Arc<crate::ws::schedules::SchedulesBridge>,
+}
+
+/// Composes the storage-backed bridges over unique temporary roots.
+fn compose_group_bridges() -> GroupBridges {
+    let clock: Arc<dyn Clock + Send + Sync> = Arc::new(TestClock);
+    GroupBridges {
+        files: Arc::new(
+            crate::ws::files::FilesBridge::with_poll_interval(
+                crate::ws::files::inert_forwarder(),
+                &files_workspace("observer"),
+                &files_workspace("observer-artifacts"),
+                60_000,
+            )
+            .expect("files bridge"),
+        ),
+        memories: Arc::new(
+            crate::ws::memory::MemoryBridge::new(
+                crate::ws::memory::inert_forwarder(),
+                &files_workspace("observer-memfs"),
+                Arc::clone(&clock),
+            )
+            .expect("memory bridge"),
+        ),
+        agents: Arc::new(
+            crate::ws::agents::AgentsBridge::new(
+                crate::ws::agents::inert_forwarder(),
+                &files_workspace("observer-agents"),
+                Arc::clone(&clock),
+            )
+            .expect("agents bridge"),
+        ),
+        conversations: Arc::new(
+            crate::ws::conversations::ConversationsBridge::new(
+                crate::ws::conversations::inert_forwarder(),
+                &files_workspace("observer-conversations"),
+                Arc::clone(&clock),
+                None,
+            )
+            .expect("conversations bridge"),
+        ),
+        models: Arc::new(
+            crate::ws::models::ModelsBridge::new(
+                crate::ws::models::inert_forwarder(),
+                &files_workspace("observer-models"),
+                Arc::clone(&clock),
+            )
+            .expect("models bridge"),
+        ),
+        schedules: Arc::new(
+            crate::ws::schedules::SchedulesBridge::new(
+                crate::ws::schedules::inert_forwarder(),
+                &files_workspace("observer-schedules"),
+                Arc::clone(&clock),
+            )
+            .expect("schedules bridge"),
+        ),
+    }
 }

@@ -265,6 +265,17 @@ fn typed_failure_state(
             )
             .expect("settings bridge"),
         ),
+        devices: Arc::new(
+            crate::ws::device::DeviceBridge::new(
+                crate::ws::device::inert_forwarder(),
+                &prepared.workspace_dir,
+                &prepared.storage_dir,
+            )
+            .expect("device bridge"),
+        ),
+        introspection: Arc::new(crate::ws::introspection::IntrospectionBridge::new(
+            crate::ws::introspection::inert_forwarder(),
+        )),
         next_observation: std::sync::atomic::AtomicU64::new(1),
         outbound: Arc::new(Mutex::new(HashMap::from([(origin, sender)]))),
     }

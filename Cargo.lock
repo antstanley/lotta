@@ -947,6 +947,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hmac",
  "lotta-domain",
+ "lotta-extensions",
  "lotta-memfs",
  "lotta-protocol",
  "lotta-providers",
