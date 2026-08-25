@@ -284,13 +284,15 @@ impl ProductionComponents {
         register_turn_authorities(&shared, &provider, &setup, &runtime_state, &brokers, &shell);
         let runtime_service = Arc::new(ProductionRuntimeService::new(
             store_paths.clone(),
-            Arc::clone(&clock),
-            setup.hook_runtime(),
-            Arc::clone(&runtime_state),
-            Arc::clone(&approval_manager),
-            Arc::clone(&brokers),
-            shared.settings(),
-            tasks,
+            ProductionRuntimeDependencies {
+                clock: Arc::clone(&clock),
+                hooks: setup.hook_runtime(),
+                state: Arc::clone(&runtime_state),
+                approvals: Arc::clone(&approval_manager),
+                brokers: Arc::clone(&brokers),
+                settings: shared.settings(),
+                tasks,
+            },
         ));
         let (reflection, memory_push, reflection_port, memory_port) = post_turn_capabilities();
         let turn_controller = Arc::new(ProductionTurnController::new(
@@ -388,6 +390,34 @@ impl ProductionComponents {
     }
 }
 
+fn production_task40(
+    workspace: &std::path::Path,
+    skill_roots: &SkillRoots,
+    shell: &ShellToolBundle,
+    tasks: Arc<TaskLifecyclePort>,
+) -> Result<Task40ToolBundle, SetupError> {
+    let discovered = SkillDiscovery::discover(skill_roots, SkillSources::ALL)
+        .map_err(|_| SetupError::Adapter("skill discovery".into()))?;
+    let skills: Arc<dyn lotta_tools::builtin::skill::RegisteredSkillPort> = Arc::new(
+        SkillToolPort::new(discovered)
+            .map_err(|_| SetupError::Adapter("skill tool registry".into()))?,
+    );
+    let (interaction, _requests) = InteractionPort::new();
+    Task40ToolBundle::new(
+        Arc::new(PlanningPort::new()),
+        tasks,
+        production_shell_scope()?,
+        skills,
+        interaction,
+        Arc::new(
+            LanguageServerRegistry::new(workspace.to_path_buf(), [])
+                .map_err(|_| SetupError::Adapter("language server registry".into()))?,
+        ),
+        shell,
+    )
+    .map_err(|_| SetupError::Adapter("task40 tool bundle".into()))
+}
+
 fn production_builtins(
     root: &std::path::Path,
     workspace: &std::path::Path,
@@ -398,25 +428,7 @@ fn production_builtins(
 ) -> Result<Vec<ToolRegistration>, SetupError> {
     let file = FileToolBundle::new(workspace, &root.join("artifacts"))
         .map_err(|_| SetupError::Adapter("file tool bundle".into()))?;
-    let discovered = SkillDiscovery::discover(skill_roots, SkillSources::ALL)
-        .map_err(|_| SetupError::Adapter("skill discovery".into()))?;
-    let skills: Arc<dyn lotta_tools::builtin::skill::RegisteredSkillPort> = Arc::new(
-        SkillToolPort::new(discovered)
-            .map_err(|_| SetupError::Adapter("skill tool registry".into()))?,
-    );
-    let (interaction, _requests) = InteractionPort::new();
-    let task40 = Task40ToolBundle::new(
-        Arc::new(PlanningPort::new()),
-        tasks,
-        skills,
-        interaction,
-        Arc::new(
-            LanguageServerRegistry::new(workspace.to_path_buf(), [])
-                .map_err(|_| SetupError::Adapter("language server registry".into()))?,
-        ),
-        shell,
-    )
-    .map_err(|_| SetupError::Adapter("task40 tool bundle".into()))?;
+    let task40 = production_task40(workspace, skill_roots, shell, tasks)?;
     let agent = AgentId::accept("production-agent").map_err(adapter)?;
     let conversation =
         lotta_domain::ConversationId::accept("production-conversation").map_err(adapter)?;
@@ -1085,6 +1097,16 @@ impl lotta_app_server::ws::device::BackgroundProcessSource for ShellBackgroundPr
     }
 }
 
+struct ProductionRuntimeDependencies {
+    clock: Arc<dyn Clock + Send + Sync>,
+    hooks: Arc<dyn lotta_runtime::hooks::HookRuntime>,
+    state: Arc<ProductionRuntimeState>,
+    approvals: Arc<lotta_runtime::ApprovalManager>,
+    brokers: Arc<ProductionTurnBrokers>,
+    settings: Arc<SettingsBridge>,
+    tasks: Arc<TaskLifecyclePort>,
+}
+
 pub(crate) struct ProductionRuntimeService {
     store: LocalStore,
     clock: Arc<dyn Clock + Send + Sync>,
@@ -1098,25 +1120,16 @@ pub(crate) struct ProductionRuntimeService {
 }
 
 impl ProductionRuntimeService {
-    fn new(
-        store_paths: StorePaths,
-        clock: Arc<dyn Clock + Send + Sync>,
-        hooks: Arc<dyn lotta_runtime::hooks::HookRuntime>,
-        state: Arc<ProductionRuntimeState>,
-        approvals: Arc<lotta_runtime::ApprovalManager>,
-        brokers: Arc<ProductionTurnBrokers>,
-        settings: Arc<SettingsBridge>,
-        tasks: Arc<TaskLifecyclePort>,
-    ) -> Self {
+    fn new(store_paths: StorePaths, dependencies: ProductionRuntimeDependencies) -> Self {
         Self {
             store: LocalStore::new(store_paths),
-            clock,
-            hooks,
-            state,
-            approvals,
-            brokers,
-            settings,
-            tasks,
+            clock: dependencies.clock,
+            hooks: dependencies.hooks,
+            state: dependencies.state,
+            approvals: dependencies.approvals,
+            brokers: dependencies.brokers,
+            settings: dependencies.settings,
+            tasks: dependencies.tasks,
             device_snapshot: Mutex::new(None),
         }
     }
@@ -1828,10 +1841,25 @@ fn emit_started_continuation(
         .get(&key)
         .map(|pending| pending.item.clone())
         .ok_or(AppServerError::Malformed)?;
-    sink.emit(
-        scope,
-        loop_event("EXECUTING_COMMAND", Vec::new(), Vec::new())?,
-    )
+    let state = service
+        .state
+        .inner
+        .try_lock()
+        .map_err(|_| AppServerError::Internal)?;
+    let handle = state
+        .registry
+        .lookup(&RuntimeKey::from(scope))
+        .ok_or(AppServerError::Internal)?;
+    let runs = state
+        .registry
+        .lifecycle(&handle)
+        .ok_or(AppServerError::Internal)?
+        .projection()
+        .active_run_ids()
+        .iter()
+        .map(|run_id| run_id.as_str().to_owned())
+        .collect();
+    sink.emit(scope, loop_event("EXECUTING_COMMAND", runs, Vec::new())?)
 }
 
 async fn sync_outcome(
@@ -1843,21 +1871,17 @@ async fn sync_outcome(
     if active.is_none() {
         let _ = service.ensure_runtime(&command.runtime)?;
     }
+    let status = authoritative_status_snapshot(service, &key, active.as_ref()).await?;
     let device = service.device_snapshot(&command.runtime)?;
     let mut broadcasts = vec![lotta_app_server::ws::RuntimeEvent::UpdateDeviceStatus {
         device_status: device,
     }];
     let executing_tools = service.executing_tool_snapshot(&key)?;
-    broadcasts.extend(sync_status_broadcasts(
-        service,
-        &key,
-        active.as_ref(),
-        executing_tools,
-    )?);
+    broadcasts.extend(sync_status_broadcasts(status, executing_tools)?);
     broadcasts.push(lotta_app_server::ws::RuntimeEvent::UpdateSubagentState {
-        subagents: task_snapshot(service).await?,
+        subagents: task_snapshot(service, &command.runtime).await?,
     });
-    if command.recover_approvals.unwrap_or(true) {
+    if command.recover_approvals {
         broadcasts.extend(sync_approval_broadcasts(
             service,
             &command.runtime,
@@ -1871,35 +1895,59 @@ async fn sync_outcome(
 
 async fn task_snapshot(
     service: &ProductionRuntimeService,
+    scope: &RuntimeScope,
 ) -> Result<BoundedJsonValue, AppServerError> {
     let tasks = service
         .tasks
-        .snapshot()
+        .snapshot(scope)
         .await
         .map_err(|_| AppServerError::Internal)?;
     BoundedJsonValue::new(serde_json::to_value(tasks).map_err(|_| AppServerError::Internal)?)
         .map_err(|_| AppServerError::Internal)
 }
 
-fn sync_status_broadcasts(
+struct AuthoritativeStatusSnapshot {
+    status: &'static str,
+    active_run_ids: Vec<String>,
+    queue: Vec<QueueItem>,
+}
+
+async fn active_run_ids(
     service: &ProductionRuntimeService,
     key: &RuntimeKey,
-    active: Option<&(lotta_domain::TurnLease, Vec<QueueItem>)>,
-    executing_tools: Vec<String>,
-) -> Result<Vec<lotta_app_server::ws::RuntimeEvent>, AppServerError> {
-    if let Some((active_lease, queue)) = active {
-        let _ = active_lease;
-        return Ok(vec![
-            loop_event("EXECUTING_COMMAND", Vec::new(), executing_tools)?,
-            queue_event(queue)?,
-        ]);
+    lease: &TurnLease,
+) -> Result<Vec<String>, AppServerError> {
+    let state = service.state.inner.lock().await;
+    let handle = state.registry.lookup(key).ok_or(AppServerError::Internal)?;
+    let lifecycle = state
+        .registry
+        .lifecycle(&handle)
+        .ok_or(AppServerError::Internal)?;
+    if !lifecycle.is_current(lease) {
+        return Err(AppServerError::Malformed);
     }
-    let Ok(state) = service.state.inner.try_lock() else {
-        return Ok(Vec::new());
-    };
-    let Some(handle) = state.registry.lookup(key) else {
-        return Ok(Vec::new());
-    };
+    Ok(lifecycle
+        .projection()
+        .active_run_ids()
+        .iter()
+        .map(|run_id| run_id.as_str().to_owned())
+        .collect())
+}
+
+async fn authoritative_status_snapshot(
+    service: &ProductionRuntimeService,
+    key: &RuntimeKey,
+    active: Option<&(TurnLease, Vec<QueueItem>)>,
+) -> Result<AuthoritativeStatusSnapshot, AppServerError> {
+    if let Some((lease, queue)) = active {
+        return Ok(AuthoritativeStatusSnapshot {
+            status: "EXECUTING_COMMAND",
+            active_run_ids: active_run_ids(service, key, lease).await?,
+            queue: queue.clone(),
+        });
+    }
+    let state = service.state.inner.lock().await;
+    let handle = state.registry.lookup(key).ok_or(AppServerError::Internal)?;
     let lifecycle = state
         .registry
         .lifecycle(&handle)
@@ -1908,22 +1956,36 @@ fn sync_status_broadcasts(
     let queue = state
         .registry
         .queue(&handle)
-        .ok_or(AppServerError::Internal)?;
+        .ok_or(AppServerError::Internal)?
+        .items()
+        .cloned()
+        .collect();
+    Ok(AuthoritativeStatusSnapshot {
+        status: loop_status_name(lifecycle.loop_status()),
+        active_run_ids: lifecycle
+            .active_run_ids()
+            .iter()
+            .map(|run_id| run_id.as_str().to_owned())
+            .collect(),
+        queue,
+    })
+}
+
+fn loop_status_name(status: lotta_domain::LoopStatus) -> &'static str {
+    match status {
+        lotta_domain::LoopStatus::WaitingOnInput => "WAITING_ON_INPUT",
+        lotta_domain::LoopStatus::ExecutingCommand => "EXECUTING_COMMAND",
+        lotta_domain::LoopStatus::SendingApiRequest => "SENDING_API_REQUEST",
+    }
+}
+
+fn sync_status_broadcasts(
+    status: AuthoritativeStatusSnapshot,
+    executing_tools: Vec<String>,
+) -> Result<Vec<lotta_app_server::ws::RuntimeEvent>, AppServerError> {
     Ok(vec![
-        loop_event(
-            match lifecycle.loop_status() {
-                lotta_domain::LoopStatus::WaitingOnInput => "WAITING_ON_INPUT",
-                lotta_domain::LoopStatus::ExecutingCommand => "EXECUTING_COMMAND",
-                lotta_domain::LoopStatus::SendingApiRequest => "SENDING_API_REQUEST",
-            },
-            lifecycle
-                .active_run_ids()
-                .iter()
-                .map(|run_id| run_id.as_str().to_owned())
-                .collect(),
-            executing_tools,
-        )?,
-        queue_event(&queue.items().cloned().collect::<Vec<_>>())?,
+        loop_event(status.status, status.active_run_ids, executing_tools)?,
+        queue_event(&status.queue)?,
     ])
 }
 
@@ -2020,7 +2082,7 @@ impl RuntimeCommandService for ProductionRuntimeService {
                     .await
                     .map_err(|_| AppServerError::Internal)?;
             }
-            let broadcasts = if command.recover_approvals.unwrap_or(true) {
+            let broadcasts = if command.recover_approvals {
                 sync_approval_broadcasts(self, &runtime, None)?
             } else {
                 Vec::new()
@@ -2759,10 +2821,126 @@ impl ProductionEffects {
         });
         self.actor.append(Box::new(entry))
     }
+
+    fn wire_event(
+        &self,
+        event: TurnEvent,
+    ) -> Result<lotta_app_server::ws::RuntimeEvent, lotta_runtime::RuntimeError> {
+        match event {
+            TurnEvent::ControlRequest(request) => self.control_request_event(request),
+            TurnEvent::StreamDelta(projection) => self.stream_projection_event(projection),
+            TurnEvent::Finished { reason } => self.finished_event(
+                NonEmptyString::new(format!("{reason:?}").to_lowercase()).map_err(effect_error)?,
+            ),
+            TurnEvent::Cancelled => {
+                self.finished_event(NonEmptyString::new("cancelled").map_err(effect_error)?)
+            }
+            TurnEvent::Failed { reason } => {
+                self.finished_event(NonEmptyString::new(reason.wire_value()).map_err(effect_error)?)
+            }
+            TurnEvent::Retry(_) => loop_event("RETRYING_API_REQUEST", Vec::new(), Vec::new())
+                .map_err(|_| effect_error("retry loop snapshot")),
+            TurnEvent::ToolResult(result) => self.tool_result_event(result),
+        }
+    }
+
+    fn control_request_event(
+        &self,
+        request: lotta_runtime::turn::ControlRequest,
+    ) -> Result<lotta_app_server::ws::RuntimeEvent, lotta_runtime::RuntimeError> {
+        let payload = BoundedJsonValue::new(serde_json::json!({
+            "subtype": "can_use_tool",
+            "tool_call_id": request.call_id.as_str(),
+            "tool_name": request.tool_name.as_str(),
+            "input": request.input.as_value(),
+            "permission_suggestions": [],
+            "blocked_path": null,
+        }))
+        .map_err(effect_error)?;
+        Ok(lotta_app_server::ws::RuntimeEvent::ControlRequest {
+            request_id: request.request_id,
+            request: payload,
+            agent_id: NonEmptyString::new(self.scope.agent_id.as_str().to_owned()).ok(),
+            conversation_id: NonEmptyString::new(self.scope.conversation_id.as_str().to_owned())
+                .ok(),
+        })
+    }
+
+    fn stream_projection_event(
+        &self,
+        projection: TurnProjection,
+    ) -> Result<lotta_app_server::ws::RuntimeEvent, lotta_runtime::RuntimeError> {
+        let delta = BoundedJsonValue::new(serde_json::json!({
+            "kind": format!("{:?}", projection.kind).to_lowercase(),
+            "text": projection.text.as_str(),
+            "input_id": self.input_id.as_str()
+        }))
+        .map_err(effect_error)?;
+        Ok(lotta_app_server::ws::RuntimeEvent::StreamDelta {
+            delta,
+            subagent_id: None,
+        })
+    }
+
+    fn finished_event(
+        &self,
+        stop_reason: NonEmptyString,
+    ) -> Result<lotta_app_server::ws::RuntimeEvent, lotta_runtime::RuntimeError> {
+        Ok(lotta_app_server::ws::RuntimeEvent::TurnFinished {
+            turn_id: self.turn_id.clone(),
+            run_id: Some(self.run_id.clone()),
+            stop_reason,
+            error: None,
+        })
+    }
+
+    fn tool_result_event(
+        &self,
+        result: lotta_runtime::turn::ToolResultRecord,
+    ) -> Result<lotta_app_server::ws::RuntimeEvent, lotta_runtime::RuntimeError> {
+        let status = if matches!(&result.outcome, ToolOutcome::Success { .. }) {
+            "success"
+        } else {
+            "error"
+        };
+        let delta = BoundedJsonValue::new(serde_json::json!({
+            "id": format!("{}-tool-end-{}", self.turn_id.as_str(), result.call_id.as_str()),
+            "date": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "message_type": "client_tool_end",
+            "tool_call_id": result.call_id.as_str(),
+            "status": status,
+        }))
+        .map_err(effect_error)?;
+        Ok(lotta_app_server::ws::RuntimeEvent::StreamDelta {
+            delta,
+            subagent_id: None,
+        })
+    }
+
+    fn emit_tool_completion_snapshot(&self, call_id: &str) -> EffectResult {
+        let key = RuntimeKey::from(&self.scope);
+        self.runtime_state
+            .executing_tools
+            .lock()
+            .map_err(|_| effect_error("executing tool state"))?
+            .remove(&key);
+        let snapshot = loop_event("EXECUTING_COMMAND", Vec::new(), Vec::new())
+            .map_err(|_| effect_error("tool completion snapshot"))?;
+        self.sink
+            .emit(&self.scope, snapshot)
+            .map_err(|_| effect_error("tool completion snapshot"))?;
+        debug_assert!(!call_id.is_empty());
+        Ok(())
+    }
 }
 
 impl TurnEffectPort for ProductionEffects {
-    fn tool_started(&self, call_id: &lotta_runtime::ports::ToolCallId) -> EffectResult {
+    fn tool_started(
+        &self,
+        call_id: &lotta_runtime::ports::ToolCallId,
+        tool_name: &NonEmptyString,
+        input: &lotta_runtime::ports::ValidatedToolInput,
+    ) -> EffectResult {
         let key = RuntimeKey::from(&self.scope);
         self.runtime_state
             .executing_tools
@@ -2770,8 +2948,12 @@ impl TurnEffectPort for ProductionEffects {
             .map_err(|_| effect_error("executing tool state"))?
             .insert(key, vec![call_id.as_str().to_owned()]);
         let delta = BoundedJsonValue::new(serde_json::json!({
+            "id": format!("{}-tool-start-{}", self.turn_id.as_str(), call_id.as_str()),
+            "date": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             "message_type": "client_tool_start",
             "tool_call_id": call_id.as_str(),
+            "tool_name": tool_name.as_str(),
+            "tool_args": input.as_value(),
         }))
         .map_err(effect_error)?;
         self.sink
@@ -2814,84 +2996,12 @@ impl TurnEffectPort for ProductionEffects {
             TurnEvent::ToolResult(result) => Some(result.call_id.as_str().to_owned()),
             _ => None,
         };
-        let wire = match event {
-            TurnEvent::ControlRequest(request) => {
-                lotta_app_server::ws::RuntimeEvent::ControlRequest {
-                    request_id: request.request_id,
-                    request: BoundedJsonValue::new(serde_json::json!({
-                        "subtype": "can_use_tool",
-                        "tool_call_id": request.call_id.as_str(),
-                        "tool_name": request.tool_name.as_str(),
-                        "input": request.input.as_value(),
-                        "permission_suggestions": [],
-                        "blocked_path": null,
-                    }))
-                    .map_err(effect_error)?,
-                    agent_id: NonEmptyString::new(self.scope.agent_id.as_str().to_owned()).ok(),
-                    conversation_id: NonEmptyString::new(
-                        self.scope.conversation_id.as_str().to_owned(),
-                    )
-                    .ok(),
-                }
-            }
-            TurnEvent::StreamDelta(projection) => lotta_app_server::ws::RuntimeEvent::StreamDelta {
-                delta: BoundedJsonValue::new(serde_json::json!({
-                    "kind": format!("{:?}", projection.kind).to_lowercase(),
-                    "text": projection.text.as_str(),
-                    "input_id": self.input_id.as_str()
-                }))
-                .map_err(effect_error)?,
-                subagent_id: None,
-            },
-            TurnEvent::Finished { reason } => lotta_app_server::ws::RuntimeEvent::TurnFinished {
-                turn_id: self.turn_id.clone(),
-                run_id: Some(self.run_id.clone()),
-                stop_reason: NonEmptyString::new(format!("{reason:?}").to_lowercase())
-                    .map_err(effect_error)?,
-                error: None,
-            },
-            TurnEvent::Cancelled => lotta_app_server::ws::RuntimeEvent::TurnFinished {
-                turn_id: self.turn_id.clone(),
-                run_id: Some(self.run_id.clone()),
-                stop_reason: NonEmptyString::new("cancelled").map_err(effect_error)?,
-                error: None,
-            },
-            TurnEvent::Failed { reason } => lotta_app_server::ws::RuntimeEvent::TurnFinished {
-                turn_id: self.turn_id.clone(),
-                run_id: Some(self.run_id.clone()),
-                stop_reason: NonEmptyString::new(reason.wire_value()).map_err(effect_error)?,
-                error: None,
-            },
-            TurnEvent::Retry(_retry) => loop_event("RETRYING_API_REQUEST", Vec::new(), Vec::new())
-                .map_err(|_| effect_error("retry loop snapshot"))?,
-            TurnEvent::ToolResult(result) => lotta_app_server::ws::RuntimeEvent::StreamDelta {
-                delta: BoundedJsonValue::new(serde_json::json!({
-                    "message_type": "client_tool_end",
-                    "tool_call_id": result.call_id.as_str(),
-                    "tool_result": result.outcome,
-                }))
-                .map_err(effect_error)?,
-                subagent_id: None,
-            },
-        };
+        let wire = self.wire_event(event)?;
         self.sink
             .emit(&self.scope, wire)
             .map_err(|_| effect_error("runtime event sink"))?;
         if let Some(call_id) = tool_end {
-            let key = RuntimeKey::from(&self.scope);
-            let mut tools = self
-                .runtime_state
-                .executing_tools
-                .lock()
-                .map_err(|_| effect_error("executing tool state"))?;
-            tools.remove(&key);
-            drop(tools);
-            let snapshot = loop_event("EXECUTING_COMMAND", Vec::new(), Vec::new())
-                .map_err(|_| effect_error("tool completion snapshot"))?;
-            self.sink
-                .emit(&self.scope, snapshot)
-                .map_err(|_| effect_error("tool completion snapshot"))?;
-            debug_assert!(!call_id.is_empty());
+            self.emit_tool_completion_snapshot(&call_id)?;
         }
         #[cfg(test)]
         if cancelled {
@@ -3479,15 +3589,17 @@ mod production_tests {
         let settings = test_settings_bridge(paths.root(), paths.root());
         let service = ProductionRuntimeService::new(
             paths,
-            Arc::new(TestClock),
-            Arc::new(lotta_runtime::hooks::NoopHookRuntime),
-            Arc::new(ProductionRuntimeState::new(Arc::new(
-                lotta_runtime::observe::RuntimeObserver::default(),
-            ))),
-            approvals,
-            Arc::new(ProductionTurnBrokers::new()),
-            settings,
-            Arc::new(TaskLifecyclePort::new()),
+            ProductionRuntimeDependencies {
+                clock: Arc::new(TestClock),
+                hooks: Arc::new(lotta_runtime::hooks::NoopHookRuntime),
+                state: Arc::new(ProductionRuntimeState::new(Arc::new(
+                    lotta_runtime::observe::RuntimeObserver::default(),
+                ))),
+                approvals,
+                brokers: Arc::new(ProductionTurnBrokers::new()),
+                settings,
+                tasks: Arc::new(TaskLifecyclePort::new()),
+            },
         );
         service.register_device_snapshot_source(Arc::new(|_| {
             BoundedJsonValue::new(serde_json::json!({"is_online": true}))
@@ -3649,13 +3761,15 @@ mod production_tests {
         let settings = test_settings_bridge(&root, &workspace);
         let service = Arc::new(ProductionRuntimeService::new(
             paths,
-            Arc::new(TestClock),
-            setup.hook_runtime(),
-            Arc::clone(&state),
-            Arc::clone(&approvals),
-            Arc::clone(&brokers),
-            Arc::clone(&settings),
-            Arc::new(TaskLifecyclePort::new()),
+            ProductionRuntimeDependencies {
+                clock: Arc::new(TestClock),
+                hooks: setup.hook_runtime(),
+                state: Arc::clone(&state),
+                approvals: Arc::clone(&approvals),
+                brokers: Arc::clone(&brokers),
+                settings: Arc::clone(&settings),
+                tasks: Arc::new(TaskLifecyclePort::new()),
+            },
         ));
         let controller = Arc::new(ProductionTurnController::new(
             setup,
@@ -4402,7 +4516,7 @@ mod production_tests {
                     .sync(SyncCommand {
                         request_id: None,
                         runtime: scope.clone(),
-                        recover_approvals: None,
+                        recover_approvals: true,
                         force_device_status: None,
                     })
                     .await
@@ -4792,13 +4906,15 @@ mod production_tests {
         let settings = test_settings_bridge(paths.root(), paths.root());
         let service = ProductionRuntimeService::new(
             paths,
-            Arc::new(TestClock),
-            Arc::new(lotta_runtime::hooks::NoopHookRuntime),
-            Arc::clone(&state),
-            approvals,
-            Arc::new(ProductionTurnBrokers::new()),
-            settings,
-            Arc::new(TaskLifecyclePort::new()),
+            ProductionRuntimeDependencies {
+                clock: Arc::new(TestClock),
+                hooks: Arc::new(lotta_runtime::hooks::NoopHookRuntime),
+                state: Arc::clone(&state),
+                approvals,
+                brokers: Arc::new(ProductionTurnBrokers::new()),
+                settings,
+                tasks: Arc::new(TaskLifecyclePort::new()),
+            },
         );
         (Arc::new(service), state)
     }

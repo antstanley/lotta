@@ -7,10 +7,14 @@ use crate::{
     },
     registry::ToolRegistration,
 };
+use lotta_domain::RuntimeScope;
 use lotta_runtime::ports::{ToolApprovalPolicy, ToolOutcome, ToolOutcomeCode, ToolOutcomeMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 use tokio::sync::Mutex;
 
 /// Maximum retained task records.
@@ -81,25 +85,36 @@ struct TaskState {
 
 /// Typed explicit task lifecycle port.
 pub struct TaskLifecyclePort {
-    state: Mutex<TaskState>,
+    states: Mutex<HashMap<RuntimeScope, TaskState>>,
 }
 
 impl TaskLifecyclePort {
-    /// Creates isolated conversation task state.
+    /// Creates isolated runtime-scoped task state.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            state: Mutex::new(TaskState {
-                next_id: 1,
-                revision: 1,
-                ..TaskState::default()
-            }),
+            states: Mutex::new(HashMap::new()),
         }
     }
 
-    async fn create(&self, input: CreateInput) -> Result<TaskRecord, TaskError> {
+    fn empty_state() -> TaskState {
+        TaskState {
+            next_id: 1,
+            revision: 1,
+            ..TaskState::default()
+        }
+    }
+
+    async fn create(
+        &self,
+        scope: &RuntimeScope,
+        input: CreateInput,
+    ) -> Result<TaskRecord, TaskError> {
         validate_create(&input)?;
-        let mut state = self.state.lock().await;
+        let mut states = self.states.lock().await;
+        let state = states
+            .entry(scope.clone())
+            .or_insert_with(Self::empty_state);
         let mut candidate = state.clone();
         if candidate.records.len() >= TASKS_ITEMS_MAX {
             return Err(TaskError::Limit);
@@ -127,13 +142,13 @@ impl TaskLifecyclePort {
         Ok(record)
     }
 
-    async fn get(&self, task_id: &str) -> Result<TaskRecord, TaskError> {
+    async fn get(&self, scope: &RuntimeScope, task_id: &str) -> Result<TaskRecord, TaskError> {
         validate_text(task_id)?;
-        self.state
+        self.states
             .lock()
             .await
-            .records
-            .get(task_id)
+            .get(scope)
+            .and_then(|state| state.records.get(task_id))
             .cloned()
             .ok_or(TaskError::Unknown)
     }
@@ -142,12 +157,11 @@ impl TaskLifecyclePort {
     ///
     /// # Errors
     /// Returns a bounded-state or synchronization failure.
-    pub async fn snapshot(&self) -> Result<Vec<TaskRecord>, TaskError> {
-        self.list().await
-    }
-
-    async fn list(&self) -> Result<Vec<TaskRecord>, TaskError> {
-        let state = self.state.lock().await;
+    pub async fn snapshot(&self, scope: &RuntimeScope) -> Result<Vec<TaskRecord>, TaskError> {
+        let states = self.states.lock().await;
+        let Some(state) = states.get(scope) else {
+            return Ok(Vec::new());
+        };
         let mut output = Vec::new();
         output
             .try_reserve_exact(state.order.len())
@@ -158,9 +172,14 @@ impl TaskLifecyclePort {
         Ok(output)
     }
 
-    async fn update(&self, input: UpdateInput) -> Result<TaskRecord, TaskError> {
+    async fn update(
+        &self,
+        scope: &RuntimeScope,
+        input: UpdateInput,
+    ) -> Result<TaskRecord, TaskError> {
         validate_update(&input)?;
-        let mut state = self.state.lock().await;
+        let mut states = self.states.lock().await;
+        let state = states.get_mut(scope).ok_or(TaskError::Unknown)?;
         let mut candidate = state.clone();
         validate_dependencies(&candidate, &input)?;
         let revision = next_revision(&mut candidate)?;
@@ -242,6 +261,7 @@ pub enum TaskError {
 
 struct TaskExecutor {
     port: Arc<TaskLifecyclePort>,
+    scope: RuntimeScope,
 }
 
 impl ToolExecutor for TaskExecutor {
@@ -249,11 +269,12 @@ impl ToolExecutor for TaskExecutor {
         let name = request.definition.internal_name.as_str().to_owned();
         let value = request.input.as_value().clone();
         let port = Arc::clone(&self.port);
+        let scope = self.scope.clone();
         Box::pin(async move {
             if request.cancellation.is_cancelled() {
                 return failure("interrupted", "Task operation interrupted.");
             }
-            let result = execute_operation(&port, &name, value).await;
+            let result = execute_operation(&port, &scope, &name, value).await;
             match result {
                 Ok(value) => Ok(RawToolOutcome::Success(value)),
                 Err(TaskError::Unknown) => failure("unknown_task", "Task not found."),
@@ -266,17 +287,18 @@ impl ToolExecutor for TaskExecutor {
 
 async fn execute_operation(
     port: &TaskLifecyclePort,
+    scope: &RuntimeScope,
     name: &str,
     value: Value,
 ) -> Result<String, TaskError> {
     match name {
-        "TaskCreate" => encode(&port.create(decode(value)?).await?),
+        "TaskCreate" => encode(&port.create(scope, decode(value)?).await?),
         "TaskGet" => {
             let input: IdInput = decode(value)?;
-            encode(&port.get(&input.task_id).await?)
+            encode(&port.get(scope, &input.task_id).await?)
         }
-        "TaskList" => encode(&json!({"tasks": port.snapshot().await?})),
-        "TaskUpdate" => encode(&port.update(decode(value)?).await?),
+        "TaskList" => encode(&json!({"tasks": port.snapshot(scope).await?})),
+        "TaskUpdate" => encode(&port.update(scope, decode(value)?).await?),
         _ => Err(TaskError::Invalid),
     }
 }
@@ -565,8 +587,11 @@ fn failure(code: &str, message: &str) -> Result<RawToolOutcome, ExecutorError> {
 ///
 /// # Errors
 /// Rejects malformed pinned assets.
-pub fn registrations(port: Arc<TaskLifecyclePort>) -> Result<Vec<ToolRegistration>, TaskError> {
-    let executor: Arc<dyn ToolExecutor> = Arc::new(TaskExecutor { port });
+pub fn registrations(
+    port: Arc<TaskLifecyclePort>,
+    scope: RuntimeScope,
+) -> Result<Vec<ToolRegistration>, TaskError> {
+    let executor: Arc<dyn ToolExecutor> = Arc::new(TaskExecutor { port, scope });
     let mut output = Vec::new();
     for name in ["TaskCreate", "TaskGet", "TaskList", "TaskUpdate"] {
         output.push(

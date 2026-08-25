@@ -601,15 +601,7 @@ fn compose_listener_state(
     devices.register_background_processes_if_set(device_ports.background);
     Ok(Arc::new(ListenerState {
         auth: prepared.auth,
-        listener_instance: format!(
-            "listener-{}-{}",
-            std::process::id(),
-            clock
-                .now()
-                .as_utc()
-                .timestamp_nanos_opt()
-                .unwrap_or_default()
-        ),
+        listener_instance: listener_instance(clock),
         clock: Arc::clone(clock),
         shutdown,
         limits,
@@ -639,6 +631,18 @@ fn compose_listener_state(
         next_observation: AtomicU64::new(1),
         outbound,
     }))
+}
+
+fn listener_instance(clock: &Arc<dyn Clock + Send + Sync>) -> String {
+    format!(
+        "listener-{}-{}",
+        std::process::id(),
+        clock
+            .now()
+            .as_utc()
+            .timestamp_nanos_opt()
+            .unwrap_or_default()
+    )
 }
 
 /// Device-group ports registered by the production composition root.

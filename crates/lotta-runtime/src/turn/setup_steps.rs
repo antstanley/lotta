@@ -29,9 +29,19 @@ impl SetupOrchestrator<'_> {
         stages.push(SetupStage::ResolveCwd);
 
         self.check_ready(&input)?;
+        let runtime = lotta_domain::RuntimeScope::new(
+            input.agent_id.clone(),
+            input.conversation_id.clone(),
+            None,
+        );
         let scope = self
             .ports
-            .apply_scope(cwd.effective(), input.permission_mode, &input.cancellation)
+            .apply_scope(
+                runtime,
+                cwd.effective(),
+                input.permission_mode,
+                &input.cancellation,
+            )
             .await
             .map_err(SetupError::from)
             .map_err(SetupFailure::pre)?;

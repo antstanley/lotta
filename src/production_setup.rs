@@ -330,6 +330,7 @@ impl ProductionSetupPorts {
             .ok_or_else(|| RuntimeError::NotFound {
                 context: "turn tool snapshot unavailable".into(),
             })?;
+        let snapshot = Self::scoped_task_snapshot(snapshot, &scope.runtime)?;
         Ok(tools.scoped(
             snapshot,
             Arc::new(scope.permissions),
@@ -344,6 +345,42 @@ impl ProductionSetupPorts {
             )),
             scope.cwd,
         ))
+    }
+
+    fn scoped_task_snapshot(
+        snapshot: Arc<lotta_tools::RegistrySnapshot>,
+        scope: &lotta_domain::RuntimeScope,
+    ) -> Result<Arc<lotta_tools::RegistrySnapshot>, RuntimeError> {
+        let (toolset, mut registrations) = snapshot.complete_registrations();
+        let tasks = Arc::new(lotta_tools::builtin::task::TaskLifecyclePort::new());
+        let scoped =
+            lotta_tools::builtin::task::registrations(tasks, scope.clone()).map_err(|_| {
+                RuntimeError::AdapterFailure {
+                    code: "scoped_task_tools",
+                    context: "runtime-scoped task lifecycle".into(),
+                }
+            })?;
+        for replacement in scoped {
+            let name = replacement.definition.internal_name.as_str();
+            if let Some(current) = registrations
+                .iter_mut()
+                .find(|item| item.definition.internal_name.as_str() == name)
+            {
+                *current = replacement;
+            }
+        }
+        let registry =
+            lotta_tools::ToolRegistry::new(registrations).map_err(Self::tool_registry_runtime)?;
+        registry
+            .compose(toolset, &[], None)
+            .map_err(Self::tool_registry_runtime)
+    }
+
+    fn tool_registry_runtime(_: lotta_tools::RegistryError) -> RuntimeError {
+        RuntimeError::AdapterFailure {
+            code: "scoped_tool_registry",
+            context: "runtime-scoped tool snapshot".into(),
+        }
     }
 
     /// Returns the configured lifecycle hook runtime.
@@ -545,6 +582,7 @@ enum ReminderEntry {
 
 #[derive(Clone)]
 struct ProductionScope {
+    runtime: lotta_domain::RuntimeScope,
     cwd: PathBuf,
     permissions: PermissionPolicy,
 }
@@ -683,6 +721,7 @@ impl SetupPorts for ProductionSetupPorts {
 
     fn apply_scope(
         &self,
+        runtime: lotta_domain::RuntimeScope,
         cwd: &Path,
         mode: PermissionMode,
         cancellation: &CancellationToken,
@@ -704,16 +743,12 @@ impl SetupPorts for ProductionSetupPorts {
                     context: "permission settings".into(),
                 }
             })?;
-            let runtime_scope = lotta_domain::RuntimeScope::new(
-                lotta_domain::AgentId::accept("production-scope").map_err(runtime_adapter)?,
-                lotta_domain::ConversationId::accept("production-scope")
-                    .map_err(runtime_adapter)?,
-                None,
-            );
-            let permissions = PermissionPolicy::new(&canonical, runtime_scope, Some(mode), loaded)
-                .map_err(|_| RuntimeError::PermissionDenied {
-                    context: "permission policy".into(),
-                })?;
+            let permissions =
+                PermissionPolicy::new(&canonical, runtime.clone(), Some(mode), loaded).map_err(
+                    |_| RuntimeError::PermissionDenied {
+                        context: "permission policy".into(),
+                    },
+                )?;
             let id = self.next_scope_snapshot.fetch_add(1, Ordering::Relaxed);
             self.scope_snapshots
                 .lock()
@@ -724,6 +759,7 @@ impl SetupPorts for ProductionSetupPorts {
                 .insert(
                     id,
                     ProductionScope {
+                        runtime,
                         cwd: canonical,
                         permissions,
                     },

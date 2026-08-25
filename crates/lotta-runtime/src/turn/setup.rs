@@ -8,7 +8,7 @@
 use super::TurnToolCatalog;
 use crate::RuntimeError;
 use crate::ports::{AgentStore, ConversationStore, ProviderRequest};
-use lotta_domain::{Agent, AgentId, Conversation, ConversationId, PermissionMode};
+use lotta_domain::{Agent, AgentId, Conversation, ConversationId, PermissionMode, RuntimeScope};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -286,6 +286,7 @@ pub trait SetupPorts: Send + Sync {
     /// Applies the real permission and workspace sandbox engines.
     fn apply_scope(
         &self,
+        runtime: RuntimeScope,
         cwd: &Path,
         mode: PermissionMode,
         cancellation: &CancellationToken,

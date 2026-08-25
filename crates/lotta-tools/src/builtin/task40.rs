@@ -9,6 +9,7 @@ use super::{
     task::{self, TaskLifecyclePort},
 };
 use crate::{ToolRegistry, registry::ToolRegistration};
+use lotta_domain::RuntimeScope;
 use std::{collections::BTreeSet, sync::Arc};
 
 /// Fixed Task 40 bundle construction error.
@@ -32,6 +33,7 @@ impl Task40ToolBundle {
     pub fn new(
         planning: Arc<PlanningPort>,
         tasks: Arc<TaskLifecyclePort>,
+        scope: RuntimeScope,
         skills: Arc<dyn RegisteredSkillPort>,
         interaction: Arc<InteractionPort>,
         lsp_registry: Arc<LanguageServerRegistry>,
@@ -39,7 +41,7 @@ impl Task40ToolBundle {
     ) -> Result<Self, Task40BundleError> {
         let mut registrations = planning::registrations(planning).map_err(|_| Task40BundleError)?;
         registrations
-            .extend(task::registrations(Arc::clone(&tasks)).map_err(|_| Task40BundleError)?);
+            .extend(task::registrations(Arc::clone(&tasks), scope).map_err(|_| Task40BundleError)?);
         registrations.push(skill::registration(skills).map_err(|_| Task40BundleError)?);
         registrations.push(interaction::registration(interaction).map_err(|_| Task40BundleError)?);
         registrations.push(lsp::registration(lsp_registry).map_err(|_| Task40BundleError)?);

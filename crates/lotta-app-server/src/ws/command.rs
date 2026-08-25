@@ -121,7 +121,7 @@ pub struct RuntimeStartCommand {
     pub client_info: Option<RuntimeStartClientInfo>,
     /// Whether stale approvals should be recovered.
     #[serde(default = "recover_approvals_default")]
-    pub recover_approvals: Option<bool>,
+    pub recover_approvals: bool,
     /// Whether initial device status must be forced.
     pub force_device_status: Option<bool>,
     /// Whether resolution waits for replay.
@@ -167,13 +167,13 @@ pub struct SyncCommand {
     pub runtime: RuntimeScope,
     /// Whether stale approvals should be recovered.
     #[serde(default = "recover_approvals_default")]
-    pub recover_approvals: Option<bool>,
+    pub recover_approvals: bool,
     /// Whether unchanged device status must be emitted.
     pub force_device_status: Option<bool>,
 }
 
-fn recover_approvals_default() -> Option<bool> {
-    Some(true)
+const fn recover_approvals_default() -> bool {
+    true
 }
 
 /// Scoped run cancellation request.

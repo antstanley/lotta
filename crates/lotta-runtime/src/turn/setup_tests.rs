@@ -14,7 +14,7 @@ mod setup {
         ProviderToolChoice, ProviderTools, ReasoningControls, TokenLimit,
     };
     use lotta_domain::{
-        Agent, AgentId, Conversation, ConversationId, ModelDescriptor, PermissionMode,
+        Agent, AgentId, Conversation, ConversationId, ModelDescriptor, PermissionMode, RuntimeScope,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
@@ -211,6 +211,7 @@ mod setup {
         }
         fn apply_scope(
             &self,
+            _runtime: RuntimeScope,
             cwd: &Path,
             mode: PermissionMode,
             cancellation: &CancellationToken,
@@ -745,6 +746,11 @@ mod setup {
             });
             let scope = ports
                 .apply_scope(
+                    RuntimeScope::new(
+                        AgentId::accept("agent-a").unwrap(),
+                        ConversationId::accept("conversation-a").unwrap(),
+                        None,
+                    ),
                     &root,
                     PermissionMode::Unrestricted,
                     &CancellationToken::new(),

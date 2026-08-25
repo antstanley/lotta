@@ -1,5 +1,5 @@
 use super::*;
-use lotta_domain::{BoundedJsonValue, BoundedVec};
+use lotta_domain::{BoundedJsonValue, BoundedVec, RuntimeScope};
 use lotta_runtime::ports::{
     InternalToolName, ModelFacingToolName, PermissionAction, SecretRedactionPolicy,
     SecretRedactionSpec, ToolApprovalPolicy, ToolDescriptionAsset, ToolExecutionOwner,
@@ -14,6 +14,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 static ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn test_runtime_scope() -> RuntimeScope {
+    RuntimeScope::new(
+        AgentId::accept("setup-test-agent").expect("agent id"),
+        ConversationId::accept("setup-test-conversation").expect("conversation id"),
+        None,
+    )
+}
 
 #[derive(Default)]
 struct Statuses(Mutex<Vec<SetupStatus>>);
@@ -525,6 +533,7 @@ async fn production_stale_claim_before_append_is_reclaimed() {
     let early = fixture.ports().with_clock(|| 1_000);
     let early_scope = SetupPorts::apply_scope(
         &early,
+        test_runtime_scope(),
         &fallback,
         PermissionMode::Unrestricted,
         &CancellationToken::new(),
@@ -547,6 +556,7 @@ async fn production_stale_claim_before_append_is_reclaimed() {
         .with_clock(|| (REMINDER_PENDING_TTL_SECONDS + 2) * 1_000);
     let late_scope = SetupPorts::apply_scope(
         &late,
+        test_runtime_scope(),
         &fallback,
         PermissionMode::Unrestricted,
         &CancellationToken::new(),
@@ -576,6 +586,7 @@ async fn production_crash_after_append_recovers_consumed() {
     let ports = fixture.ports();
     let ports_scope = SetupPorts::apply_scope(
         &ports,
+        test_runtime_scope(),
         &fallback,
         PermissionMode::Unrestricted,
         &CancellationToken::new(),
@@ -623,6 +634,7 @@ async fn production_crash_after_append_recovers_consumed() {
     let recovered = fixture.ports().with_clock(|| 7_000);
     let recovered_scope = SetupPorts::apply_scope(
         &recovered,
+        test_runtime_scope(),
         &fallback,
         PermissionMode::Unrestricted,
         &CancellationToken::new(),
@@ -653,6 +665,7 @@ async fn production_concurrent_claim_exactly_one() {
         let second = fixture.ports().with_clock(|| 1_000);
         let first_scope = SetupPorts::apply_scope(
             &first,
+            test_runtime_scope(),
             &fallback,
             PermissionMode::Unrestricted,
             &CancellationToken::new(),
@@ -661,6 +674,7 @@ async fn production_concurrent_claim_exactly_one() {
         .expect("apply first scope");
         let second_scope = SetupPorts::apply_scope(
             &second,
+            test_runtime_scope(),
             &fallback,
             PermissionMode::Unrestricted,
             &CancellationToken::new(),
@@ -785,6 +799,7 @@ async fn production_strict_vs_unrestricted_actual_catalog() {
     let unrestricted = fixture.ports();
     let unrestricted_scope = SetupPorts::apply_scope(
         &unrestricted,
+        test_runtime_scope(),
         &fixture.root.join("isolation/workspace"),
         PermissionMode::Unrestricted,
         &CancellationToken::new(),
@@ -801,6 +816,7 @@ async fn production_strict_vs_unrestricted_actual_catalog() {
     let strict = fixture.ports();
     let strict_scope = SetupPorts::apply_scope(
         &strict,
+        test_runtime_scope(),
         &fixture.root.join("isolation/workspace"),
         PermissionMode::Strict,
         &CancellationToken::new(),
@@ -932,6 +948,7 @@ async fn production_strict_path_command_is_not_catalog_authorized() {
     let ports = fixture.ports();
     let scope_handle = SetupPorts::apply_scope(
         &ports,
+        test_runtime_scope(),
         &fixture.root.join("isolation/workspace"),
         PermissionMode::Strict,
         &CancellationToken::new(),

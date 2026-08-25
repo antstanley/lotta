@@ -81,6 +81,7 @@ async fn registry_aliases_share_state_and_every_nonblocking_tool_executes() {
     let bundle = Task40ToolBundle::new(
         Arc::clone(&planning),
         tasks,
+        scope(),
         skills,
         interaction,
         lsp,

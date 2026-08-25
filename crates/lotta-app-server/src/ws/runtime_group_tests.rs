@@ -152,7 +152,7 @@ async fn sync_preserves_flags_and_routes() {
     let RuntimeCommand::Sync(command) = &command else {
         panic!("sync")
     };
-    assert_eq!(command.recover_approvals, Some(false));
+    assert!(!command.recover_approvals);
     assert_eq!(command.force_device_status, Some(true));
     let (output, _) = route_command(
         router,

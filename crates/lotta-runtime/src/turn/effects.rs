@@ -109,7 +109,12 @@ pub trait TurnEffectPort: Send + Sync {
     ///
     /// # Errors
     /// Returns an owner-local lifecycle emission failure.
-    fn tool_started(&self, _call_id: &ToolCallId) -> Result<(), RuntimeError> {
+    fn tool_started(
+        &self,
+        _call_id: &ToolCallId,
+        _tool_name: &NonEmptyString,
+        _input: &ValidatedToolInput,
+    ) -> Result<(), RuntimeError> {
         Ok(())
     }
     /// Appends one normalized tool result to owner-local turn records.
