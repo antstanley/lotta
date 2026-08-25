@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 
 use lotta_domain::bounds::{CONNECTIONS_MAX, RUNTIME_SUBSCRIPTIONS_PER_CONNECTION_MAX};
-use std::time::{Duration, Instant};
+use std::{
+    hash::Hash,
+    time::{Duration, Instant},
+};
 
 /// Maximum suspended reconnect leases retained by one listener instance.
 pub const SUSPENDED_CONNECTIONS_MAX: usize = 1_024;
@@ -13,6 +16,17 @@ use super::{envelope::StampedRuntimeEvent, event::RuntimeEvent};
 
 /// Stable connection identifier assigned by the hub.
 pub type ConnectionId = u64;
+
+/// Collision-proof authenticated identity for resumable WebSocket state.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ReconnectIdentity {
+    /// Listener process instance that owns the lease.
+    pub listener_instance: String,
+    /// Stable verified authentication principal.
+    pub principal: String,
+    /// Client-generated identity distinguishing devices under one principal.
+    pub client_id: String,
+}
 
 struct SuspendedConnection {
     connection: RuntimeConnection,
@@ -33,9 +47,28 @@ pub struct EventDelivery {
 /// Owner-local connection registry and per-connection sequencing.
 pub struct RuntimeConnections {
     entries: HashMap<ConnectionId, RuntimeConnection>,
-    suspended: HashMap<String, SuspendedConnection>,
+    suspended: HashMap<ReconnectIdentity, SuspendedConnection>,
     next_id: ConnectionId,
     next_ordinal: u64,
+}
+
+fn connection_name(identity: &ReconnectIdentity) -> String {
+    serde_json::to_string(&(
+        &identity.listener_instance,
+        &identity.principal,
+        &identity.client_id,
+    ))
+    .unwrap_or_default()
+}
+
+fn reconnect_identity_from_name(value: &str) -> Option<ReconnectIdentity> {
+    let (listener_instance, principal, client_id): (String, String, String) =
+        serde_json::from_str(value).ok()?;
+    Some(ReconnectIdentity {
+        listener_instance,
+        principal,
+        client_id,
+    })
 }
 
 impl Default for RuntimeConnections {
@@ -67,7 +100,7 @@ impl RuntimeConnections {
     /// Returns a visible capacity, allocation, takeover, identifier, or counter error.
     pub fn open_authenticated(
         &mut self,
-        identity: Option<&str>,
+        identity: Option<&ReconnectIdentity>,
     ) -> Result<ConnectionId, crate::error::AppServerError> {
         self.validate_open(identity)?;
         let id = self.next_id;
@@ -91,13 +124,17 @@ impl RuntimeConnections {
 
     fn validate_open(
         &mut self,
-        identity: Option<&str>,
+        identity: Option<&ReconnectIdentity>,
     ) -> Result<(), crate::error::AppServerError> {
         self.purge_expired();
         if self.entries.len() == CONNECTIONS_MAX.value {
             return Err(crate::error::AppServerError::Unavailable);
         }
-        if identity.is_some_and(|key| self.entries.values().any(|entry| entry.id.as_str() == key)) {
+        if identity.is_some_and(|key| {
+            self.entries
+                .values()
+                .any(|entry| entry.id.as_str() == connection_name(key))
+        }) {
             return Err(crate::error::AppServerError::Forbidden);
         }
         self.entries
@@ -108,7 +145,7 @@ impl RuntimeConnections {
     fn connection_for(
         &self,
         id: ConnectionId,
-        identity: Option<&str>,
+        identity: Option<&ReconnectIdentity>,
         resumed: Option<RuntimeConnection>,
     ) -> Result<RuntimeConnection, crate::error::AppServerError> {
         if let Some(mut connection) = resumed {
@@ -117,7 +154,7 @@ impl RuntimeConnections {
         }
         Ok(RuntimeConnection {
             id: NonEmptyString::new(
-                identity.map_or_else(|| format!("connection-{id}"), str::to_owned),
+                identity.map_or_else(|| format!("connection-{id}"), connection_name),
             )
             .map_err(|_| crate::error::AppServerError::Internal)?,
             ordinal: self.next_ordinal,
@@ -151,8 +188,11 @@ impl RuntimeConnections {
         if self.suspended.len() >= SUSPENDED_CONNECTIONS_MAX {
             self.evict_oldest_suspended();
         }
+        let Some(identity) = reconnect_identity_from_name(connection.id.as_str()) else {
+            return;
+        };
         self.suspended.insert(
-            connection.id.as_str().to_owned(),
+            identity,
             SuspendedConnection {
                 connection,
                 suspended_at: Instant::now(),

@@ -41,8 +41,7 @@ pub fn verified_principal(token: &str) -> Result<String, AppServerError> {
     let principal = object
         .get("sub")
         .and_then(Value::as_str)
-        .or_else(|| object.get("iss").and_then(Value::as_str))
-        .unwrap_or("signed-bearer");
+        .ok_or(AppServerError::Unauthorized)?;
     if principal.is_empty() || principal.len() > 256 {
         return Err(AppServerError::Unauthorized);
     }

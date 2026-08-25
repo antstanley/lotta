@@ -6,13 +6,21 @@
 
 #[cfg(test)]
 mod reconnect {
-    use crate::ws::{RuntimeEvent, RuntimeRouter, test_support::*};
+    use crate::ws::{RuntimeEvent, RuntimeRouter, connection::ReconnectIdentity, test_support::*};
 
     fn resumed() -> (RuntimeRouter, crate::ws::ConnectionId) {
         let clock = std::sync::Arc::new(TestClock::new());
         let ids = std::sync::Arc::new(TestIds::new());
         let mut router = RuntimeRouter::new(clock, ids);
-        let original = router.connections.open().expect("open");
+        let identity = ReconnectIdentity {
+            listener_instance: "listener".into(),
+            principal: "principal".into(),
+            client_id: "device".into(),
+        };
+        let original = router
+            .connections
+            .open_authenticated(Some(&identity))
+            .expect("open");
         router.connections.initialize(original).expect("initialize");
         router
             .connections
@@ -22,7 +30,7 @@ mod reconnect {
         router.connections.suspend(original);
         let resumed = router
             .connections
-            .open_authenticated(Some("connection-1"))
+            .open_authenticated(Some(&identity))
             .expect("resume");
         router.connections.initialize(resumed).expect("initialize");
         (router, resumed)
@@ -66,11 +74,20 @@ mod reconnect {
     #[test]
     fn rejects_live_identity_takeover() {
         let (router, _, _, _) = router();
-        let error = router
-            .lock()
-            .expect("router")
+        let identity = ReconnectIdentity {
+            listener_instance: "listener".into(),
+            principal: "principal".into(),
+            client_id: "device".into(),
+        };
+        let mut locked = router.lock().expect("router");
+        locked.connections.close(1);
+        locked
             .connections
-            .open_authenticated(Some("connection-1"))
+            .open_authenticated(Some(&identity))
+            .expect("authenticated open");
+        let error = locked
+            .connections
+            .open_authenticated(Some(&identity))
             .expect_err("live identity cannot be replaced");
         assert!(matches!(error, crate::error::AppServerError::Forbidden));
     }

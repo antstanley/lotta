@@ -346,13 +346,16 @@ impl ApprovalManager {
         scope: &RuntimeScope,
         lease_generation: Option<u64>,
     ) -> Result<Vec<ApprovalRequest>, RuntimeError> {
+        let Some(lease_generation) = lease_generation else {
+            return Ok(Vec::new());
+        };
         let _transaction = self.transaction()?;
         Ok(self
             .list_requests_unlocked(scope)?
             .into_iter()
             .filter(|request| {
                 request.state == ApprovalState::Pending
-                    && lease_generation.is_none_or(|lease| request.lease_generation == lease)
+                    && request.lease_generation == lease_generation
             })
             .collect())
     }

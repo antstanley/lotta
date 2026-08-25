@@ -1098,10 +1098,6 @@ pub(crate) struct ProductionRuntimeService {
 }
 
 impl ProductionRuntimeService {
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "explicit production authority graph"
-    )]
     fn new(
         store_paths: StorePaths,
         clock: Arc<dyn Clock + Send + Sync>,
@@ -1861,7 +1857,7 @@ async fn sync_outcome(
     broadcasts.push(lotta_app_server::ws::RuntimeEvent::UpdateSubagentState {
         subagents: task_snapshot(service).await?,
     });
-    if command.recover_approvals.unwrap_or(false) {
+    if command.recover_approvals.unwrap_or(true) {
         broadcasts.extend(sync_approval_broadcasts(
             service,
             &command.runtime,
@@ -2024,6 +2020,11 @@ impl RuntimeCommandService for ProductionRuntimeService {
                     .await
                     .map_err(|_| AppServerError::Internal)?;
             }
+            let broadcasts = if command.recover_approvals.unwrap_or(true) {
+                sync_approval_broadcasts(self, &runtime, None)?
+            } else {
+                Vec::new()
+            };
             Ok(RuntimeStartOutcome {
                 runtime,
                 created_agent: false,
@@ -2040,7 +2041,7 @@ impl RuntimeCommandService for ProductionRuntimeService {
                     )
                     .map_err(|_| AppServerError::Internal)?,
                 ),
-                broadcasts: RuntimeEventBatch::new(Vec::new())
+                broadcasts: RuntimeEventBatch::new(broadcasts)
                     .map_err(|_| AppServerError::Internal)?,
             })
         })

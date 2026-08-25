@@ -796,7 +796,10 @@ pub const WS_OUTBOUND_FRAMES_PER_CONNECTION_MAX: usize = 256;
 
 const RECONNECT_CLIENT_ID_HEADER: &str = "x-lotta-reconnect-id";
 
-fn authenticated_reconnect_identity(state: &ListenerState, headers: &HeaderMap) -> Option<String> {
+fn authenticated_reconnect_identity(
+    state: &ListenerState,
+    headers: &HeaderMap,
+) -> Option<crate::ws::connection::ReconnectIdentity> {
     if state.auth.is_none() {
         return None;
     }
@@ -809,19 +812,20 @@ fn authenticated_reconnect_identity(state: &ListenerState, headers: &HeaderMap) 
         return None;
     }
     let principal = state.auth.principal(headers).ok()?;
-    Some(format!(
-        "{}:{}:{}",
-        state.listener_instance, principal, client_id
-    ))
+    Some(crate::ws::connection::ReconnectIdentity {
+        listener_instance: state.listener_instance.clone(),
+        principal,
+        client_id: client_id.to_owned(),
+    })
 }
 
 async fn serve_socket(
     mut socket: WebSocket,
     state: Arc<ListenerState>,
-    reconnect_identity: Option<String>,
+    reconnect_identity: Option<crate::ws::connection::ReconnectIdentity>,
 ) {
     let (sender, mut receiver) = mpsc::channel(WS_OUTBOUND_FRAMES_PER_CONNECTION_MAX);
-    let Ok(connection_id) = open_connection(&state, sender, reconnect_identity.as_deref()) else {
+    let Ok(connection_id) = open_connection(&state, sender, reconnect_identity.as_ref()) else {
         return;
     };
     let mut heartbeat = Heartbeat::new(state.clock.as_ref());
@@ -875,7 +879,7 @@ async fn serve_socket(
 fn open_connection(
     state: &ListenerState,
     sender: mpsc::Sender<String>,
-    reconnect_identity: Option<&str>,
+    reconnect_identity: Option<&crate::ws::connection::ReconnectIdentity>,
 ) -> Result<crate::ws::ConnectionId, AppServerError> {
     let id = {
         let mut router = lock_router(&state.runtime_router)?;
@@ -918,11 +922,7 @@ async fn close_connection(state: &ListenerState, id: crate::ws::ConnectionId) {
         outbound.remove(&id);
     }
     if let Ok(mut router) = state.runtime_router.lock() {
-        if state.auth.is_none() {
-            router.connections.close(id);
-        } else {
-            router.connections.suspend(id);
-        }
+        router.connections.suspend(id);
     }
 }
 
