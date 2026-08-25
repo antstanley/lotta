@@ -246,6 +246,7 @@ impl RuntimeRouter {
     /// Returns a bounded routing failure.
     pub fn apply_sync(
         &mut self,
+        connection: ConnectionId,
         command: &super::command::SyncCommand,
         outcome: &super::service::SyncOutcome,
     ) -> Result<RouteOutput, crate::error::AppServerError> {
@@ -259,7 +260,39 @@ impl RuntimeRouter {
                     success: true,
                     error: None,
                 });
-        self.response_then_broadcast(response, &command.runtime, &outcome.broadcasts)
+        self.response_after_replay(connection, response, &command.runtime, &outcome.broadcasts)
+    }
+
+    fn response_after_replay(
+        &mut self,
+        connection: ConnectionId,
+        response: Option<ConnectionResponse>,
+        runtime: &RuntimeScope,
+        events: &RuntimeEventBatch,
+    ) -> Result<RouteOutput, crate::error::AppServerError> {
+        let mut batches = Vec::new();
+        batches
+            .try_reserve_exact(events.len())
+            .map_err(|_| crate::error::AppServerError::Unavailable)?;
+        for event in events.as_slice() {
+            let delivery = self.connections.deliver_to(
+                connection,
+                runtime,
+                event,
+                self.clock.as_ref(),
+                self.ids.as_ref(),
+            )?;
+            batches.push(RoutedEventBatch {
+                scope: runtime.clone(),
+                event: event.clone(),
+                deliveries: bounded_deliveries(vec![delivery])?,
+            });
+        }
+        Ok(RouteOutput {
+            responses: bounded_responses(response)?,
+            event_batches: BoundedVec::new(batches)
+                .map_err(|_| crate::error::AppServerError::PayloadTooLarge)?,
+        })
     }
 
     /// Applies a successful abort response.
@@ -405,7 +438,7 @@ pub async fn route_command(
         }
         RuntimeCommand::Sync(command) => {
             let outcome = service.sync(command.clone()).await?;
-            let output = lock_router(&router)?.apply_sync(&command, &outcome)?;
+            let output = lock_router(&router)?.apply_sync(connection, &command, &outcome)?;
             Ok((output, None))
         }
         RuntimeCommand::AbortMessage(command) => {

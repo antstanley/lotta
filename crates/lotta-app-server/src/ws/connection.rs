@@ -22,6 +22,7 @@ pub struct EventDelivery {
 /// Owner-local connection registry and per-connection sequencing.
 pub struct RuntimeConnections {
     entries: HashMap<ConnectionId, RuntimeConnection>,
+    suspended: HashMap<String, RuntimeConnection>,
     next_id: ConnectionId,
     next_ordinal: u64,
 }
@@ -30,6 +31,7 @@ impl Default for RuntimeConnections {
     fn default() -> Self {
         Self {
             entries: HashMap::new(),
+            suspended: HashMap::new(),
             next_id: 1,
             next_ordinal: 1,
         }
@@ -42,33 +44,74 @@ impl RuntimeConnections {
     /// # Errors
     /// Returns a visible capacity, allocation, identifier, or counter error.
     pub fn open(&mut self) -> Result<ConnectionId, crate::error::AppServerError> {
-        if self.entries.len() == CONNECTIONS_MAX.value {
-            return Err(crate::error::AppServerError::Unavailable);
-        }
-        self.entries
-            .try_reserve(1)
-            .map_err(|_| crate::error::AppServerError::Unavailable)?;
+        self.open_authenticated(None)
+    }
+
+    /// Opens or resumes one authenticated reconnect identity.
+    ///
+    /// A live identity cannot be replaced. Suspended state is consumed exactly
+    /// once, so an authenticated reconnect preserves subscriptions and sequence.
+    ///
+    /// # Errors
+    /// Returns a visible capacity, allocation, takeover, identifier, or counter error.
+    pub fn open_authenticated(
+        &mut self,
+        identity: Option<&str>,
+    ) -> Result<ConnectionId, crate::error::AppServerError> {
+        self.validate_open(identity)?;
         let id = self.next_id;
-        let ordinal = self.next_ordinal;
         let next_id = id
             .checked_add(1)
             .ok_or(crate::error::AppServerError::Internal)?;
-        let next_ordinal = ordinal
-            .checked_add(1)
-            .ok_or(crate::error::AppServerError::Internal)?;
-        let connection = RuntimeConnection {
-            id: NonEmptyString::new(format!("connection-{id}"))
-                .map_err(|_| crate::error::AppServerError::Internal)?,
-            ordinal,
+        let resumed = identity.and_then(|key| self.suspended.remove(key));
+        let connection = self.connection_for(id, identity, resumed)?;
+        if connection.ordinal == self.next_ordinal {
+            self.next_ordinal = self
+                .next_ordinal
+                .checked_add(1)
+                .ok_or(crate::error::AppServerError::Internal)?;
+        }
+        self.entries.insert(id, connection);
+        self.next_id = next_id;
+        Ok(id)
+    }
+
+    fn validate_open(
+        &mut self,
+        identity: Option<&str>,
+    ) -> Result<(), crate::error::AppServerError> {
+        if self.entries.len() == CONNECTIONS_MAX.value {
+            return Err(crate::error::AppServerError::Unavailable);
+        }
+        if identity.is_some_and(|key| self.entries.values().any(|entry| entry.id.as_str() == key)) {
+            return Err(crate::error::AppServerError::Forbidden);
+        }
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| crate::error::AppServerError::Unavailable)
+    }
+
+    fn connection_for(
+        &self,
+        id: ConnectionId,
+        identity: Option<&str>,
+        resumed: Option<RuntimeConnection>,
+    ) -> Result<RuntimeConnection, crate::error::AppServerError> {
+        if let Some(mut connection) = resumed {
+            connection.initialized = false;
+            return Ok(connection);
+        }
+        Ok(RuntimeConnection {
+            id: NonEmptyString::new(
+                identity.map_or_else(|| format!("connection-{id}"), str::to_owned),
+            )
+            .map_err(|_| crate::error::AppServerError::Internal)?,
+            ordinal: self.next_ordinal,
             initialized: false,
             subscriptions: BoundedVec::new(Vec::new())
                 .map_err(|_| crate::error::AppServerError::Internal)?,
             event_seq: 0,
-        };
-        self.entries.insert(id, connection);
-        self.next_id = next_id;
-        self.next_ordinal = next_ordinal;
-        Ok(id)
+        })
     }
 
     /// Marks protocol initialization complete.
@@ -80,9 +123,17 @@ impl RuntimeConnections {
         Ok(())
     }
 
-    /// Removes a closed connection.
+    /// Removes a closed connection without retaining reconnect state.
     pub fn close(&mut self, id: ConnectionId) {
         self.entries.remove(&id);
+    }
+
+    /// Suspends an authenticated connection for a later same-identity reconnect.
+    pub fn suspend(&mut self, id: ConnectionId) {
+        if let Some(connection) = self.entries.remove(&id) {
+            self.suspended
+                .insert(connection.id.as_str().to_owned(), connection);
+        }
     }
 
     /// Adds one idempotent exact-scope subscription before mutation.
@@ -130,6 +181,33 @@ impl RuntimeConnections {
             .get(&id)
             .map(|entry| entry.subscriptions.as_slice().to_vec())
             .unwrap_or_default()
+    }
+
+    /// Stamps one logical event for exactly one connection.
+    ///
+    /// # Errors
+    /// Returns before UUID/time generation if its sequence would overflow.
+    pub fn deliver_to(
+        &mut self,
+        id: ConnectionId,
+        scope: &RuntimeScope,
+        event: &RuntimeEvent,
+        clock: &(dyn lotta_domain::Clock + Send + Sync),
+        ids: &dyn super::envelope::EventIdGenerator,
+    ) -> Result<EventDelivery, crate::error::AppServerError> {
+        let connection = self.entry_mut(id)?;
+        let sequence = connection
+            .event_seq
+            .checked_add(1)
+            .ok_or(crate::error::AppServerError::Internal)?;
+        let ordinal = connection.ordinal;
+        let frame = super::envelope::stamp(event.clone(), scope.clone(), sequence, clock, ids)?;
+        self.entry_mut(id)?.event_seq = sequence;
+        Ok(EventDelivery {
+            connection_id: id,
+            ordinal,
+            frame,
+        })
     }
 
     /// Stamps one logical event independently for subscribers in ordinal order.

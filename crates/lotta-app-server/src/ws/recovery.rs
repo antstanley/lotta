@@ -1,0 +1,120 @@
+//! Authenticated reconnect recovery behavior.
+//!
+//! The stable identity is supplied only after upgrade authentication. A live
+//! identity owns its lease exclusively; transient close suspends its ordinal,
+//! subscriptions, and last emitted sequence for one later same-identity open.
+
+#[cfg(test)]
+mod reconnect {
+    use crate::ws::{RuntimeEvent, RuntimeRouter, test_support::*};
+
+    fn resumed() -> (RuntimeRouter, crate::ws::ConnectionId) {
+        let clock = std::sync::Arc::new(TestClock::new());
+        let ids = std::sync::Arc::new(TestIds::new());
+        let mut router = RuntimeRouter::new(clock, ids);
+        let original = router.connections.open().expect("open");
+        router.connections.initialize(original).expect("initialize");
+        router
+            .connections
+            .subscribe(original, scope(1))
+            .expect("subscribe");
+        router.connections.set_event_seq(original, 4);
+        router.connections.suspend(original);
+        let resumed = router
+            .connections
+            .open_authenticated(Some("connection-1"))
+            .expect("resume");
+        router.connections.initialize(resumed).expect("initialize");
+        (router, resumed)
+    }
+
+    #[test]
+    fn restores_subscriptions() {
+        let (router, connection) = resumed();
+        assert_eq!(router.connections.subscriptions_of(connection), [scope(1)]);
+    }
+
+    #[test]
+    fn sequence_continues() {
+        let (mut router, connection) = resumed();
+        let delivery = router
+            .broadcast(&scope(1), &status_event("idle"))
+            .expect("broadcast");
+        assert_eq!(delivery.as_slice()[0].connection_id, connection);
+        assert_eq!(delivery.as_slice()[0].frame.event_seq, 5);
+    }
+
+    #[test]
+    fn replays_pending_approvals() {
+        let (mut router, connection) = resumed();
+        let event = RuntimeEvent::ControlRequest {
+            request_id: text("approval-1"),
+            request: bounded(serde_json::json!({"state": "pending"})),
+            agent_id: None,
+            conversation_id: None,
+        };
+        let delivery = router
+            .broadcast(&scope(1), &event)
+            .expect("approval replay");
+        assert_eq!(delivery.as_slice()[0].connection_id, connection);
+        assert_eq!(
+            delivery.as_slice()[0].frame.event.discriminant(),
+            "control_request"
+        );
+    }
+
+    #[test]
+    fn rejects_live_identity_takeover() {
+        let (router, _, _, _) = router();
+        let error = router
+            .lock()
+            .expect("router")
+            .connections
+            .open_authenticated(Some("connection-1"))
+            .expect_err("live identity cannot be replaced");
+        assert!(matches!(error, crate::error::AppServerError::Forbidden));
+    }
+}
+
+#[cfg(test)]
+mod repairs_missing_tool_end {
+    use crate::ws::{RuntimeEvent, RuntimeRouter, test_support::*};
+    use serde_json::json;
+
+    #[test]
+    fn next_loop_snapshot_repairs_client_tool_state() {
+        let (router, _, _, connection) = router();
+        let mut router: std::sync::MutexGuard<'_, RuntimeRouter> = router.lock().expect("router");
+        router
+            .connections
+            .subscribe(connection, scope(1))
+            .expect("subscribe");
+        let start = RuntimeEvent::StreamDelta {
+            delta: bounded(json!({
+                "message_type": "client_tool_start",
+                "tool_call_id": "tool-1"
+            })),
+            subagent_id: None,
+        };
+        let started = router.broadcast(&scope(1), &start).expect("tool start");
+        assert_eq!(started.as_slice()[0].frame.event_seq, 1);
+
+        let repair = RuntimeEvent::UpdateLoopStatus {
+            loop_status: bounded(json!({
+                "status": "idle",
+                "active_run_ids": [],
+                "executing_tool_call_ids": []
+            })),
+        };
+        let repaired = router
+            .broadcast(&scope(1), &repair)
+            .expect("repair snapshot");
+        assert_eq!(repaired.as_slice()[0].frame.event_seq, 2);
+        let RuntimeEvent::UpdateLoopStatus { loop_status } = &repaired.as_slice()[0].frame.event
+        else {
+            panic!("loop snapshot");
+        };
+        assert_eq!(loop_status.as_value()["status"], "idle");
+        assert_eq!(loop_status.as_value()["executing_tool_call_ids"], json!([]));
+    }
+}

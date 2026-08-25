@@ -130,6 +130,14 @@ pub trait RuntimeCommandService: Send + Sync {
     ) -> ServiceFuture<'_, CompactionProgress>;
     /// Replays runtime state.
     fn sync(&self, command: SyncCommand) -> ServiceFuture<'_, SyncOutcome>;
+    /// Installs the listener-owned authoritative device snapshot source.
+    fn register_device_snapshot_source(
+        &self,
+        _source: Arc<
+            dyn Fn() -> Result<BoundedJsonValue, crate::error::AppServerError> + Send + Sync,
+        >,
+    ) {
+    }
     /// Aborts runtime work.
     fn abort_message(&self, command: AbortMessageCommand) -> ServiceFuture<'_, AbortOutcome>;
     /// Applies a device-state change.

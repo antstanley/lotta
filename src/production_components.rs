@@ -80,6 +80,8 @@ const DEFAULT_OUTPUT_TOKENS: u64 = 4_096;
 const TRANSCRIPT_MANIFEST_SCHEMA_VERSION: u8 = 2;
 const TRANSCRIPT_SESSION_SCHEMA_VERSION: u8 = 3;
 
+type DeviceSnapshotSource = Arc<dyn Fn() -> Result<BoundedJsonValue, AppServerError> + Send + Sync>;
+
 #[cfg(test)]
 pub(crate) type CancellationStageObserver =
     Arc<dyn Fn(lotta_runtime::turn::CancelStep) + Send + Sync>;
@@ -1074,6 +1076,7 @@ pub(crate) struct ProductionRuntimeService {
     approvals: Arc<lotta_runtime::ApprovalManager>,
     brokers: Arc<ProductionTurnBrokers>,
     settings: Arc<SettingsBridge>,
+    device_snapshot: Mutex<Option<DeviceSnapshotSource>>,
 }
 
 impl ProductionRuntimeService {
@@ -1094,7 +1097,26 @@ impl ProductionRuntimeService {
             approvals,
             brokers,
             settings,
+            device_snapshot: Mutex::new(None),
         }
+    }
+
+    fn active_lease(&self, key: &RuntimeKey) -> Result<Option<TurnLease>, AppServerError> {
+        self.state
+            .active
+            .lock()
+            .map_err(|_| AppServerError::Internal)
+            .map(|active| active.get(key).map(|item| item.lease.clone()))
+    }
+
+    fn device_snapshot(&self) -> Result<BoundedJsonValue, AppServerError> {
+        let source = self
+            .device_snapshot
+            .lock()
+            .map_err(|_| AppServerError::Internal)?
+            .clone()
+            .ok_or(AppServerError::Unavailable)?;
+        source()
     }
 
     async fn compact(
@@ -1785,17 +1807,19 @@ async fn sync_outcome(
     command: SyncCommand,
 ) -> Result<SyncOutcome, AppServerError> {
     let key = RuntimeKey::from(&command.runtime);
-    let active = service
-        .state
-        .active
-        .lock()
-        .map_err(|_| AppServerError::Internal)?
-        .get(&key)
-        .map(|active| active.lease.clone());
+    let active = service.active_lease(&key)?;
     if active.is_none() {
         let _ = service.ensure_runtime(&command.runtime)?;
     }
-    let mut broadcasts = sync_status_broadcasts(service, &key, active.as_ref())?;
+    let device = service.device_snapshot()?;
+    let mut broadcasts = vec![lotta_app_server::ws::RuntimeEvent::UpdateDeviceStatus {
+        device_status: device,
+    }];
+    broadcasts.extend(sync_status_broadcasts(service, &key, active.as_ref())?);
+    broadcasts.push(lotta_app_server::ws::RuntimeEvent::UpdateSubagentState {
+        subagents: BoundedJsonValue::new(serde_json::json!([]))
+            .map_err(|_| AppServerError::Internal)?,
+    });
     broadcasts.extend(sync_approval_broadcasts(service, &command.runtime)?);
     Ok(SyncOutcome {
         broadcasts: RuntimeEventBatch::new(broadcasts).map_err(|_| AppServerError::Internal)?,
@@ -1893,6 +1917,12 @@ fn sync_approval_broadcasts(
 }
 
 impl RuntimeCommandService for ProductionRuntimeService {
+    fn register_device_snapshot_source(&self, source: DeviceSnapshotSource) {
+        if let Ok(mut current) = self.device_snapshot.lock() {
+            *current = Some(source);
+        }
+    }
+
     fn runtime_start(
         &self,
         command: RuntimeStartCommand,
@@ -3332,7 +3362,7 @@ mod production_tests {
             Arc::new(crate::production_setup::ProductionEditedInputValidator),
         ));
         let settings = test_settings_bridge(paths.root(), paths.root());
-        ProductionRuntimeService::new(
+        let service = ProductionRuntimeService::new(
             paths,
             Arc::new(TestClock),
             Arc::new(lotta_runtime::hooks::NoopHookRuntime),
@@ -3342,7 +3372,12 @@ mod production_tests {
             approvals,
             Arc::new(ProductionTurnBrokers::new()),
             settings,
-        )
+        );
+        service.register_device_snapshot_source(Arc::new(|| {
+            BoundedJsonValue::new(serde_json::json!({"is_online": true}))
+                .map_err(|_| AppServerError::Internal)
+        }));
+        service
     }
 
     /// Builds a settings bridge over inert forwarding for fixture composition.

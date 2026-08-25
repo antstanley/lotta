@@ -43,7 +43,7 @@ pub(super) struct TestClock {
     pub(super) calls: AtomicUsize,
 }
 impl TestClock {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             calls: AtomicUsize::new(0),
         }
@@ -63,7 +63,7 @@ pub(super) struct TestIds {
     pub(super) calls: AtomicUsize,
 }
 impl TestIds {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             calls: AtomicUsize::new(0),
         }

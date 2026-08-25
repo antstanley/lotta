@@ -889,6 +889,12 @@ impl DeviceBridge {
         }
     }
 
+    /// Returns the current full device-status snapshot for authoritative sync.
+    #[must_use]
+    pub fn status_snapshot(&self) -> Value {
+        self.device_status_json()
+    }
+
     fn device_status_json(&self) -> Value {
         json!({
             "is_online": true,

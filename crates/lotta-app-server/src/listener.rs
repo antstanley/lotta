@@ -18,7 +18,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use lotta_domain::Clock;
+use lotta_domain::{BoundedJsonValue, Clock};
+use sha2::Digest as _;
 use tokio::{
     net::TcpListener,
     sync::mpsc,
@@ -653,6 +654,15 @@ impl DevicePorts {
 /// resolver, and the built-in slash-command runner over live bridges.
 fn register_device_runtime_ports(state: &Arc<ListenerState>) {
     let devices = Arc::downgrade(&state.devices);
+    let snapshot_devices = Arc::downgrade(&state.devices);
+    state
+        .runtime_service
+        .register_device_snapshot_source(Arc::new(move || {
+            let device = snapshot_devices
+                .upgrade()
+                .ok_or(AppServerError::Unavailable)?;
+            BoundedJsonValue::new(device.status_snapshot()).map_err(|_| AppServerError::Internal)
+        }));
     state.devices.register_event_sink(event_sink(state));
     state.devices.register_scope_gate(Arc::new({
         let runtime_router = Arc::clone(&state.runtime_router);
@@ -761,21 +771,37 @@ async fn upgrade(
     let Ok(websocket) = websocket else {
         return AppServerError::Malformed.into_response();
     };
+    let reconnect_identity = authenticated_reconnect_identity(&state.auth, &headers);
     let connection = state.clone();
     websocket
         .max_frame_size(state.limits.frame_bytes)
         .max_message_size(state.limits.frame_bytes)
         .on_failed_upgrade(|_| {})
-        .on_upgrade(move |socket| serve_socket(socket, connection))
+        .on_upgrade(move |socket| serve_socket(socket, connection, reconnect_identity))
         .into_response()
 }
 
 /// Maximum queued outbound frames for one live connection.
 pub const WS_OUTBOUND_FRAMES_PER_CONNECTION_MAX: usize = 256;
 
-async fn serve_socket(mut socket: WebSocket, state: Arc<ListenerState>) {
+fn authenticated_reconnect_identity(
+    auth: &crate::auth::AuthPolicy,
+    headers: &HeaderMap,
+) -> Option<String> {
+    if auth.is_none() {
+        return None;
+    }
+    let token = crate::auth::bearer_token(headers).ok()?;
+    Some(format!("auth-{:x}", sha2::Sha256::digest(token.as_bytes())))
+}
+
+async fn serve_socket(
+    mut socket: WebSocket,
+    state: Arc<ListenerState>,
+    reconnect_identity: Option<String>,
+) {
     let (sender, mut receiver) = mpsc::channel(WS_OUTBOUND_FRAMES_PER_CONNECTION_MAX);
-    let Ok(connection_id) = open_connection(&state, sender) else {
+    let Ok(connection_id) = open_connection(&state, sender, reconnect_identity.as_deref()) else {
         return;
     };
     let mut heartbeat = Heartbeat::new(state.clock.as_ref());
@@ -829,10 +855,11 @@ async fn serve_socket(mut socket: WebSocket, state: Arc<ListenerState>) {
 fn open_connection(
     state: &ListenerState,
     sender: mpsc::Sender<String>,
+    reconnect_identity: Option<&str>,
 ) -> Result<crate::ws::ConnectionId, AppServerError> {
     let id = {
         let mut router = lock_router(&state.runtime_router)?;
-        let id = router.connections.open()?;
+        let id = router.connections.open_authenticated(reconnect_identity)?;
         router.connections.initialize(id)?;
         id
     };
@@ -871,7 +898,11 @@ async fn close_connection(state: &ListenerState, id: crate::ws::ConnectionId) {
         outbound.remove(&id);
     }
     if let Ok(mut router) = state.runtime_router.lock() {
-        router.connections.close(id);
+        if state.auth.is_none() {
+            router.connections.close(id);
+        } else {
+            router.connections.suspend(id);
+        }
     }
 }
 

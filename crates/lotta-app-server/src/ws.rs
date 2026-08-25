@@ -41,6 +41,8 @@ pub mod memory;
 pub mod models;
 /// §Outbound message groups coverage model over the pinned protocol fixture.
 pub mod outbound;
+/// Reconnect subscription and event-sequence recovery.
+pub mod recovery;
 /// Synchronous owner-local routing and deferred input application.
 pub mod router;
 /// Schedules command group bridging wire frames to Tasks 60 and 61.
@@ -54,6 +56,8 @@ pub mod settings;
 /// Skills command group bridging wire frames to Task 36 skill selection.
 #[path = "ws/groups/skills.rs"]
 pub mod skills;
+/// Authoritative sync snapshot semantics.
+pub mod sync;
 /// Teleport command group bridging wire frames to pending teleport state.
 #[path = "ws/groups/teleport.rs"]
 pub mod teleport;
