@@ -146,9 +146,11 @@ fn confined_dir(root: &Path, cwd: Option<&String>) -> Result<PathBuf, String> {
 /// Validates one branch reference name before handing it to git.
 ///
 /// Rejects option-looking leading dashes and any character outside the
-/// git-check-ref-format alphabet (`A-Za-z0-9._/-`), plus the known dangerous
-/// sequences: empty components (`..`, `//`, leading/trailing `/`),
-/// `.lock` suffixes, leading `.`, trailing `.`, and `@{`.
+/// git-check-ref-format alphabet (`A-Za-z0-9._/-`), then mirrors the pinned
+/// `git check-ref-format --branch` boundaries: no two consecutive dots,
+/// trailing `.`, or `@{`, and every `/`-component must be non-empty (no
+/// leading, trailing, or doubled `/`), must not begin with `.`, and must not
+/// end with a case-insensitive `.lock` suffix.
 pub(crate) fn valid_branch_name(branch: &str) -> bool {
     if branch.starts_with('-') || branch.is_empty() || branch.len() > BRANCH_QUERY_BYTES_MAX {
         return false;
@@ -159,13 +161,12 @@ pub(crate) fn valid_branch_name(branch: &str) -> bool {
         return false;
     }
     // Every byte is ASCII from here, so suffix slicing stays boundary-safe.
-    !branch.starts_with('.')
-        && !branch.ends_with('.')
-        && !branch.ends_with('/')
-        && !has_lock_suffix(branch)
-        && !branch.contains("..")
-        && !branch.contains("//")
+    !branch.contains("..")
         && !branch.contains("@{")
+        && !branch.ends_with('.')
+        && branch.split('/').all(|component| {
+            !component.is_empty() && !component.starts_with('.') && !has_lock_suffix(component)
+        })
 }
 
 /// Case-insensitive `.lock` suffix probe over already-validated ASCII input.
@@ -407,6 +408,34 @@ mod round_trip {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn branch_names_validate_like_check_ref_format() {
+        // Existing accepted shapes stay accepted.
+        for name in ["main", "feature/topic", "release_1-2.3"] {
+            assert!(valid_branch_name(name), "{name} must be accepted");
+        }
+        // Option-looking and out-of-alphabet names stay rejected.
+        for name in ["", "--amend", "-x", "bad name", "tilde~1", "a:b", "@{up}"] {
+            assert!(!valid_branch_name(name), "{name} must be rejected");
+        }
+        // Boundary cases git check-ref-format --branch also rejects.
+        for name in [
+            "/leading",
+            "trailing/",
+            "double//slash",
+            ".leading-dot",
+            "dot/.prefixed-component",
+            "trailing-dot.",
+            "two..dots",
+            "ends.lock",
+            "component/.lock",
+            "foo.lock/bar",
+            "foo.LOCK/Bar",
+        ] {
+            assert!(!valid_branch_name(name), "{name} must be rejected");
+        }
     }
 
     #[test]

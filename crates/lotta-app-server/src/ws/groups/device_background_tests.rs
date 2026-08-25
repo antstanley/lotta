@@ -63,10 +63,8 @@ impl RuntimeEventSink for RecordingSink {
     }
 }
 
-#[tokio::test]
-async fn emits_update_device_status_and_no_tool_entry() {
-    // One real repository so a successful checkout triggers the pinned
-    // post-checkout device-status refresh.
+/// A real git repository plus its storage sibling for bridge construction.
+fn fixture_repo() -> (PathBuf, PathBuf) {
     let root = unique_root();
     let workspace = root.join("workspace");
     let storage = root.join("storage");
@@ -74,7 +72,17 @@ async fn emits_update_device_status_and_no_tool_entry() {
     std::fs::create_dir_all(&storage).expect("storage");
     git(&workspace, &["init", "-b", "main"]);
     git(&workspace, &["commit", "--allow-empty", "-m", "init"]);
+    (workspace, storage)
+}
 
+/// One bridge wired to a recording forwarder, sink, and all-scopes gate.
+struct BackgroundFixture {
+    bridge: Arc<DeviceBridge>,
+    messages: Arc<Mutex<Vec<(ConnectionId, DeviceMessage)>>>,
+    sink: Arc<RecordingSink>,
+}
+
+fn fixture(workspace: &std::path::Path, storage: &std::path::Path) -> BackgroundFixture {
     let messages: Arc<Mutex<Vec<(ConnectionId, DeviceMessage)>>> = Arc::default();
     let sink_messages = Arc::clone(&messages);
     let forward: DeviceForwarder = Arc::new(move |connection, message| {
@@ -84,7 +92,7 @@ async fn emits_update_device_status_and_no_tool_entry() {
             .push((connection, message));
         Ok(())
     });
-    let bridge = Arc::new(DeviceBridge::new(forward, &workspace, &storage).expect("bridge"));
+    let bridge = Arc::new(DeviceBridge::new(forward, workspace, storage).expect("bridge"));
     let sink = Arc::new(RecordingSink::default());
     bridge.register_event_sink(Arc::clone(&sink) as Arc<dyn RuntimeEventSink>);
     bridge.register_scope_gate(Arc::new(|_| {
@@ -94,6 +102,34 @@ async fn emits_update_device_status_and_no_tool_entry() {
             None,
         )]
     }));
+    BackgroundFixture {
+        bridge,
+        messages,
+        sink,
+    }
+}
+
+/// The `device_status` JSON body of the single recorded listener event.
+fn recorded_status(fixture: &BackgroundFixture) -> Value {
+    let events = fixture.sink.events.lock().expect("sink lock");
+    assert_eq!(events.len(), 1, "one listener state event");
+    match &events[0] {
+        RuntimeEvent::UpdateDeviceStatus { device_status } => {
+            serde_json::to_value(device_status.as_value()).expect("bounded encodes")
+        }
+        other => panic!(
+            "expected update_device_status, got {}",
+            other.discriminant()
+        ),
+    }
+}
+
+#[tokio::test]
+async fn emits_update_device_status_and_no_tool_entry() {
+    // One real repository so a successful checkout triggers the pinned
+    // post-checkout device-status refresh.
+    let (workspace, storage) = fixture_repo();
+    let fixture = fixture(&workspace, &storage);
 
     let command: Value = json!({
         "type": "checkout_branch",
@@ -106,25 +142,15 @@ async fn emits_update_device_status_and_no_tool_entry() {
     let decoded = super::decode(&frame)
         .expect("wellformed checkout")
         .expect("checkout routed");
-    bridge.apply(CONNECTION, &decoded).await;
+    fixture.bridge.apply(CONNECTION, &decoded).await;
 
-    let captured = messages.lock().expect("message lock").clone();
+    let captured = fixture.messages.lock().expect("message lock").clone();
     assert_eq!(captured.len(), 1, "the direct answer only");
     assert_eq!(captured[0].1.discriminant_of(), "checkout_branch_response");
 
     // The state refresh rides RuntimeEvent::UpdateDeviceStatus with the
     // complete scoped device_status body including background processes.
-    let events = sink.events.lock().expect("sink lock");
-    assert_eq!(events.len(), 1, "one listener state event");
-    let status = match &events[0] {
-        RuntimeEvent::UpdateDeviceStatus { device_status } => {
-            serde_json::to_value(device_status.as_value()).expect("bounded encodes")
-        }
-        other => panic!(
-            "expected update_device_status, got {}",
-            other.discriminant()
-        ),
-    };
+    let status = recorded_status(&fixture);
     assert_eq!(
         status["background_processes"],
         json!([]),

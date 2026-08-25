@@ -337,9 +337,9 @@ async fn exact_file_errors_propagate() {
                 CancellationToken::new(),
             )
             .await;
-        assert!(
-            std::mem::discriminant(&result.expect_err("error"))
-                == std::mem::discriminant(&error(mode))
+        assert_eq!(
+            std::mem::discriminant(&result.expect_err("error")),
+            std::mem::discriminant(&error(mode))
         );
     }
 }

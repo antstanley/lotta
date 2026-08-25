@@ -79,7 +79,7 @@ async fn name_filter_narrows_case_insensitively() {
     let ids = listed_ids(&fixture, json!({"name": "archive"})).await;
     assert_eq!(
         ids,
-        vec![format!("agent-local-alpha-1")],
+        vec!["agent-local-alpha-1".to_string()],
         "substring name match ignores case"
     );
 }

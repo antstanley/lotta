@@ -437,7 +437,13 @@ async fn checkout_branch_validates_names() {
     let repo = git_repo(&fixture.workspace);
     let cwd = repo.to_str().expect("utf-8 repo path").to_owned();
 
-    for (request_id, branch) in [("cb-bad-1", "--amend"), ("cb-bad-2", "bad name")] {
+    for (request_id, branch) in [
+        ("cb-bad-1", "--amend"),
+        ("cb-bad-2", "bad name"),
+        ("cb-bad-3", "/leading"),
+        ("cb-bad-4", "dot/.prefixed"),
+        ("cb-bad-5", "foo.lock/bar"),
+    ] {
         fixture
             .send(&json!({
                 "type": "checkout_branch",
@@ -460,6 +466,42 @@ async fn checkout_branch_validates_names() {
         .output()
         .expect("head query");
     assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "main");
+}
+
+/// A successful checkout whose HEAD query then fails (unborn repository: the
+/// `checkout -b` mutates HEAD but `rev-parse` cannot resolve it) answers the
+/// failure shape instead of echoing success with the requested branch name.
+#[tokio::test]
+async fn checkout_branch_fails_when_head_query_fails() {
+    let fixture = harness("head-fail");
+    let repo = fixture.workspace.join("unborn-repo");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    git(&repo, &["init", "-b", "main"], &mut Vec::new());
+    let cwd = repo.to_str().expect("utf-8 repo path").to_owned();
+
+    fixture
+        .send(&json!({
+            "type": "checkout_branch",
+            "request_id": "cb-unborn",
+            "branch": "topic/unborn",
+            "create": true,
+            "cwd": cwd,
+        }))
+        .await;
+
+    let encoded = fixture.encoded();
+    assert_eq!(encoded[0]["type"], "checkout_branch_response");
+    assert_eq!(
+        encoded[0]["success"],
+        json!(false),
+        "a failed HEAD query must fail the checkout answer"
+    );
+    assert_eq!(
+        encoded[0]["branch"],
+        json!(""),
+        "nothing observed on disk is echoed"
+    );
+    assert!(encoded[0]["error"].is_string());
 }
 
 /// An unresolvable cwd is rejected instead of accepted as-is.

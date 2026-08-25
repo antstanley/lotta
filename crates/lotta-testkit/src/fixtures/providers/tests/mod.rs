@@ -183,7 +183,10 @@ fn image_strict_and_drop_are_distinct() {
         .expect("strict");
     assert_eq!(drop.request.image_policy, ImagePolicy::Drop);
     assert_eq!(strict.request.image_policy, ImagePolicy::Strict);
-    assert!(strict.expected_request.as_value()["outcome"] == "preflight_error");
+    assert_eq!(
+        strict.expected_request.as_value()["outcome"],
+        "preflight_error"
+    );
 }
 #[test]
 fn each_dialect_has_distinct_wire_semantics() {

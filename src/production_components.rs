@@ -131,6 +131,122 @@ impl lotta_store::MemoryPushJob for RegisteredMemoryPush {
     }
 }
 
+/// Concrete production tooling assembled by [`production_tooling`]: shared
+/// store paths, provider port, setup ports, tool port, approval manager, and
+/// the shell bundle backing background-process snapshots.
+type ProductionTooling = (
+    StorePaths,
+    ProductionProviderPort,
+    Arc<ProductionSetupPorts>,
+    Arc<ProductionToolPort>,
+    Arc<lotta_runtime::ApprovalManager>,
+    Arc<ShellToolBundle>,
+);
+
+/// Assembles [`ProductionTooling`] from storage/workspace roots. The store
+/// paths are returned too so callers share one store root identity.
+fn production_tooling(root: &Path, workspace: &Path) -> Result<ProductionTooling, SetupError> {
+    let store_paths = StorePaths::new(root).map_err(adapter)?;
+    let provider_runtime = production_provider_runtime(&store_paths, root)?;
+    let (models, default_model) = production_catalog(&provider_runtime)?;
+    let tool_sandbox: Arc<dyn lotta_tools::builtin::shell::ShellSandbox> =
+        Arc::new(OsSandbox::detect(workspace_policy(root, workspace)?));
+    let shell = Arc::new(
+        ShellToolBundle::new(
+            &workspace.canonicalize().map_err(adapter)?,
+            production_shell_scope()?,
+            Arc::clone(&tool_sandbox),
+        )
+        .map_err(|_| SetupError::Adapter("shell tool bundle".into()))?,
+    );
+    let setup = Arc::new(ProductionSetupPorts::new(setup_config(
+        root,
+        workspace,
+        models,
+        default_model,
+        provider_runtime.connections(),
+        shell.as_ref(),
+    )?)?);
+    let tools = Arc::new(ProductionToolPort::new(
+        setup.registry(),
+        setup.hook_runtime(),
+        root.join("artifacts"),
+        Arc::clone(&shell),
+    )?);
+    let approval_manager = Arc::new(lotta_runtime::ApprovalManager::new(
+        LocalStore::new(store_paths.clone()).approval_journal(),
+        Arc::new(crate::production_setup::ProductionEditedInputValidator),
+    ));
+    Ok((
+        store_paths,
+        provider_runtime,
+        setup,
+        tools,
+        approval_manager,
+        shell,
+    ))
+}
+
+/// Wires the authoritative turn-side ports onto the shared WS bridges:
+/// compaction through the registered production service, conversations
+/// lifecycle on the same registry turn execution holds, and the device
+/// authority ports over that registry.
+fn register_turn_authorities(
+    shared: &lotta_app_server::listener::SharedGroupBridges,
+    provider: &Arc<ProductionProviderPort>,
+    setup: &Arc<ProductionSetupPorts>,
+    runtime_state: &Arc<ProductionRuntimeState>,
+    brokers: &Arc<ProductionTurnBrokers>,
+    shell: &Arc<ShellToolBundle>,
+) {
+    let compaction = Arc::new(crate::production_setup::RegisteredProductionCompaction {
+        service: lotta_runtime::CompactionService::new(
+            crate::production_setup::ProductionProviderSummarizer {
+                provider: Arc::clone(provider),
+            },
+            crate::production_setup::ProductionCompactionEffects {
+                setup: Arc::clone(setup),
+                runtime_state: Arc::clone(runtime_state),
+            },
+        ),
+    });
+    brokers.register_compaction_service(Some(compaction));
+    // The WebSocket conversations group shares the authoritative lifecycle
+    // registry (busy-vs-idle compaction) and routes through the registered
+    // production compaction service with its real hooks and summarizer.
+    shared.register_conversations_authority(Some(Arc::new(ConversationsProductionAuthority {
+        state: Arc::clone(runtime_state),
+        brokers: Arc::clone(brokers),
+    })));
+    register_device_authority_ports(shared, runtime_state, setup.mod_registries(), shell);
+}
+
+/// The unavailable-by-default post-turn capability slots plus the registered
+/// forwarding ports the turn controller observes.
+/// The unavailable-by-default reflection/memory-push capability slots plus
+/// their registered forwarding ports, assembled by [`post_turn_capabilities`].
+type PostTurnCapabilities = (
+    Arc<Mutex<Arc<dyn lotta_store::ReflectionJob>>>,
+    Arc<Mutex<Arc<dyn lotta_store::MemoryPushJob>>>,
+    Arc<dyn lotta_store::ReflectionJob>,
+    Arc<dyn lotta_store::MemoryPushJob>,
+);
+
+#[must_use]
+fn post_turn_capabilities() -> PostTurnCapabilities {
+    let reflection: Arc<Mutex<Arc<dyn lotta_store::ReflectionJob>>> = Arc::new(Mutex::new(
+        Arc::new(crate::production_setup::UnavailableReflection),
+    ));
+    let memory_push: Arc<Mutex<Arc<dyn lotta_store::MemoryPushJob>>> = Arc::new(Mutex::new(
+        Arc::new(crate::production_setup::UnavailableMemoryPush),
+    ));
+    let reflection_port: Arc<dyn lotta_store::ReflectionJob> =
+        Arc::new(RegisteredReflection(Arc::clone(&reflection)));
+    let memory_port: Arc<dyn lotta_store::MemoryPushJob> =
+        Arc::new(RegisteredMemoryPush(Arc::clone(&memory_push)));
+    (reflection, memory_push, reflection_port, memory_port)
+}
+
 impl ProductionComponents {
     /// Builds concrete local production dependencies before listener bind.
     ///
@@ -153,60 +269,12 @@ impl ProductionComponents {
             Arc::clone(&clock),
         )
         .map_err(|_| SetupError::Adapter("shared group bridge roots".into()))?;
-        let store_paths = StorePaths::new(&root).map_err(adapter)?;
-        let provider_runtime = production_provider_runtime(&store_paths, &root)?;
-        let (models, default_model) = production_catalog(&provider_runtime)?;
-        let tool_sandbox: Arc<dyn lotta_tools::builtin::shell::ShellSandbox> =
-            Arc::new(OsSandbox::detect(workspace_policy(&root, &workspace)?));
-        let shell = Arc::new(
-            ShellToolBundle::new(
-                &workspace.canonicalize().map_err(adapter)?,
-                production_shell_scope()?,
-                Arc::clone(&tool_sandbox),
-            )
-            .map_err(|_| SetupError::Adapter("shell tool bundle".into()))?,
-        );
-        let setup = Arc::new(ProductionSetupPorts::new(setup_config(
-            &root,
-            &workspace,
-            models,
-            default_model,
-            provider_runtime.connections(),
-            shell.as_ref(),
-        )?)?);
+        let (store_paths, provider_runtime, setup, tools, approval_manager, shell) =
+            production_tooling(&root, &workspace)?;
         let provider = Arc::new(provider_runtime);
-        let tools = Arc::new(ProductionToolPort::new(
-            setup.registry(),
-            setup.hook_runtime(),
-            root.join("artifacts"),
-            Arc::clone(&shell),
-        )?);
-        let approval_manager = Arc::new(lotta_runtime::ApprovalManager::new(
-            LocalStore::new(store_paths.clone()).approval_journal(),
-            Arc::new(crate::production_setup::ProductionEditedInputValidator),
-        ));
         let runtime_state = Arc::new(ProductionRuntimeState::new(Arc::clone(&observer)));
         let brokers = Arc::new(ProductionTurnBrokers::new());
-        let compaction = Arc::new(crate::production_setup::RegisteredProductionCompaction {
-            service: lotta_runtime::CompactionService::new(
-                crate::production_setup::ProductionProviderSummarizer {
-                    provider: Arc::clone(&provider),
-                },
-                crate::production_setup::ProductionCompactionEffects {
-                    setup: Arc::clone(&setup),
-                    runtime_state: Arc::clone(&runtime_state),
-                },
-            ),
-        });
-        brokers.register_compaction_service(Some(compaction));
-        // The WebSocket conversations group shares the authoritative lifecycle
-        // registry (busy-vs-idle compaction) and routes through the registered
-        // production compaction service with its real hooks and summarizer.
-        shared.register_conversations_authority(Some(Arc::new(ConversationsProductionAuthority {
-            state: Arc::clone(&runtime_state),
-            brokers: Arc::clone(&brokers),
-        })));
-        register_device_authority_ports(&shared, &runtime_state, setup.mod_registries(), &shell);
+        register_turn_authorities(&shared, &provider, &setup, &runtime_state, &brokers, &shell);
         let runtime_service = Arc::new(ProductionRuntimeService::new(
             store_paths.clone(),
             Arc::clone(&clock),
@@ -216,26 +284,17 @@ impl ProductionComponents {
             Arc::clone(&brokers),
             shared.settings(),
         ));
-        let reflection: Arc<Mutex<Arc<dyn lotta_store::ReflectionJob>>> = Arc::new(Mutex::new(
-            Arc::new(crate::production_setup::UnavailableReflection),
-        ));
-        let memory_push: Arc<Mutex<Arc<dyn lotta_store::MemoryPushJob>>> = Arc::new(Mutex::new(
-            Arc::new(crate::production_setup::UnavailableMemoryPush),
-        ));
-        let reflection_port: Arc<dyn lotta_store::ReflectionJob> =
-            Arc::new(RegisteredReflection(Arc::clone(&reflection)));
-        let memory_port: Arc<dyn lotta_store::MemoryPushJob> =
-            Arc::new(RegisteredMemoryPush(Arc::clone(&memory_push)));
+        let (reflection, memory_push, reflection_port, memory_port) = post_turn_capabilities();
         let turn_controller = Arc::new(ProductionTurnController::new(
             Arc::clone(&setup),
-            provider,
-            tools,
+            Arc::clone(&provider),
+            Arc::clone(&tools),
             LocalStore::new(store_paths.clone()),
             Arc::clone(&clock),
             workspace,
-            runtime_state,
+            Arc::clone(&runtime_state),
             Arc::clone(&brokers),
-            approval_manager,
+            Arc::clone(&approval_manager),
             reflection_port,
             memory_port,
             shared.skills(),
@@ -934,7 +993,8 @@ fn register_device_authority_ports(
 
 /// Bridges the WebSocket device group to the authoritative production runtime:
 /// queue removals mutate the exact `ListenerRuntime` registry the turn path
-/// uses, so a WS-removed item can never be pumped by an active turn afterward.
+/// uses, and items queued onto an in-flight turn's private admission queue —
+/// so a WS-removed item can never be pumped by an active turn afterward.
 pub(crate) struct ProductionQueueAuthority {
     pub(crate) state: Arc<ProductionRuntimeState>,
 }
@@ -947,6 +1007,26 @@ impl lotta_app_server::ws::device::QueueAuthority for ProductionQueueAuthority {
     ) -> Pin<Box<dyn Future<Output = Result<Option<QueueMutation>, RuntimeError>> + Send + 'a>>
     {
         Box::pin(async move {
+            // Inputs admitted while a turn runs sit on that turn's active
+            // admission queue, guarded by this std mutex independently of the
+            // registry lock the executing turn holds. Cancelling here deletes
+            // the item before the post-turn transfer can hand it to the
+            // registry pump, so the removal stays authoritative mid-turn.
+            let active_cancel = match self
+                .state
+                .active
+                .lock()
+                .map_err(|_| RuntimeError::Conflict {
+                    context: "device queue active admission".into(),
+                })?
+                .get_mut(&RuntimeKey::from(scope))
+            {
+                Some(admission) => admission.queue.cancel(item_id)?,
+                None => None,
+            };
+            if let Some(mutation) = active_cancel {
+                return Ok(Some(mutation));
+            }
             let mut state = self.state.inner.lock().await;
             let handle =
                 state
@@ -4409,7 +4489,10 @@ mod production_tests {
                 source.join("SKILL.md"),
                 // The explicit id keeps discovery's canonical visited-set
                 // dedup from renaming the skill to its physical source path.
-                "---\nid: demo-skill\nname: demo-skill\ndescription: Demo skill wiring marker.\n---\nBody.\n",
+                concat!(
+                    "---\nid: demo-skill\nname: demo-skill\n",
+                    "description: Demo skill wiring marker.\n---\nBody.\n"
+                ),
             )
             .unwrap();
             skills.apply(
@@ -4613,6 +4696,152 @@ mod production_tests {
         let guard = state.inner.lock().await;
         let handle = guard.registry.lookup(&RuntimeKey::from(&target)).unwrap();
         assert!(guard.registry.queue(&handle).expect("entry").is_empty());
+    }
+
+    /// Admits one input, spawns its real turn against [`HeldProvider`], and
+    /// waits until the provider parked inside `stream()` — proving the
+    /// registry lock is held by the executing turn. Returns the joined task
+    /// handle plus the connection cancellation that releases the provider.
+    async fn start_held_turn(
+        controller: &Arc<ProductionTurnController>,
+        service: &ProductionRuntimeService,
+        held: &Arc<HeldProvider>,
+        target: &RuntimeScope,
+        client_message_id: &str,
+    ) -> (
+        tokio::task::JoinHandle<Result<(), AppServerError>>,
+        CancellationToken,
+    ) {
+        let started = service
+            .admit_input(command(target.clone(), client_message_id))
+            .await
+            .expect("start turn input");
+        assert_eq!(started.disposition, InputDisposition::Started);
+        let deferred = lotta_app_server::ws::DeferredInput {
+            scope: target.clone(),
+            disposition: started.disposition,
+            continuation: started.continuation,
+        };
+        let cancellation = CancellationToken::new();
+        let sink = Arc::new(Sink::default());
+        let command = command(target.clone(), client_message_id);
+        let controller = Arc::clone(controller);
+        let token = cancellation.clone();
+        let turn =
+            tokio::spawn(
+                async move { controller.submit_turn(command, deferred, token, sink).await },
+            );
+        tokio::time::timeout(std::time::Duration::from_secs(5), held.waiting.acquire())
+            .await
+            .expect("provider wait entered")
+            .expect("provider wait semaphore")
+            .forget();
+        (turn, cancellation)
+    }
+
+    /// A WS removal issued while a turn executes cancels the item on the
+    /// active admission's private queue: the post-turn transfer never carries
+    /// it, the pump never runs it, and the removed disposition plus snapshot
+    /// are emitted to subscribers.
+    #[tokio::test]
+    async fn ws_removal_during_held_turn_cancels_before_pump() {
+        use std::sync::atomic::Ordering;
+
+        let held = Arc::new(HeldProvider::default());
+        let label = "device-held";
+        let (root, service, controller, ..) =
+            production_controller_fixture(label, held.clone() as Arc<dyn ProviderPort>).await;
+        let target = scope(label);
+        let observer = Arc::new(ProductionCancellationObserver::default());
+        service.state.observe_cancellation(Arc::clone(&observer));
+
+        // Start a real turn: it holds the authoritative registry lock while
+        // the provider stays parked inside stream().
+        let (turn, connection_cancellation) =
+            start_held_turn(&controller, &service, &held, &target, "cm-start").await;
+
+        // The next ordinary input queues onto the active admission queue.
+        assert_eq!(
+            service
+                .admit_input(command(target.clone(), "cm-remove"))
+                .await
+                .expect("queue during turn")
+                .disposition,
+            InputDisposition::Queued,
+            "the input rides the active admission queue while the lock is held"
+        );
+
+        // WS-remove it through the device bridge while the registry stays held.
+        let messages: Arc<Mutex<Vec<(u64, DeviceMessage)>>> = Arc::default();
+        let queue_events = Arc::new(Sink::default());
+        let bridge = device_bridge_with_authority(
+            &root,
+            &service.state,
+            Arc::clone(&messages),
+            Arc::clone(&queue_events),
+        );
+        bridge
+            .apply(1, &decode_remove_queue_item(&target, "queue-cm-remove"))
+            .await;
+
+        assert_removed_answer(&messages);
+        assert_cancelled_broadcast(&queue_events);
+
+        // Release the turn: the transfer pumps nothing because the removed
+        // item was already deleted from the active queue.
+        connection_cancellation.cancel();
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(5), turn)
+            .await
+            .expect("turn settles after release")
+            .expect("turn task joins");
+        settled.expect("cancellation release path is clean");
+        assert_eq!(
+            observer.pumps.load(Ordering::SeqCst),
+            0,
+            "the removed item is never pumped"
+        );
+        assert_eq!(
+            held.calls.load(Ordering::SeqCst),
+            1,
+            "no successor turn starts for the removed item"
+        );
+        drop(bridge);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Asserts the direct `remove_queue_item` answer reported success.
+    fn assert_removed_answer(messages: &Mutex<Vec<(u64, DeviceMessage)>>) {
+        let captured = messages.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1);
+        match &captured[0].1 {
+            DeviceMessage::RemoveQueueItem(answer) => {
+                assert!(answer.success, "mid-turn removal is authoritative");
+                assert_eq!(answer.item_id, "queue-cm-remove");
+            }
+            other => panic!("unexpected device answer {other:?}"),
+        }
+    }
+
+    /// Asserts exactly one `update_queue` broadcast carrying the cancelled
+    /// transition keyed by client_message_id and an empty remaining snapshot.
+    fn assert_cancelled_broadcast(sink: &Sink) {
+        let events = sink.0.lock().unwrap().clone();
+        assert_eq!(events.len(), 1, "one listener state event");
+        match &events[0].1 {
+            RuntimeEvent::UpdateQueue { queue, removed } => {
+                assert_eq!(queue.as_value().as_array().map(Vec::len), Some(0));
+                let transitions = removed.as_value().as_array().unwrap();
+                assert_eq!(
+                    transitions[0]["client_message_id"],
+                    serde_json::json!("cm-remove")
+                );
+                assert_eq!(
+                    transitions[0]["disposition"],
+                    serde_json::json!("cancelled")
+                );
+            }
+            other => panic!("unexpected runtime event {}", other.discriminant()),
+        }
     }
 
     fn decode_remove_queue_item(

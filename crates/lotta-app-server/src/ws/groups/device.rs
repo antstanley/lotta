@@ -827,7 +827,8 @@ impl DeviceBridge {
     }
 
     /// Queries the actual checked-out branch from HEAD so the answer reports
-    /// reality instead of echoing the request.
+    /// reality instead of echoing the request: a failed or empty HEAD query
+    /// fails the checkout response rather than reporting the requested name.
     async fn checkout_answer(
         &self,
         command: &CheckoutBranchPayload,
@@ -839,16 +840,15 @@ impl DeviceBridge {
             BRANCH_SEARCH_TIMEOUT_MS,
         )
         .await;
-        let branch = head
-            .ok()
-            .map(|stdout| stdout.trim().to_owned())
-            .filter(|branch| !branch.is_empty())
-            .unwrap_or_else(|| command.branch.clone());
-        CheckoutBranchResponseMessage {
-            request_id: command.request_id.clone(),
-            branch,
-            success: true,
-            error: None,
+        let branch = head.ok().map(|stdout| stdout.trim().to_owned());
+        match branch {
+            Some(branch) if !branch.is_empty() => CheckoutBranchResponseMessage {
+                request_id: command.request_id.clone(),
+                branch,
+                success: true,
+                error: None,
+            },
+            _ => failed_checkout(&command.request_id, BRANCH_FAILURE_CHECKOUT),
         }
     }
 

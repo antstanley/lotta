@@ -123,7 +123,7 @@ pub(super) fn decode_base64(value: &str) -> Result<Vec<u8>, ProviderFixtureError
         return Err(ProviderFixtureError::TraceLimit);
     }
     let mut output = Vec::with_capacity(output_len);
-    for (index, block) in bytes.chunks_exact(4).enumerate() {
+    for (index, block) in bytes.as_chunks::<4>().0.iter().enumerate() {
         let final_block = index + 1 == bytes.len() / 4;
         if (block[2] == b'=' || block[3] == b'=') && !final_block {
             return Err(ProviderFixtureError::Semantic("base64 early padding"));

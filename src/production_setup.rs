@@ -25,7 +25,9 @@ use lotta_providers::{
     model::{ModelHandle, ModelOverride, resolve_model},
 };
 use lotta_runtime::boundary::{InitialMemoryBlocks, ProviderName, ProviderText};
-use lotta_runtime::hooks::{HookFailure, HookLifecycleHost, LifecycleError};
+use lotta_runtime::hooks::{
+    HookFailure, HookLifecycleHost, HookPayload, LifecycleError, LifecycleOperation,
+};
 use lotta_runtime::ports::{
     AgentStore, ConversationStore, ImagePolicy, MemFsPort, ModelFacingToolName, ProviderContent,
     ProviderContentPart, ProviderContext, ProviderDeadline, ProviderEvent, ProviderMessage,
@@ -256,22 +258,39 @@ impl ProductionSetupPorts {
         .await;
         #[cfg(not(test))]
         let result = lotta_runtime::turn::run_turn(runtime, handle, lease, refreshed, ports).await;
-        match host
-            .stop(stop_payload, cancellation, move || async move { result })
-            .await
-        {
+        self.finalize_turn(
+            &host,
+            stop_payload,
+            cancellation,
+            &admission,
+            move || async move { result },
+        )
+        .await
+    }
+
+    /// Fires the stop lifecycle hook over one completed turn and maps hook or
+    /// block failures onto the linked interrupted-admission record.
+    async fn finalize_turn(
+        &self,
+        host: &HookLifecycleHost<'_>,
+        stop_payload: HookPayload,
+        cancellation: CancellationToken,
+        admission: &AdmissionReceipt,
+        result: impl LifecycleOperation<TurnRunOutcome, RuntimeError>,
+    ) -> Result<TurnRunOutcome, RuntimeError> {
+        match host.stop(stop_payload, cancellation, result).await {
             Ok(outcome) => Ok(outcome),
             Err(LifecycleError::Operation(error)) => {
-                self.record_interrupted(&admission, &SetupError::Adapter(error.to_string()))
+                self.record_interrupted(admission, &SetupError::Adapter(error.to_string()))
                     .await?;
                 Err(error)
             }
             Err(error) => {
                 let setup_error = lifecycle_setup_error(error);
-                self.record_interrupted(&admission, &setup_error).await?;
+                self.record_interrupted(admission, &setup_error).await?;
                 Err(setup_failure_runtime(
                     lotta_runtime::turn::SetupFailure::PostAdmission {
-                        receipt: admission,
+                        receipt: admission.clone(),
                         error: setup_error,
                     },
                 ))
@@ -2879,29 +2898,17 @@ impl ProductionTurnController {
         self.run_prompt_hook(command, &text, cancellation.clone())
             .await?;
         let scope = command.runtime.clone();
-        let sink_for_brokers = Arc::clone(&sink);
         let turn_cancellation = cancellation.clone();
-        let (input, effects) = self.prepare_turn(command, text, cancellation, sink).await?;
-        let approval = ApprovalBrokerAdapter {
-            manager: Arc::clone(&self.approvals),
-            scope: scope.clone(),
-            run_id: effects.run_id.clone(),
-            turn_id: effects.turn_id.clone(),
-            input_id: effects.input_id.clone(),
-            lease_generation: pending.lease.generation(),
-            clock: Arc::clone(&self.clock),
-        };
-        let controller_tools = ControllerToolBrokerAdapter {
-            brokers: Arc::clone(&self.brokers),
-            scope: scope.clone(),
-            lease_generation: pending.lease.generation(),
-            sink: Arc::clone(&sink_for_brokers),
-        };
+        let (input, effects) = self
+            .prepare_turn(command, text, cancellation, Arc::clone(&sink))
+            .await?;
+        let approval = self.approval_adapter(&scope, pending, &effects);
+        let controller_tools = self.controller_tool_adapter(&scope, pending, &sink);
         let compaction = CompactionBrokerAdapter {
             brokers: Arc::clone(&self.brokers),
             scope: scope.clone(),
             cancellation: turn_cancellation.clone(),
-            sink: sink_for_brokers,
+            sink,
         };
         let refresh = self
             .request_refresh(command, &scope, &input, turn_cancellation)
@@ -2944,6 +2951,37 @@ impl ProductionTurnController {
             )
             .await
             .map_err(app_server_error)
+    }
+
+    fn approval_adapter(
+        &self,
+        scope: &lotta_domain::RuntimeScope,
+        pending: &crate::production_components::PendingAdmission,
+        effects: &crate::production_components::ProductionEffects,
+    ) -> ApprovalBrokerAdapter {
+        ApprovalBrokerAdapter {
+            manager: Arc::clone(&self.approvals),
+            scope: scope.clone(),
+            run_id: effects.run_id.clone(),
+            turn_id: effects.turn_id.clone(),
+            input_id: effects.input_id.clone(),
+            lease_generation: pending.lease.generation(),
+            clock: Arc::clone(&self.clock),
+        }
+    }
+
+    fn controller_tool_adapter(
+        &self,
+        scope: &lotta_domain::RuntimeScope,
+        pending: &crate::production_components::PendingAdmission,
+        sink: &Arc<dyn lotta_app_server::ws::RuntimeEventSink>,
+    ) -> ControllerToolBrokerAdapter {
+        ControllerToolBrokerAdapter {
+            brokers: Arc::clone(&self.brokers),
+            scope: scope.clone(),
+            lease_generation: pending.lease.generation(),
+            sink: Arc::clone(sink),
+        }
     }
 
     async fn request_refresh(

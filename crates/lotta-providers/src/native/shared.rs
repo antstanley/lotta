@@ -106,7 +106,7 @@ fn parse_seconds(value: &str) -> Option<u64> {
 }
 
 fn parse_decimal(value: &str, scale: u64) -> Option<u64> {
-    let (whole, fraction) = value.split_once('.').map_or((value, ""), |parts| parts);
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
     let whole = whole.parse::<u64>().ok()?.checked_mul(scale)?;
     if fraction.is_empty() {
         return Some(whole);
