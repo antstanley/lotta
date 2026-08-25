@@ -334,6 +334,33 @@ impl ApprovalManager {
         scope: &RuntimeScope,
     ) -> Result<Vec<ApprovalRequest>, RuntimeError> {
         let _transaction = self.transaction()?;
+        self.list_requests_unlocked(scope)
+    }
+
+    /// Atomically snapshots requests that remain pending for the current lease.
+    ///
+    /// # Errors
+    /// Returns durable journal failures.
+    pub fn pending_snapshot(
+        &self,
+        scope: &RuntimeScope,
+        lease_generation: Option<u64>,
+    ) -> Result<Vec<ApprovalRequest>, RuntimeError> {
+        let _transaction = self.transaction()?;
+        Ok(self
+            .list_requests_unlocked(scope)?
+            .into_iter()
+            .filter(|request| {
+                request.state == ApprovalState::Pending
+                    && lease_generation.is_none_or(|lease| request.lease_generation == lease)
+            })
+            .collect())
+    }
+
+    fn list_requests_unlocked(
+        &self,
+        scope: &RuntimeScope,
+    ) -> Result<Vec<ApprovalRequest>, RuntimeError> {
         let mut requests = self.journal.port().list(scope)?;
         requests.sort_by(|left, right| {
             left.created_at

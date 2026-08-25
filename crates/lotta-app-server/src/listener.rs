@@ -19,7 +19,6 @@ use axum::{
     routing::get,
 };
 use lotta_domain::{BoundedJsonValue, Clock};
-use sha2::Digest as _;
 use tokio::{
     net::TcpListener,
     sync::mpsc,
@@ -96,6 +95,7 @@ impl Default for SocketLimits {
 
 struct ListenerState {
     auth: crate::auth::AuthPolicy,
+    listener_instance: String,
     clock: Arc<dyn Clock + Send + Sync>,
     shutdown: CancellationToken,
     limits: SocketLimits,
@@ -601,6 +601,15 @@ fn compose_listener_state(
     devices.register_background_processes_if_set(device_ports.background);
     Ok(Arc::new(ListenerState {
         auth: prepared.auth,
+        listener_instance: format!(
+            "listener-{}-{}",
+            std::process::id(),
+            clock
+                .now()
+                .as_utc()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+        ),
         clock: Arc::clone(clock),
         shutdown,
         limits,
@@ -772,7 +781,7 @@ async fn upgrade(
     let Ok(websocket) = websocket else {
         return AppServerError::Malformed.into_response();
     };
-    let reconnect_identity = authenticated_reconnect_identity(&state.auth, &headers);
+    let reconnect_identity = authenticated_reconnect_identity(&state, &headers);
     let connection = state.clone();
     websocket
         .max_frame_size(state.limits.frame_bytes)
@@ -785,15 +794,25 @@ async fn upgrade(
 /// Maximum queued outbound frames for one live connection.
 pub const WS_OUTBOUND_FRAMES_PER_CONNECTION_MAX: usize = 256;
 
-fn authenticated_reconnect_identity(
-    auth: &crate::auth::AuthPolicy,
-    headers: &HeaderMap,
-) -> Option<String> {
-    if auth.is_none() {
+const RECONNECT_CLIENT_ID_HEADER: &str = "x-lotta-reconnect-id";
+
+fn authenticated_reconnect_identity(state: &ListenerState, headers: &HeaderMap) -> Option<String> {
+    if state.auth.is_none() {
         return None;
     }
-    let token = crate::auth::bearer_token(headers).ok()?;
-    Some(format!("auth-{:x}", sha2::Sha256::digest(token.as_bytes())))
+    let client_id = headers
+        .get(RECONNECT_CLIENT_ID_HEADER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if client_id.is_empty() || client_id.len() > 256 || !client_id.is_ascii() {
+        return None;
+    }
+    let principal = state.auth.principal(headers).ok()?;
+    Some(format!(
+        "{}:{}:{}",
+        state.listener_instance, principal, client_id
+    ))
 }
 
 async fn serve_socket(

@@ -114,6 +114,20 @@ impl AuthPolicy {
             }
         }
     }
+
+    /// Returns a stable verified principal independent of token renewal.
+    ///
+    /// # Errors
+    /// Returns unauthorized when credentials cannot yield a verified principal.
+    pub fn principal(&self, headers: &HeaderMap) -> Result<String, AppServerError> {
+        match self {
+            Self::None => Ok("anonymous".to_owned()),
+            Self::CapabilityToken { .. } => Ok("capability-token".to_owned()),
+            Self::SignedBearer { .. } => {
+                signed_bearer_token::verified_principal(bearer_token(headers)?)
+            }
+        }
+    }
 }
 
 fn prepare_capability(args: &ServerArgs) -> Result<AuthPolicy, AppServerError> {

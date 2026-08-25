@@ -105,6 +105,13 @@ pub trait TurnEffectPort: Send + Sync {
     /// # Errors
     /// Returns an owner-local effect failure.
     fn emit(&self, event: TurnEvent) -> Result<(), RuntimeError>;
+    /// Emits the pinned client start lifecycle before tool execution begins.
+    ///
+    /// # Errors
+    /// Returns an owner-local lifecycle emission failure.
+    fn tool_started(&self, _call_id: &ToolCallId) -> Result<(), RuntimeError> {
+        Ok(())
+    }
     /// Appends one normalized tool result to owner-local turn records.
     ///
     /// # Errors

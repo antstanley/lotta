@@ -138,6 +138,14 @@ impl TaskLifecyclePort {
             .ok_or(TaskError::Unknown)
     }
 
+    /// Returns the complete authoritative task snapshot in creation order.
+    ///
+    /// # Errors
+    /// Returns a bounded-state or synchronization failure.
+    pub async fn snapshot(&self) -> Result<Vec<TaskRecord>, TaskError> {
+        self.list().await
+    }
+
     async fn list(&self) -> Result<Vec<TaskRecord>, TaskError> {
         let state = self.state.lock().await;
         let mut output = Vec::new();
@@ -267,7 +275,7 @@ async fn execute_operation(
             let input: IdInput = decode(value)?;
             encode(&port.get(&input.task_id).await?)
         }
-        "TaskList" => encode(&json!({"tasks": port.list().await?})),
+        "TaskList" => encode(&json!({"tasks": port.snapshot().await?})),
         "TaskUpdate" => encode(&port.update(decode(value)?).await?),
         _ => Err(TaskError::Invalid),
     }

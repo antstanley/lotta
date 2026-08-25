@@ -26,6 +26,29 @@ struct Claims<'a> {
 ///
 /// # Errors
 /// Returns a fixed unauthorized error for every malformed or invalid token.
+pub fn verified_principal(token: &str) -> Result<String, AppServerError> {
+    let claim_component = token
+        .split('.')
+        .nth(1)
+        .ok_or(AppServerError::Unauthorized)?;
+    let claim_bytes = decode_component(claim_component)?;
+    let bounded: BoundedJsonValue =
+        serde_json::from_slice(&claim_bytes).map_err(|_| AppServerError::Unauthorized)?;
+    let object = bounded
+        .as_value()
+        .as_object()
+        .ok_or(AppServerError::Unauthorized)?;
+    let principal = object
+        .get("sub")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("iss").and_then(Value::as_str))
+        .unwrap_or("signed-bearer");
+    if principal.is_empty() || principal.len() > 256 {
+        return Err(AppServerError::Unauthorized);
+    }
+    Ok(principal.to_owned())
+}
+
 pub fn verify_token(
     token: &str,
     shared_secret: &Secret<Vec<u8>>,

@@ -290,6 +290,7 @@ fn typed_failure_state(
     let storage = storage_bridges(&prepared);
     super::ListenerState {
         auth: prepared.auth,
+        listener_instance: "test-listener".to_owned(),
         clock: clock(),
         shutdown: tokio_util::sync::CancellationToken::new(),
         limits: super::SocketLimits::default(),

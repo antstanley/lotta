@@ -93,6 +93,7 @@ fn state(
     let group = compose_group_bridges();
     let state = Arc::new(ListenerState {
         auth: AuthPolicy::None,
+        listener_instance: "test-listener".to_owned(),
         clock,
         shutdown: tokio_util::sync::CancellationToken::new(),
         limits: SocketLimits::default(),

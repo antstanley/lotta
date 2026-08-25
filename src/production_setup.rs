@@ -2866,11 +2866,11 @@ impl ProductionTurnController {
             self.store.clone(),
             command.runtime.clone(),
             sink,
+            Arc::clone(&self.runtime_state),
             turn_id,
             run_id,
             NonEmptyString::new(input_id)
                 .map_err(|_| lotta_app_server::error::AppServerError::Malformed)?,
-            Arc::clone(&self.clock),
         );
         #[cfg(test)]
         let effects = if let Some(observer) = self

@@ -18,6 +18,7 @@ pub struct Task40BundleError;
 /// Task 40 registrations plus the canonical Task 38 shell registrations.
 pub struct Task40ToolBundle {
     registrations: Vec<ToolRegistration>,
+    tasks: Arc<TaskLifecyclePort>,
 }
 
 impl Task40ToolBundle {
@@ -37,20 +38,30 @@ impl Task40ToolBundle {
         shell: &ShellToolBundle,
     ) -> Result<Self, Task40BundleError> {
         let mut registrations = planning::registrations(planning).map_err(|_| Task40BundleError)?;
-        registrations.extend(task::registrations(tasks).map_err(|_| Task40BundleError)?);
+        registrations
+            .extend(task::registrations(Arc::clone(&tasks)).map_err(|_| Task40BundleError)?);
         registrations.push(skill::registration(skills).map_err(|_| Task40BundleError)?);
         registrations.push(interaction::registration(interaction).map_err(|_| Task40BundleError)?);
         registrations.push(lsp::registration(lsp_registry).map_err(|_| Task40BundleError)?);
         registrations.extend_from_slice(shell.registrations());
         validate_unique(&registrations)?;
         ToolRegistry::new(registrations.clone()).map_err(|_| Task40BundleError)?;
-        Ok(Self { registrations })
+        Ok(Self {
+            registrations,
+            tasks,
+        })
     }
 
     /// Returns the collision-checked registration set for Task 32 toolsets.
     #[must_use]
     pub fn registrations(&self) -> &[ToolRegistration] {
         &self.registrations
+    }
+
+    /// Returns the exact lifecycle port used by the registered task tools.
+    #[must_use]
+    pub fn tasks(&self) -> Arc<TaskLifecyclePort> {
+        Arc::clone(&self.tasks)
     }
 }
 

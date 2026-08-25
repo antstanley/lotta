@@ -1,12 +1,23 @@
 use std::collections::HashMap;
 
 use lotta_domain::bounds::{CONNECTIONS_MAX, RUNTIME_SUBSCRIPTIONS_PER_CONNECTION_MAX};
+use std::time::{Duration, Instant};
+
+/// Maximum suspended reconnect leases retained by one listener instance.
+pub const SUSPENDED_CONNECTIONS_MAX: usize = 1_024;
+/// Time after close during which an authenticated client can resume its lease.
+pub const SUSPENDED_CONNECTION_TTL: Duration = Duration::from_secs(300);
 use lotta_domain::{BoundedVec, NonEmptyString, RuntimeConnection, RuntimeScope};
 
 use super::{envelope::StampedRuntimeEvent, event::RuntimeEvent};
 
 /// Stable connection identifier assigned by the hub.
 pub type ConnectionId = u64;
+
+struct SuspendedConnection {
+    connection: RuntimeConnection,
+    suspended_at: Instant,
+}
 
 /// One ordered, connection-specific delivery.
 #[derive(Clone, Debug)]
@@ -22,7 +33,7 @@ pub struct EventDelivery {
 /// Owner-local connection registry and per-connection sequencing.
 pub struct RuntimeConnections {
     entries: HashMap<ConnectionId, RuntimeConnection>,
-    suspended: HashMap<String, RuntimeConnection>,
+    suspended: HashMap<String, SuspendedConnection>,
     next_id: ConnectionId,
     next_ordinal: u64,
 }
@@ -63,7 +74,9 @@ impl RuntimeConnections {
         let next_id = id
             .checked_add(1)
             .ok_or(crate::error::AppServerError::Internal)?;
-        let resumed = identity.and_then(|key| self.suspended.remove(key));
+        let resumed = identity
+            .and_then(|key| self.suspended.remove(key))
+            .map(|lease| lease.connection);
         let connection = self.connection_for(id, identity, resumed)?;
         if connection.ordinal == self.next_ordinal {
             self.next_ordinal = self
@@ -80,6 +93,7 @@ impl RuntimeConnections {
         &mut self,
         identity: Option<&str>,
     ) -> Result<(), crate::error::AppServerError> {
+        self.purge_expired();
         if self.entries.len() == CONNECTIONS_MAX.value {
             return Err(crate::error::AppServerError::Unavailable);
         }
@@ -130,9 +144,35 @@ impl RuntimeConnections {
 
     /// Suspends an authenticated connection for a later same-identity reconnect.
     pub fn suspend(&mut self, id: ConnectionId) {
-        if let Some(connection) = self.entries.remove(&id) {
-            self.suspended
-                .insert(connection.id.as_str().to_owned(), connection);
+        let Some(connection) = self.entries.remove(&id) else {
+            return;
+        };
+        self.purge_expired();
+        if self.suspended.len() >= SUSPENDED_CONNECTIONS_MAX {
+            self.evict_oldest_suspended();
+        }
+        self.suspended.insert(
+            connection.id.as_str().to_owned(),
+            SuspendedConnection {
+                connection,
+                suspended_at: Instant::now(),
+            },
+        );
+    }
+
+    fn purge_expired(&mut self) {
+        self.suspended
+            .retain(|_, lease| lease.suspended_at.elapsed() < SUSPENDED_CONNECTION_TTL);
+    }
+
+    fn evict_oldest_suspended(&mut self) {
+        let oldest = self
+            .suspended
+            .iter()
+            .min_by_key(|(_, lease)| lease.suspended_at)
+            .map(|(identity, _)| identity.clone());
+        if let Some(identity) = oldest {
+            self.suspended.remove(&identity);
         }
     }
 

@@ -144,6 +144,7 @@ fn router() -> axum::Router {
     let storage = inert_storage_bridges();
     let state = Arc::new(ListenerState {
         auth: AuthPolicy::None,
+        listener_instance: "test-listener".to_owned(),
         clock: Arc::new(TestClock),
         shutdown: tokio_util::sync::CancellationToken::new(),
         limits: SocketLimits::default(),

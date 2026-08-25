@@ -1444,6 +1444,7 @@ async fn execute_call(
     }) {
         return Err(protocol("duplicate unfinished tool call"));
     }
+    turn.effects.tool_started(&call_id)?;
     let execution_started = Instant::now();
     let execution_event = turn
         .safe_event(RuntimeEventKind::Tool)
