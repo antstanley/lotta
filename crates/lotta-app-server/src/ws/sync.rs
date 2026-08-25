@@ -99,8 +99,8 @@ mod snapshot_semantics {
         let event = RuntimeEvent::UpdateQueue {
             queue: bounded(json!([])),
             removed: bounded(json!([
-                {"item_id": "first", "disposition": "dequeued"},
-                {"item_id": "second", "disposition": "cancelled"}
+                {"client_message_id": "first", "disposition": "dequeued"},
+                {"client_message_id": "second", "disposition": "cancelled"}
             ])),
         };
         let RuntimeEvent::UpdateQueue { removed, .. } = event else {
@@ -111,7 +111,7 @@ mod snapshot_semantics {
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|row| row.get("item_id").and_then(Value::as_str))
+            .filter_map(|row| row.get("client_message_id").and_then(Value::as_str))
             .collect();
         assert_eq!(ids, ["first", "second"]);
     }

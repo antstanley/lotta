@@ -80,7 +80,8 @@ const DEFAULT_OUTPUT_TOKENS: u64 = 4_096;
 const TRANSCRIPT_MANIFEST_SCHEMA_VERSION: u8 = 2;
 const TRANSCRIPT_SESSION_SCHEMA_VERSION: u8 = 3;
 
-type DeviceSnapshotSource = Arc<dyn Fn() -> Result<BoundedJsonValue, AppServerError> + Send + Sync>;
+type DeviceSnapshotSource =
+    Arc<dyn Fn(&RuntimeScope) -> Result<BoundedJsonValue, AppServerError> + Send + Sync>;
 
 #[cfg(test)]
 pub(crate) type CancellationStageObserver =
@@ -1101,22 +1102,32 @@ impl ProductionRuntimeService {
         }
     }
 
-    fn active_lease(&self, key: &RuntimeKey) -> Result<Option<TurnLease>, AppServerError> {
+    fn active_snapshot(
+        &self,
+        key: &RuntimeKey,
+    ) -> Result<Option<(TurnLease, Vec<QueueItem>)>, AppServerError> {
         self.state
             .active
             .lock()
             .map_err(|_| AppServerError::Internal)
-            .map(|active| active.get(key).map(|item| item.lease.clone()))
+            .map(|active| {
+                active.get(key).map(|item| {
+                    (
+                        item.lease.clone(),
+                        item.queue.items().cloned().collect::<Vec<_>>(),
+                    )
+                })
+            })
     }
 
-    fn device_snapshot(&self) -> Result<BoundedJsonValue, AppServerError> {
+    fn device_snapshot(&self, scope: &RuntimeScope) -> Result<BoundedJsonValue, AppServerError> {
         let source = self
             .device_snapshot
             .lock()
             .map_err(|_| AppServerError::Internal)?
             .clone()
             .ok_or(AppServerError::Unavailable)?;
-        source()
+        source(scope)
     }
 
     async fn compact(
@@ -1781,7 +1792,7 @@ fn emit_started_continuation(
         .and_then(serde_json::Value::as_str)
         .ok_or(AppServerError::Malformed)?;
     let key = (RuntimeKey::from(scope), id.to_owned());
-    let item = service
+    let _item = service
         .state
         .inner
         .try_lock()
@@ -1790,16 +1801,7 @@ fn emit_started_continuation(
         .get(&key)
         .map(|pending| pending.item.clone())
         .ok_or(AppServerError::Malformed)?;
-    sink.emit(
-        scope,
-        lotta_app_server::ws::RuntimeEvent::UpdateLoopStatus {
-            loop_status: BoundedJsonValue::new(serde_json::json!({
-                "status": "started",
-                "client_message_id": item.client_message_id.as_str()
-            }))
-            .map_err(|_| AppServerError::Internal)?,
-        },
-    )
+    sink.emit(scope, loop_event("EXECUTING_COMMAND", Vec::new())?)
 }
 
 async fn sync_outcome(
@@ -1807,11 +1809,11 @@ async fn sync_outcome(
     command: SyncCommand,
 ) -> Result<SyncOutcome, AppServerError> {
     let key = RuntimeKey::from(&command.runtime);
-    let active = service.active_lease(&key)?;
+    let active = service.active_snapshot(&key)?;
     if active.is_none() {
         let _ = service.ensure_runtime(&command.runtime)?;
     }
-    let device = service.device_snapshot()?;
+    let device = service.device_snapshot(&command.runtime)?;
     let mut broadcasts = vec![lotta_app_server::ws::RuntimeEvent::UpdateDeviceStatus {
         device_status: device,
     }];
@@ -1829,18 +1831,14 @@ async fn sync_outcome(
 fn sync_status_broadcasts(
     service: &ProductionRuntimeService,
     key: &RuntimeKey,
-    active: Option<&lotta_domain::TurnLease>,
+    active: Option<&(lotta_domain::TurnLease, Vec<QueueItem>)>,
 ) -> Result<Vec<lotta_app_server::ws::RuntimeEvent>, AppServerError> {
-    if let Some(active_lease) = active {
-        return Ok(vec![lotta_app_server::ws::RuntimeEvent::UpdateLoopStatus {
-            loop_status: BoundedJsonValue::new(serde_json::json!({
-                "status": "executing_command",
-                "active_run_ids": [],
-                "lease_generation": active_lease.generation(),
-                "executing_tool_call_ids": []
-            }))
-            .map_err(|_| AppServerError::Internal)?,
-        }]);
+    if let Some((active_lease, queue)) = active {
+        let _ = active_lease;
+        return Ok(vec![
+            loop_event("EXECUTING_COMMAND", Vec::new())?,
+            queue_event(queue)?,
+        ]);
     }
     let Ok(state) = service.state.inner.try_lock() else {
         return Ok(Vec::new());
@@ -1858,28 +1856,42 @@ fn sync_status_broadcasts(
         .queue(&handle)
         .ok_or(AppServerError::Internal)?;
     Ok(vec![
-        lotta_app_server::ws::RuntimeEvent::UpdateLoopStatus {
-            loop_status: BoundedJsonValue::new(serde_json::json!({
-                "status": match lifecycle.loop_status() {
-                    lotta_domain::LoopStatus::WaitingOnInput => "idle",
-                    lotta_domain::LoopStatus::ExecutingCommand => "executing_command",
-                    lotta_domain::LoopStatus::SendingApiRequest => "sending",
-                },
-                "active_run_ids": lifecycle.active_run_ids(),
-                "executing_tool_call_ids": []
-            }))
-            .map_err(|_| AppServerError::Internal)?,
-        },
-        lotta_app_server::ws::RuntimeEvent::UpdateQueue {
-            queue: BoundedJsonValue::new(
-                serde_json::to_value(queue.items().collect::<Vec<_>>())
-                    .map_err(|_| AppServerError::Internal)?,
-            )
-            .map_err(|_| AppServerError::Internal)?,
-            removed: BoundedJsonValue::new(serde_json::json!([]))
-                .map_err(|_| AppServerError::Internal)?,
-        },
+        loop_event(
+            match lifecycle.loop_status() {
+                lotta_domain::LoopStatus::WaitingOnInput => "WAITING_ON_INPUT",
+                lotta_domain::LoopStatus::ExecutingCommand => "EXECUTING_COMMAND",
+                lotta_domain::LoopStatus::SendingApiRequest => "SENDING_API_REQUEST",
+            },
+            lifecycle
+                .active_run_ids()
+                .iter()
+                .map(|run_id| run_id.as_str().to_owned())
+                .collect(),
+        )?,
+        queue_event(&queue.items().cloned().collect::<Vec<_>>())?,
     ])
+}
+
+fn loop_event(
+    status: &'static str,
+    active_run_ids: Vec<String>,
+) -> Result<lotta_app_server::ws::RuntimeEvent, AppServerError> {
+    let loop_status = BoundedJsonValue::new(serde_json::json!({
+        "status": status,
+        "active_run_ids": active_run_ids,
+        "executing_tool_call_ids": [],
+    }))
+    .map_err(|_| AppServerError::Internal)?;
+    Ok(lotta_app_server::ws::RuntimeEvent::UpdateLoopStatus { loop_status })
+}
+
+fn queue_event(items: &[QueueItem]) -> Result<lotta_app_server::ws::RuntimeEvent, AppServerError> {
+    let queue =
+        BoundedJsonValue::new(serde_json::to_value(items).map_err(|_| AppServerError::Internal)?)
+            .map_err(|_| AppServerError::Internal)?;
+    let removed =
+        BoundedJsonValue::new(serde_json::json!([])).map_err(|_| AppServerError::Internal)?;
+    Ok(lotta_app_server::ws::RuntimeEvent::UpdateQueue { queue, removed })
 }
 
 fn sync_approval_broadcasts(
@@ -1894,16 +1906,13 @@ fn sync_approval_broadcasts(
         let lotta_runtime::RecoveryAction::Replay(request) = action else {
             continue;
         };
-        let state_name = format!("{:?}", request.state).to_lowercase();
         let payload = BoundedJsonValue::new(serde_json::json!({
-            "request_id": request.request_id.as_str(),
+            "subtype": "can_use_tool",
             "tool_call_id": request.tool_call_id.as_str(),
-            "lease_generation": request.lease_generation,
-            "revision": request.revision,
             "tool_name": request.tool_name.as_str(),
             "input": request.original_input.as_value(),
-            "state": state_name,
-            "expires_at": request.expires_at,
+            "permission_suggestions": [],
+            "blocked_path": null,
         }))
         .map_err(|_| AppServerError::Internal)?;
         broadcasts.push(lotta_app_server::ws::RuntimeEvent::ControlRequest {
@@ -2721,11 +2730,12 @@ impl TurnEffectPort for ProductionEffects {
                 lotta_app_server::ws::RuntimeEvent::ControlRequest {
                     request_id: request.request_id,
                     request: BoundedJsonValue::new(serde_json::json!({
+                        "subtype": "can_use_tool",
                         "tool_call_id": request.call_id.as_str(),
-                        "lease_generation": request.lease_generation,
                         "tool_name": request.tool_name.as_str(),
                         "input": request.input.as_value(),
-                        "schema": request.schema.as_value()
+                        "permission_suggestions": [],
+                        "blocked_path": null,
                     }))
                     .map_err(effect_error)?,
                     agent_id: NonEmptyString::new(self.scope.agent_id.as_str().to_owned()).ok(),
@@ -2763,12 +2773,8 @@ impl TurnEffectPort for ProductionEffects {
                 stop_reason: NonEmptyString::new(reason.wire_value()).map_err(effect_error)?,
                 error: None,
             },
-            TurnEvent::Retry(retry) => lotta_app_server::ws::RuntimeEvent::UpdateLoopStatus {
-                loop_status: BoundedJsonValue::new(
-                    serde_json::json!({"status":"retrying","event":format!("{retry:?}")}),
-                )
-                .map_err(effect_error)?,
-            },
+            TurnEvent::Retry(_retry) => loop_event("RETRYING_API_REQUEST", Vec::new())
+                .map_err(|_| effect_error("retry loop snapshot"))?,
             TurnEvent::ToolResult(result) => lotta_app_server::ws::RuntimeEvent::StreamDelta {
                 delta: BoundedJsonValue::new(
                     serde_json::json!({"type":"tool_result","call_id":result.call_id.as_str()}),
@@ -2986,7 +2992,7 @@ mod production_tests {
                         .as_value()
                         .get("status")
                         .and_then(serde_json::Value::as_str)
-                        == Some("idle")
+                        == Some("WAITING_ON_INPUT")
                 }
                 _ => false,
             })
@@ -3373,7 +3379,7 @@ mod production_tests {
             Arc::new(ProductionTurnBrokers::new()),
             settings,
         );
-        service.register_device_snapshot_source(Arc::new(|| {
+        service.register_device_snapshot_source(Arc::new(|_| {
             BoundedJsonValue::new(serde_json::json!({"is_online": true}))
                 .map_err(|_| AppServerError::Internal)
         }));

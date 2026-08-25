@@ -101,7 +101,7 @@ mod repairs_missing_tool_end {
 
         let repair = RuntimeEvent::UpdateLoopStatus {
             loop_status: bounded(json!({
-                "status": "idle",
+                "status": "WAITING_ON_INPUT",
                 "active_run_ids": [],
                 "executing_tool_call_ids": []
             })),
@@ -114,7 +114,7 @@ mod repairs_missing_tool_end {
         else {
             panic!("loop snapshot");
         };
-        assert_eq!(loop_status.as_value()["status"], "idle");
+        assert_eq!(loop_status.as_value()["status"], "WAITING_ON_INPUT");
         assert_eq!(loop_status.as_value()["executing_tool_call_ids"], json!([]));
     }
 }

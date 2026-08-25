@@ -19,6 +19,10 @@ pub type RuntimeEventBatch = BoundedVec<RuntimeEvent, WS_RUNTIME_ROUTE_EVENTS_MA
 /// Object-safe future returned by Runtime command service methods.
 pub type ServiceFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, crate::error::AppServerError>> + Send + 'a>>;
+/// Narrow scope-aware authoritative device snapshot port.
+pub type DeviceSnapshotSource = Arc<
+    dyn Fn(&RuntimeScope) -> Result<BoundedJsonValue, crate::error::AppServerError> + Send + Sync,
+>;
 
 /// Successful runtime resolution and initial snapshots.
 pub struct RuntimeStartOutcome {
@@ -131,13 +135,7 @@ pub trait RuntimeCommandService: Send + Sync {
     /// Replays runtime state.
     fn sync(&self, command: SyncCommand) -> ServiceFuture<'_, SyncOutcome>;
     /// Installs the listener-owned authoritative device snapshot source.
-    fn register_device_snapshot_source(
-        &self,
-        _source: Arc<
-            dyn Fn() -> Result<BoundedJsonValue, crate::error::AppServerError> + Send + Sync,
-        >,
-    ) {
-    }
+    fn register_device_snapshot_source(&self, _source: DeviceSnapshotSource) {}
     /// Aborts runtime work.
     fn abort_message(&self, command: AbortMessageCommand) -> ServiceFuture<'_, AbortOutcome>;
     /// Applies a device-state change.

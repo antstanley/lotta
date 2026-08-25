@@ -3027,8 +3027,12 @@ impl ProductionTurnController {
         sink.emit(
             &command.runtime,
             lotta_app_server::ws::RuntimeEvent::UpdateLoopStatus {
-                loop_status: BoundedJsonValue::new(serde_json::json!({"status":"idle"}))
-                    .map_err(|_| lotta_app_server::error::AppServerError::Internal)?,
+                loop_status: BoundedJsonValue::new(serde_json::json!({
+                    "status": "WAITING_ON_INPUT",
+                    "active_run_ids": [],
+                    "executing_tool_call_ids": [],
+                }))
+                .map_err(|_| lotta_app_server::error::AppServerError::Internal)?,
             },
         )?;
         Ok(())

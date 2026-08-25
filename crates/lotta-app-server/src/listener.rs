@@ -657,11 +657,12 @@ fn register_device_runtime_ports(state: &Arc<ListenerState>) {
     let snapshot_devices = Arc::downgrade(&state.devices);
     state
         .runtime_service
-        .register_device_snapshot_source(Arc::new(move || {
+        .register_device_snapshot_source(Arc::new(move |scope| {
             let device = snapshot_devices
                 .upgrade()
                 .ok_or(AppServerError::Unavailable)?;
-            BoundedJsonValue::new(device.status_snapshot()).map_err(|_| AppServerError::Internal)
+            BoundedJsonValue::new(device.status_snapshot(scope))
+                .map_err(|_| AppServerError::Internal)
         }));
     state.devices.register_event_sink(event_sink(state));
     state.devices.register_scope_gate(Arc::new({
@@ -1028,9 +1029,30 @@ fn dispatch_output(
     connection_id: crate::ws::ConnectionId,
     output: &crate::ws::RouteOutput,
 ) -> Result<(), AppServerError> {
+    if output.response_after_events {
+        dispatch_batches(state, output)?;
+        dispatch_responses(state, connection_id, output)
+    } else {
+        dispatch_responses(state, connection_id, output)?;
+        dispatch_batches(state, output)
+    }
+}
+
+fn dispatch_responses(
+    state: &ListenerState,
+    connection_id: crate::ws::ConnectionId,
+    output: &crate::ws::RouteOutput,
+) -> Result<(), AppServerError> {
     for response in output.responses.as_slice() {
         dispatch_value(state, connection_id, response)?;
     }
+    Ok(())
+}
+
+fn dispatch_batches(
+    state: &ListenerState,
+    output: &crate::ws::RouteOutput,
+) -> Result<(), AppServerError> {
     for batch in output.event_batches.as_slice() {
         dispatch_event_batch(
             state,

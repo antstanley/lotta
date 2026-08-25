@@ -137,6 +137,8 @@ pub struct RouteOutput {
     pub responses: ConnectionResponseBatch,
     /// Logical events paired with their stamped deliveries.
     pub event_batches: RoutedEventBatches,
+    /// Whether responses physically follow all event deliveries.
+    pub response_after_events: bool,
 }
 
 /// Deferred phase-two input work returned after admission application.
@@ -292,6 +294,7 @@ impl RuntimeRouter {
             responses: bounded_responses(response)?,
             event_batches: BoundedVec::new(batches)
                 .map_err(|_| crate::error::AppServerError::PayloadTooLarge)?,
+            response_after_events: true,
         })
     }
 
@@ -374,6 +377,7 @@ impl RuntimeRouter {
             responses: bounded_responses(response)?,
             event_batches: BoundedVec::new(batches)
                 .map_err(|_| crate::error::AppServerError::PayloadTooLarge)?,
+            response_after_events: false,
         })
     }
 }
@@ -406,6 +410,7 @@ fn empty_output(
         responses: bounded_responses(response)?,
         event_batches: BoundedVec::new(Vec::new())
             .map_err(|_| crate::error::AppServerError::PayloadTooLarge)?,
+        response_after_events: false,
     })
 }
 

@@ -872,40 +872,57 @@ impl DeviceBridge {
         if scopes.is_empty() {
             return;
         }
-        let status = self.device_status_json();
+        for scope in scopes {
+            let status = self.device_status_json(Some(&scope));
+            Self::emit_device_status(&sink, &scope, status);
+        }
+    }
+
+    fn emit_device_status(sink: &Arc<dyn RuntimeEventSink>, scope: &RuntimeScope, status: Value) {
         let Ok(status) = lotta_domain::BoundedJsonValue::new(status) else {
             tracing::warn!("bounded update_device_status encoding failed");
             return;
         };
-        for scope in scopes {
-            if let Err(error) = sink.emit(
-                &scope,
-                RuntimeEvent::UpdateDeviceStatus {
-                    device_status: status.clone(),
-                },
-            ) {
-                tracing::warn!(error = %error, "update_device_status broadcast failed");
-            }
+        if let Err(error) = sink.emit(
+            scope,
+            RuntimeEvent::UpdateDeviceStatus {
+                device_status: status,
+            },
+        ) {
+            tracing::warn!(error = %error, "update_device_status broadcast failed");
         }
     }
 
     /// Returns the current full device-status snapshot for authoritative sync.
     #[must_use]
-    pub fn status_snapshot(&self) -> Value {
-        self.device_status_json()
+    pub fn status_snapshot(&self, scope: &RuntimeScope) -> Value {
+        self.device_status_json(Some(scope))
     }
 
-    fn device_status_json(&self) -> Value {
+    fn device_status_json(&self, scope: Option<&RuntimeScope>) -> Value {
+        let cwd = scope
+            .and_then(|scope| lock(&self.cwd_of).as_ref().map(|resolver| resolver(scope)))
+            .unwrap_or_else(|| self.workspace_root.clone());
         json!({
+            "current_connection_id": null,
+            "connection_name": null,
             "is_online": true,
-            "current_working_directory": self.workspace_root.to_string_lossy(),
+            "is_processing": false,
+            "current_permission_mode": "standard",
+            "current_working_directory": cwd.to_string_lossy(),
             "boot_working_directory": self.workspace_root.to_string_lossy(),
+            "git_context": null,
             "letta_code_version": env!("CARGO_PKG_VERSION"),
+            "current_toolset": null,
+            "current_toolset_preference": "default",
             "background_processes": lock(&self.background).snapshot(),
             "supported_commands": builtin_and_registered_commands(self),
             "pending_control_requests": [],
             "current_loaded_tools": [],
             "current_available_skills": [],
+            "experiments": [],
+            "memory_directory": null,
+            "reflection_settings": null,
         })
     }
 

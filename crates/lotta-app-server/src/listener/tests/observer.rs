@@ -177,6 +177,7 @@ fn output(state: &ListenerState, event: RuntimeEvent) -> RouteOutput {
             deliveries,
         }])
         .unwrap(),
+        response_after_events: false,
     }
 }
 
