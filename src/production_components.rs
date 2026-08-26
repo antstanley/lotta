@@ -1908,8 +1908,43 @@ async fn task_snapshot(
         .snapshot(scope)
         .await
         .map_err(|_| AppServerError::Internal)?;
-    serde_json::from_value(serde_json::to_value(tasks).map_err(|_| AppServerError::Internal)?)
-        .map_err(|_| AppServerError::Internal)
+    tasks.into_iter().map(task_subagent_state).collect()
+}
+
+fn task_subagent_state(
+    task: lotta_tools::builtin::task::TaskRecord,
+) -> Result<lotta_app_server::ws::event::SubagentState, AppServerError> {
+    use lotta_app_server::ws::event::{SubagentState, SubagentStatus};
+    let status = match serde_json::to_value(task.status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .as_deref()
+    {
+        Some("pending") => SubagentStatus::Pending,
+        Some("in_progress") => SubagentStatus::Running,
+        Some("completed") => SubagentStatus::Completed,
+        _ => SubagentStatus::Error,
+    };
+    Ok(SubagentState {
+        subagent_id: task.task_id,
+        subagent_type: "task40".into(),
+        description: task.description,
+        prompt: Some(task.subject),
+        status,
+        agent_url: None,
+        conversation_id: None,
+        model: None,
+        is_background: None,
+        silent: None,
+        tool_call_id: None,
+        parent_agent_id: None,
+        parent_conversation_id: None,
+        start_time: task.created_at,
+        tool_calls: Vec::new(),
+        total_tokens: 0,
+        duration_ms: task.updated_at.saturating_sub(task.created_at),
+        error: None,
+    })
 }
 
 struct AuthoritativeStatusSnapshot {
@@ -3153,6 +3188,7 @@ fn adapter(error: impl std::fmt::Display) -> SetupError {
 #[cfg(test)]
 mod production_tests {
     use super::*;
+    use futures_util::{SinkExt, StreamExt};
     use lotta_app_server::ws::RuntimeEvent;
     use lotta_app_server::ws::device::{
         BackgroundProcessSource, DeviceBridge, DeviceForwarder, DeviceMessage,
@@ -4380,6 +4416,378 @@ mod production_tests {
             expires_at: Timestamp::parse_persisted_rfc3339("2026-08-19T00:00:00Z").unwrap(),
             state: lotta_runtime::ApprovalState::Pending,
             revision: 0,
+        }
+    }
+
+    fn production_sync_service(root: &Path) -> Arc<ProductionRuntimeService> {
+        let paths = StorePaths::new(root).unwrap();
+        let approvals = Arc::new(lotta_runtime::ApprovalManager::new(
+            LocalStore::new(paths.clone()).approval_journal(),
+            Arc::new(crate::production_setup::ProductionEditedInputValidator),
+        ));
+        let service = Arc::new(ProductionRuntimeService::new(
+            paths,
+            ProductionRuntimeDependencies {
+                clock: Arc::new(TestClock),
+                hooks: Arc::new(lotta_runtime::hooks::NoopHookRuntime),
+                state: Arc::new(ProductionRuntimeState::new(Arc::new(
+                    lotta_runtime::observe::RuntimeObserver::default(),
+                ))),
+                approvals,
+                brokers: Arc::new(ProductionTurnBrokers::new()),
+                settings: test_settings_bridge(root, &root.join("workspace")),
+                tasks: Arc::new(TaskLifecyclePort::new()),
+            },
+        ));
+        service.register_device_snapshot_source(Arc::new(|scope| {
+            serde_json::from_value(serde_json::json!({
+                "current_connection_id": "production-sync-device", "connection_name": null,
+                "is_online": true, "is_processing": true,
+                "current_permission_mode": "standard",
+                "current_working_directory": scope.agent_id.as_str(), "git_context": null,
+                "letta_code_version": "production-test", "current_toolset": null,
+                "current_toolset_preference": "auto", "current_loaded_tools": ["TaskCreate"],
+                "current_available_skills": [], "background_processes": [],
+                "pending_control_requests": [], "experiments": [], "memory_directory": null,
+                "reflection_settings": null, "supported_commands": ["sync"]
+            }))
+            .map_err(|_| AppServerError::Internal)
+        }));
+        service
+    }
+
+    async fn create_task40_record(service: &ProductionRuntimeService, target: &RuntimeScope) {
+        use lotta_runtime::ports::{ToolCallId, ValidatedToolInput};
+        use lotta_tools::pipeline::{RawToolExecutionRequest, RawToolOutcome};
+        let registration =
+            lotta_tools::builtin::task::registrations(Arc::clone(&service.tasks), target.clone())
+                .unwrap()
+                .into_iter()
+                .find(|row| row.definition.internal_name.as_str() == "TaskCreate")
+                .unwrap();
+        let outcome = registration
+            .executor
+            .execute(RawToolExecutionRequest::without_secrets(
+                ToolCallId::from_name(ProviderName::new("task40-sync-call".into()).unwrap()),
+                ValidatedToolInput::new(
+                    BoundedJsonValue::new(serde_json::json!({
+                        "subject": "Production sync child", "description": "Task40 scoped fixture"
+                    }))
+                    .unwrap(),
+                )
+                .unwrap(),
+                CancellationToken::new(),
+                registration.definition.timeout,
+                Arc::clone(&registration.definition),
+                registration.definition.model_name.clone(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RawToolOutcome::Success(_)));
+    }
+
+    async fn prepare_production_sync_state(
+        service: &ProductionRuntimeService,
+        target: &RuntimeScope,
+    ) {
+        let _ = service.ensure_runtime(target).unwrap();
+        let key = RuntimeKey::from(target);
+        let mut state = service.state.inner.lock().await;
+        let handle = state.registry.lookup(&key).unwrap();
+        let input = command(target.clone(), "sync-queued");
+        let active_item = service.admission_item(&input, "sync-active").unwrap();
+        let item = service.admission_item(&input, "sync-queued").unwrap();
+        let first = state
+            .registry
+            .admit(
+                &handle,
+                AdmissionRequest {
+                    item: active_item.clone(),
+                    route: AdmissionRoute::Ordinary,
+                },
+            )
+            .unwrap();
+        assert_eq!(first.disposition(), InputDisposition::Started);
+        let continuation = ProductionRuntimeService::start_admission(
+            &mut state,
+            target,
+            "sync-active",
+            handle.clone(),
+            active_item,
+        )
+        .unwrap();
+        let queued = state
+            .registry
+            .admit(
+                &handle,
+                AdmissionRequest {
+                    item,
+                    route: AdmissionRoute::Ordinary,
+                },
+            )
+            .unwrap();
+        assert_eq!(queued.disposition(), InputDisposition::Queued);
+        let pending = state
+            .pending
+            .remove(&(key.clone(), "sync-active".into()))
+            .unwrap();
+        let lease = pending.lease.clone();
+        let active_runs: Vec<_> = state
+            .registry
+            .lifecycle(&pending.handle)
+            .unwrap()
+            .projection()
+            .active_run_ids()
+            .iter()
+            .map(|run| run.as_str().to_owned())
+            .collect();
+        assert!(!active_runs.is_empty());
+        drop(state);
+        service.state.active.lock().unwrap().insert(
+            key,
+            ActiveAdmission {
+                handle: pending.handle,
+                lease: pending.lease.clone(),
+                cancellation: pending.cancellation,
+                queue: {
+                    let mut queue = lotta_runtime::ConversationQueue::default();
+                    let _ = queue
+                        .enqueue(service.admission_item(&input, "sync-queued").unwrap())
+                        .unwrap();
+                    queue
+                },
+                history: lotta_domain::AdmissionHistory::default(),
+            },
+        );
+        let _ = continuation;
+        create_task40_record(service, target).await;
+        service
+            .approvals
+            .store_request(approval_request(target.clone(), lease.generation()))
+            .unwrap();
+    }
+
+    fn assert_typed_sync_frames(frames: &[serde_json::Value], target: &RuntimeScope) {
+        let kinds: Vec<_> = frames
+            .iter()
+            .map(|frame| frame["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "update_device_status",
+                "update_loop_status",
+                "update_queue",
+                "update_subagent_state",
+                "control_request",
+                "sync_response",
+            ]
+        );
+        serde_json::from_value::<lotta_app_server::ws::event::DeviceStatus>(
+            frames[0]["device_status"].clone(),
+        )
+        .unwrap();
+        serde_json::from_value::<lotta_app_server::ws::event::LoopState>(
+            frames[1]["loop_status"].clone(),
+        )
+        .unwrap();
+        serde_json::from_value::<Vec<QueueItem>>(frames[2]["queue"].clone()).unwrap();
+        serde_json::from_value::<Vec<lotta_app_server::ws::event::SubagentState>>(
+            frames[3]["subagents"].clone(),
+        )
+        .unwrap();
+        serde_json::from_value::<lotta_app_server::ws::event::ApprovalRequest>(
+            frames[4]["request"].clone(),
+        )
+        .unwrap();
+        assert_eq!(frames[2]["queue"][0]["client_message_id"], "sync-queued");
+        assert_eq!(
+            frames[3]["subagents"][0]["description"],
+            "Task40 scoped fixture"
+        );
+        assert_eq!(frames[4]["request_id"], "approval-held");
+        assert_eq!(frames[5]["runtime"], serde_json::to_value(target).unwrap());
+        for (index, frame) in frames[..5].iter().enumerate() {
+            assert_eq!(frame["event_seq"], u64::try_from(index + 1).unwrap());
+            for field in ["emitted_at", "idempotency_key"] {
+                assert!(frame.get(field).is_some());
+            }
+        }
+        for field in ["event_seq", "emitted_at", "idempotency_key"] {
+            assert!(
+                frames[5].get(field).is_none(),
+                "response must be unstamped: {field}"
+            );
+        }
+    }
+
+    async fn receive_json(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> serde_json::Value {
+        loop {
+            let message = socket
+                .next()
+                .await
+                .expect("socket open")
+                .expect("socket frame");
+            match message {
+                tokio_tungstenite::tungstenite::Message::Text(body) => {
+                    return serde_json::from_str(&body).unwrap();
+                }
+                tokio_tungstenite::tungstenite::Message::Ping(body) => {
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Pong(body))
+                        .await
+                        .unwrap();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn start_sync_listener(
+        root: &Path,
+        service: Arc<ProductionRuntimeService>,
+    ) -> lotta_app_server::listener::ListenerHandle {
+        let token = root.join("sync.token");
+        std::fs::write(&token, "production-sync-token\n").unwrap();
+        let args = lotta_app_server::config::ServerArgs {
+            listen_enabled: true,
+            ws_auth: Some("capability-token".into()),
+            ws_token_file: Some(token),
+            storage_dir: Some(root.to_path_buf()),
+            workspace_dir: Some(root.join("workspace")),
+            ..Default::default()
+        };
+        let prepared = args.prepare().unwrap();
+        let shared = lotta_app_server::listener::SharedGroupBridges::new(
+            root,
+            &root.join("workspace"),
+            Arc::new(TestClock),
+        )
+        .unwrap();
+        let runtime: Arc<dyn RuntimeCommandService> = service;
+        let controller = Arc::new(lotta_app_server::ws::ServiceBackedTurnController::new(
+            Arc::clone(&runtime),
+        ));
+        lotta_app_server::listener::start_listener_with_runtime_service_controller_observer_and_bridges(
+            prepared, Arc::new(TestClock), runtime, controller,
+            Arc::new(lotta_app_server::observer::InertRuntimeBroadcastObserver), shared,
+        ).await.unwrap()
+    }
+
+    async fn connect_authenticated(
+        handle: &lotta_app_server::listener::ListenerHandle,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = handle.websocket_url().into_client_request().unwrap();
+        request.headers_mut().insert(
+            "authorization",
+            "Bearer production-sync-token".parse().unwrap(),
+        );
+        tokio_tungstenite::connect_async(request).await.unwrap().0
+    }
+
+    async fn send_sync(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        target: &RuntimeScope,
+        request_id: &str,
+    ) {
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::json!({
+                    "type": "sync", "request_id": request_id, "runtime": target,
+                    "recover_approvals": true, "force_device_status": true
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    mod ws {
+        mod sync {
+            mod replays_snapshots {
+                use crate::production_components::production_tests::*;
+
+                #[tokio::test]
+                async fn production_listener_replays_full_snapshot_in_physical_order() {
+                    let root = TempRoot::new("lotta-production-sync-live");
+                    let service = production_sync_service(&root);
+                    let target = scope("production-sync-live");
+                    prepare_production_sync_state(&service, &target).await;
+                    let mut handle = start_sync_listener(&root, Arc::clone(&service)).await;
+                    let mut socket = connect_authenticated(&handle).await;
+                    send_sync(&mut socket, &target, "sync-live").await;
+                    let mut frames = Vec::new();
+                    for _ in 0..6 {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            receive_json(&mut socket),
+                        )
+                        .await
+                        {
+                            Ok(frame) => frames.push(frame),
+                            Err(error) => panic!("sync frame timeout after {frames:?}: {error}"),
+                        }
+                    }
+                    assert_typed_sync_frames(&frames, &target);
+                    drop(socket);
+                    handle.shutdown();
+                    handle.wait().await.unwrap();
+                }
+
+                #[tokio::test]
+                async fn production_listener_sync_contention_is_atomic_typed_failure() {
+                    let root = TempRoot::new("lotta-production-sync-contended");
+                    let service = production_sync_service(&root);
+                    let target = scope("production-sync-contended");
+                    prepare_production_sync_state(&service, &target).await;
+                    let mut handle = start_sync_listener(&root, Arc::clone(&service)).await;
+                    let mut socket = connect_authenticated(&handle).await;
+                    let active = service
+                        .state
+                        .active
+                        .lock()
+                        .unwrap()
+                        .remove(&RuntimeKey::from(&target));
+                    let guard = service.state.inner.lock().await;
+                    send_sync(&mut socket, &target, "sync-contended").await;
+                    let frame = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        receive_json(&mut socket),
+                    )
+                    .await
+                    .expect("typed failure timeout");
+                    assert_eq!(frame["type"], "sync_response");
+                    assert_eq!(frame["success"], false);
+                    assert_eq!(frame["error"], "runtime service unavailable");
+                    for field in ["event_seq", "emitted_at", "idempotency_key"] {
+                        assert!(frame.get(field).is_none());
+                    }
+                    drop(guard);
+                    drop(active);
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Ping(
+                            Vec::new().into(),
+                        ))
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        socket.next().await.unwrap().unwrap(),
+                        tokio_tungstenite::tungstenite::Message::Pong(_)
+                    ));
+                    drop(socket);
+                    handle.shutdown();
+                    handle.wait().await.unwrap();
+                }
+            }
         }
     }
 

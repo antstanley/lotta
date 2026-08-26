@@ -916,6 +916,7 @@ name = "lotta"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "futures-util",
  "lotta-app-server",
  "lotta-domain",
  "lotta-extensions",
@@ -932,6 +933,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "uuid",
 ]

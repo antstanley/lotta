@@ -24,8 +24,10 @@ tokio.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+futures-util.workspace = true
 lotta-testkit = { version = "0.1.0", path = "crates/lotta-testkit" }
 reqwest.workspace = true
+tokio-tungstenite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

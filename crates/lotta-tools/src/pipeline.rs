@@ -127,8 +127,9 @@ impl SecretDelivery {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn test_empty_secret_delivery() -> SecretDelivery {
+#[doc(hidden)]
+#[must_use]
+pub fn test_empty_secret_delivery() -> SecretDelivery {
     SecretDelivery {
         kind: SecretDeliveryKind::ChildEnvironment,
         values: Arc::new(Vec::new()),
@@ -159,6 +160,28 @@ pub struct RawToolExecutionRequest {
 }
 
 impl RawToolExecutionRequest {
+    /// Builds a raw request without secret delivery for integration tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn without_secrets(
+        tool_call_id: ToolCallId,
+        input: ValidatedToolInput,
+        cancellation: CancellationToken,
+        deadline: ToolTimeout,
+        definition: Arc<ToolDefinition>,
+        model_name: ModelFacingToolName,
+    ) -> Self {
+        Self {
+            tool_call_id,
+            input,
+            cancellation,
+            deadline,
+            definition,
+            model_name,
+            secrets: test_empty_secret_delivery(),
+        }
+    }
+
     /// Executor-only private delivery accessor.
     #[must_use]
     pub fn secret_delivery(&self) -> &SecretDelivery {
