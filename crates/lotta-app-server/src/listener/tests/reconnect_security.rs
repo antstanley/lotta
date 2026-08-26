@@ -1,4 +1,10 @@
-use std::{fs, sync::{Arc, atomic::{AtomicU64, Ordering}}};
+use std::{
+    fs,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt};
@@ -43,7 +49,9 @@ impl Harness {
     async fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let secret = std::env::temp_dir().join(format!(
-            "lotta-reconnect-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)
+            "lotta-reconnect-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::write(&secret, SECRET).expect("secret");
         let args = ServerArgs {
@@ -56,25 +64,31 @@ impl Harness {
         let _ = fs::remove_file(secret);
         let start = Timestamp::parse_persisted_rfc3339("2026-08-14T00:00:00Z").expect("time");
         let clock = Arc::new(FakeClock::new(start));
-        let (handle, state) = start_listener_with_state_for_test(
-            prepared,
-            clock.clone(),
-            Arc::new(ReconnectService),
-        )
-        .await
-        .expect("listener");
+        let (handle, state) =
+            start_listener_with_state_for_test(prepared, clock.clone(), Arc::new(ReconnectService))
+                .await
+                .expect("listener");
         let url = handle.websocket_url().to_owned();
-        Self { handle: Some(handle), state, clock, url }
+        Self {
+            handle: Some(handle),
+            state,
+            clock,
+            url,
+        }
     }
 
     async fn connect(&self, sub: &str, serial: u64, client_id: Option<&str>) -> Client {
         let mut request = self.url.clone().into_client_request().expect("request");
         request.headers_mut().insert(
             "authorization",
-            format!("Bearer {}", token(sub, serial)).parse().expect("auth header"),
+            format!("Bearer {}", token(sub, serial))
+                .parse()
+                .expect("auth header"),
         );
         if let Some(id) = client_id {
-            request.headers_mut().insert("x-lotta-reconnect-id", id.parse().expect("id header"));
+            request
+                .headers_mut()
+                .insert("x-lotta-reconnect-id", id.parse().expect("id header"));
         }
         connect_async(request).await.expect("upgrade").0
     }
@@ -107,8 +121,14 @@ impl Harness {
 
     async fn barrier(&self) {
         let mut socket = self.connect("barrier", 1, None).await;
-        socket.send(Message::Ping(Vec::new().into())).await.expect("ping");
-        assert!(matches!(socket.next().await.expect("pong").expect("pong frame"), Message::Pong(_)));
+        socket
+            .send(Message::Ping(Vec::new().into()))
+            .await
+            .expect("ping");
+        assert!(matches!(
+            socket.next().await.expect("pong").expect("pong frame"),
+            Message::Pong(_)
+        ));
         socket.close(None).await.expect("barrier close");
     }
 
@@ -120,46 +140,117 @@ impl Harness {
 
 impl Drop for Harness {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.as_mut() { handle.shutdown(); }
+        if let Some(handle) = self.handle.as_mut() {
+            handle.shutdown();
+        }
     }
 }
 
 struct ReconnectService;
 
 impl RuntimeCommandService for ReconnectService {
-    fn runtime_start(&self, command: crate::ws::command::RuntimeStartCommand) -> ServiceFuture<'_, RuntimeStartOutcome> {
+    fn runtime_start(
+        &self,
+        command: crate::ws::command::RuntimeStartCommand,
+    ) -> ServiceFuture<'_, RuntimeStartOutcome> {
         let agent = command.agent_id.expect("agent").as_str().to_owned();
-        let conversation = command.conversation_id.expect("conversation").as_str().to_owned();
-        Box::pin(async move { Ok(RuntimeStartOutcome {
-            runtime: scope(&agent, &conversation), created_agent: false, created_conversation: false,
-            agent: None, conversation: None, broadcasts: events(Vec::new()),
-        }) })
+        let conversation = command
+            .conversation_id
+            .expect("conversation")
+            .as_str()
+            .to_owned();
+        Box::pin(async move {
+            Ok(RuntimeStartOutcome {
+                runtime: scope(&agent, &conversation),
+                created_agent: false,
+                created_conversation: false,
+                agent: None,
+                conversation: None,
+                broadcasts: events(Vec::new()),
+            })
+        })
     }
-    fn admit_input(&self, _: crate::ws::command::InputCommand) -> ServiceFuture<'_, InputAdmission> {
-        Box::pin(async { Ok(InputAdmission { disposition: InputDisposition::Started, error: None, continuation: None, after_ack: events(Vec::new()) }) })
+    fn admit_input(
+        &self,
+        _: crate::ws::command::InputCommand,
+    ) -> ServiceFuture<'_, InputAdmission> {
+        Box::pin(async {
+            Ok(InputAdmission {
+                disposition: InputDisposition::Started,
+                error: None,
+                continuation: None,
+                after_ack: events(Vec::new()),
+            })
+        })
     }
-    fn continue_input(&self, _: RuntimeScope, _: Option<BoundedJsonValue>, _: Arc<dyn RuntimeEventSink>) -> ServiceFuture<'_, ()> { Box::pin(async { Ok(()) }) }
-    fn compact(&self, _: RuntimeScope, _: lotta_runtime::CompactionMode, _: NonEmptyString, _: lotta_runtime::ports::ProviderRequest) -> ServiceFuture<'_, lotta_runtime::turn::CompactionProgress> { Box::pin(async { Err(AppServerError::Unavailable) }) }
+    fn continue_input(
+        &self,
+        _: RuntimeScope,
+        _: Option<BoundedJsonValue>,
+        _: Arc<dyn RuntimeEventSink>,
+    ) -> ServiceFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn compact(
+        &self,
+        _: RuntimeScope,
+        _: lotta_runtime::CompactionMode,
+        _: NonEmptyString,
+        _: lotta_runtime::ports::ProviderRequest,
+    ) -> ServiceFuture<'_, lotta_runtime::turn::CompactionProgress> {
+        Box::pin(async { Err(AppServerError::Unavailable) })
+    }
     fn sync(&self, _: crate::ws::command::SyncCommand) -> ServiceFuture<'_, SyncOutcome> {
-        Box::pin(async { Ok(SyncOutcome { broadcasts: events(vec![RuntimeEvent::UpdateQueue { queue: Vec::new(), removed: Vec::new() }]) }) })
+        Box::pin(async {
+            Ok(SyncOutcome {
+                broadcasts: events(vec![RuntimeEvent::UpdateQueue {
+                    queue: Vec::new(),
+                    removed: Vec::new(),
+                }]),
+            })
+        })
     }
-    fn abort_message(&self, _: crate::ws::command::AbortMessageCommand) -> ServiceFuture<'_, AbortOutcome> { Box::pin(async { Ok(AbortOutcome { aborted: false }) }) }
-    fn change_device_state(&self, _: crate::ws::command::ChangeDeviceStateCommand) -> ServiceFuture<'_, DeviceStateOutcome> { Box::pin(async { Ok(DeviceStateOutcome { broadcasts: events(Vec::new()) }) }) }
+    fn abort_message(
+        &self,
+        _: crate::ws::command::AbortMessageCommand,
+    ) -> ServiceFuture<'_, AbortOutcome> {
+        Box::pin(async { Ok(AbortOutcome { aborted: false }) })
+    }
+    fn change_device_state(
+        &self,
+        _: crate::ws::command::ChangeDeviceStateCommand,
+    ) -> ServiceFuture<'_, DeviceStateOutcome> {
+        Box::pin(async {
+            Ok(DeviceStateOutcome {
+                broadcasts: events(Vec::new()),
+            })
+        })
+    }
 }
 
 fn scope(agent: &str, conversation: &str) -> RuntimeScope {
-    RuntimeScope::new(AgentId::accept(agent).expect("agent"), ConversationId::accept(conversation).expect("conversation"), None)
+    RuntimeScope::new(
+        AgentId::accept(agent).expect("agent"),
+        ConversationId::accept(conversation).expect("conversation"),
+        None,
+    )
 }
 
-fn events(values: Vec<RuntimeEvent>) -> RuntimeEventBatch { BoundedVec::new(values).expect("events") }
+fn events(values: Vec<RuntimeEvent>) -> RuntimeEventBatch {
+    BoundedVec::new(values).expect("events")
+}
 
 fn token(sub: &str, serial: u64) -> String {
     let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
-    let claims = URL_SAFE_NO_PAD.encode(json!({"sub":sub,"serial":serial,"exp":2_000_000_000i64}).to_string());
+    let claims = URL_SAFE_NO_PAD
+        .encode(json!({"sub":sub,"serial":serial,"exp":2_000_000_000i64}).to_string());
     let message = format!("{header}.{claims}");
     let mut mac = Hmac::<Sha256>::new_from_slice(SECRET).expect("key");
     mac.update(message.as_bytes());
-    format!("{message}.{}", URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
+    format!(
+        "{message}.{}",
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    )
 }
 
 async fn recv_json(socket: &mut Client) -> Value {
@@ -194,7 +285,13 @@ async fn renewed_bearer_same_principal_and_client_resumes_subscription_and_seque
     h.close(old).await;
     let mut renewed = h.connect("principal", 2, Some("device")).await;
     assert_eq!(h.sync_seq(&mut renewed, "resume").await, 2);
-    assert_eq!(h.active().into_iter().find(|(_, n, _)| *n == 1).map(|(_, _, seq)| seq), Some(2));
+    assert_eq!(
+        h.active()
+            .into_iter()
+            .find(|(_, n, _)| *n == 1)
+            .map(|(_, _, seq)| seq),
+        Some(2)
+    );
 }
 
 #[tokio::test]
@@ -212,7 +309,15 @@ async fn principals_and_colon_ids_cannot_collide_or_inherit() {
 async fn malformed_empty_and_oversized_reconnect_ids_are_non_resumable() {
     let h = Harness::new().await;
     let oversized = "x".repeat(257);
-    for (index, id) in [None, Some("   "), Some("bad\tvalue"), Some(oversized.as_str())].into_iter().enumerate() {
+    for (index, id) in [
+        None,
+        Some("   "),
+        Some("bad\tvalue"),
+        Some(oversized.as_str()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let suffix = format!("invalid-{index}");
         let mut first = h.connect("invalid", 1, id).await;
         h.subscribe(&mut first, &suffix).await;
@@ -230,7 +335,10 @@ async fn live_takeover_is_rejected_without_replacing_owner() {
     let mut owner = h.connect("live", 1, Some("device")).await;
     h.subscribe(&mut owner, "live").await;
     let mut takeover = h.connect("live", 2, Some("device")).await;
-    assert!(matches!(takeover.next().await, None | Some(Ok(Message::Close(_)) | Err(_))));
+    assert!(matches!(
+        takeover.next().await,
+        None | Some(Ok(Message::Close(_)) | Err(_))
+    ));
     assert_eq!(h.sync_seq(&mut owner, "live").await, 1);
 }
 
@@ -255,7 +363,9 @@ async fn deterministic_clock_ttl_exact_boundary_and_expiry() {
     h.subscribe(&mut before, "before").await;
     assert_eq!(h.sync_seq(&mut before, "before").await, 1);
     h.close(before).await;
-    h.clock.advance(chrono::Duration::seconds(TTL - 1)).expect("advance");
+    h.clock
+        .advance(chrono::Duration::seconds(TTL - 1))
+        .expect("advance");
     let mut before = h.connect("ttl", 2, Some("before")).await;
     assert_eq!(h.sync_seq(&mut before, "before").await, 2);
     h.close(before).await;
@@ -263,7 +373,9 @@ async fn deterministic_clock_ttl_exact_boundary_and_expiry() {
     h.subscribe(&mut exact, "exact").await;
     assert_eq!(h.sync_seq(&mut exact, "exact").await, 1);
     h.close(exact).await;
-    h.clock.advance(chrono::Duration::seconds(TTL)).expect("advance");
+    h.clock
+        .advance(chrono::Duration::seconds(TTL))
+        .expect("advance");
     let mut exact = h.connect("ttl", 2, Some("exact")).await;
     assert_eq!(h.sync_seq(&mut exact, "exact").await, 1);
 }
@@ -275,7 +387,9 @@ async fn suspended_count_cap_evicts_oldest_deterministically_and_protects_resume
         let id = format!("cap-{index:04}");
         let socket = h.connect("cap", 1, Some(&id)).await;
         h.close(socket).await;
-        h.clock.advance(chrono::Duration::milliseconds(1)).expect("advance");
+        h.clock
+            .advance(chrono::Duration::milliseconds(1))
+            .expect("advance");
     }
     let mut protected = h.connect("cap", 2, Some("cap-0001")).await;
     h.subscribe(&mut protected, "protected").await;
@@ -283,7 +397,11 @@ async fn suspended_count_cap_evicts_oldest_deterministically_and_protects_resume
     let overflow = h.connect("cap", 1, Some("cap-overflow")).await;
     h.close(overflow).await;
     let evicted = h.connect("cap", 2, Some("cap-0000")).await;
-    assert!(h.active().iter().any(|(_, subscriptions, _)| *subscriptions == 1));
+    assert!(
+        h.active()
+            .iter()
+            .any(|(_, subscriptions, _)| *subscriptions == 1)
+    );
     h.close(evicted).await;
     assert_eq!(h.sync_seq(&mut protected, "protected").await, 2);
 }

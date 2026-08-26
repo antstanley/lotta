@@ -886,14 +886,14 @@ impl ProductionRuntimeState {
         }
     }
 
-    pub(crate) fn take_pending(
+    pub(crate) async fn take_pending(
         &self,
         scope: &RuntimeScope,
         id: &str,
     ) -> Result<PendingAdmission, AppServerError> {
         self.inner
-            .try_lock()
-            .map_err(|_| AppServerError::Internal)?
+            .lock()
+            .await
             .pending
             .remove(&(RuntimeKey::from(scope), id.to_owned()))
             .ok_or(AppServerError::Malformed)
@@ -1678,6 +1678,10 @@ impl ProductionRuntimeService {
             return Err(AppServerError::Malformed);
         }
         let run_sequence = u64::try_from(state.sequence).map_err(|_| AppServerError::Internal)?;
+        state.sequence = state
+            .sequence
+            .checked_add(1)
+            .ok_or(AppServerError::Internal)?;
         let run_id = lotta_domain::RunId::generate_sequence(run_sequence)
             .map_err(|_| AppServerError::Internal)?;
         let continuation = continuation_value(client_message_id)?;
@@ -2344,18 +2348,23 @@ impl RuntimeCommandService for ProductionRuntimeService {
             if let Some(admission) = self.admit_active_ordinary(&command)? {
                 return Ok(admission);
             }
-            let _ = self.ensure_runtime(&command.runtime)?;
             let client_message_id = input_client_message_id(command.payload.as_value())?;
             let item = self.admission_item(&command, &client_message_id)?;
-            let mut state = self
-                .state
-                .inner
-                .try_lock()
-                .map_err(|_| AppServerError::Internal)?;
-            let handle = state
-                .registry
-                .lookup(&RuntimeKey::from(&command.runtime))
-                .ok_or(AppServerError::Internal)?;
+            let mut state = self.state.inner.lock().await;
+            let handle =
+                if let Some(handle) = state.registry.lookup(&RuntimeKey::from(&command.runtime)) {
+                    handle
+                } else {
+                    let owner = Uuid::from_u128(state.sequence);
+                    state.sequence = state
+                        .sequence
+                        .checked_add(1)
+                        .ok_or(AppServerError::Internal)?;
+                    state
+                        .registry
+                        .get_or_create(&command.runtime, owner)
+                        .map_err(runtime_service_error)?
+                };
             let outcome = state
                 .registry
                 .admit(
@@ -4934,20 +4943,279 @@ mod production_tests {
         target: &RuntimeScope,
         request_id: &str,
     ) {
+        send_json(
+            socket,
+            serde_json::json!({
+                "type": "sync", "request_id": request_id, "runtime": target,
+                "recover_approvals": true, "force_device_status": true
+            }),
+        )
+        .await;
+    }
+
+    async fn send_json(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        value: serde_json::Value,
+    ) {
         socket
             .send(tokio_tungstenite::tungstenite::Message::Text(
-                serde_json::json!({
-                    "type": "sync", "request_id": request_id, "runtime": target,
-                    "recover_approvals": true, "force_device_status": true
-                })
-                .to_string()
-                .into(),
+                value.to_string().into(),
             ))
             .await
             .unwrap();
     }
 
+    async fn send_runtime_start(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        target: &RuntimeScope,
+    ) {
+        send_json(
+            socket,
+            serde_json::json!({
+                "type": "runtime_start", "request_id": "recovery-start",
+                "agent_id": target.agent_id, "conversation_id": target.conversation_id,
+                "recover_approvals": true, "force_device_status": true
+            }),
+        )
+        .await;
+    }
+
+    async fn send_input(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        target: &RuntimeScope,
+    ) {
+        send_json(
+            socket,
+            serde_json::json!({
+                "type": "input", "request_id": "recovery-input", "runtime": target,
+                "payload": {"kind": "create_message", "messages": [{
+                    "client_message_id": "recovery-message", "role": "user",
+                    "content": "create a task"
+                }]}
+            }),
+        )
+        .await;
+    }
+
+    async fn receive_until(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        done: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let frame = receive_json(socket).await;
+                if done(&frame) {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("expected socket frame")
+    }
+
+    async fn receive_until_apply(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        reducer: &mut ClientReducer,
+        done: impl Fn(&serde_json::Value) -> bool,
+    ) -> Vec<serde_json::Value> {
+        let mut frames = Vec::new();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let frame = receive_json(socket).await;
+                reducer.apply(&frame);
+                let finished = done(&frame);
+                frames.push(frame);
+                if finished {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(result.is_ok(), "expected socket frame after {frames:#?}");
+        frames
+    }
+
+    async fn start_production_listener(
+        root: &Path,
+        service: Arc<ProductionRuntimeService>,
+        controller: Arc<ProductionTurnController>,
+    ) -> lotta_app_server::listener::ListenerHandle {
+        let token = root.join("sync.token");
+        std::fs::write(&token, "production-sync-token\n").unwrap();
+        let prepared = lotta_app_server::config::ServerArgs {
+            listen_enabled: true,
+            ws_auth: Some("capability-token".into()),
+            ws_token_file: Some(token),
+            storage_dir: Some(root.to_path_buf()),
+            workspace_dir: Some(root.join("workspace")),
+            ..Default::default()
+        }
+        .prepare()
+        .unwrap();
+        let shared = lotta_app_server::listener::SharedGroupBridges::new(
+            root,
+            &root.join("workspace"),
+            Arc::new(TestClock),
+        )
+        .unwrap();
+        let runtime: Arc<dyn RuntimeCommandService> = service;
+        lotta_app_server::listener::start_listener_with_runtime_service_controller_observer_and_bridges(
+            prepared, Arc::new(TestClock), runtime, controller,
+            Arc::new(lotta_app_server::observer::InertRuntimeBroadcastObserver), shared,
+        ).await.unwrap()
+    }
+
+    struct ToolCallingProvider {
+        calls: std::sync::atomic::AtomicU64,
+    }
+
+    impl Default for ToolCallingProvider {
+        fn default() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl ProviderPort for ToolCallingProvider {
+        fn stream(&self, _: ProviderRequest, events: ProviderEventSink) -> PortFuture<'_, ()> {
+            Box::pin(async move {
+                let attempt = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    let call_id = lotta_runtime::ports::ToolCallId::from_name(ProviderName::new(
+                        "recovery-tool-call".into(),
+                    )?);
+                    events
+                        .send(ProviderEvent::ToolCallStart {
+                            call_id: call_id.clone(),
+                            name: lotta_runtime::boundary::ProviderEventText::new(
+                                "TaskOutput".into(),
+                            )?,
+                        })
+                        .await?;
+                    events
+                        .send(ProviderEvent::ToolCallArgumentsDelta {
+                            call_id: call_id.clone(),
+                            chunk: lotta_runtime::boundary::ToolArgumentChunk::new(
+                                br#"{"task_id":"missing","block":false,"timeout":0}"#.to_vec(),
+                            )?,
+                        })
+                        .await?;
+                    events.send(ProviderEvent::ToolCallEnd { call_id }).await?;
+                }
+                events
+                    .send(ProviderEvent::Stop {
+                        reason: if attempt == 0 {
+                            lotta_runtime::ports::StopReason::ToolUse
+                        } else {
+                            lotta_runtime::ports::StopReason::EndTurn
+                        },
+                    })
+                    .await
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct ClientReducer {
+        executing: std::collections::BTreeSet<String>,
+    }
+
+    impl ClientReducer {
+        fn apply(&mut self, frame: &serde_json::Value) {
+            if frame["type"] == "stream_delta" {
+                match frame["delta"]["message_type"].as_str() {
+                    Some("client_tool_start") => {
+                        self.executing
+                            .insert(frame["delta"]["tool_call_id"].as_str().unwrap().into());
+                    }
+                    Some("client_tool_end") => {
+                        self.executing
+                            .remove(frame["delta"]["tool_call_id"].as_str().unwrap());
+                    }
+                    _ => {}
+                }
+            } else if frame["type"] == "update_loop_status" {
+                self.executing = frame["loop_status"]["executing_tool_call_ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|id| id.as_str().unwrap().to_owned())
+                    .collect();
+            }
+        }
+    }
+
     mod ws {
+        mod recovery {
+            mod repairs_missing_tool_end {
+                use crate::production_components::production_tests::*;
+
+                #[tokio::test]
+                async fn production_socket_sync_repairs_dropped_tool_end() {
+                    let provider = Arc::new(ToolCallingProvider::default());
+                    let (root, service, controller, ..) = production_controller_fixture(
+                        "recovery-live",
+                        provider.clone() as Arc<dyn ProviderPort>,
+                    )
+                    .await;
+                    let target = scope("recovery-live");
+                    let mut handle =
+                        start_production_listener(&root, Arc::clone(&service), controller).await;
+                    let mut socket = connect_authenticated(&handle).await;
+                    send_runtime_start(&mut socket, &target).await;
+                    receive_until(&mut socket, |frame| {
+                        frame["type"] == "runtime_start_response"
+                    })
+                    .await;
+                    send_input(&mut socket, &target).await;
+                    let accepted = receive_until(&mut socket, |frame| {
+                        frame["type"] == "input_accepted" && frame["request_id"] == "recovery-input"
+                    })
+                    .await;
+                    assert_eq!(
+                        accepted["accepted"],
+                        true,
+                        "input rejected; state lock available={}, frame={accepted:#?}",
+                        service.state.inner.try_lock().is_ok()
+                    );
+                    lotta_app_server::listener::set_test_outbound_frame_filter(Some(Arc::new(
+                        |body| !body.contains("\"message_type\":\"client_tool_end\""),
+                    )));
+                    let mut reducer = ClientReducer::default();
+                    receive_until_apply(&mut socket, &mut reducer, |frame| {
+                        frame["delta"]["message_type"] == "client_tool_start"
+                    })
+                    .await;
+                    assert_eq!(reducer.executing.len(), 1);
+                    while provider.calls.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                    send_sync(&mut socket, &target, "repair-sync").await;
+                    receive_until_apply(&mut socket, &mut reducer, |frame| {
+                        frame["type"] == "sync_response"
+                    })
+                    .await;
+                    assert!(reducer.executing.is_empty());
+                    lotta_app_server::listener::set_test_outbound_frame_filter(None);
+                    drop(socket);
+                    handle.shutdown();
+                    handle.wait().await.unwrap();
+                    let _ = std::fs::remove_dir_all(root);
+                }
+            }
+        }
+
         mod sync {
             mod replays_snapshots {
                 use crate::production_components::production_tests::*;
@@ -5101,7 +5369,7 @@ mod production_tests {
         let id = admitted.continuation.as_ref().unwrap().as_value()["client_message_id"]
             .as_str()
             .unwrap();
-        let pending = service.state.take_pending(&owner, id).unwrap();
+        let pending = service.state.take_pending(&owner, id).await.unwrap();
         let request = service
             .approvals
             .store_request(approval_request(owner.clone(), pending.lease.generation()))
@@ -5153,6 +5421,7 @@ mod production_tests {
         let pending = service
             .state
             .take_pending(&scope, "first")
+            .await
             .expect("take pending input");
         service.state.active.lock().unwrap().insert(
             RuntimeKey::from(&scope),

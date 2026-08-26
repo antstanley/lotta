@@ -64,6 +64,9 @@ mod heartbeat_integration;
 #[path = "listener/tests/observer.rs"]
 mod observer_tests;
 #[cfg(test)]
+#[path = "listener/tests/reconnect_security.rs"]
+mod reconnect_security;
+#[cfg(test)]
 #[path = "listener/tests/transport.rs"]
 mod transport;
 #[cfg(test)]
@@ -72,9 +75,6 @@ mod url_resolution;
 #[cfg(test)]
 #[path = "listener/tests/websocket.rs"]
 mod websocket;
-#[cfg(test)]
-#[path = "listener/tests/reconnect_security.rs"]
-mod reconnect_security;
 
 /// Compatibility re-export of the canonical WebSocket frame ceiling.
 pub use crate::bounds::WS_FRAME_BYTES_MAX as FRAME_BYTES_MAX;
@@ -292,14 +292,19 @@ async fn start_listener_with_state_for_test(
     let listener = TcpListener::bind(format_bind_address(&prepared.host, prepared.port))
         .await
         .map_err(|_| AppServerError::Listener)?;
-    let address = listener.local_addr().map_err(|_| AppServerError::Listener)?;
+    let address = listener
+        .local_addr()
+        .map_err(|_| AppServerError::Listener)?;
     let (base_url, websocket_url, openai_url) = resolved_urls(&prepared, address);
     let shutdown = CancellationToken::new();
     let path = prepared.websocket_path.clone();
     let state = compose_listener_state(
         prepared,
         &clock,
-        SocketLimits { frame_bytes: WS_FRAME_BYTES_MAX, ping_interval_ms: 3_600_000 },
+        SocketLimits {
+            frame_bytes: WS_FRAME_BYTES_MAX,
+            ping_interval_ms: 3_600_000,
+        },
         RuntimeEndpoints::from_parts(
             runtime_service,
             Arc::new(UnsupportedRuntimeCommandService),
@@ -318,7 +323,12 @@ async fn start_listener_with_state_for_test(
             .map_err(|_| AppServerError::Listener)
     });
     let handle = ListenerHandle {
-        address, base_url, websocket_url, openai_url, shutdown, task,
+        address,
+        base_url,
+        websocket_url,
+        openai_url,
+        shutdown,
+        task,
     };
     Ok((handle, state))
 }
@@ -1126,9 +1136,37 @@ async fn send_outbound_batch(
     batch: OutboundBatch,
 ) -> Result<(), axum::Error> {
     for body in batch {
-        socket.send(Message::Text(body.into())).await?;
+        if outbound_frame_allowed(&body) {
+            socket.send(Message::Text(body.into())).await?;
+        }
     }
     Ok(())
+}
+
+type OutboundFrameFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+type SharedOutboundFrameFilter = std::sync::Mutex<Option<OutboundFrameFilter>>;
+
+static OUTBOUND_FRAME_FILTER: std::sync::OnceLock<SharedOutboundFrameFilter> =
+    std::sync::OnceLock::new();
+
+#[doc(hidden)]
+pub fn set_test_outbound_frame_filter(filter: Option<OutboundFrameFilter>) {
+    *OUTBOUND_FRAME_FILTER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("outbound frame filter") = filter;
+}
+
+fn outbound_frame_allowed(body: &str) -> bool {
+    if let Some(filter) = OUTBOUND_FRAME_FILTER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("outbound frame filter")
+        .as_ref()
+    {
+        return filter(body);
+    }
+    true
 }
 
 fn dispatch_atomic_output(

@@ -3122,7 +3122,7 @@ fn attach_controller_error(
     }
 }
 
-fn activate_submission(
+async fn activate_submission(
     controller: &ProductionTurnController,
     command: &lotta_app_server::ws::command::InputCommand,
     deferred: &lotta_app_server::ws::DeferredInput,
@@ -3138,7 +3138,8 @@ fn activate_submission(
     let admission_id = ProductionTurnController::validate_submission(command, deferred)?;
     let pending = controller
         .runtime_state
-        .take_pending(&command.runtime, &admission_id)?;
+        .take_pending(&command.runtime, &admission_id)
+        .await?;
     let active_cancellation = pending.cancellation.clone();
     let key = lotta_runtime::RuntimeKey::from(&command.runtime);
     let active = crate::production_components::ActiveAdmission {
@@ -3199,7 +3200,7 @@ async fn submit_production_turn(
     let mut primary = None;
     loop {
         let (pending, active_cancellation, listener_cancellation) =
-            match activate_submission(controller, &command, &deferred, cancellation) {
+            match activate_submission(controller, &command, &deferred, cancellation).await {
                 Ok(active) => active,
                 Err(error) => return Err(attach_controller_error(primary, error)),
             };
