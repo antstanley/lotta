@@ -101,41 +101,84 @@ fn control_row_emits_control_request() {
 #[tokio::test]
 async fn admission_row_emits_input_accepted() {
     let members = members_in_fixture(&ADMISSION_ROW).expect("pinned row resolves");
-    let clock = Arc::new(lotta_testkit::clock::FakeClock::new(
-        lotta_domain::Timestamp::parse_persisted_rfc3339("2026-08-14T00:00:00Z")
-            .expect("fixture instant"),
-    ));
-    let router = Arc::new(std::sync::Mutex::new(RuntimeRouter::new(
-        clock,
-        Arc::new(RandomEventIdGenerator),
-    )));
-    let command = InputCommand {
-        request_id: Some(text("in-1")),
-        runtime: scope(),
-        payload: bounded(json!({"text": "hello"})),
-    };
-    let (output, deferred) = route_command(
-        Arc::clone(&router),
-        Arc::new(RejectingService),
-        CONNECTION,
-        RuntimeCommand::Input(command),
-    )
-    .await
-    .expect("rejected admissions still route an acknowledgement");
-    assert_eq!(
-        deferred.as_ref().map(|deferred| deferred.disposition),
-        Some(InputDisposition::Rejected),
-        "rejections defer no continuation"
-    );
-    assert_eq!(output.responses.as_slice().len(), 1);
-    let response = serde_json::to_value(&output.responses.as_slice()[0]).expect("encodes");
-    let emitted = response["type"].as_str().expect("typed response");
-    assert_eq!(emitted, "input_accepted", "admissions acknowledge first");
-    assert_eq!(response["accepted"], false);
-    assert!(
-        members.contains(&emitted.to_owned()),
-        "emitted {emitted} must belong to Admission-row members {members:?}"
-    );
+    let cases = [
+        (
+            InputAdmission {
+                disposition: InputDisposition::Rejected,
+                error: None,
+                continuation: None,
+                work: crate::ws::InputAdmissionWork::None,
+                after_ack: BoundedVec::new(Vec::new()).expect("empty batch"),
+            },
+            false,
+            false,
+            "rejected admission",
+        ),
+        (
+            InputAdmission {
+                disposition: InputDisposition::Started,
+                error: None,
+                continuation: Some(bounded(json!({"continue": "new"}))),
+                work: crate::ws::InputAdmissionWork::NewStarted(bounded(
+                    json!({"continue": "new"}),
+                )),
+                after_ack: BoundedVec::new(Vec::new()).expect("empty batch"),
+            },
+            true,
+            true,
+            "newly started admission",
+        ),
+        (
+            InputAdmission {
+                disposition: InputDisposition::Started,
+                error: None,
+                continuation: None,
+                work: crate::ws::InputAdmissionWork::None,
+                after_ack: BoundedVec::new(Vec::new()).expect("empty batch"),
+            },
+            true,
+            false,
+            "duplicate started acknowledgement",
+        ),
+    ];
+
+    for (index, (admission, accepted, expects_work, case)) in cases.into_iter().enumerate() {
+        let clock = Arc::new(lotta_testkit::clock::FakeClock::new(
+            lotta_domain::Timestamp::parse_persisted_rfc3339("2026-08-14T00:00:00Z")
+                .expect("fixture instant"),
+        ));
+        let router = Arc::new(std::sync::Mutex::new(RuntimeRouter::new(
+            clock,
+            Arc::new(RandomEventIdGenerator),
+        )));
+        let command = InputCommand {
+            request_id: Some(text(&format!("in-{index}"))),
+            runtime: scope(),
+            payload: bounded(json!({"text": "hello"})),
+        };
+        let (output, deferred) = route_command(
+            Arc::clone(&router),
+            Arc::new(FixedAdmissionService(Mutex::new(Some(admission)))),
+            CONNECTION,
+            RuntimeCommand::Input(command),
+        )
+        .await
+        .expect("admissions route an acknowledgement");
+        assert_eq!(deferred.is_some(), expects_work, "{case} deferred work");
+        if let Some(deferred) = deferred {
+            assert_eq!(deferred.disposition, InputDisposition::Started, "{case}");
+            assert!(deferred.continuation.is_some(), "{case} has continuation");
+        }
+        assert_eq!(output.responses.as_slice().len(), 1, "{case}");
+        let response = serde_json::to_value(&output.responses.as_slice()[0]).expect("encodes");
+        let emitted = response["type"].as_str().expect("typed response");
+        assert_eq!(emitted, "input_accepted", "{case} acknowledges first");
+        assert_eq!(response["accepted"], accepted, "{case}");
+        assert!(
+            members.contains(&emitted.to_owned()),
+            "emitted {emitted} must belong to Admission-row members {members:?}"
+        );
+    }
 }
 
 #[test]
@@ -212,10 +255,10 @@ fn management_row_emits_app_server_info() {
     );
 }
 
-/// Service seam answering every input with a rejection acknowledgement.
-struct RejectingService;
+/// Service seam answering one input with a fixed admission outcome.
+struct FixedAdmissionService(Mutex<Option<InputAdmission>>);
 
-impl RuntimeCommandService for RejectingService {
+impl RuntimeCommandService for FixedAdmissionService {
     fn runtime_start(
         &self,
         _: ConnectionId,
@@ -225,16 +268,13 @@ impl RuntimeCommandService for RejectingService {
     }
 
     fn admit_input(&self, _: InputCommand) -> ServiceFuture<'_, InputAdmission> {
-        fn rejected<'a>() -> ServiceFuture<'a, InputAdmission> {
-            Box::pin(std::future::ready(Ok(InputAdmission {
-                disposition: InputDisposition::Rejected,
-                error: None,
-                continuation: None,
-                work: crate::ws::InputAdmissionWork::None,
-                after_ack: BoundedVec::new(Vec::new()).expect("empty batch"),
-            })))
-        }
-        Box::pin(rejected())
+        let admission = self
+            .0
+            .lock()
+            .expect("admission lock")
+            .take()
+            .expect("one admission");
+        Box::pin(std::future::ready(Ok(admission)))
     }
 
     fn continue_input(

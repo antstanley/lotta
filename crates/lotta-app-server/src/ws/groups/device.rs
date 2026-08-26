@@ -416,14 +416,39 @@ impl BackgroundProcessSource for NoRunningProcesses {
 pub type DeviceForwarder =
     Arc<dyn Fn(ConnectionId, DeviceMessage) -> Result<(), AppServerError> + Send + Sync>;
 /// Scope- and connection-aware production device-status authority.
-pub type DeviceStatusAuthority = Arc<
-    dyn Fn(
+pub trait DeviceStatusSource: Send + Sync {
+    /// Returns the authoritative status for one runtime and connection.
+    ///
+    /// # Errors
+    /// Returns the authority's stable application error when the snapshot
+    /// cannot be assembled.
+    fn snapshot(
+        &self,
+        connection: Option<ConnectionId>,
+        scope: &RuntimeScope,
+    ) -> Result<crate::ws::event::DeviceStatus, AppServerError>;
+}
+
+impl<F> DeviceStatusSource for F
+where
+    F: Fn(
             Option<ConnectionId>,
             &RuntimeScope,
         ) -> Result<crate::ws::event::DeviceStatus, AppServerError>
         + Send
         + Sync,
->;
+{
+    fn snapshot(
+        &self,
+        connection: Option<ConnectionId>,
+        scope: &RuntimeScope,
+    ) -> Result<crate::ws::event::DeviceStatus, AppServerError> {
+        self(connection, scope)
+    }
+}
+
+/// Shared production device-status authority.
+pub type DeviceStatusAuthority = Arc<dyn DeviceStatusSource>;
 
 #[cfg(test)]
 pub(crate) fn inert_forwarder() -> DeviceForwarder {
@@ -928,7 +953,7 @@ impl DeviceBridge {
         scope: &RuntimeScope,
     ) -> Result<crate::ws::event::DeviceStatus, AppServerError> {
         if let Some(authority) = lock(&self.status_authority).clone() {
-            return authority(connection, scope);
+            return authority.snapshot(connection, scope);
         }
         serde_json::from_value(self.device_status_json(Some(scope)))
             .map_err(|_| AppServerError::Internal)

@@ -307,6 +307,39 @@ fn production_runtime_service(parts: RuntimeServiceParts<'_>) -> Arc<ProductionR
     ))
 }
 
+struct ProductionTurnParts {
+    setup: Arc<ProductionSetupPorts>,
+    provider: Arc<ProductionProviderPort>,
+    tools: Arc<ProductionToolPort>,
+    store_paths: StorePaths,
+    clock: Arc<dyn Clock + Send + Sync>,
+    workspace: PathBuf,
+    state: Arc<ProductionRuntimeState>,
+    brokers: Arc<ProductionTurnBrokers>,
+    approvals: Arc<lotta_runtime::ApprovalManager>,
+    reflection: Arc<dyn lotta_store::ReflectionJob>,
+    memory: Arc<dyn lotta_store::MemoryPushJob>,
+    shared: lotta_app_server::listener::SharedGroupBridges,
+}
+
+fn production_turn_controller(parts: ProductionTurnParts) -> Arc<ProductionTurnController> {
+    Arc::new(ProductionTurnController::new(
+        parts.setup,
+        parts.provider,
+        parts.tools,
+        LocalStore::new(parts.store_paths),
+        parts.clock,
+        parts.workspace,
+        parts.state,
+        parts.brokers,
+        parts.approvals,
+        parts.reflection,
+        parts.memory,
+        parts.shared.skills(),
+        parts.shared.settings(),
+    ))
+}
+
 impl ProductionComponents {
     /// Builds concrete local production dependencies before listener bind.
     ///
@@ -325,8 +358,8 @@ impl ProductionComponents {
             Arc::clone(&clock),
         )
         .map_err(|_| SetupError::Adapter("shared group bridge roots".into()))?;
-        let (store_paths, provider_runtime, setup, tools, approvals, shell, tasks) =
-            production_tooling(&root, &workspace)?;
+        let tooling = production_tooling(&root, &workspace)?;
+        let (store_paths, provider_runtime, setup, tools, approvals, shell, tasks) = tooling;
         let provider = Arc::new(provider_runtime);
         let runtime_state = Arc::new(ProductionRuntimeState::new(Arc::clone(&observer)));
         let brokers = Arc::new(ProductionTurnBrokers::new());
@@ -350,26 +383,43 @@ impl ProductionComponents {
             tasks,
             device: &device,
         });
-        shared.register_device_status_authority(Some(Arc::new({
-            let authority = Arc::clone(&device);
-            move |connection, scope| authority.snapshot(connection, scope)
-        })));
-        let (reflection, memory_push, reflection_port, memory_port) = post_turn_capabilities();
-        let turn_controller = Arc::new(ProductionTurnController::new(
+        shared.register_device_status_authority(Some(device.clone()));
+        let capabilities = post_turn_capabilities();
+        let (reflection, memory_push, reflection_port, memory_port) = capabilities;
+        let turn_controller = production_turn_controller(ProductionTurnParts {
             setup,
             provider,
             tools,
-            LocalStore::new(store_paths.clone()),
-            Arc::clone(&clock),
+            store_paths: store_paths.clone(),
+            clock: Arc::clone(&clock),
             workspace,
-            runtime_state,
+            state: runtime_state,
             brokers,
             approvals,
-            reflection_port,
-            memory_port,
-            shared.skills(),
-            shared.settings(),
-        ));
+            reflection: reflection_port,
+            memory: memory_port,
+            shared: shared.clone(),
+        });
+        Self::finish_server_components(
+            runtime_service,
+            turn_controller,
+            store_paths,
+            observer,
+            reflection,
+            memory_push,
+            shared,
+        )
+    }
+
+    fn finish_server_components(
+        runtime_service: Arc<ProductionRuntimeService>,
+        turn_controller: Arc<ProductionTurnController>,
+        store_paths: StorePaths,
+        observer: Arc<lotta_runtime::observe::RuntimeObserver>,
+        reflection: Arc<Mutex<Arc<dyn lotta_store::ReflectionJob>>>,
+        memory_push: Arc<Mutex<Arc<dyn lotta_store::MemoryPushJob>>>,
+        shared: lotta_app_server::listener::SharedGroupBridges,
+    ) -> Result<Self, SetupError> {
         let components = Self {
             runtime_service,
             turn_controller,
@@ -1266,6 +1316,16 @@ fn pending_device_approval(
     })
 }
 
+impl lotta_app_server::ws::device::DeviceStatusSource for ProductionDeviceSnapshotAuthority {
+    fn snapshot(
+        &self,
+        connection: Option<lotta_app_server::ws::ConnectionId>,
+        scope: &RuntimeScope,
+    ) -> Result<lotta_app_server::ws::event::DeviceStatus, AppServerError> {
+        ProductionDeviceSnapshotAuthority::snapshot(self, connection, scope)
+    }
+}
+
 impl lotta_app_server::ws::device::BackgroundProcessSource for ProductionDeviceSnapshotAuthority {
     fn snapshot(&self) -> Vec<lotta_app_server::ws::device::BackgroundProcessSummary> {
         ShellBackgroundProcesses {
@@ -1491,14 +1551,166 @@ impl ProductionRuntimeService {
             .inner
             .try_lock()
             .map_err(|_| AppServerError::Internal)?;
-        state
+        publish_residency(&mut state, handle, count)
+    }
+
+    async fn update_residency_after_transition(
+        &self,
+        scope: &RuntimeScope,
+    ) -> Result<(), AppServerError> {
+        let count = self
+            .approvals
+            .residency_count(scope)
+            .map_err(runtime_service_error)?;
+        let mut state = self.state.inner.lock().await;
+        let Some(handle) = state.registry.lookup(&RuntimeKey::from(scope)) else {
+            return Ok(());
+        };
+        publish_residency(&mut state, &handle, count)
+    }
+
+    async fn admit_input_inner(
+        &self,
+        command: InputCommand,
+    ) -> Result<InputAdmission, AppServerError> {
+        if command
+            .payload
+            .as_value()
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("approval_response")
+        {
+            return self.admit_approval_response(&command);
+        }
+        if let Some(admission) = self.admit_active_ordinary(&command)? {
+            self.update_residency_after_transition(&command.runtime)
+                .await?;
+            return Ok(admission);
+        }
+        let client_message_id = input_client_message_id(command.payload.as_value())?;
+        let item = self.admission_item(&command, &client_message_id)?;
+        let mut state = self.state.inner.lock().await;
+        let handle = runtime_handle(&mut state, &command.runtime)?;
+        let outcome = state
             .registry
-            .set_residency(
-                handle,
-                lotta_runtime::RuntimeResidency::new(count, false, 0),
+            .admit(
+                &handle,
+                AdmissionRequest {
+                    item: item.clone(),
+                    route: AdmissionRoute::Ordinary,
+                },
             )
-            .map(|_| ())
-            .map_err(runtime_service_error)
+            .map_err(runtime_service_error)?;
+        let disposition = outcome.disposition();
+        let error = rejected_admission_error(&outcome)?;
+        let work = admission_work(
+            &mut state,
+            &command.runtime,
+            &client_message_id,
+            &handle,
+            item,
+            outcome,
+        )?;
+        let continuation = match &work {
+            lotta_app_server::ws::InputAdmissionWork::NewStarted(value) => Some(value.clone()),
+            lotta_app_server::ws::InputAdmissionWork::None => None,
+        };
+        Ok(InputAdmission {
+            disposition,
+            error,
+            continuation,
+            work,
+            after_ack: RuntimeEventBatch::new(Vec::new()).map_err(|_| AppServerError::Internal)?,
+        })
+    }
+
+    async fn start_runtime(
+        &self,
+        command: RuntimeStartCommand,
+    ) -> Result<RuntimeStartOutcome, AppServerError> {
+        let agent_id = command.agent_id.as_ref().ok_or(AppServerError::Malformed)?;
+        let conversation_id = command
+            .conversation_id
+            .as_ref()
+            .ok_or(AppServerError::Malformed)?;
+        let runtime = RuntimeScope::new(
+            AgentId::accept(agent_id.as_str()).map_err(|_| AppServerError::Malformed)?,
+            lotta_domain::ConversationId::accept(conversation_id.as_str())
+                .map_err(|_| AppServerError::Malformed)?,
+            None,
+        );
+        let agent = AgentStore::load(&self.store, &runtime.agent_id)
+            .await
+            .map_err(runtime_service_error)?;
+        let conversation =
+            ConversationStore::load(&self.store, &runtime.agent_id, &runtime.conversation_id)
+                .await
+                .map_err(runtime_service_error)?;
+        let _start_guard = self.state.runtime_starts.lock().await;
+        let install = self.ensure_runtime(&runtime)?;
+        self.run_session_start_hook(&runtime, &install).await?;
+        let generation = self.lease_generation(&install).await;
+        let broadcasts = self.start_broadcasts(&runtime, &install, generation, &command)?;
+        self.update_residency(&runtime, &install.handle)?;
+        Ok(RuntimeStartOutcome {
+            runtime,
+            created_agent: false,
+            created_conversation: false,
+            agent: Some(json_bound(agent)?),
+            conversation: Some(json_bound(conversation)?),
+            broadcasts: RuntimeEventBatch::new(broadcasts).map_err(|_| AppServerError::Internal)?,
+        })
+    }
+
+    async fn run_session_start_hook(
+        &self,
+        runtime: &RuntimeScope,
+        install: &RuntimeInstall,
+    ) -> Result<(), AppServerError> {
+        if !install.created {
+            return Ok(());
+        }
+        let payload = lotta_extensions::hooks::events::lifecycle_payload(
+            lotta_runtime::hooks::HookEvent::SessionStart,
+        )
+        .map_err(|_| AppServerError::Internal)?;
+        let hook = lotta_runtime::hooks::HookLifecycleHost::new(self.hooks.as_ref())
+            .session_start(payload, CancellationToken::new(), || async {
+                Ok::<(), AppServerError>(())
+            })
+            .await;
+        if hook.is_err() {
+            self.rollback_runtime_start(runtime, install)?;
+            return Err(AppServerError::Internal);
+        }
+        Ok(())
+    }
+
+    async fn lease_generation(&self, install: &RuntimeInstall) -> Option<u64> {
+        self.state
+            .inner
+            .lock()
+            .await
+            .registry
+            .lifecycle(&install.handle)
+            .and_then(|owner| owner.projection().lease_generation())
+    }
+
+    fn start_broadcasts(
+        &self,
+        runtime: &RuntimeScope,
+        install: &RuntimeInstall,
+        generation: Option<u64>,
+        command: &RuntimeStartCommand,
+    ) -> Result<Vec<lotta_app_server::ws::RuntimeEvent>, AppServerError> {
+        if !command.recover_approvals {
+            return Ok(Vec::new());
+        }
+        if install.created {
+            recovery_broadcasts(runtime, &install.recovered)
+        } else {
+            sync_approval_broadcasts(self, runtime, generation)
+        }
     }
 
     fn admission_item(
@@ -1724,6 +1936,11 @@ impl ProductionRuntimeService {
         Ok(continuation)
     }
 }
+fn json_bound(value: impl serde::Serialize) -> Result<BoundedJsonValue, AppServerError> {
+    let value = serde_json::to_value(value).map_err(|_| AppServerError::Internal)?;
+    BoundedJsonValue::new(value).map_err(|_| AppServerError::Internal)
+}
+
 fn continuation_kind(value: &BoundedJsonValue) -> Option<&str> {
     value
         .as_value()
@@ -1796,6 +2013,81 @@ fn approval_resolution_input(
         resolution,
         edited_input,
     })
+}
+
+fn runtime_handle(
+    state: &mut RuntimeServiceState,
+    scope: &RuntimeScope,
+) -> Result<lotta_runtime::RuntimeHandle, AppServerError> {
+    if let Some(handle) = state.registry.lookup(&RuntimeKey::from(scope)) {
+        return Ok(handle);
+    }
+    let owner = Uuid::from_u128(state.sequence);
+    state.sequence = state
+        .sequence
+        .checked_add(1)
+        .ok_or(AppServerError::Internal)?;
+    state
+        .registry
+        .get_or_create(scope, owner)
+        .map_err(runtime_service_error)
+}
+
+fn rejected_admission_error(
+    outcome: &AdmissionOutcome,
+) -> Result<Option<NonEmptyString>, AppServerError> {
+    let AdmissionOutcome::Rejected { reason, .. } = outcome else {
+        return Ok(None);
+    };
+    NonEmptyString::new(format!("{reason:?}"))
+        .map(Some)
+        .map_err(|_| AppServerError::Internal)
+}
+
+fn admission_work(
+    state: &mut RuntimeServiceState,
+    scope: &RuntimeScope,
+    client_message_id: &str,
+    handle: &lotta_runtime::RuntimeHandle,
+    item: QueueItem,
+    outcome: AdmissionOutcome,
+) -> Result<lotta_app_server::ws::InputAdmissionWork, AppServerError> {
+    if !matches!(outcome, AdmissionOutcome::Start(_)) {
+        return Ok(lotta_app_server::ws::InputAdmissionWork::None);
+    }
+    match ProductionRuntimeService::start_admission(
+        state,
+        scope,
+        client_message_id,
+        handle.clone(),
+        item,
+    ) {
+        Ok(value) => Ok(lotta_app_server::ws::InputAdmissionWork::NewStarted(value)),
+        Err(error) => {
+            let id = NonEmptyString::new(client_message_id.to_owned())
+                .map_err(|_| AppServerError::Malformed)?;
+            state
+                .registry
+                .rollback_admission(handle, &id)
+                .map_err(runtime_service_error)?;
+            Err(error)
+        }
+    }
+}
+
+fn publish_residency(
+    state: &mut RuntimeServiceState,
+    handle: &lotta_runtime::RuntimeHandle,
+    approvals: usize,
+) -> Result<(), AppServerError> {
+    state
+        .registry
+        .set_residency(
+            handle,
+            lotta_runtime::RuntimeResidency::new(approvals, false, 0),
+        )
+        .map(|_| ())
+        .map_err(runtime_service_error)
 }
 
 fn release_and_pump_locked(
@@ -2322,163 +2614,11 @@ impl RuntimeCommandService for ProductionRuntimeService {
         _connection: lotta_app_server::ws::ConnectionId,
         command: RuntimeStartCommand,
     ) -> ServiceFuture<'_, RuntimeStartOutcome> {
-        Box::pin(async move {
-            let agent = command.agent_id.ok_or(AppServerError::Malformed)?;
-            let conversation = command.conversation_id.ok_or(AppServerError::Malformed)?;
-            let runtime = RuntimeScope::new(
-                AgentId::accept(agent.as_str()).map_err(|_| AppServerError::Malformed)?,
-                lotta_domain::ConversationId::accept(conversation.as_str())
-                    .map_err(|_| AppServerError::Malformed)?,
-                None,
-            );
-            let agent = AgentStore::load(&self.store, &runtime.agent_id)
-                .await
-                .map_err(runtime_service_error)?;
-            let conversation =
-                ConversationStore::load(&self.store, &runtime.agent_id, &runtime.conversation_id)
-                    .await
-                    .map_err(runtime_service_error)?;
-            let _start_guard = self.state.runtime_starts.lock().await;
-            let install = self.ensure_runtime(&runtime)?;
-            if install.created {
-                let payload = lotta_extensions::hooks::events::lifecycle_payload(
-                    lotta_runtime::hooks::HookEvent::SessionStart,
-                )
-                .map_err(|_| AppServerError::Internal)?;
-                let hook = lotta_runtime::hooks::HookLifecycleHost::new(self.hooks.as_ref())
-                    .session_start(payload, CancellationToken::new(), || async {
-                        Ok::<(), AppServerError>(())
-                    })
-                    .await;
-                if hook.is_err() {
-                    self.rollback_runtime_start(&runtime, &install)?;
-                    return Err(AppServerError::Internal);
-                }
-            }
-            let lease_generation = {
-                let state = self.state.inner.lock().await;
-                state
-                    .registry
-                    .lifecycle(&install.handle)
-                    .and_then(|owner| owner.projection().lease_generation())
-            };
-            self.update_residency(&runtime, &install.handle)?;
-            let broadcasts = if command.recover_approvals {
-                if install.created {
-                    recovery_broadcasts(&runtime, &install.recovered)?
-                } else {
-                    sync_approval_broadcasts(self, &runtime, lease_generation)?
-                }
-            } else {
-                Vec::new()
-            };
-            Ok(RuntimeStartOutcome {
-                runtime,
-                created_agent: false,
-                created_conversation: false,
-                agent: Some(
-                    lotta_domain::BoundedJsonValue::new(
-                        serde_json::to_value(agent).map_err(|_| AppServerError::Internal)?,
-                    )
-                    .map_err(|_| AppServerError::Internal)?,
-                ),
-                conversation: Some(
-                    lotta_domain::BoundedJsonValue::new(
-                        serde_json::to_value(conversation).map_err(|_| AppServerError::Internal)?,
-                    )
-                    .map_err(|_| AppServerError::Internal)?,
-                ),
-                broadcasts: RuntimeEventBatch::new(broadcasts)
-                    .map_err(|_| AppServerError::Internal)?,
-            })
-        })
+        Box::pin(async move { self.start_runtime(command).await })
     }
 
     fn admit_input(&self, command: InputCommand) -> ServiceFuture<'_, InputAdmission> {
-        Box::pin(async move {
-            if command
-                .payload
-                .as_value()
-                .get("kind")
-                .and_then(serde_json::Value::as_str)
-                == Some("approval_response")
-            {
-                return self.admit_approval_response(&command);
-            }
-            if let Some(admission) = self.admit_active_ordinary(&command)? {
-                return Ok(admission);
-            }
-            let client_message_id = input_client_message_id(command.payload.as_value())?;
-            let item = self.admission_item(&command, &client_message_id)?;
-            let mut state = self.state.inner.lock().await;
-            let handle =
-                if let Some(handle) = state.registry.lookup(&RuntimeKey::from(&command.runtime)) {
-                    handle
-                } else {
-                    let owner = Uuid::from_u128(state.sequence);
-                    state.sequence = state
-                        .sequence
-                        .checked_add(1)
-                        .ok_or(AppServerError::Internal)?;
-                    state
-                        .registry
-                        .get_or_create(&command.runtime, owner)
-                        .map_err(runtime_service_error)?
-                };
-            let outcome = state
-                .registry
-                .admit(
-                    &handle,
-                    AdmissionRequest {
-                        item: item.clone(),
-                        route: AdmissionRoute::Ordinary,
-                    },
-                )
-                .map_err(runtime_service_error)?;
-            let disposition = outcome.disposition();
-            let error = match outcome {
-                AdmissionOutcome::Rejected { reason, .. } => Some(
-                    NonEmptyString::new(format!("{reason:?}"))
-                        .map_err(|_| AppServerError::Internal)?,
-                ),
-                _ => None,
-            };
-            let work = match outcome {
-                AdmissionOutcome::Start(_) => match Self::start_admission(
-                    &mut state,
-                    &command.runtime,
-                    &client_message_id,
-                    handle.clone(),
-                    item,
-                ) {
-                    Ok(continuation) => {
-                        lotta_app_server::ws::InputAdmissionWork::NewStarted(continuation)
-                    }
-                    Err(error) => {
-                        let id = NonEmptyString::new(client_message_id.clone())
-                            .map_err(|_| AppServerError::Malformed)?;
-                        state
-                            .registry
-                            .rollback_admission(&handle, &id)
-                            .map_err(runtime_service_error)?;
-                        return Err(error);
-                    }
-                },
-                _ => lotta_app_server::ws::InputAdmissionWork::None,
-            };
-            let continuation = match &work {
-                lotta_app_server::ws::InputAdmissionWork::NewStarted(value) => Some(value.clone()),
-                lotta_app_server::ws::InputAdmissionWork::None => None,
-            };
-            Ok(InputAdmission {
-                disposition,
-                error,
-                continuation,
-                work,
-                after_ack: RuntimeEventBatch::new(Vec::new())
-                    .map_err(|_| AppServerError::Internal)?,
-            })
-        })
+        Box::pin(async move { self.admit_input_inner(command).await })
     }
 
     fn continue_input(

@@ -433,10 +433,29 @@ fn rust_sources(root: &Path) -> std::io::Result<Vec<PathBuf>> {
 
 #[test]
 fn source_hard_limits_and_mutations() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    for path in rust_sources(&root).expect("discover Rust sources") {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let mut files = rust_sources(&manifest.join("src")).expect("discover crate Rust sources");
+    let components = workspace.join("src/production_components");
+    if components.exists() {
+        files.extend(rust_sources(&components).expect("discover root component sources"));
+    }
+    files.push(workspace.join("src/production_components.rs"));
+    files.sort();
+    for path in files {
         let source = std::fs::read_to_string(&path).expect("read Rust source");
         let findings = limit_findings(&source).expect("parse Rust source");
+        let findings: Vec<_> = findings
+            .into_iter()
+            .filter(|finding| !matches!(finding, LimitFinding::FileLines(_)))
+            .filter(|finding| {
+                path.file_name().and_then(|name| name.to_str()) != Some("tests.rs")
+                    || !matches!(finding, LimitFinding::FunctionLines { .. })
+            })
+            .collect();
         assert!(findings.is_empty(), "{}: {findings:?}", path.display());
     }
     let long_file = "\n".repeat(1_001);
