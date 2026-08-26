@@ -415,6 +415,15 @@ impl BackgroundProcessSource for NoRunningProcesses {
 /// Push callback delivering one outbound message to one connection.
 pub type DeviceForwarder =
     Arc<dyn Fn(ConnectionId, DeviceMessage) -> Result<(), AppServerError> + Send + Sync>;
+/// Scope- and connection-aware production device-status authority.
+pub type DeviceStatusAuthority = Arc<
+    dyn Fn(
+            Option<ConnectionId>,
+            &RuntimeScope,
+        ) -> Result<crate::ws::event::DeviceStatus, AppServerError>
+        + Send
+        + Sync,
+>;
 
 #[cfg(test)]
 pub(crate) fn inert_forwarder() -> DeviceForwarder {
@@ -442,6 +451,7 @@ pub struct DeviceBridge {
     queue_authority: Mutex<Option<Arc<dyn QueueAuthority>>>,
     mod_commands: Mutex<Option<Arc<lotta_extensions::mods::registry::ModRegistries>>>,
     background: Mutex<Arc<dyn BackgroundProcessSource>>,
+    status_authority: Mutex<Option<DeviceStatusAuthority>>,
     event_sink: Mutex<Option<Arc<dyn RuntimeEventSink>>>,
     scopes: Mutex<Option<ScopeGate>>,
     cwd_of: Mutex<Option<CwdResolver>>,
@@ -470,6 +480,7 @@ impl DeviceBridge {
             queue_authority: Mutex::new(None),
             mod_commands: Mutex::new(None),
             background: Mutex::new(Arc::new(NoRunningProcesses)),
+            status_authority: Mutex::new(None),
             event_sink: Mutex::new(None),
             scopes: Mutex::new(None),
             cwd_of: Mutex::new(None),
@@ -500,6 +511,11 @@ impl DeviceBridge {
         if let Some(registries) = registries {
             self.register_mod_commands(registries);
         }
+    }
+
+    /// Registers the production authority used by sync and status refreshes.
+    pub fn register_status_authority(&self, authority: DeviceStatusAuthority) {
+        *lock(&self.status_authority) = Some(authority);
     }
 
     /// Registers the sink broadcasting listener state (`update_queue`,
@@ -870,20 +886,24 @@ impl DeviceBridge {
             return;
         }
         for scope in scopes {
-            let status = self.device_status_json(Some(&scope));
+            let status = self.status_snapshot_for(Some(connection), &scope);
             Self::emit_device_status(&sink, &scope, status);
         }
     }
 
-    fn emit_device_status(sink: &Arc<dyn RuntimeEventSink>, scope: &RuntimeScope, status: Value) {
-        let Ok(status) = serde_json::from_value(status) else {
+    fn emit_device_status(
+        sink: &Arc<dyn RuntimeEventSink>,
+        scope: &RuntimeScope,
+        status: Result<crate::ws::event::DeviceStatus, AppServerError>,
+    ) {
+        let Ok(status) = status else {
             tracing::warn!("typed update_device_status encoding failed");
             return;
         };
         if let Err(error) = sink.emit(
             scope,
             RuntimeEvent::UpdateDeviceStatus {
-                device_status: status,
+                device_status: Box::new(status),
             },
         ) {
             tracing::warn!(error = %error, "update_device_status broadcast failed");
@@ -893,7 +913,25 @@ impl DeviceBridge {
     /// Returns the current full device-status snapshot for authoritative sync.
     #[must_use]
     pub fn status_snapshot(&self, scope: &RuntimeScope) -> Value {
-        self.device_status_json(Some(scope))
+        self.status_snapshot_for(None, scope)
+            .and_then(|status| serde_json::to_value(status).map_err(|_| AppServerError::Internal))
+            .unwrap_or_else(|_| self.device_status_json(Some(scope)))
+    }
+
+    /// Returns the typed authoritative snapshot for one requesting connection.
+    ///
+    /// # Errors
+    /// Returns the registered authority's typed snapshot failure.
+    pub fn status_snapshot_for(
+        &self,
+        connection: Option<ConnectionId>,
+        scope: &RuntimeScope,
+    ) -> Result<crate::ws::event::DeviceStatus, AppServerError> {
+        if let Some(authority) = lock(&self.status_authority).clone() {
+            return authority(connection, scope);
+        }
+        serde_json::from_value(self.device_status_json(Some(scope)))
+            .map_err(|_| AppServerError::Internal)
     }
 
     fn device_status_json(&self, scope: Option<&RuntimeScope>) -> Value {

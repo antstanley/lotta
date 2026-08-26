@@ -403,6 +403,14 @@ impl ProductionSetupPorts {
         Arc::clone(&self.registry)
     }
 
+    /// Discovers the current scoped production skill catalog.
+    pub fn available_skills(
+        &self,
+        cwd: &Path,
+    ) -> Result<Vec<lotta_extensions::skills::Skill>, SetupError> {
+        self.discover_skills(cwd)
+    }
+
     /// Returns the shared Task 45 mod registry backing device commands.
     #[must_use]
     pub fn mod_registries(&self) -> Arc<ModRegistries> {

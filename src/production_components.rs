@@ -228,7 +228,7 @@ fn register_turn_authorities(
         state: Arc::clone(runtime_state),
         brokers: Arc::clone(brokers),
     })));
-    register_device_authority_ports(shared, runtime_state, setup.mod_registries(), shell);
+    register_device_authority_ports(shared, runtime_state, setup, shell);
 }
 
 /// The unavailable-by-default post-turn capability slots plus the registered
@@ -285,6 +285,14 @@ impl ProductionComponents {
         let runtime_state = Arc::new(ProductionRuntimeState::new(Arc::clone(&observer)));
         let brokers = Arc::new(ProductionTurnBrokers::new());
         register_turn_authorities(&shared, &provider, &setup, &runtime_state, &brokers, &shell);
+        let device_authority = Arc::new(ProductionDeviceSnapshotAuthority {
+            state: Arc::clone(&runtime_state),
+            approvals: Arc::clone(&approval_manager),
+            setup: Arc::clone(&setup),
+            settings: shared.settings(),
+            shell: Arc::clone(&shell),
+            workspace: workspace.clone(),
+        });
         let runtime_service = Arc::new(ProductionRuntimeService::new(
             store_paths.clone(),
             ProductionRuntimeDependencies {
@@ -295,8 +303,13 @@ impl ProductionComponents {
                 brokers: Arc::clone(&brokers),
                 settings: shared.settings(),
                 tasks,
+                device_authority: Some(Arc::clone(&device_authority)),
             },
         ));
+        shared.register_device_status_authority(Some(Arc::new({
+            let authority = Arc::clone(&device_authority);
+            move |connection, scope| authority.snapshot(connection, scope)
+        })));
         let (reflection, memory_push, reflection_port, memory_port) = post_turn_capabilities();
         let turn_controller = Arc::new(ProductionTurnController::new(
             Arc::clone(&setup),
@@ -1027,13 +1040,13 @@ impl lotta_app_server::ws::conversations::ConversationAuthority
 fn register_device_authority_ports(
     shared: &lotta_app_server::listener::SharedGroupBridges,
     state: &Arc<ProductionRuntimeState>,
-    mod_registries: Arc<ModRegistries>,
+    setup: &Arc<ProductionSetupPorts>,
     shell: &Arc<ShellToolBundle>,
 ) {
     shared.register_queue_authority(Some(Arc::new(ProductionQueueAuthority {
         state: Arc::clone(state),
     })));
-    shared.register_mod_commands(Some(mod_registries));
+    shared.register_mod_commands(Some(setup.mod_registries()));
     shared.register_background_processes(Some(Arc::new(ShellBackgroundProcesses {
         shell: Arc::clone(shell),
     })));
@@ -1110,6 +1123,165 @@ impl lotta_app_server::ws::device::BackgroundProcessSource for ShellBackgroundPr
     }
 }
 
+pub(crate) struct ProductionDeviceSnapshotAuthority {
+    pub(crate) state: Arc<ProductionRuntimeState>,
+    pub(crate) approvals: Arc<lotta_runtime::ApprovalManager>,
+    pub(crate) setup: Arc<ProductionSetupPorts>,
+    pub(crate) settings: Arc<SettingsBridge>,
+    pub(crate) shell: Arc<ShellToolBundle>,
+    pub(crate) workspace: PathBuf,
+}
+
+impl ProductionDeviceSnapshotAuthority {
+    fn snapshot(
+        &self,
+        connection: Option<lotta_app_server::ws::ConnectionId>,
+        scope: &RuntimeScope,
+    ) -> Result<lotta_app_server::ws::event::DeviceStatus, AppServerError> {
+        use lotta_app_server::ws::event::{DevicePermissionMode, ToolsetPreference};
+        let cwd = self
+            .settings
+            .cwd_for_next_turn(
+                Some(scope.agent_id.as_str()),
+                scope.conversation_id.as_str(),
+            )
+            .effective()
+            .to_path_buf();
+        let (is_processing, generation) = self.lifecycle(scope)?;
+        Ok(lotta_app_server::ws::event::DeviceStatus {
+            current_connection_id: connection.map(|id| id.to_string()),
+            connection_name: None,
+            is_online: connection.is_some(),
+            is_processing,
+            current_permission_mode: DevicePermissionMode::Standard,
+            current_working_directory: Some(cwd.to_string_lossy().into_owned()),
+            cwd_revision: None,
+            git_context: None,
+            letta_code_version: Some(env!("CARGO_PKG_VERSION").into()),
+            current_toolset: None,
+            current_toolset_preference: ToolsetPreference::Auto,
+            current_loaded_tools: self.tools()?,
+            current_available_skills: self.skills(&cwd)?,
+            background_processes: lotta_app_server::ws::device::BackgroundProcessSource::snapshot(
+                &ShellBackgroundProcesses {
+                    shell: Arc::clone(&self.shell),
+                },
+            )
+            .into_iter()
+            .map(|process| serde_json::to_value(process).and_then(serde_json::from_value))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| AppServerError::Internal)?,
+            pending_control_requests: self.approvals(scope, generation)?,
+            experiments: Vec::new(),
+            memory_directory: None,
+            cwd_map: None,
+            boot_working_directory: Some(self.workspace.to_string_lossy().into_owned()),
+            should_doctor: None,
+            reflection_settings: None,
+            supported_commands: Vec::new(),
+        })
+    }
+
+    fn lifecycle(&self, scope: &RuntimeScope) -> Result<(bool, Option<u64>), AppServerError> {
+        let active = self
+            .state
+            .active
+            .lock()
+            .map_err(|_| AppServerError::Internal)?;
+        if let Some(item) = active.get(&RuntimeKey::from(scope)) {
+            return Ok((true, Some(item.lease.generation())));
+        }
+        drop(active);
+        let state = self
+            .state
+            .inner
+            .try_lock()
+            .map_err(|_| AppServerError::Internal)?;
+        let Some(handle) = state.registry.lookup(&RuntimeKey::from(scope)) else {
+            return Ok((false, None));
+        };
+        let lifecycle = state
+            .registry
+            .lifecycle(&handle)
+            .ok_or(AppServerError::Internal)?;
+        Ok((!lifecycle.projection().active_run_ids().is_empty(), None))
+    }
+
+    fn tools(&self) -> Result<Vec<String>, AppServerError> {
+        self.setup
+            .registry()
+            .snapshot()
+            .map(|snapshot| {
+                snapshot
+                    .model_names()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .map_err(|_| AppServerError::Internal)
+    }
+
+    fn skills(
+        &self,
+        cwd: &Path,
+    ) -> Result<Vec<lotta_app_server::ws::event::AvailableSkillSummary>, AppServerError> {
+        self.setup
+            .available_skills(cwd)
+            .map_err(|_| AppServerError::Internal)?
+            .into_iter()
+            .map(|skill| {
+                Ok(lotta_app_server::ws::event::AvailableSkillSummary {
+                    id: skill.id,
+                    name: skill.name,
+                    description: skill.description,
+                    path: skill.skill_file.to_string_lossy().into_owned(),
+                    source: format!("{:?}", skill.source).to_ascii_lowercase(),
+                })
+            })
+            .collect()
+    }
+
+    fn approvals(
+        &self,
+        scope: &RuntimeScope,
+        generation: Option<u64>,
+    ) -> Result<Vec<lotta_app_server::ws::event::PendingApprovalRequest>, AppServerError> {
+        self.approvals
+            .pending_snapshot(scope, generation)
+            .map_err(runtime_service_error)?
+            .into_iter()
+            .map(pending_device_approval)
+            .collect()
+    }
+}
+
+fn pending_device_approval(
+    request: lotta_runtime::ApprovalRequest,
+) -> Result<lotta_app_server::ws::event::PendingApprovalRequest, AppServerError> {
+    Ok(lotta_app_server::ws::event::PendingApprovalRequest {
+        request_id: request.request_id,
+        request: lotta_app_server::ws::event::ApprovalRequest {
+            subtype: lotta_app_server::ws::event::ApprovalSubtype::CanUseTool,
+            tool_call_id: request.tool_call_id,
+            tool_name: request.tool_name,
+            input: BoundedJsonValue::new(request.original_input.as_value().clone())
+                .map_err(|_| AppServerError::Internal)?,
+            permission_suggestions: Vec::new(),
+            blocked_path: None,
+            diffs: None,
+        },
+    })
+}
+
+impl lotta_app_server::ws::device::BackgroundProcessSource for ProductionDeviceSnapshotAuthority {
+    fn snapshot(&self) -> Vec<lotta_app_server::ws::device::BackgroundProcessSummary> {
+        ShellBackgroundProcesses {
+            shell: Arc::clone(&self.shell),
+        }
+        .snapshot()
+    }
+}
+
 struct ProductionRuntimeDependencies {
     clock: Arc<dyn Clock + Send + Sync>,
     hooks: Arc<dyn lotta_runtime::hooks::HookRuntime>,
@@ -1118,6 +1290,7 @@ struct ProductionRuntimeDependencies {
     brokers: Arc<ProductionTurnBrokers>,
     settings: Arc<SettingsBridge>,
     tasks: Arc<TaskLifecyclePort>,
+    device_authority: Option<Arc<ProductionDeviceSnapshotAuthority>>,
 }
 
 pub(crate) struct ProductionRuntimeService {
@@ -1129,6 +1302,7 @@ pub(crate) struct ProductionRuntimeService {
     brokers: Arc<ProductionTurnBrokers>,
     settings: Arc<SettingsBridge>,
     tasks: Arc<TaskLifecyclePort>,
+    device_authority: Option<Arc<ProductionDeviceSnapshotAuthority>>,
     device_snapshot: Mutex<Option<DeviceSnapshotSource>>,
 }
 
@@ -1143,6 +1317,7 @@ impl ProductionRuntimeService {
             brokers: dependencies.brokers,
             settings: dependencies.settings,
             tasks: dependencies.tasks,
+            device_authority: dependencies.device_authority,
             device_snapshot: Mutex::new(None),
         }
     }
@@ -1187,7 +1362,11 @@ impl ProductionRuntimeService {
             .map_err(|_| AppServerError::Internal)?
             .clone()
             .ok_or(AppServerError::Unavailable)?;
-        source(scope)
+        source(scope).or_else(|error| {
+            self.device_authority
+                .as_ref()
+                .map_or(Err(error), |authority| authority.snapshot(None, scope))
+        })
     }
 
     async fn compact(
@@ -3682,6 +3861,7 @@ mod production_tests {
                 brokers: Arc::new(ProductionTurnBrokers::new()),
                 settings,
                 tasks: Arc::new(TaskLifecyclePort::new()),
+                device_authority: None,
             },
         );
         service.register_device_snapshot_source(Arc::new(|_| {
@@ -3875,6 +4055,7 @@ mod production_tests {
                 brokers: Arc::clone(&brokers),
                 settings: Arc::clone(&settings),
                 tasks: Arc::new(TaskLifecyclePort::new()),
+                device_authority: None,
             },
         ));
         service.register_device_snapshot_source(Arc::new(|_| {
@@ -4485,6 +4666,7 @@ mod production_tests {
                 brokers: Arc::new(ProductionTurnBrokers::new()),
                 settings: test_settings_bridge(root, &root.join("workspace")),
                 tasks: Arc::new(TaskLifecyclePort::new()),
+                device_authority: None,
             },
         ));
         service.register_device_snapshot_source(Arc::new(|scope| {
@@ -5418,6 +5600,7 @@ mod production_tests {
                 brokers: Arc::new(ProductionTurnBrokers::new()),
                 settings,
                 tasks: Arc::new(TaskLifecyclePort::new()),
+                device_authority: None,
             },
         );
         (Arc::new(service), state)

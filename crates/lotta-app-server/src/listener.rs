@@ -299,6 +299,8 @@ pub struct SharedGroupBridges {
         Arc<std::sync::Mutex<Option<Arc<lotta_extensions::mods::registry::ModRegistries>>>>,
     background_processes:
         Arc<std::sync::Mutex<Option<Arc<dyn crate::ws::device::BackgroundProcessSource>>>>,
+    device_status_authority:
+        Arc<std::sync::Mutex<Option<crate::ws::device::DeviceStatusAuthority>>>,
 }
 
 impl SharedGroupBridges {
@@ -333,6 +335,7 @@ impl SharedGroupBridges {
             queue_authority: Arc::new(std::sync::Mutex::new(None)),
             mod_commands: Arc::new(std::sync::Mutex::new(None)),
             background_processes: Arc::new(std::sync::Mutex::new(None)),
+            device_status_authority: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -430,6 +433,25 @@ impl SharedGroupBridges {
             .ok()
             .and_then(|current| current.clone())
     }
+
+    /// Registers the production device-status authority.
+    pub fn register_device_status_authority(
+        &self,
+        authority: Option<crate::ws::device::DeviceStatusAuthority>,
+    ) {
+        if let Ok(mut current) = self.device_status_authority.lock() {
+            *current = authority;
+        }
+    }
+
+    /// Returns the registered production device-status authority.
+    #[must_use]
+    pub fn device_status_authority(&self) -> Option<crate::ws::device::DeviceStatusAuthority> {
+        self.device_status_authority
+            .lock()
+            .ok()
+            .and_then(|current| current.clone())
+    }
 }
 
 /// Binds a listener over host-composed skills/settings bridges.
@@ -485,6 +507,7 @@ fn compose_shared_bridges(
         queue_authority: Arc::new(std::sync::Mutex::new(None)),
         mod_commands: Arc::new(std::sync::Mutex::new(None)),
         background_processes: Arc::new(std::sync::Mutex::new(None)),
+        device_status_authority: Arc::new(std::sync::Mutex::new(None)),
     })
 }
 
@@ -599,6 +622,9 @@ fn compose_listener_state(
     let devices = compose_device_bridges(&outbound, &prepared, device_ports.queue_authority)?;
     devices.register_mod_commands_if_set(device_ports.mod_commands);
     devices.register_background_processes_if_set(device_ports.background);
+    if let Some(authority) = device_ports.status_authority {
+        devices.register_status_authority(authority);
+    }
     Ok(Arc::new(ListenerState {
         auth: prepared.auth,
         listener_instance: listener_instance(clock),
@@ -650,6 +676,7 @@ struct DevicePorts {
     queue_authority: Option<Arc<dyn crate::ws::device::QueueAuthority>>,
     mod_commands: Option<Arc<lotta_extensions::mods::registry::ModRegistries>>,
     background: Option<Arc<dyn crate::ws::device::BackgroundProcessSource>>,
+    status_authority: Option<crate::ws::device::DeviceStatusAuthority>,
 }
 
 impl DevicePorts {
@@ -658,6 +685,7 @@ impl DevicePorts {
             queue_authority: shared.queue_authority(),
             mod_commands: shared.mod_commands(),
             background: shared.background_processes(),
+            status_authority: shared.device_status_authority(),
         }
     }
 }
@@ -674,8 +702,7 @@ fn register_device_runtime_ports(state: &Arc<ListenerState>) {
             let device = snapshot_devices
                 .upgrade()
                 .ok_or(AppServerError::Unavailable)?;
-            serde_json::from_value(device.status_snapshot(scope))
-                .map_err(|_| AppServerError::Internal)
+            device.status_snapshot_for(None, scope)
         }));
     state.devices.register_event_sink(event_sink(state));
     state.devices.register_scope_gate(Arc::new({
