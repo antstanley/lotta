@@ -152,7 +152,8 @@ impl ConversationQueue {
     /// This rollback operation preserves the hard bound and rejects duplicate IDs.
     ///
     /// # Errors
-    /// Returns a stable error when the queue is full, the ID is duplicated, or revision is exhausted.
+    /// Returns a stable error when the queue is full, the ID is duplicated,
+    /// or revision is exhausted.
     pub fn requeue_front(&mut self, item: QueueItem) -> Result<QueueMutation, RuntimeError> {
         if self.items.len() >= QUEUE_ITEMS_HARD_MAX.value {
             return Err(RuntimeError::LimitExceeded {

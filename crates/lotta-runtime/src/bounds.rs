@@ -1030,7 +1030,7 @@ mod tests {
             ),
             (
                 "approval/resolve.rs",
-                "for request in recovered {",
+                "for (prior, interrupted) in recovered {",
                 0,
                 LoopClass::BoundedIterator("recovered"),
             ),
