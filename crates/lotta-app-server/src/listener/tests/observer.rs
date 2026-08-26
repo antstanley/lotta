@@ -88,7 +88,7 @@ fn event(name: &str) -> RuntimeEvent {
 fn state(
     observer: Arc<dyn RuntimeBroadcastObserver>,
     subscribed: bool,
-) -> (Arc<ListenerState>, u64, mpsc::Receiver<String>) {
+) -> (Arc<ListenerState>, u64, mpsc::Receiver<Vec<String>>) {
     let clock: Arc<dyn Clock + Send + Sync> = Arc::new(TestClock);
     let mut router = RuntimeRouter::new(clock.clone(), Arc::new(RandomEventIdGenerator));
     let id = router.connections.open().unwrap();
@@ -201,7 +201,7 @@ async fn initial_route_output_queues_exact_frame_and_observes_actual_batch() {
     let (state, id, mut receiver) = state(observer.clone(), true);
     let logical = event("INITIAL");
     dispatch_output(&state, id, &output(&state, logical.clone())).unwrap();
-    let queued = wire(&receiver.recv().await.unwrap());
+    let queued = wire(&receiver.recv().await.unwrap()[0]);
     let values = observer.values();
     let record = &values.as_slice()[0];
     assert_eq!(record.batch_ordinal, 1);
@@ -226,7 +226,7 @@ async fn continuation_sink_records_next_batch_and_queues_exact_frame() {
     event_sink(&state)
         .emit(&scope(1), event("CONTINUATION"))
         .unwrap();
-    let queued = wire(&receiver.recv().await.unwrap());
+    let queued = wire(&receiver.recv().await.unwrap()[0]);
     let values = observer.values();
     assert_eq!(values.len(), 2);
     let record = &values.as_slice()[1];
@@ -258,7 +258,7 @@ fn zero_subscriber_dispatch_observes_actual_empty_batch() {
 async fn panicking_observer_cannot_change_dispatch_or_delivery() {
     let (state, id, mut receiver) = state(Arc::new(PanickingObserver), true);
     assert!(dispatch_output(&state, id, &output(&state, event("PANIC"))).is_ok());
-    let queued = wire(&receiver.recv().await.unwrap());
+    let queued = wire(&receiver.recv().await.unwrap()[0]);
     assert_eq!(queued["type"], "update_loop_status");
 }
 

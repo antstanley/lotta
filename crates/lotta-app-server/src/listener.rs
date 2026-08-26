@@ -77,7 +77,9 @@ mod websocket;
 pub use crate::bounds::WS_FRAME_BYTES_MAX as FRAME_BYTES_MAX;
 
 /// Shared outbound frame sink keyed by connection identity.
-type SharedOutbound = Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>;
+type OutboundBatch = Vec<String>;
+type SharedOutbound =
+    Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<OutboundBatch>>>>;
 
 struct SocketLimits {
     frame_bytes: usize,
@@ -117,7 +119,7 @@ struct ListenerState {
     devices: Arc<DeviceBridge>,
     introspection: Arc<IntrospectionBridge>,
     next_observation: AtomicU64,
-    outbound: Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
+    outbound: SharedOutbound,
 }
 
 /// Owned running listener with resolved URLs and graceful shutdown.
@@ -289,7 +291,7 @@ async fn start_listener_for_test(
 /// compaction shares the turn path's authoritative lifecycle registry.
 #[derive(Clone)]
 pub struct SharedGroupBridges {
-    outbound: Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
+    outbound: SharedOutbound,
     skills: Arc<SkillsBridge>,
     settings: Arc<SettingsBridge>,
     conversations_authority:
@@ -314,9 +316,7 @@ impl SharedGroupBridges {
         workspace_dir: &std::path::Path,
         clock: Arc<dyn Clock + Send + Sync>,
     ) -> Result<Self, AppServerError> {
-        let outbound: Arc<
-            std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>,
-        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let outbound: SharedOutbound = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let skills = Arc::new(SkillsBridge::new(
             skills_forwarder(&outbound),
             storage_dir,
@@ -872,8 +872,8 @@ async fn serve_socket(
                 send_close(&mut socket, close_code::AWAY, "server shutdown").await;
                 break;
             }
-            Some(body) = receiver.recv() => {
-                if socket.send(Message::Text(body.into())).await.is_err() {
+            Some(batch) = receiver.recv() => {
+                if send_outbound_batch(&mut socket, batch).await.is_err() {
                     break;
                 }
             }
@@ -909,7 +909,7 @@ async fn serve_socket(
 
 fn open_connection(
     state: &ListenerState,
-    sender: mpsc::Sender<String>,
+    sender: mpsc::Sender<OutboundBatch>,
     reconnect_identity: Option<&crate::ws::connection::ReconnectIdentity>,
 ) -> Result<crate::ws::ConnectionId, AppServerError> {
     let id = {
@@ -929,7 +929,7 @@ fn open_connection(
 fn prepare_outbound(
     state: &ListenerState,
     id: crate::ws::ConnectionId,
-    sender: mpsc::Sender<String>,
+    sender: mpsc::Sender<OutboundBatch>,
 ) -> Result<(), AppServerError> {
     let mut outbound = state
         .outbound
@@ -1074,18 +1074,56 @@ fn event_sink(state: &Arc<ListenerState>) -> Arc<dyn crate::ws::RuntimeEventSink
     ))
 }
 
+async fn send_outbound_batch(
+    socket: &mut WebSocket,
+    batch: OutboundBatch,
+) -> Result<(), axum::Error> {
+    for body in batch {
+        socket.send(Message::Text(body.into())).await?;
+    }
+    Ok(())
+}
+
+fn dispatch_atomic_output(
+    state: &ListenerState,
+    connection_id: crate::ws::ConnectionId,
+    output: &crate::ws::RouteOutput,
+) -> Result<(), AppServerError> {
+    let mut frames = Vec::new();
+    for batch in output.event_batches.as_slice() {
+        for delivery in batch.deliveries.as_slice() {
+            if delivery.connection_id == connection_id {
+                frames.push(
+                    serde_json::to_string(&delivery.frame).map_err(|_| AppServerError::Internal)?,
+                );
+            }
+        }
+    }
+    for response in output.responses.as_slice() {
+        frames.push(serde_json::to_string(response).map_err(|_| AppServerError::Internal)?);
+    }
+    let sender = state
+        .outbound
+        .lock()
+        .map_err(|_| AppServerError::Internal)?
+        .get(&connection_id)
+        .cloned()
+        .ok_or(AppServerError::Unavailable)?;
+    sender
+        .try_send(frames)
+        .map_err(|_| AppServerError::Unavailable)
+}
+
 fn dispatch_output(
     state: &ListenerState,
     connection_id: crate::ws::ConnectionId,
     output: &crate::ws::RouteOutput,
 ) -> Result<(), AppServerError> {
     if output.response_after_events {
-        dispatch_batches(state, output)?;
-        dispatch_responses(state, connection_id, output)
-    } else {
-        dispatch_responses(state, connection_id, output)?;
-        dispatch_batches(state, output)
+        return dispatch_atomic_output(state, connection_id, output);
     }
+    dispatch_responses(state, connection_id, output)?;
+    dispatch_batches(state, output)
 }
 
 fn dispatch_responses(
@@ -1123,7 +1161,7 @@ fn dispatch_value(
 }
 
 fn send_frame(
-    outbound: &std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>,
+    outbound: &std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<OutboundBatch>>>,
     connection_id: crate::ws::ConnectionId,
     value: &impl serde::Serialize,
 ) -> Result<(), AppServerError> {
@@ -1135,96 +1173,74 @@ fn send_frame(
         .ok_or(AppServerError::Unavailable)?;
     let body = serde_json::to_string(value).map_err(|_| AppServerError::Internal)?;
     sender
-        .try_send(body)
+        .try_send(vec![body])
         .map_err(|_| AppServerError::Unavailable)
 }
 
-fn external_forwarder(
-    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
-) -> ExternalForwarder {
+fn external_forwarder(outbound: &SharedOutbound) -> ExternalForwarder {
     let outbound = Arc::clone(outbound);
     Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
 }
 
-fn teleport_forwarder(
-    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
-) -> TeleportForwarder {
+fn teleport_forwarder(outbound: &SharedOutbound) -> TeleportForwarder {
     let outbound = Arc::clone(outbound);
     Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
 }
 
-fn terminal_forwarder(
-    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
-) -> TerminalForwarder {
+fn terminal_forwarder(outbound: &SharedOutbound) -> TerminalForwarder {
     let outbound = Arc::clone(outbound);
     Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
 }
 
-fn files_forwarder(
-    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
-) -> crate::ws::files::FilesForwarder {
+fn files_forwarder(outbound: &SharedOutbound) -> crate::ws::files::FilesForwarder {
     let outbound = Arc::clone(outbound);
     Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
 }
 
-fn memory_forwarder(
-    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
-) -> crate::ws::memory::MemoryForwarder {
+fn memory_forwarder(outbound: &SharedOutbound) -> crate::ws::memory::MemoryForwarder {
     let outbound = Arc::clone(outbound);
     Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
 }
 
-fn models_forwarder(
-    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
-) -> crate::ws::models::ModelsForwarder {
+fn models_forwarder(outbound: &SharedOutbound) -> crate::ws::models::ModelsForwarder {
     let outbound = Arc::clone(outbound);
     Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
 }
 
-fn schedules_forwarder(
-    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
-) -> crate::ws::schedules::SchedulesForwarder {
+fn schedules_forwarder(outbound: &SharedOutbound) -> crate::ws::schedules::SchedulesForwarder {
     let outbound = Arc::clone(outbound);
     Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
 }
 
-fn skills_forwarder(
-    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
-) -> crate::ws::skills::SkillsForwarder {
+fn skills_forwarder(outbound: &SharedOutbound) -> crate::ws::skills::SkillsForwarder {
     let outbound = Arc::clone(outbound);
     Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
 }
 
-fn settings_forwarder(
-    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
-) -> crate::ws::settings::SettingsForwarder {
+fn settings_forwarder(outbound: &SharedOutbound) -> crate::ws::settings::SettingsForwarder {
     let outbound = Arc::clone(outbound);
     Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
 }
 
-fn device_forwarder(
-    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
-) -> crate::ws::device::DeviceForwarder {
+fn device_forwarder(outbound: &SharedOutbound) -> crate::ws::device::DeviceForwarder {
     let outbound = Arc::clone(outbound);
     Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
 }
 
 fn introspection_forwarder(
-    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
+    outbound: &SharedOutbound,
 ) -> crate::ws::introspection::IntrospectionForwarder {
     let outbound = Arc::clone(outbound);
     Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
 }
 
-fn agents_forwarder(
-    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
-) -> crate::ws::agents::AgentsForwarder {
+fn agents_forwarder(outbound: &SharedOutbound) -> crate::ws::agents::AgentsForwarder {
     let outbound = Arc::clone(outbound);
     Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
 }
 
 fn conversations_forwarder(
-    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
+    outbound: &SharedOutbound,
 ) -> crate::ws::conversations::ConversationsForwarder {
     let outbound = Arc::clone(outbound);
     Arc::new(move |connection_id, message| send_frame(&outbound, connection_id, &message))
@@ -1236,7 +1252,7 @@ fn conversations_forwarder(
 /// bridges, so compaction commands acquire their command leases from the same
 /// lifecycle registry the production turn path uses.
 fn compose_conversations_bridge(
-    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
+    outbound: &SharedOutbound,
     storage_dir: &std::path::Path,
     clock: &Arc<dyn Clock + Send + Sync>,
     authority: Option<Arc<dyn crate::ws::conversations::ConversationAuthority>>,
@@ -1261,7 +1277,7 @@ struct StorageBridges {
 
 /// Composes the storage-root-backed command-group bridges once at startup.
 fn compose_storage_bridges(
-    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
+    outbound: &SharedOutbound,
     prepared: &PreparedServer,
     clock: &Arc<dyn Clock + Send + Sync>,
     artifacts_dir: &std::path::Path,
@@ -1310,7 +1326,7 @@ fn compose_storage_bridges(
 /// # Errors
 /// Returns a stable listener error when the workspace root is not absolute.
 fn compose_device_bridges(
-    outbound: &Arc<std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>>,
+    outbound: &SharedOutbound,
     prepared: &PreparedServer,
     queue_authority: Option<Arc<dyn crate::ws::device::QueueAuthority>>,
 ) -> Result<Arc<DeviceBridge>, AppServerError> {
@@ -1634,7 +1650,7 @@ fn dispatch_event_batch(
 }
 
 fn dispatch_deliveries(
-    outbound: &std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<String>>>,
+    outbound: &std::sync::Mutex<HashMap<crate::ws::ConnectionId, mpsc::Sender<OutboundBatch>>>,
     deliveries: &EventDeliveryBatch,
 ) -> Result<(), AppServerError> {
     let senders = {
@@ -1653,7 +1669,7 @@ fn dispatch_deliveries(
     for (delivery, sender) in deliveries.as_slice().iter().zip(senders) {
         let body = serde_json::to_string(&delivery.frame).map_err(|_| AppServerError::Internal)?;
         sender
-            .try_send(body)
+            .try_send(vec![body])
             .map_err(|_| AppServerError::Unavailable)?;
     }
     Ok(())

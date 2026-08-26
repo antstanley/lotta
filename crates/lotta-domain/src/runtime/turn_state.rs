@@ -146,6 +146,12 @@ impl<'a> TurnStateView<'a> {
             TurnState::Idle | TurnState::Command { .. } => &[],
         }
     }
+
+    /// Returns the current command or turn lease generation.
+    #[must_use]
+    pub fn lease_generation(self) -> Option<u64> {
+        self.state.lease().map(TurnLease::generation)
+    }
 }
 
 /// The sole owner of one runtime's turn lifecycle.

@@ -180,19 +180,18 @@ impl ApprovalManager {
             .waiters
             .lock()
             .map_err(|_| adapter("approval waiter lock"))?;
-        if waiters
-            .insert(
-                key,
-                Waiter {
+        match waiters.entry(key) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                Err(conflict("approval waiter exists"))
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Waiter {
                     revision: canonical.revision,
                     sender,
-                },
-            )
-            .is_some()
-        {
-            return Err(conflict("approval waiter exists"));
+                });
+                Ok(receiver)
+            }
         }
-        Ok(receiver)
     }
 
     /// Validates one exact pending revision without mutating durable or transient state.
@@ -294,7 +293,14 @@ impl ApprovalManager {
             .transpose()
     }
 
-    fn remove_waiter(&self, request: &ApprovalRequest) -> Result<(), RuntimeError> {
+    /// Removes the transient waiter for one exact request.
+    ///
+    /// Timeout and cancellation owners call this before returning so a later
+    /// continuation may register without colliding with an abandoned receiver.
+    ///
+    /// # Errors
+    /// Returns a poisoned waiter-map error.
+    pub fn remove_waiter(&self, request: &ApprovalRequest) -> Result<(), RuntimeError> {
         let key = (
             request.scope.clone(),
             request.request_id.as_str().to_owned(),

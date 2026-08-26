@@ -1981,6 +1981,7 @@ impl lotta_runtime::turn::ApprovalPort for ApprovalBrokerAdapter {
                     Err(RuntimeError::Cancelled { context: "approval wait".into() })
                 },
                 () = tokio::time::sleep(timeout) => {
+                    manager.remove_waiter(&canonical)?;
                     let _ = manager.expire(&canonical)?;
                     Err(RuntimeError::Timeout { context: "approval expired".into() })
                 },
@@ -2977,12 +2978,28 @@ impl ProductionTurnController {
             .lock()
             .expect("cancellation stage observer")
             .clone();
-        let mut state = self.runtime_state.inner.lock().await;
+        let mut runtime = {
+            let state = self.runtime_state.inner.lock().await;
+            let observer = state.registry.observer().clone();
+            drop(state);
+            let mut runtime = lotta_runtime::ListenerRuntime::with_observer(observer);
+            let owner = uuid::Uuid::from_u128(pending.lease.generation().into());
+            let local = runtime
+                .get_or_create(&scope, owner)
+                .map_err(app_server_error)?;
+            let run_id = effects.run_id.clone();
+            let local_lease = runtime
+                .lifecycle_mut(&local)
+                .map_err(app_server_error)?
+                .begin_turn("production-local".to_owned(), run_id)
+                .map_err(app_server_error)?;
+            (runtime, local, local_lease)
+        };
         self.setup
             .run_production_turn(
-                &mut state.registry,
-                pending.handle.clone(),
-                pending.lease.clone(),
+                &mut runtime.0,
+                runtime.1.clone(),
+                runtime.2.clone(),
                 input,
                 &approval,
                 &controller_tools,
@@ -3121,9 +3138,7 @@ fn activate_submission(
         handle: pending.handle.clone(),
         lease: pending.lease.clone(),
         cancellation: active_cancellation.clone(),
-        queue: Arc::new(std::sync::Mutex::new(
-            lotta_runtime::ConversationQueue::default(),
-        )),
+        queue: Arc::clone(&pending.queue),
         history: lotta_domain::AdmissionHistory::default(),
     };
     let replaced = {

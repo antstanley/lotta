@@ -49,6 +49,7 @@ impl LifecycleOwner {
             is_processing: self.lifecycle.state().is_processing(),
             loop_status: self.lifecycle.state().loop_status(),
             active_run_ids: self.lifecycle.state().active_run_ids(),
+            lease_generation: self.lifecycle.state().lease_generation(),
             last_stop_reason: self.lifecycle.last_stop_reason(),
         }
     }
@@ -148,6 +149,7 @@ pub struct LifecycleProjection<'a> {
     is_processing: bool,
     loop_status: LoopStatus,
     active_run_ids: &'a [RunId],
+    lease_generation: Option<u64>,
     last_stop_reason: Option<&'a StopReason>,
 }
 
@@ -171,6 +173,11 @@ impl<'a> LifecycleProjection<'a> {
     #[must_use]
     pub const fn active_run_ids(self) -> &'a [RunId] {
         self.active_run_ids
+    }
+    /// Returns the current command or turn lease generation.
+    #[must_use]
+    pub const fn lease_generation(self) -> Option<u64> {
+        self.lease_generation
     }
     /// Returns the last settled stop reason.
     #[must_use]

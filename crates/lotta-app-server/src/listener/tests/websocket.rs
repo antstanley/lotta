@@ -167,8 +167,8 @@ async fn outbound_registry_fans_out_actual_broadcast_to_both_peers() {
     let (tx2, mut rx2) = mpsc::channel(1);
     let outbound = Mutex::new(HashMap::from([(first, tx1), (second, tx2)]));
     super::dispatch_deliveries(&outbound, &deliveries).unwrap();
-    let one: Value = serde_json::from_str(&rx1.recv().await.unwrap()).unwrap();
-    let two: Value = serde_json::from_str(&rx2.recv().await.unwrap()).unwrap();
+    let one: Value = serde_json::from_str(&rx1.recv().await.unwrap()[0]).unwrap();
+    let two: Value = serde_json::from_str(&rx2.recv().await.unwrap()[0]).unwrap();
     for value in [&one, &two] {
         assert_eq!(value["type"], "update_queue");
         assert_eq!(value["queue"], serde_json::json!([]));
@@ -285,7 +285,7 @@ fn typed_failure_state(
     prepared: crate::config::PreparedServer,
     router: Arc<Mutex<crate::ws::RuntimeRouter>>,
     origin: crate::ws::ConnectionId,
-    sender: mpsc::Sender<String>,
+    sender: mpsc::Sender<Vec<String>>,
 ) -> super::ListenerState {
     let storage = storage_bridges(&prepared);
     super::ListenerState {
@@ -337,7 +337,7 @@ async fn typed_runtime_failures_are_unstamped_and_sent_to_origin() {
     let origin = runtime_router.connections.open().unwrap();
     runtime_router.connections.initialize(origin).unwrap();
     let router = Arc::new(Mutex::new(runtime_router));
-    let (sender, mut receiver) = mpsc::channel(4);
+    let (sender, mut receiver) = mpsc::channel::<Vec<String>>(4);
     let state = typed_failure_state(prepared, router, origin, sender);
     for (wire, expected, false_field) in [
         (
@@ -363,7 +363,7 @@ async fn typed_runtime_failures_are_unstamped_and_sent_to_origin() {
     ] {
         let frame = crate::framing::decode_text(&wire.to_string()).unwrap();
         super::dispatch_typed_failure(&state, origin, &frame).unwrap();
-        let value: Value = serde_json::from_str(&receiver.recv().await.unwrap()).unwrap();
+        let value: Value = serde_json::from_str(&receiver.recv().await.unwrap()[0]).unwrap();
         assert_eq!(value["type"], expected);
         assert_eq!(value[false_field], false);
         assert_eq!(value["error"], "runtime service unavailable");

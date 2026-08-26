@@ -772,6 +772,7 @@ pub(crate) struct PendingAdmission {
     pub(crate) lease: lotta_domain::TurnLease,
     pub(crate) item: QueueItem,
     pub(crate) cancellation: CancellationToken,
+    pub(crate) queue: Arc<std::sync::Mutex<lotta_runtime::ConversationQueue>>,
 }
 
 pub(crate) struct ActiveAdmission {
@@ -900,7 +901,7 @@ impl ProductionRuntimeState {
         scope: &RuntimeScope,
         pending: PendingAdmission,
         reason: &'static str,
-        lifecycle_already_released: bool,
+        _cancellation_terminal_persisted: bool,
     ) -> Result<Option<(QueueItem, BoundedJsonValue)>, AppServerError> {
         let key = RuntimeKey::from(scope);
         let active = self
@@ -914,15 +915,9 @@ impl ProductionRuntimeState {
         }
         let mut state = self.inner.lock().await;
         drain_active_queue(&mut state, &pending.handle, &active.queue)?;
-        let pumped = release_and_pump_locked(
-            &mut state,
-            scope,
-            pending,
-            reason,
-            lifecycle_already_released,
-        )?;
+        let pumped = release_and_pump_locked(&mut state, scope, pending, reason)?;
         #[cfg(test)]
-        if lifecycle_already_released {
+        if _cancellation_terminal_persisted {
             self.record_cancellation("release");
         }
         #[cfg(test)]
@@ -1672,6 +1667,9 @@ impl ProductionRuntimeService {
                     lease,
                     item,
                     cancellation: CancellationToken::new(),
+                    queue: Arc::new(std::sync::Mutex::new(
+                        lotta_runtime::ConversationQueue::default(),
+                    )),
                 });
                 Ok(continuation)
             }
@@ -1768,14 +1766,12 @@ fn release_and_pump_locked(
     scope: &RuntimeScope,
     pending: PendingAdmission,
     reason: &'static str,
-    lifecycle_already_released: bool,
 ) -> Result<Option<(QueueItem, BoundedJsonValue)>, AppServerError> {
     let current_key = (
         RuntimeKey::from(scope),
         pending.item.client_message_id.as_str().to_owned(),
     );
-    if !lifecycle_already_released && let Err(error) = finish_released_turn(state, &pending, reason)
-    {
+    if let Err(error) = finish_released_turn(state, &pending, reason) {
         return restore_failed_release(state, current_key, pending, error);
     }
     pending.cancellation.cancel();
@@ -1913,6 +1909,7 @@ fn install_pumped_input(
                 lease,
                 item: item.clone(),
                 cancellation: CancellationToken::new(),
+                queue: pending.queue,
             });
             state.sequence = candidate.next_sequence;
             Ok(Some((item, candidate.continuation)))
@@ -2094,7 +2091,7 @@ struct AuthoritativeStatusSnapshot {
     queue: Vec<QueueItem>,
 }
 
-fn active_run_ids(
+async fn active_run_ids(
     service: &ProductionRuntimeService,
     key: &RuntimeKey,
     lease: &TurnLease,
@@ -2128,7 +2125,7 @@ async fn authoritative_status_snapshot(
     if let Some((lease, queue)) = active {
         return Ok(AuthoritativeStatusSnapshot {
             status: "EXECUTING_COMMAND",
-            active_run_ids: active_run_ids(service, key, lease).unwrap_or_default(),
+            active_run_ids: active_run_ids(service, key, lease).await?,
             queue: queue.clone(),
         });
     }
@@ -2255,7 +2252,7 @@ impl RuntimeCommandService for ProductionRuntimeService {
                 ConversationStore::load(&self.store, &runtime.agent_id, &runtime.conversation_id)
                     .await
                     .map_err(runtime_service_error)?;
-            let (_handle, created_runtime) = self.ensure_runtime(&runtime)?;
+            let (handle, created_runtime) = self.ensure_runtime(&runtime)?;
             if created_runtime {
                 let payload = lotta_extensions::hooks::events::lifecycle_payload(
                     lotta_runtime::hooks::HookEvent::SessionStart,
@@ -2268,8 +2265,15 @@ impl RuntimeCommandService for ProductionRuntimeService {
                     .await
                     .map_err(|_| AppServerError::Internal)?;
             }
+            let lease_generation = {
+                let state = self.state.inner.lock().await;
+                state
+                    .registry
+                    .lifecycle(&handle)
+                    .and_then(|owner| owner.projection().lease_generation())
+            };
             let broadcasts = if command.recover_approvals {
-                sync_approval_broadcasts(self, &runtime, None)?
+                sync_approval_broadcasts(self, &runtime, lease_generation)?
             } else {
                 Vec::new()
             };
@@ -3109,20 +3113,38 @@ impl ProductionEffects {
         })
     }
 
-    fn emit_tool_completion_snapshot(&self, call_id: &str) -> EffectResult {
+    fn clear_executing_tool(&self, call_id: &str) -> EffectResult {
         let key = RuntimeKey::from(&self.scope);
-        self.runtime_state
+        let mut tools = self
+            .runtime_state
+            .executing_tools
+            .lock()
+            .map_err(|_| effect_error("executing tool state"))?;
+        if let Some(active) = tools.get_mut(&key) {
+            active.retain(|active_id| active_id != call_id);
+            if active.is_empty() {
+                tools.remove(&key);
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_tool_completion_snapshot(&self, call_id: &str) -> EffectResult {
+        self.clear_executing_tool(call_id)?;
+        let active_run_ids = vec![self.run_id.as_str().to_owned()];
+        let executing = self
+            .runtime_state
             .executing_tools
             .lock()
             .map_err(|_| effect_error("executing tool state"))?
-            .remove(&key);
-        let snapshot = loop_event("EXECUTING_COMMAND", Vec::new(), Vec::new())
+            .get(&RuntimeKey::from(&self.scope))
+            .cloned()
+            .unwrap_or_default();
+        let snapshot = loop_event("EXECUTING_COMMAND", active_run_ids, executing)
             .map_err(|_| effect_error("tool completion snapshot"))?;
         self.sink
             .emit(&self.scope, snapshot)
-            .map_err(|_| effect_error("tool completion snapshot"))?;
-        debug_assert!(!call_id.is_empty());
-        Ok(())
+            .map_err(|_| effect_error("tool completion snapshot"))
     }
 }
 
@@ -3159,7 +3181,8 @@ impl TurnEffectPort for ProductionEffects {
             tool_name: Some(tool_name.clone()),
             tool_args: Some(serde_json::to_string(input.as_value()).map_err(effect_error)?),
         };
-        self.sink
+        let emitted = self
+            .sink
             .emit(
                 &self.scope,
                 lotta_app_server::ws::RuntimeEvent::StreamDelta {
@@ -3167,7 +3190,11 @@ impl TurnEffectPort for ProductionEffects {
                     subagent_id: None,
                 },
             )
-            .map_err(|_| effect_error("tool start event"))
+            .map_err(|_| effect_error("tool start event"));
+        if emitted.is_err() {
+            self.clear_executing_tool(call_id.as_str())?;
+        }
+        emitted
     }
 
     fn persist_projection(&self, projection: TurnProjection) -> EffectResult {
@@ -3200,17 +3227,12 @@ impl TurnEffectPort for ProductionEffects {
             _ => None,
         };
         let wire = self.wire_event(event)?;
-        let emitted = self
-            .sink
-            .emit(&self.scope, wire)
-            .map_err(|_| effect_error("runtime event sink"));
         if let Some(call_id) = tool_end {
-            let cleanup = self.emit_tool_completion_snapshot(&call_id);
-            emitted?;
-            cleanup?;
-        } else {
-            emitted?;
+            self.emit_tool_completion_snapshot(&call_id)?;
         }
+        self.sink
+            .emit(&self.scope, wire)
+            .map_err(|_| effect_error("runtime event sink"))?;
         #[cfg(test)]
         if cancelled {
             self.record_cancellation("cancelled");
@@ -5684,8 +5706,8 @@ mod production_tests {
             .forget();
         assert!(!turn.is_finished(), "provider release gate holds the turn");
         assert!(
-            service.state.inner.try_lock().is_err(),
-            "executing turn holds the production registry mutex"
+            service.state.inner.try_lock().is_ok(),
+            "executing turn releases the production registry mutex"
         );
         (turn, cancellation)
     }
@@ -5805,8 +5827,8 @@ mod production_tests {
 
         assert!(!turn.is_finished(), "removal leaves the held turn parked");
         assert!(
-            service.state.inner.try_lock().is_err(),
-            "registry stays held through the real removal and snapshot"
+            service.state.inner.try_lock().is_ok(),
+            "registry remains available through removal and snapshot"
         );
 
         // Release the turn after deleting its only queued successor.
