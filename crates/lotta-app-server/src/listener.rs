@@ -879,6 +879,7 @@ async fn upgrade(
 pub const WS_OUTBOUND_FRAMES_PER_CONNECTION_MAX: usize = 256;
 
 const RECONNECT_CLIENT_ID_HEADER: &str = "x-lotta-reconnect-id";
+pub(crate) const RECONNECT_CLIENT_ID_BYTES_MAX: usize = 256;
 
 fn authenticated_reconnect_identity(
     state: &ListenerState,
@@ -893,7 +894,7 @@ fn authenticated_reconnect_identity(
         .ok()?
         .trim();
     if client_id.is_empty()
-        || client_id.len() > 256
+        || client_id.len() > RECONNECT_CLIENT_ID_BYTES_MAX
         || !client_id.is_ascii()
         || client_id.bytes().any(|byte| byte.is_ascii_control())
     {
@@ -1151,18 +1152,16 @@ static OUTBOUND_FRAME_FILTER: std::sync::OnceLock<SharedOutboundFrameFilter> =
 
 #[doc(hidden)]
 pub fn set_test_outbound_frame_filter(filter: Option<OutboundFrameFilter>) {
-    *OUTBOUND_FRAME_FILTER
-        .get_or_init(|| std::sync::Mutex::new(None))
-        .lock()
-        .expect("outbound frame filter") = filter;
+    let slot = OUTBOUND_FRAME_FILTER.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(mut guard) = slot.lock() {
+        *guard = filter;
+    }
 }
 
 fn outbound_frame_allowed(body: &str) -> bool {
-    if let Some(filter) = OUTBOUND_FRAME_FILTER
-        .get_or_init(|| std::sync::Mutex::new(None))
-        .lock()
-        .expect("outbound frame filter")
-        .as_ref()
+    let slot = OUTBOUND_FRAME_FILTER.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(guard) = slot.lock()
+        && let Some(filter) = guard.as_ref()
     {
         return filter(body);
     }

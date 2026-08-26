@@ -346,17 +346,26 @@ async fn typed_runtime_failures_are_unstamped_and_sent_to_origin() {
             "success",
         ),
         (
-            serde_json::json!({"type":"input","request_id":"r","runtime":{"agent_id":"a","conversation_id":"c"},"payload":{}}),
+            serde_json::json!({
+                "type":"input", "request_id":"r",
+                "runtime":{"agent_id":"a","conversation_id":"c"}, "payload":{}
+            }),
             "input_accepted",
             "accepted",
         ),
         (
-            serde_json::json!({"type":"sync","request_id":"r","runtime":{"agent_id":"a","conversation_id":"c"}}),
+            serde_json::json!({
+                "type":"sync", "request_id":"r",
+                "runtime":{"agent_id":"a","conversation_id":"c"}
+            }),
             "sync_response",
             "success",
         ),
         (
-            serde_json::json!({"type":"abort_message","request_id":"r","runtime":{"agent_id":"a","conversation_id":"c"}}),
+            serde_json::json!({
+                "type":"abort_message", "request_id":"r",
+                "runtime":{"agent_id":"a","conversation_id":"c"}
+            }),
             "abort_message_response",
             "success",
         ),

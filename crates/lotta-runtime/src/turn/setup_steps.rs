@@ -248,6 +248,44 @@ impl SetupOrchestrator<'_> {
         Ok((agent, conversation))
     }
 
+    async fn commit_admission(
+        &self,
+        input: &SetupInput,
+        reminder: Option<&super::setup::ReminderClaim>,
+    ) -> Result<super::setup::AdmissionReceipt, SetupFailure> {
+        self.check_ready(input)?;
+        let receipt = self
+            .ports
+            .admit_input(
+                &input.agent_id,
+                &input.conversation_id,
+                &input.user_input,
+                reminder,
+            )
+            .await
+            .map_err(SetupError::from)
+            .map_err(SetupFailure::pre)?;
+        if !receipt.appended {
+            return self
+                .post_admission(
+                    receipt,
+                    SetupError::Adapter("admission did not append input".into()),
+                )
+                .await;
+        }
+        if let Some(claim) = reminder
+            && let Err(error) = self
+                .ports
+                .commit_cwd_reminder(claim, &receipt, &input.cancellation)
+                .await
+                .map_err(SetupError::from)
+        {
+            return self.post_admission(receipt, error).await;
+        }
+        self.check_post_admission(input, &receipt).await?;
+        Ok(receipt)
+    }
+
     #[allow(clippy::too_many_arguments, reason = "explicit setup artifacts")]
     async fn admit_and_finish(
         &self,
@@ -280,36 +318,7 @@ impl SetupOrchestrator<'_> {
             .validate_bytes()
             .map_err(SetupError::from)
             .map_err(SetupFailure::pre)?;
-        self.check_ready(input)?;
-        let receipt = self
-            .ports
-            .admit_input(
-                &input.agent_id,
-                &input.conversation_id,
-                &input.user_input,
-                reminder.as_ref(),
-            )
-            .await
-            .map_err(SetupError::from)
-            .map_err(SetupFailure::pre)?;
-        if !receipt.appended {
-            return self
-                .post_admission(
-                    receipt,
-                    SetupError::Adapter("admission did not append input".into()),
-                )
-                .await;
-        }
-        if let Some(claim) = reminder.as_ref()
-            && let Err(error) = self
-                .ports
-                .commit_cwd_reminder(claim, &receipt, &input.cancellation)
-                .await
-                .map_err(SetupError::from)
-        {
-            return self.post_admission(receipt, error).await;
-        }
-        self.check_post_admission(input, &receipt).await?;
+        let receipt = self.commit_admission(input, reminder.as_ref()).await?;
         stages.push(SetupStage::BuildProviderRequestAndEmitStatus);
         Ok(SetupOutput {
             request,

@@ -137,9 +137,10 @@ async fn input_accepted_before_caused_events() {
     let (router, _, _, id) = router();
     subscribe(&router, id);
     let service = Arc::new(RecordingService::default());
-    let command = decode_wire(
-        &json!({"type":"input","request_id":"r","runtime":scope(1),"payload":{"kind":"create_message","messages":[]}}),
-    );
+    let command = decode_wire(&json!({
+        "type":"input", "request_id":"r", "runtime":scope(1),
+        "payload":{"kind":"create_message","messages":[]}
+    }));
     let (output, deferred) = route_command(router.clone(), service.clone(), id, command)
         .await
         .unwrap();

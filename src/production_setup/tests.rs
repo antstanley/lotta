@@ -579,6 +579,27 @@ async fn production_stale_claim_before_append_is_reclaimed() {
     assert_ne!(first.input_id(), reclaimed.input_id());
 }
 
+fn crash_transcript_entry(input_id: &str) -> (TranscriptEntry, Timestamp) {
+    let now = Timestamp::from_utc(chrono::Utc::now());
+    let entry = TranscriptEntry::Message(MessageEntry {
+        entry_type: MessageEntryType::Message,
+        id: NonEmptyString::new(input_id.to_owned()).expect("entry id"),
+        parent_id: None,
+        timestamp: now,
+        message: LocalMessage {
+            id: MessageId::accept(input_id).expect("message id"),
+            role: LocalMessageRole::User,
+            content: Some(
+                BoundedJsonValue::new(serde_json::json!("crash input")).expect("content"),
+            ),
+            timestamp: chrono::Utc::now().timestamp_millis() as f64,
+            metadata: None,
+            extras: Default::default(),
+        },
+    });
+    (entry, now)
+}
+
 #[tokio::test]
 async fn production_crash_after_append_recovers_consumed() {
     let fixture = Fixture::new("crash-recovery").await;
@@ -605,23 +626,7 @@ async fn production_crash_after_append_recovers_consumed() {
     .await
     .expect("claim reminder")
     .expect("claim exists");
-    let now = Timestamp::from_utc(chrono::Utc::now());
-    let entry = TranscriptEntry::Message(MessageEntry {
-        entry_type: MessageEntryType::Message,
-        id: NonEmptyString::new(claim.input_id().to_owned()).expect("entry id"),
-        parent_id: None,
-        timestamp: now,
-        message: LocalMessage {
-            id: MessageId::accept(claim.input_id()).expect("message id"),
-            role: LocalMessageRole::User,
-            content: Some(
-                BoundedJsonValue::new(serde_json::json!("crash input")).expect("content"),
-            ),
-            timestamp: chrono::Utc::now().timestamp_millis() as f64,
-            metadata: None,
-            extras: Default::default(),
-        },
-    });
+    let (entry, now) = crash_transcript_entry(claim.input_id());
     append_or_initialize(
         &fixture.store,
         &fixture.agent.id,
@@ -843,6 +848,47 @@ async fn production_strict_vs_unrestricted_actual_catalog() {
     );
 }
 
+async fn run_isolated_turn_pair(
+    ports: Arc<ProductionSetupPorts>,
+    strict_input: SetupInput,
+    unrestricted_input: SetupInput,
+) -> (
+    lotta_runtime::turn::SetupOutput,
+    lotta_runtime::turn::SetupOutput,
+) {
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let strict_task = {
+        let ports = Arc::clone(&ports);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            SetupOrchestrator::new(ports.as_ref())
+                .prepare(strict_input)
+                .await
+        })
+    };
+    let unrestricted_task = {
+        let ports = Arc::clone(&ports);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            SetupOrchestrator::new(ports.as_ref())
+                .prepare(unrestricted_input)
+                .await
+        })
+    };
+    barrier.wait().await;
+    let strict = strict_task
+        .await
+        .expect("strict join")
+        .expect("strict setup");
+    let unrestricted = unrestricted_task
+        .await
+        .expect("unrestricted join")
+        .expect("unrestricted setup");
+    (strict, unrestricted)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn production_concurrent_turn_scopes_are_isolated() {
     for repetition in 0..100 {
@@ -890,36 +936,8 @@ async fn production_concurrent_turn_scopes_are_isolated() {
             unrestricted_status.clone(),
             vec!["second-skill".to_owned()],
         );
-        let barrier = Arc::new(tokio::sync::Barrier::new(3));
-        let strict_task = {
-            let ports = Arc::clone(&ports);
-            let barrier = Arc::clone(&barrier);
-            tokio::spawn(async move {
-                barrier.wait().await;
-                SetupOrchestrator::new(ports.as_ref())
-                    .prepare(strict_input)
-                    .await
-            })
-        };
-        let unrestricted_task = {
-            let ports = Arc::clone(&ports);
-            let barrier = Arc::clone(&barrier);
-            tokio::spawn(async move {
-                barrier.wait().await;
-                SetupOrchestrator::new(ports.as_ref())
-                    .prepare(unrestricted_input)
-                    .await
-            })
-        };
-        barrier.wait().await;
-        let strict = strict_task
-            .await
-            .expect("strict join")
-            .expect("strict setup");
-        let unrestricted = unrestricted_task
-            .await
-            .expect("unrestricted join")
-            .expect("unrestricted setup");
+        let (strict, unrestricted) =
+            run_isolated_turn_pair(Arc::clone(&ports), strict_input, unrestricted_input).await;
         assert!(strict.prompt.contains("first-skill"));
         assert!(!strict.prompt.contains("second-skill"));
         assert!(unrestricted.prompt.contains("second-skill"));

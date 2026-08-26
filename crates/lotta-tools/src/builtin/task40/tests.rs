@@ -64,33 +64,7 @@ impl SandboxPort for Sandbox {
     }
 }
 
-#[tokio::test]
-async fn registry_aliases_share_state_and_every_nonblocking_tool_executes() {
-    let root = temp_root();
-    std::fs::create_dir_all(&root).unwrap();
-    let root = root.canonicalize().unwrap();
-    let source = root.join("sample.rs");
-    std::fs::write(&source, "fn main() {}").unwrap();
-    let planning = Arc::new(PlanningPort::new());
-    let tasks = Arc::new(TaskLifecyclePort::new());
-    let skills: Arc<dyn RegisteredSkillPort> = Arc::new(SkillPort);
-    let (interaction, _receiver) = InteractionPort::new();
-    let server: Arc<dyn lsp::LanguageServerPort> = Arc::new(LspPort);
-    let lsp = Arc::new(LanguageServerRegistry::new(root.clone(), [("rs".into(), server)]).unwrap());
-    let shell = ShellToolBundle::new(&root, scope(), Arc::new(Sandbox)).unwrap();
-    let bundle = Task40ToolBundle::new(
-        Arc::clone(&planning),
-        tasks,
-        scope(),
-        skills,
-        interaction,
-        lsp,
-        &shell,
-    )
-    .unwrap();
-    assert_eq!(named(bundle.registrations(), "TaskOutput"), 1);
-    assert_eq!(named(bundle.registrations(), "TaskStop"), 1);
-
+async fn assert_registry_aliases(bundle: &Task40ToolBundle, planning: &PlanningPort) {
     let registry = ToolRegistry::new(bundle.registrations().to_vec()).unwrap();
     let pascal = registry
         .update(ToolsetId::Codex, &[], Some(&["update_plan"]))
@@ -116,7 +90,9 @@ async fn registry_aliases_share_state_and_every_nonblocking_tool_executes() {
     )
     .await;
     assert_eq!(planning.plan().unwrap()[0].step, "second");
+}
 
+async fn execute_nonblocking_tools(bundle: &Task40ToolBundle, source: &Path) {
     for (name, input) in [
         (
             "write_todos",
@@ -147,6 +123,37 @@ async fn registry_aliases_share_state_and_every_nonblocking_tool_executes() {
         };
         let _ = execute_any(&tool, input).await;
     }
+}
+
+#[tokio::test]
+async fn registry_aliases_share_state_and_every_nonblocking_tool_executes() {
+    let root = temp_root();
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let source = root.join("sample.rs");
+    std::fs::write(&source, "fn main() {}").unwrap();
+    let planning = Arc::new(PlanningPort::new());
+    let tasks = Arc::new(TaskLifecyclePort::new());
+    let skills: Arc<dyn RegisteredSkillPort> = Arc::new(SkillPort);
+    let (interaction, _receiver) = InteractionPort::new();
+    let server: Arc<dyn lsp::LanguageServerPort> = Arc::new(LspPort);
+    let lsp = Arc::new(LanguageServerRegistry::new(root.clone(), [("rs".into(), server)]).unwrap());
+    let shell = ShellToolBundle::new(&root, scope(), Arc::new(Sandbox)).unwrap();
+    let bundle = Task40ToolBundle::new(
+        Arc::clone(&planning),
+        tasks,
+        scope(),
+        skills,
+        interaction,
+        lsp,
+        &shell,
+    )
+    .unwrap();
+    assert_eq!(named(bundle.registrations(), "TaskOutput"), 1);
+    assert_eq!(named(bundle.registrations(), "TaskStop"), 1);
+
+    assert_registry_aliases(&bundle, &planning).await;
+    execute_nonblocking_tools(&bundle, &source).await;
     shell.shutdown().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }

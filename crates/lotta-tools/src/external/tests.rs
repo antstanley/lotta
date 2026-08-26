@@ -71,9 +71,10 @@ pub mod registration {
         assert_eq!(call.runtime_id, runtime);
         assert_eq!(call.internal_name.as_str(), "alpha");
         connection.respond(success(&call, "ok")).unwrap();
-        assert!(
-            matches!(task.await.unwrap(), ToolOutcome::Success { content } if content.as_str() == "ok")
-        );
+        assert!(matches!(
+            task.await.unwrap(),
+            ToolOutcome::Success { content } if content.as_str() == "ok"
+        ));
     }
 
     #[test]
@@ -173,9 +174,12 @@ pub mod registration {
         );
         assert!(Arc::ptr_eq(&before, &registry.snapshot().unwrap()));
         let duplicate = [group(None, ["same".to_owned(), "same".to_owned()])];
-        assert!(
-            matches!(manager.update(&connection, &runtime, GroupRevision::new(1), &duplicate, selection(None)), Err(ExternalRegistrationError::DuplicateTool(name)) if name == "same")
-        );
+        assert!(matches!(
+            manager.update(
+                &connection, &runtime, GroupRevision::new(1), &duplicate, selection(None)
+            ),
+            Err(ExternalRegistrationError::DuplicateTool(name)) if name == "same"
+        ));
         assert!(Arc::ptr_eq(&before, &registry.snapshot().unwrap()));
     }
 }
@@ -270,9 +274,11 @@ pub mod owner_disconnect {
         ));
         let _request = receiver.recv().await.unwrap();
         drop(connection);
-        assert!(
-            matches!(task.await.unwrap(), ToolOutcome::ToolDefinedError { code, .. } if code.as_str() == "external_owner_disconnected")
-        );
+        assert!(matches!(
+            task.await.unwrap(),
+            ToolOutcome::ToolDefinedError { code, .. }
+                if code.as_str() == "external_owner_disconnected"
+        ));
         assert_eq!(manager.pending_calls().unwrap(), 0);
     }
 
@@ -306,9 +312,10 @@ pub mod owner_disconnect {
             owner.respond(success(&call, "right")).unwrap(),
             ResponseDisposition::Resolved
         );
-        assert!(
-            matches!(task.await.unwrap(), ToolOutcome::Success { content } if content.as_str() == "right")
-        );
+        assert!(matches!(
+            task.await.unwrap(),
+            ToolOutcome::Success { content } if content.as_str() == "right"
+        ));
         assert_eq!(
             owner.respond(success(&call, "late")).unwrap(),
             ResponseDisposition::UnknownIgnored
@@ -533,9 +540,10 @@ async fn malformed_response_does_not_settle_legitimate_call() {
         connection.respond(success(&call, "right")).unwrap(),
         ResponseDisposition::Resolved
     );
-    assert!(
-        matches!(task.await.unwrap(), ToolOutcome::Success { content } if content.as_str() == "right")
-    );
+    assert!(matches!(
+        task.await.unwrap(),
+        ToolOutcome::Success { content } if content.as_str() == "right"
+    ));
 }
 
 #[tokio::test]
@@ -561,9 +569,11 @@ async fn cloned_handle_and_explicit_close_have_exact_lifecycle() {
     assert_eq!(manager.pending_calls().unwrap(), 1);
     clone.close();
     clone.close();
-    assert!(
-        matches!(task.await.unwrap(), ToolOutcome::ToolDefinedError { code, .. } if code.as_str() == "external_owner_disconnected")
-    );
+    assert!(matches!(
+        task.await.unwrap(),
+        ToolOutcome::ToolDefinedError { code, .. }
+            if code.as_str() == "external_owner_disconnected"
+    ));
     assert_eq!(manager.pending_calls().unwrap(), 0);
 }
 

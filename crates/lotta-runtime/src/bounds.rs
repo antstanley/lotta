@@ -718,6 +718,44 @@ mod tests {
         assert_ne!(TURN_STEPS_BOUND.counter, TURN_TOOL_CALLS_BOUND.counter);
     }
 
+    fn assert_basic_resource_bounds(
+        actual: &[ResourceBound],
+        expected: &[(&str, usize, &str, &str)],
+    ) {
+        assert_eq!(actual.len(), expected.len());
+        for (bound, &(name, value, event, counter)) in actual.iter().zip(expected) {
+            assert_eq!(
+                (bound.name, bound.value, bound.event, bound.counter),
+                (name, value, event, counter)
+            );
+            assert_eq!(bound.reached, BoundReached::Reject);
+            assert!(bound.observe(value - 1).is_none());
+            assert!(!bound.observe(value).unwrap().exceeded);
+            assert!(bound.observe(value + 1).unwrap().exceeded);
+        }
+    }
+
+    fn assert_tool_resource_bounds(
+        actual: &[ResourceBound],
+        expected: &[(&str, usize, &str, &str, &str)],
+    ) {
+        let rows = expected
+            .iter()
+            .map(|&(name, value, event, counter, _)| (name, value, event, counter))
+            .collect::<Vec<_>>();
+        assert_basic_resource_bounds(actual, &rows);
+        assert!(
+            expected
+                .iter()
+                .all(|row| { row.0.ends_with("_MAX") || row.0.ends_with("_MS") })
+        );
+        assert!(
+            expected
+                .iter()
+                .all(|row| { matches!(row.4, "bytes" | "chars" | "ms" | "items") })
+        );
+    }
+
     #[test]
     fn exact_seven_tool_rows_do_not_drift() {
         let expected = [
@@ -771,48 +809,7 @@ mod tests {
                 "items",
             ),
         ];
-        assert_eq!(TOOL_RESOURCE_BOUNDS.len(), expected.len());
-        for (bound, (name, value, event, counter, units)) in
-            TOOL_RESOURCE_BOUNDS.iter().zip(expected)
-        {
-            assert_eq!(
-                (
-                    bound.name,
-                    bound.value,
-                    bound.event,
-                    bound.counter,
-                    bound.reached
-                ),
-                (name, value, event, counter, BoundReached::Reject)
-            );
-            assert!(name.ends_with("_MAX") || name.ends_with("_MS"));
-            assert!(matches!(units, "bytes" | "chars" | "ms" | "items"));
-            assert!(bound.observe(value - 1).is_none());
-            let at = bound.observe(value).unwrap();
-            assert_eq!(
-                (
-                    at.name,
-                    at.actual,
-                    at.exceeded,
-                    at.event,
-                    at.counter,
-                    at.reached
-                ),
-                (name, value, false, event, counter, BoundReached::Reject)
-            );
-            let over = bound.observe(value + 1).unwrap();
-            assert_eq!(
-                (
-                    over.name,
-                    over.actual,
-                    over.exceeded,
-                    over.event,
-                    over.counter,
-                    over.reached
-                ),
-                (name, value + 1, true, event, counter, BoundReached::Reject)
-            );
-        }
+        assert_tool_resource_bounds(&TOOL_RESOURCE_BOUNDS, &expected);
     }
 
     #[test]
@@ -867,53 +864,11 @@ mod tests {
                 "provider_tool_count_limit_total",
             ),
         ];
-        assert_eq!(PROVIDER_RESOURCE_BOUNDS.len(), expected.len());
-        for (bound, (name, value, event, counter)) in PROVIDER_RESOURCE_BOUNDS.iter().zip(expected)
-        {
-            assert_eq!(
-                (bound.name, bound.value, bound.event, bound.counter),
-                (name, value, event, counter)
-            );
-            assert_eq!(bound.reached, BoundReached::Reject);
-            assert!(name.ends_with("_MAX"));
-            assert!(value > 0);
-            assert!(bound.observe(value - 1).is_none());
-            let at_limit = bound.observe(value).expect("limit must be observable");
-            assert_eq!(
-                (
-                    at_limit.name,
-                    at_limit.event,
-                    at_limit.counter,
-                    at_limit.reached
-                ),
-                (bound.name, bound.event, bound.counter, bound.reached)
-            );
-            assert_eq!(at_limit.actual, value);
-            assert!(!at_limit.exceeded);
-            let over_limit = bound
-                .observe(value + 1)
-                .expect("overage must be observable");
-            assert_eq!(
-                (
-                    over_limit.name,
-                    over_limit.event,
-                    over_limit.counter,
-                    over_limit.reached,
-                ),
-                (bound.name, bound.event, bound.counter, bound.reached)
-            );
-            assert_eq!(over_limit.actual, value + 1);
-            assert!(over_limit.exceeded);
-        }
+        assert_basic_resource_bounds(&PROVIDER_RESOURCE_BOUNDS, &expected);
     }
 
-    #[test]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the exact 19-row drift fixture is intentionally explicit"
-    )]
-    fn exact_nineteen_row_table_does_not_drift() {
-        let expected = [
+    fn runtime_resource_rows_first() -> Vec<(&'static str, usize, &'static str, &'static str)> {
+        vec![
             (
                 "MEMORY_FILES_MAX",
                 100_000,
@@ -968,6 +923,11 @@ mod tests {
                 "process_stdin_byte_limit",
                 "process_stdin_byte_limit_total",
             ),
+        ]
+    }
+
+    fn runtime_resource_rows_second() -> Vec<(&'static str, usize, &'static str, &'static str)> {
+        vec![
             (
                 "PROCESS_OUTPUT_CHUNK_BYTES_MAX",
                 64 * 1024,
@@ -1028,20 +988,16 @@ mod tests {
                 "confined_path_component_limit",
                 "confined_path_component_limit_total",
             ),
-        ];
-        assert_eq!(expected.len(), RUNTIME_RESOURCE_BOUNDS.len());
-        for (bound, (name, value, event, counter)) in RUNTIME_RESOURCE_BOUNDS.iter().zip(expected) {
-            assert_eq!(
-                (bound.name, bound.value, bound.event, bound.counter),
-                (name, value, event, counter)
-            );
-            assert_eq!(bound.reached, BoundReached::Reject);
-            assert!(name.ends_with("_MAX"));
-            assert!(bound.observe(value - 1).is_none());
-            assert!(!bound.observe(value).unwrap().exceeded);
-            assert!(bound.observe(value + 1).unwrap().exceeded);
-        }
+        ]
     }
+
+    #[test]
+    fn exact_nineteen_row_table_does_not_drift() {
+        let mut expected = runtime_resource_rows_first();
+        expected.extend(runtime_resource_rows_second());
+        assert_basic_resource_bounds(&RUNTIME_RESOURCE_BOUNDS, &expected);
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum LoopClass {
         NamedBound(&'static str),
@@ -1059,307 +1015,321 @@ mod tests {
     mod bounds {
         use super::*;
 
+        const LOOP_MANIFEST: &[(&str, &str, usize, LoopClass)] = &[
+            (
+                "approval/recovery.rs",
+                "for request in self.journal.port().list(scope)? {",
+                0,
+                LoopClass::BoundedIterator("list(scope)?"),
+            ),
+            (
+                "approval/resolve.rs",
+                "for request in self.journal.port().list(scope)? {",
+                0,
+                LoopClass::BoundedIterator("list(scope)?"),
+            ),
+            (
+                "approval/resolve.rs",
+                "for request in recovered {",
+                0,
+                LoopClass::BoundedIterator("recovered"),
+            ),
+            (
+                "boundary.rs",
+                "for component in path.components() {",
+                0,
+                LoopClass::BoundedIterator("path.components()"),
+            ),
+            (
+                "compaction.rs",
+                "while cutoff > 0 && splits_tool_protocol(messages, cutoff) {",
+                0,
+                LoopClass::NamedBound("cutoff -= 1"),
+            ),
+            (
+                "observe/events.rs",
+                "for sink in &self.sinks {",
+                0,
+                LoopClass::BoundedIterator("&self.sinks"),
+            ),
+            (
+                "observe/metrics.rs",
+                "for (bucket, upper) in histogram.2.iter_mut().zip(LATENCY_BUCKETS_MS) {",
+                0,
+                LoopClass::BoundedIterator("LATENCY_BUCKETS_MS"),
+            ),
+            (
+                "ports/provider.rs",
+                "for message in request.messages.as_slice() {",
+                0,
+                LoopClass::BoundedIterator("request.messages.as_slice()"),
+            ),
+            (
+                "ports/provider.rs",
+                "for part in message.content.as_slice() {",
+                0,
+                LoopClass::BoundedIterator("message.content.as_slice()"),
+            ),
+            (
+                "ports/provider.rs",
+                "for tool in request.tools.as_slice() {",
+                0,
+                LoopClass::BoundedIterator("request.tools.as_slice()"),
+            ),
+            (
+                "ports/provider.rs",
+                "for item in self.0 {",
+                0,
+                LoopClass::BoundedIterator("self.0"),
+            ),
+            (
+                "ports/provider.rs",
+                "for part in self.0 {",
+                0,
+                LoopClass::BoundedIterator("self.0"),
+            ),
+            (
+                "ports/provider.rs",
+                "for message in self.messages.as_slice() {",
+                0,
+                LoopClass::BoundedIterator("self.messages.as_slice()"),
+            ),
+            (
+                "ports/provider.rs",
+                "for part in message.content.as_slice() {",
+                1,
+                LoopClass::BoundedIterator("message.content.as_slice()"),
+            ),
+            (
+                "ports/provider.rs",
+                "for part in content.as_slice() {",
+                0,
+                LoopClass::BoundedIterator("content.as_slice()"),
+            ),
+            (
+                "ports/provider.rs",
+                "for input in values {",
+                0,
+                LoopClass::BoundedIterator("values"),
+            ),
+            (
+                "ports/provider.rs",
+                "while let Some(current) = work.pop() {",
+                0,
+                LoopClass::NamedBound("work.pop()"),
+            ),
+            (
+                "ports/provider.rs",
+                "while self.receiver.try_recv().is_ok() {}",
+                0,
+                LoopClass::NamedBound("try_recv()"),
+            ),
+            (
+                "ports/tool.rs",
+                "for segment in value[1..].split('/') {",
+                0,
+                LoopClass::BoundedIterator("value[1..].split('/')"),
+            ),
+            (
+                "ports/tool.rs",
+                "while index < bytes.len() {",
+                0,
+                LoopClass::NamedBound("index += 1"),
+            ),
+            (
+                "ports/tool.rs",
+                "for (index, field) in values.iter().enumerate() {",
+                0,
+                LoopClass::BoundedIterator("values.iter().enumerate()"),
+            ),
+            (
+                "ports/tool.rs",
+                "for (index, item) in required.iter().enumerate() {",
+                0,
+                LoopClass::BoundedIterator("required.iter().enumerate()"),
+            ),
+            (
+                "retry/executor.rs",
+                "for expected_attempt in 1..=attempts_max {",
+                0,
+                LoopClass::NamedBound("attempt_count = attempt_count.saturating_add(1)"),
+            ),
+            (
+                "retry/executor.rs",
+                "while !state.complete() {",
+                0,
+                LoopClass::NamedBound("progress_count"),
+            ),
+            (
+                "retry/executor.rs",
+                "for _ in 0..pending_items_max {",
+                0,
+                LoopClass::BoundedIterator("0..pending_items_max"),
+            ),
+            (
+                "retry/fallback.rs",
+                "while !detail.is_char_boundary(end) {",
+                0,
+                LoopClass::NamedBound("end -= 1"),
+            ),
+            (
+                "schedule/cron.rs",
+                "for _ in 0..SEARCH_MINUTES_MAX {",
+                0,
+                LoopClass::NamedBound("SEARCH_MINUTES_MAX"),
+            ),
+            (
+                "schedule/cron.rs",
+                "for part in field.split(',') {",
+                0,
+                LoopClass::BoundedIterator("field.split(',')"),
+            ),
+            (
+                "schedule/jitter.rs",
+                "loop {",
+                0,
+                LoopClass::NamedBound("source.next_u64()"),
+            ),
+            (
+                "schedule/scheduler.rs",
+                "loop {",
+                0,
+                LoopClass::NamedBound("cancellation.cancelled()"),
+            ),
+            (
+                "schedule/scheduler.rs",
+                "for task in &file.tasks {",
+                0,
+                LoopClass::BoundedIterator("&file.tasks"),
+            ),
+            (
+                "schedule/scheduler.rs",
+                "for pending in drain_due(&self.state, now.as_utc().timestamp_millis()) {",
+                0,
+                LoopClass::BoundedIterator(
+                    "drain_due(&self.state, now.as_utc().timestamp_millis())",
+                ),
+            ),
+            (
+                "schedule/store.rs",
+                "for task in &self.tasks {",
+                0,
+                LoopClass::BoundedIterator("&self.tasks"),
+            ),
+            (
+                "turn/cancel.rs",
+                "for call in &self.calls {",
+                0,
+                LoopClass::BoundedIterator("&self.calls"),
+            ),
+            (
+                "turn/cancel.rs",
+                "for call in &self.calls {",
+                1,
+                LoopClass::BoundedIterator("&self.calls"),
+            ),
+            (
+                "turn/cancel.rs",
+                "for call_id in context.unfinished.drain_pending() {",
+                0,
+                LoopClass::BoundedIterator("drain_pending()"),
+            ),
+            (
+                "turn/tool_calls.rs",
+                "for definition in definitions {",
+                0,
+                LoopClass::BoundedIterator("definitions"),
+            ),
+            (
+                "turn/loop.rs",
+                concat!(
+                    "for candidate in self .fallbacks .iter() ",
+                    ".zip(fallbacks.iter().copied()) .map(Some) ",
+                    ".chain(std::iter::once(None)) {"
+                ),
+                0,
+                LoopClass::BoundedIterator("fallbacks.iter().copied()"),
+            ),
+            (
+                "turn/loop.rs",
+                "for step_index in 0..TURN_STEPS_MAX {",
+                0,
+                LoopClass::NamedBound("step_decision(step_index)"),
+            ),
+            (
+                "turn/loop.rs",
+                "loop {",
+                0,
+                LoopClass::NamedBound("compact_and_refresh"),
+            ),
+            (
+                "turn/loop.rs",
+                "loop {",
+                1,
+                LoopClass::NamedBound("result = future.as_mut() => return Ok(result)"),
+            ),
+            (
+                "turn/loop.rs",
+                "loop {",
+                2,
+                LoopClass::NamedBound("receiver.try_recv()"),
+            ),
+            (
+                "turn/loop.rs",
+                "while let Some(event) = receive_retry(receiver).await {",
+                0,
+                LoopClass::NamedBound("receive_retry(receiver).await"),
+            ),
+            (
+                "turn/loop.rs",
+                "while let Some(event) = output.receive().await? {",
+                0,
+                LoopClass::NamedBound("output.receive().await?"),
+            ),
+            (
+                "turn/loop.rs",
+                "for result in completed {",
+                0,
+                LoopClass::BoundedIterator("completed"),
+            ),
+            (
+                "worktree_watcher.rs",
+                "loop {",
+                0,
+                LoopClass::NamedBound("WORKTREE_WATCHER_IDLE_STOP_MS"),
+            ),
+        ];
+
         #[test]
-        #[allow(
-            clippy::too_many_lines,
-            reason = "the complete loop manifest is explicit evidence"
-        )]
         fn loops_assert_progress() {
-            const MANIFEST: &[(&str, &str, usize, LoopClass)] = &[
-                (
-                    "approval/recovery.rs",
-                    "for request in self.journal.port().list(scope)? {",
-                    0,
-                    LoopClass::BoundedIterator("list(scope)?"),
-                ),
-                (
-                    "approval/resolve.rs",
-                    "for request in self.journal.port().list(scope)? {",
-                    0,
-                    LoopClass::BoundedIterator("list(scope)?"),
-                ),
-                (
-                    "boundary.rs",
-                    "for component in path.components() {",
-                    0,
-                    LoopClass::BoundedIterator("path.components()"),
-                ),
-                (
-                    "compaction.rs",
-                    "while cutoff > 0 && splits_tool_protocol(messages, cutoff) {",
-                    0,
-                    LoopClass::NamedBound("cutoff -= 1"),
-                ),
-                (
-                    "observe/events.rs",
-                    "for sink in &self.sinks {",
-                    0,
-                    LoopClass::BoundedIterator("&self.sinks"),
-                ),
-                (
-                    "observe/metrics.rs",
-                    "for (bucket, upper) in histogram.2.iter_mut().zip(LATENCY_BUCKETS_MS) {",
-                    0,
-                    LoopClass::BoundedIterator("LATENCY_BUCKETS_MS"),
-                ),
-                (
-                    "ports/provider.rs",
-                    "for message in request.messages.as_slice() {",
-                    0,
-                    LoopClass::BoundedIterator("request.messages.as_slice()"),
-                ),
-                (
-                    "ports/provider.rs",
-                    "for part in message.content.as_slice() {",
-                    0,
-                    LoopClass::BoundedIterator("message.content.as_slice()"),
-                ),
-                (
-                    "ports/provider.rs",
-                    "for tool in request.tools.as_slice() {",
-                    0,
-                    LoopClass::BoundedIterator("request.tools.as_slice()"),
-                ),
-                (
-                    "ports/provider.rs",
-                    "for item in self.0 {",
-                    0,
-                    LoopClass::BoundedIterator("self.0"),
-                ),
-                (
-                    "ports/provider.rs",
-                    "for part in self.0 {",
-                    0,
-                    LoopClass::BoundedIterator("self.0"),
-                ),
-                (
-                    "ports/provider.rs",
-                    "for message in self.messages.as_slice() {",
-                    0,
-                    LoopClass::BoundedIterator("self.messages.as_slice()"),
-                ),
-                (
-                    "ports/provider.rs",
-                    "for part in message.content.as_slice() {",
-                    1,
-                    LoopClass::BoundedIterator("message.content.as_slice()"),
-                ),
-                (
-                    "ports/provider.rs",
-                    "for part in content.as_slice() {",
-                    0,
-                    LoopClass::BoundedIterator("content.as_slice()"),
-                ),
-                (
-                    "ports/provider.rs",
-                    "for input in values {",
-                    0,
-                    LoopClass::BoundedIterator("values"),
-                ),
-                (
-                    "ports/provider.rs",
-                    "while let Some(current) = work.pop() {",
-                    0,
-                    LoopClass::NamedBound("work.pop()"),
-                ),
-                (
-                    "ports/provider.rs",
-                    "while self.receiver.try_recv().is_ok() {}",
-                    0,
-                    LoopClass::NamedBound("try_recv()"),
-                ),
-                (
-                    "ports/tool.rs",
-                    "for segment in value[1..].split('/') {",
-                    0,
-                    LoopClass::BoundedIterator("value[1..].split('/')"),
-                ),
-                (
-                    "ports/tool.rs",
-                    "while index < bytes.len() {",
-                    0,
-                    LoopClass::NamedBound("index += 1"),
-                ),
-                (
-                    "ports/tool.rs",
-                    "for (index, field) in values.iter().enumerate() {",
-                    0,
-                    LoopClass::BoundedIterator("values.iter().enumerate()"),
-                ),
-                (
-                    "ports/tool.rs",
-                    "for (index, item) in required.iter().enumerate() {",
-                    0,
-                    LoopClass::BoundedIterator("required.iter().enumerate()"),
-                ),
-                (
-                    "retry/executor.rs",
-                    "for expected_attempt in 1..=attempts_max {",
-                    0,
-                    LoopClass::NamedBound("attempt_count = attempt_count.saturating_add(1)"),
-                ),
-                (
-                    "retry/executor.rs",
-                    "while !state.complete() {",
-                    0,
-                    LoopClass::NamedBound("progress_count"),
-                ),
-                (
-                    "retry/executor.rs",
-                    "for _ in 0..pending_items_max {",
-                    0,
-                    LoopClass::BoundedIterator("0..pending_items_max"),
-                ),
-                (
-                    "retry/fallback.rs",
-                    "while !detail.is_char_boundary(end) {",
-                    0,
-                    LoopClass::NamedBound("end -= 1"),
-                ),
-                (
-                    "schedule/cron.rs",
-                    "for _ in 0..SEARCH_MINUTES_MAX {",
-                    0,
-                    LoopClass::NamedBound("SEARCH_MINUTES_MAX"),
-                ),
-                (
-                    "schedule/cron.rs",
-                    "for part in field.split(',') {",
-                    0,
-                    LoopClass::BoundedIterator("field.split(',')"),
-                ),
-                (
-                    "schedule/jitter.rs",
-                    "loop {",
-                    0,
-                    LoopClass::NamedBound("source.next_u64()"),
-                ),
-                (
-                    "schedule/scheduler.rs",
-                    "loop {",
-                    0,
-                    LoopClass::NamedBound("cancellation.cancelled()"),
-                ),
-                (
-                    "schedule/scheduler.rs",
-                    "for task in &file.tasks {",
-                    0,
-                    LoopClass::BoundedIterator("&file.tasks"),
-                ),
-                (
-                    "schedule/scheduler.rs",
-                    "for pending in drain_due(&self.state, now.as_utc().timestamp_millis()) {",
-                    0,
-                    LoopClass::BoundedIterator(
-                        "drain_due(&self.state, now.as_utc().timestamp_millis())",
-                    ),
-                ),
-                (
-                    "schedule/store.rs",
-                    "for task in &self.tasks {",
-                    0,
-                    LoopClass::BoundedIterator("&self.tasks"),
-                ),
-                (
-                    "turn/cancel.rs",
-                    "for call in &self.calls {",
-                    0,
-                    LoopClass::BoundedIterator("&self.calls"),
-                ),
-                (
-                    "turn/cancel.rs",
-                    "for call in &self.calls {",
-                    1,
-                    LoopClass::BoundedIterator("&self.calls"),
-                ),
-                (
-                    "turn/cancel.rs",
-                    "for call_id in context.unfinished.drain_pending() {",
-                    0,
-                    LoopClass::BoundedIterator("drain_pending()"),
-                ),
-                (
-                    "turn/tool_calls.rs",
-                    "for definition in definitions {",
-                    0,
-                    LoopClass::BoundedIterator("definitions"),
-                ),
-                (
-                    "turn/loop.rs",
-                    "for candidate in self .fallbacks .iter() .zip(fallbacks.iter().copied()) .map(Some) .chain(std::iter::once(None)) {",
-                    0,
-                    LoopClass::BoundedIterator("fallbacks.iter().copied()"),
-                ),
-                (
-                    "turn/loop.rs",
-                    "for step_index in 0..TURN_STEPS_MAX {",
-                    0,
-                    LoopClass::NamedBound("step_decision(step_index)"),
-                ),
-                (
-                    "turn/loop.rs",
-                    "loop {",
-                    0,
-                    LoopClass::NamedBound("compact_and_refresh"),
-                ),
-                (
-                    "turn/loop.rs",
-                    "loop {",
-                    1,
-                    LoopClass::NamedBound("future => break result"),
-                ),
-                (
-                    "turn/loop.rs",
-                    "loop {",
-                    2,
-                    LoopClass::NamedBound("receiver.try_recv()"),
-                ),
-                (
-                    "turn/loop.rs",
-                    "while let Some(event) = receive_retry(receiver).await {",
-                    0,
-                    LoopClass::NamedBound("receive_retry(receiver).await"),
-                ),
-                (
-                    "turn/loop.rs",
-                    "while let Some(event) = output.receive().await? {",
-                    0,
-                    LoopClass::NamedBound("output.receive().await?"),
-                ),
-                (
-                    "turn/loop.rs",
-                    "for result in completed {",
-                    0,
-                    LoopClass::BoundedIterator("completed"),
-                ),
-                (
-                    "worktree_watcher.rs",
-                    "loop {",
-                    0,
-                    LoopClass::NamedBound("WORKTREE_WATCHER_IDLE_STOP_MS"),
-                ),
-            ];
             let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-            let files = production_modules(&root);
-            let mut actual = Vec::new();
-            for file in files {
-                actual.extend(scan_production_loops(&root, &file));
-            }
-            let expected: Vec<_> = MANIFEST
+            let actual = production_modules(&root)
+                .into_iter()
+                .flat_map(|file| scan_production_loops(&root, &file))
+                .collect::<Vec<_>>();
+            assert_loop_manifest(&actual);
+            assert_loop_classes(&actual);
+        }
+
+        fn assert_loop_manifest(actual: &[LoopSite]) {
+            let expected = LOOP_MANIFEST
                 .iter()
                 .map(|(file, header, occurrence, _)| {
                     ((*file).to_owned(), normalized_header(header), *occurrence)
                 })
-                .collect();
-            let found: Vec<_> = actual
+                .collect::<Vec<_>>();
+            let found = actual
                 .iter()
                 .map(|site| (site.file.clone(), site.header.clone(), site.occurrence))
-                .collect();
+                .collect::<Vec<_>>();
             assert_eq!(
                 found, expected,
                 "production loop manifest must be bijective; new loops require classification"
             );
-            for (site, (_, _, _, class)) in actual.iter().zip(MANIFEST) {
+        }
+
+        fn assert_loop_classes(actual: &[LoopSite]) {
+            for (site, (_, _, _, class)) in actual.iter().zip(LOOP_MANIFEST) {
                 let token = match class {
                     LoopClass::NamedBound(token) | LoopClass::BoundedIterator(token) => token,
                 };
@@ -1375,7 +1345,6 @@ mod tests {
                 );
             }
         }
-
         fn production_modules(root: &std::path::Path) -> Vec<std::path::PathBuf> {
             fn visit(path: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
                 if files.iter().any(|file| file == path) {

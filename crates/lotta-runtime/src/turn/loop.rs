@@ -510,6 +510,84 @@ struct ProductionRetryExecutor {
     fallbacks: Vec<FallbackRoute>,
 }
 
+fn retryable_failure(failure: &crate::retry::ProviderFailure) -> bool {
+    matches!(
+        failure.kind,
+        crate::retry::ProviderFailureKind::Transient | crate::retry::ProviderFailureKind::Busy
+    )
+}
+
+impl ProductionRetryExecutor {
+    async fn execute_fallback_chain(
+        &self,
+        route: ProviderRoute,
+        source: &dyn ProviderPort,
+        fallbacks: &[&dyn ProviderPort],
+        request: ProviderRequest,
+        output: crate::ports::ProviderEventSink,
+    ) -> Result<RetryTerminal, RuntimeError> {
+        let (mut current_route, mut current_port, mut current_request, mut total_attempts) =
+            (route, source, request, 0_u32);
+        for candidate in self
+            .fallbacks
+            .iter()
+            .zip(fallbacks.iter().copied())
+            .map(Some)
+            .chain(std::iter::once(None))
+        {
+            let terminal = RetryExecutor::new(
+                &self.clock,
+                &self.sleeper,
+                &self.events,
+                RetryPolicy::default(),
+                None,
+            )
+            .execute(
+                current_route.clone(),
+                current_port,
+                None,
+                current_request.clone(),
+                output.clone(),
+            )
+            .await?;
+            match terminal {
+                RetryTerminal::Success => return Ok(RetryTerminal::Success),
+                RetryTerminal::Failure {
+                    failure,
+                    attempt_count,
+                } => {
+                    total_attempts = total_attempts.saturating_add(attempt_count);
+                    let Some((route, provider)) = candidate else {
+                        return Ok(RetryTerminal::Failure {
+                            failure,
+                            attempt_count: total_attempts,
+                        });
+                    };
+                    if !retryable_failure(&failure) {
+                        return Ok(RetryTerminal::Failure {
+                            failure,
+                            attempt_count: total_attempts,
+                        });
+                    }
+                    self.events
+                        .emit(RetryEvent::new(
+                            current_route.clone(),
+                            route.destination().clone(),
+                            crate::retry::RetryReason::TransportFallback,
+                            total_attempts,
+                            0,
+                            &failure.reason,
+                        ))
+                        .await?;
+                    (current_route, current_port) = (route.destination().clone(), provider);
+                    current_request.model = route.destination_model().clone();
+                }
+            }
+        }
+        Err(protocol("fallback exhausted"))
+    }
+}
+
 impl ProviderTurnExecutorPort for ProductionRetryExecutor {
     fn begin_retry_step(
         &self,
@@ -529,74 +607,7 @@ impl ProviderTurnExecutorPort for ProductionRetryExecutor {
         request: ProviderRequest,
         output: crate::ports::ProviderEventSink,
     ) -> crate::ports::PortFuture<'a, RetryTerminal> {
-        Box::pin(async move {
-            let mut current_route = route;
-            let mut current_port = source;
-            let mut current_request = request;
-            let mut total_attempts = 0_u32;
-            for candidate in self
-                .fallbacks
-                .iter()
-                .zip(fallbacks.iter().copied())
-                .map(Some)
-                .chain(std::iter::once(None))
-            {
-                let terminal = RetryExecutor::new(
-                    &self.clock,
-                    &self.sleeper,
-                    &self.events,
-                    RetryPolicy::default(),
-                    None,
-                )
-                .execute(
-                    current_route.clone(),
-                    current_port,
-                    None,
-                    current_request.clone(),
-                    output.clone(),
-                )
-                .await?;
-                match terminal {
-                    RetryTerminal::Success => return Ok(RetryTerminal::Success),
-                    RetryTerminal::Failure {
-                        failure,
-                        attempt_count,
-                    } => {
-                        total_attempts = total_attempts.saturating_add(attempt_count);
-                        let Some((route, provider)) = candidate else {
-                            return Ok(RetryTerminal::Failure {
-                                failure,
-                                attempt_count: total_attempts,
-                            });
-                        };
-                        if !matches!(
-                            failure.kind,
-                            crate::retry::ProviderFailureKind::Transient
-                                | crate::retry::ProviderFailureKind::Busy
-                        ) {
-                            return Ok(RetryTerminal::Failure {
-                                failure,
-                                attempt_count: total_attempts,
-                            });
-                        }
-                        self.events
-                            .emit(RetryEvent::new(
-                                current_route.clone(),
-                                route.destination().clone(),
-                                crate::retry::RetryReason::TransportFallback,
-                                total_attempts,
-                                0,
-                                &failure.reason,
-                            ))
-                            .await?;
-                        current_route = route.destination().clone();
-                        current_port = provider;
-                        current_request.model = route.destination_model().clone();
-                    }
-                }
-            }
-            unreachable!("fallback chain includes terminal sentinel")
-        })
+        Box::pin(self.execute_fallback_chain(route, source, fallbacks, request, output))
     }
 }
 
@@ -663,6 +674,23 @@ pub async fn run_turn(
     run_turn_observed(runtime, handle, lease, request, ports, None).await
 }
 
+fn turn_identity(
+    runtime: &ListenerRuntime,
+    handle: &RuntimeHandle,
+) -> Result<(NonEmptyString, RunId), RuntimeError> {
+    let lifecycle = runtime
+        .lifecycle(handle)
+        .ok_or_else(|| protocol("runtime lifecycle missing"))?;
+    let turn_id = NonEmptyString::new("turn").map_err(|_| protocol("turn id"))?;
+    let run_id = lifecycle
+        .projection()
+        .active_run_ids()
+        .first()
+        .cloned()
+        .ok_or_else(|| protocol("active run id missing"))?;
+    Ok((turn_id, run_id))
+}
+
 #[doc(hidden)]
 pub async fn run_turn_observed(
     runtime: &mut ListenerRuntime,
@@ -678,16 +706,7 @@ pub async fn run_turn_observed(
         handle.key().conversation_id().clone(),
         None,
     );
-    let lifecycle = runtime
-        .lifecycle(&handle)
-        .ok_or_else(|| protocol("runtime lifecycle missing"))?;
-    let turn_id = NonEmptyString::new("turn").map_err(|_| protocol("turn id"))?;
-    let run_id = lifecycle
-        .projection()
-        .active_run_ids()
-        .first()
-        .cloned()
-        .ok_or_else(|| protocol("active run id missing"))?;
+    let (turn_id, run_id) = turn_identity(runtime, &handle)?;
     let input_id = turn_id.clone();
     let guard = LeaseGuard::new(
         handle,
@@ -905,6 +924,56 @@ enum ProviderStepResult {
     Overflow(crate::ports::ProviderContextOverflowDetail),
 }
 
+async fn await_provider_terminal<F>(
+    turn: &mut TurnContext<'_, '_>,
+    state: &mut ProviderStepState,
+    mut future: std::pin::Pin<&mut F>,
+    retry_events: &mut Option<tokio::sync::mpsc::Receiver<RetryEvent>>,
+    output: &mut crate::ports::ProviderEventReceiver,
+) -> Result<Result<RetryTerminal, RuntimeError>, RuntimeError>
+where
+    F: std::future::Future<Output = Result<RetryTerminal, RuntimeError>>,
+{
+    loop {
+        tokio::select! {
+            biased;
+            event = receive_retry(retry_events), if retry_events.is_some() => {
+                if let Some(event) = event && apply_retry(turn, event)? == Flow::Suppressed {
+                    return suppress_provider(turn, output)
+                        .map(ProviderStepResult::Flow)
+                        .map(|_| Err(protocol("provider suppressed")));
+                }
+            }
+            result = future.as_mut() => return Ok(result),
+            result = output.receive() => {
+                if drain_ready_retries(turn, retry_events)? == Flow::Suppressed
+                    || turn.is_suppressed()
+                {
+                    return suppress_provider(turn, output)
+                        .map(ProviderStepResult::Flow)
+                        .map(|_| Err(protocol("provider suppressed")));
+                }
+                match result? {
+                    Some(event) => match handle_event(turn, state, event).await? {
+                        Flow::Suppressed => {
+                            return suppress_provider(turn, output)
+                                .map(ProviderStepResult::Flow)
+                                .map(|_| Err(protocol("provider suppressed")));
+                        }
+                        Flow::Failed => {
+                            output.cancel();
+                            close_retry_step(&turn.provider)?;
+                            return Err(protocol("provider event handling failed"));
+                        }
+                        Flow::Continue | Flow::Cancelled(_) => {}
+                    },
+                    None => return Err(protocol("provider stream closed before executor")),
+                }
+            }
+        }
+    }
+}
+
 async fn run_provider_attempt(
     turn: &mut TurnContext<'_, '_>,
     state: &mut ProviderStepState,
@@ -941,40 +1010,8 @@ async fn run_provider_attempt(
     let terminal = if let Some(result) = first {
         result
     } else {
-        loop {
-            tokio::select! {
-                biased;
-                event = receive_retry(&mut retry_events), if retry_events.is_some() => {
-                    if let Some(event) = event && apply_retry(turn, event)? == Flow::Suppressed {
-                        return suppress_provider(turn, &mut output).map(ProviderStepResult::Flow);
-                    }
-                }
-                result = &mut future => break result,
-                result = output.receive() => {
-                    if drain_ready_retries(turn, &mut retry_events)? == Flow::Suppressed {
-                        return suppress_provider(turn, &mut output).map(ProviderStepResult::Flow);
-                    }
-                    if turn.is_suppressed() {
-                        return suppress_provider(turn, &mut output).map(ProviderStepResult::Flow);
-                    }
-                    match result? {
-                        Some(event) => match handle_event(turn, state, event).await? {
-                            Flow::Suppressed => {
-                                return suppress_provider(turn, &mut output)
-                                    .map(ProviderStepResult::Flow);
-                            }
-                            Flow::Failed => {
-                                output.cancel();
-                                close_retry_step(&turn.provider)?;
-                                return Ok(ProviderStepResult::Flow(Flow::Failed));
-                            }
-                            Flow::Continue | Flow::Cancelled(_) => {}
-                        },
-                        None => return Err(protocol("provider stream closed before executor")),
-                    }
-                }
-            }
-        }
+        await_provider_terminal(turn, state, future.as_mut(), &mut retry_events, &mut output)
+            .await?
     };
     close_retry_step(&turn.provider)?;
     if turn.request.cancellation.is_cancelled() {

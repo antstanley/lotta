@@ -1,4 +1,5 @@
-//! Task 40-local production composition of planning, task, skill, interaction, LSP, and shell tools.
+//! Task 40-local production composition of planning, task, skill, interaction, LSP, and
+//! shell tools.
 
 use super::{
     interaction::{self, InteractionPort},

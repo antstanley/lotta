@@ -252,6 +252,48 @@ fn events(values: Vec<RuntimeEvent>) -> RuntimeEventBatch {
     BoundedVec::new(values).unwrap()
 }
 
+fn initial_runtime_events() -> RuntimeEventBatch {
+    events(vec![
+        RuntimeEvent::UpdateDeviceStatus {
+            device_status: Box::new(DeviceStatus {
+                current_connection_id: None,
+                connection_name: None,
+                is_online: true,
+                is_processing: false,
+                current_permission_mode: DevicePermissionMode::Standard,
+                current_working_directory: Some("/synthetic/workspace".into()),
+                cwd_revision: None,
+                git_context: None,
+                letta_code_version: None,
+                current_toolset: None,
+                current_toolset_preference: ToolsetPreference::Auto,
+                current_loaded_tools: Vec::new(),
+                current_available_skills: Vec::new(),
+                background_processes: Vec::new(),
+                pending_control_requests: Vec::new(),
+                experiments: Vec::new(),
+                memory_directory: None,
+                cwd_map: None,
+                boot_working_directory: None,
+                should_doctor: None,
+                reflection_settings: None,
+                supported_commands: Vec::new(),
+            }),
+        },
+        RuntimeEvent::UpdateLoopStatus {
+            loop_status: LoopState {
+                status: LoopStatus::WaitingOnInput,
+                active_run_ids: Vec::new(),
+                executing_tool_call_ids: Vec::new(),
+            },
+        },
+        RuntimeEvent::UpdateQueue {
+            queue: Vec::new(),
+            removed: Vec::new(),
+        },
+    ])
+}
+
 impl RuntimeCommandService for Service {
     fn runtime_start(
         &self,
@@ -287,45 +329,7 @@ impl RuntimeCommandService for Service {
                 created_conversation: false,
                 agent: None,
                 conversation: None,
-                broadcasts: events(vec![
-                    RuntimeEvent::UpdateDeviceStatus {
-                        device_status: Box::new(DeviceStatus {
-                            current_connection_id: None,
-                            connection_name: None,
-                            is_online: true,
-                            is_processing: false,
-                            current_permission_mode: DevicePermissionMode::Standard,
-                            current_working_directory: Some("/synthetic/workspace".into()),
-                            cwd_revision: None,
-                            git_context: None,
-                            letta_code_version: None,
-                            current_toolset: None,
-                            current_toolset_preference: ToolsetPreference::Auto,
-                            current_loaded_tools: Vec::new(),
-                            current_available_skills: Vec::new(),
-                            background_processes: Vec::new(),
-                            pending_control_requests: Vec::new(),
-                            experiments: Vec::new(),
-                            memory_directory: None,
-                            cwd_map: None,
-                            boot_working_directory: None,
-                            should_doctor: None,
-                            reflection_settings: None,
-                            supported_commands: Vec::new(),
-                        }),
-                    },
-                    RuntimeEvent::UpdateLoopStatus {
-                        loop_status: LoopState {
-                            status: LoopStatus::WaitingOnInput,
-                            active_run_ids: Vec::new(),
-                            executing_tool_call_ids: Vec::new(),
-                        },
-                    },
-                    RuntimeEvent::UpdateQueue {
-                        queue: Vec::new(),
-                        removed: Vec::new(),
-                    },
-                ]),
+                broadcasts: initial_runtime_events(),
             })
         })
     }
@@ -864,15 +868,12 @@ fn broadcast_frames(
     Ok(frames)
 }
 
-fn trace_frames(
-    raw: Vec<RawFrame>,
-    authority: &[AuthorityObservation],
-) -> Result<Vec<TraceFrame>, String> {
-    let mut authority_frames = Vec::new();
+fn authority_trace_frames(authority: &[AuthorityObservation]) -> Result<Vec<TraceFrame>, String> {
+    let mut frames = Vec::new();
     for observation in authority {
         match observation {
             AuthorityObservation::Lifecycle { kind, cause, lease } => {
-                authority_frames.push(lifecycle_frame(kind, cause, lease))
+                frames.push(lifecycle_frame(kind, cause, lease))
             }
             AuthorityObservation::Broadcast {
                 observation,
@@ -885,20 +886,17 @@ fn trace_frames(
                 if !is_initial && !active.as_ref().is_some_and(|value| value.2) {
                     return Err("stream or terminal batch lacks current lease context".into());
                 }
-                authority_frames.extend(broadcast_frames(observation, active)?);
+                frames.extend(broadcast_frames(observation, active)?);
             }
         }
     }
-    let ordinals = authority
-        .iter()
-        .filter_map(|value| match value {
-            AuthorityObservation::Broadcast { observation, .. } => Some(observation.batch_ordinal),
-            AuthorityObservation::Lifecycle { .. } => None,
-        })
-        .collect::<Vec<_>>();
-    if ordinals != [1, 2, 3, 4, 5] {
-        return Err(format!("observer batch ordinals mismatch: {ordinals:?}"));
-    }
+    Ok(frames)
+}
+
+fn verify_authority_delivery(
+    raw: &[RawFrame],
+    authority_frames: &[TraceFrame],
+) -> Result<(), String> {
     let mut raw_messages = raw.iter().filter(|frame| {
         frame.direction == "server_to_client" && frame.wire.get("event_seq").is_some()
     });
@@ -920,6 +918,25 @@ fn trace_frames(
     if raw_messages.next().is_some() {
         return Err("extra client onMessage frame".into());
     }
+    Ok(())
+}
+
+fn trace_frames(
+    raw: Vec<RawFrame>,
+    authority: &[AuthorityObservation],
+) -> Result<Vec<TraceFrame>, String> {
+    let authority_frames = authority_trace_frames(authority)?;
+    let ordinals = authority
+        .iter()
+        .filter_map(|value| match value {
+            AuthorityObservation::Broadcast { observation, .. } => Some(observation.batch_ordinal),
+            AuthorityObservation::Lifecycle { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    if ordinals != [1, 2, 3, 4, 5] {
+        return Err(format!("observer batch ordinals mismatch: {ordinals:?}"));
+    }
+    verify_authority_delivery(&raw, &authority_frames)?;
     let mut frames = Vec::new();
     let mut authority = authority_frames.into_iter().peekable();
     let mut request_causes = std::collections::VecDeque::with_capacity(8);

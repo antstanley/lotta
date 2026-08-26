@@ -134,9 +134,10 @@ async fn input_routes_ack() {
         .connections
         .subscribe(id, scope(1))
         .unwrap_or_else(|e| panic!("subscribe: {e}"));
-    let command = decode_wire(
-        &json!({"type":"input","request_id":"r2","runtime":scope(1),"payload":{"kind":"create_message","messages":[]}}),
-    );
+    let command = decode_wire(&json!({
+        "type":"input", "request_id":"r2", "runtime":scope(1),
+        "payload":{"kind":"create_message","messages":[]}
+    }));
     let (output, deferred) =
         route_command(router, Arc::new(RecordingService::default()), id, command)
             .await
@@ -147,9 +148,10 @@ async fn input_routes_ack() {
 #[tokio::test]
 async fn sync_preserves_flags_and_routes() {
     let (router, _, _, id) = router();
-    let command = decode_wire(
-        &json!({"type":"sync","request_id":"r3","runtime":scope(1),"recover_approvals":false,"force_device_status":true}),
-    );
+    let command = decode_wire(&json!({
+        "type":"sync", "request_id":"r3", "runtime":scope(1),
+        "recover_approvals":false, "force_device_status":true
+    }));
     let RuntimeCommand::Sync(command) = &command else {
         panic!("sync")
     };
@@ -184,9 +186,10 @@ async fn change_device_payload_routes_without_response() {
         .connections
         .subscribe(id, scope(1))
         .unwrap_or_else(|e| panic!("subscribe: {e}"));
-    let command = decode_wire(
-        &json!({"type":"change_device_state","runtime":scope(1),"payload":{"mode":"strict","cwd":"/tmp","agent_id":null}}),
-    );
+    let command = decode_wire(&json!({
+        "type":"change_device_state", "runtime":scope(1),
+        "payload":{"mode":"strict","cwd":"/tmp","agent_id":null}
+    }));
     let (output, _) = route_command(router, Arc::new(RecordingService::default()), id, command)
         .await
         .unwrap_or_else(|e| panic!("route: {e}"));
@@ -214,7 +217,11 @@ async fn rejects_agent_conflict_before_allocation() {
 }
 #[tokio::test]
 async fn rejects_conversation_conflict_before_allocation() {
-    conflict(json!({"type":"runtime_start","request_id":"r","conversation_id":"c","create_conversation":{}})).await;
+    conflict(json!({
+        "type":"runtime_start", "request_id":"r",
+        "conversation_id":"c", "create_conversation":{}
+    }))
+    .await;
 }
 #[tokio::test]
 async fn malformed_runtime_start_shapes_never_call_service() {
@@ -247,9 +254,10 @@ async fn malformed_runtime_start_shapes_never_call_service() {
 #[tokio::test]
 async fn input_without_request_has_no_ack() {
     let (router, _, _, id) = router();
-    let command = decode_wire(
-        &json!({"type":"input","runtime":scope(1),"payload":{"kind":"create_message","messages":[]}}),
-    );
+    let command = decode_wire(&json!({
+        "type":"input", "runtime":scope(1),
+        "payload":{"kind":"create_message","messages":[]}
+    }));
     let (output, _) = route_command(router, Arc::new(RecordingService::default()), id, command)
         .await
         .unwrap_or_else(|e| panic!("route: {e}"));
@@ -264,9 +272,10 @@ async fn input_ack_physically_precedes_after_ack_and_continue() {
         .subscribe(id, scope(1))
         .unwrap_or_else(|e| panic!("sub: {e}"));
     let service = Arc::new(RecordingService::default());
-    let command = decode_wire(
-        &json!({"type":"input","request_id":"r","runtime":scope(1),"payload":{"kind":"create_message","messages":[]}}),
-    );
+    let command = decode_wire(&json!({
+        "type":"input", "request_id":"r", "runtime":scope(1),
+        "payload":{"kind":"create_message","messages":[]}
+    }));
     let (output, deferred) = route_command(router.clone(), service.clone(), id, command)
         .await
         .unwrap_or_else(|e| panic!("route: {e}"));

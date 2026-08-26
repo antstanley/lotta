@@ -641,7 +641,10 @@ mod setup {
                     "tools.candidates:ExtensionSnapshot { id: 0 }",
                     "tools.merge:openai:[]",
                     &format!(
-                        "request.build:prompt skills=[\"skill-a\"] cwd={} reminder=None:hello:openai/gpt-4o:0",
+                        concat!(
+                            "request.build:prompt skills=[\"skill-a\"] cwd={} ",
+                            "reminder=None:hello:openai/gpt-4o:0"
+                        ),
                         canonical.display()
                     ),
                     "input.admit:agent-a:conversation-a:hello:None"

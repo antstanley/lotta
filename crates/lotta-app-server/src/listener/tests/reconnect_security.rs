@@ -103,10 +103,20 @@ impl Harness {
     }
 
     async fn sync_seq(&self, socket: &mut Client, suffix: &str) -> u64 {
-        socket.send(Message::Text(json!({
-            "type":"sync", "request_id":format!("sync-{suffix}"),
-            "runtime":{"agent_id":format!("agent-{suffix}"),"conversation_id":format!("conversation-{suffix}")}
-        }).to_string().into())).await.expect("sync send");
+        socket
+            .send(Message::Text(
+                json!({
+                    "type":"sync", "request_id":format!("sync-{suffix}"),
+                    "runtime":{
+                        "agent_id":format!("agent-{suffix}"),
+                        "conversation_id":format!("conversation-{suffix}")
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("sync send");
         let event = recv_json(socket).await;
         assert_eq!(event["type"], "update_queue");
         let seq = event["event_seq"].as_u64().expect("sequence");
@@ -311,17 +321,36 @@ async fn principals_and_colon_ids_cannot_collide_or_inherit() {
 }
 
 #[tokio::test]
-async fn malformed_empty_and_oversized_reconnect_ids_are_non_resumable() {
+async fn reconnect_id_below_at_and_above_bound() {
     let h = Harness::new().await;
-    let oversized = "x".repeat(257);
-    for (index, id) in [
-        None,
-        Some("   "),
-        Some("bad\tvalue"),
-        Some(oversized.as_str()),
-    ]
-    .into_iter()
-    .enumerate()
+    let below = "x".repeat(super::RECONNECT_CLIENT_ID_BYTES_MAX - 1);
+    let at = "x".repeat(super::RECONNECT_CLIENT_ID_BYTES_MAX);
+    let above = "x".repeat(super::RECONNECT_CLIENT_ID_BYTES_MAX + 1);
+    for id in [&below, &at] {
+        let mut first = h.connect("bounded", 1, Some(id)).await;
+        h.subscribe(&mut first, "bounded").await;
+        assert_eq!(h.sync_seq(&mut first, "bounded").await, 1);
+        h.close(first).await;
+        let mut resumed = h.connect("bounded", 2, Some(id)).await;
+        assert_eq!(h.sync_seq(&mut resumed, "bounded").await, 2);
+        h.close(resumed).await;
+    }
+
+    let mut first = h.connect("above", 1, Some(&above)).await;
+    h.subscribe(&mut first, "above").await;
+    assert_eq!(h.sync_seq(&mut first, "above").await, 1);
+    h.close(first).await;
+    let mut renewed = h.connect("above", 2, Some(&above)).await;
+    assert_eq!(h.sync_seq(&mut renewed, "above").await, 1);
+    h.close(renewed).await;
+}
+
+#[tokio::test]
+async fn malformed_reconnect_ids_are_non_resumable() {
+    let h = Harness::new().await;
+    for (index, id) in [None, Some("   "), Some("bad\tvalue")]
+        .into_iter()
+        .enumerate()
     {
         let suffix = format!("invalid-{index}");
         let mut first = h.connect("invalid", 1, id).await;

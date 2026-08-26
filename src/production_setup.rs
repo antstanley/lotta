@@ -2957,6 +2957,35 @@ impl ProductionTurnController {
         Ok((input, effects))
     }
 
+    async fn local_turn_runtime(
+        &self,
+        scope: &lotta_domain::RuntimeScope,
+        generation: u64,
+        run_id: lotta_domain::RunId,
+    ) -> Result<
+        (
+            lotta_runtime::ListenerRuntime,
+            lotta_runtime::RuntimeHandle,
+            lotta_domain::TurnLease,
+        ),
+        lotta_app_server::error::AppServerError,
+    > {
+        let state = self.runtime_state.inner.lock().await;
+        let observer = state.registry.observer().clone();
+        drop(state);
+        let mut runtime = lotta_runtime::ListenerRuntime::with_observer(observer);
+        let owner = uuid::Uuid::from_u128(generation.into());
+        let local = runtime
+            .get_or_create(scope, owner)
+            .map_err(app_server_error)?;
+        let lease = runtime
+            .lifecycle_mut(&local)
+            .map_err(app_server_error)?
+            .begin_turn("production-local".to_owned(), run_id)
+            .map_err(app_server_error)?;
+        Ok((runtime, local, lease))
+    }
+
     async fn run_admitted(
         &self,
         command: &lotta_app_server::ws::command::InputCommand,
@@ -3000,23 +3029,9 @@ impl ProductionTurnController {
             .lock()
             .expect("cancellation stage observer")
             .clone();
-        let mut runtime = {
-            let state = self.runtime_state.inner.lock().await;
-            let observer = state.registry.observer().clone();
-            drop(state);
-            let mut runtime = lotta_runtime::ListenerRuntime::with_observer(observer);
-            let owner = uuid::Uuid::from_u128(pending.lease.generation().into());
-            let local = runtime
-                .get_or_create(&scope, owner)
-                .map_err(app_server_error)?;
-            let run_id = effects.run_id.clone();
-            let local_lease = runtime
-                .lifecycle_mut(&local)
-                .map_err(app_server_error)?
-                .begin_turn("production-local".to_owned(), run_id)
-                .map_err(app_server_error)?;
-            (runtime, local, local_lease)
-        };
+        let mut runtime = self
+            .local_turn_runtime(&scope, pending.lease.generation(), effects.run_id.clone())
+            .await?;
         self.setup
             .run_production_turn(
                 &mut runtime.0,
@@ -3201,6 +3216,46 @@ async fn activate_submission(
     ))
 }
 
+async fn run_active_submission(
+    controller: &ProductionTurnController,
+    command: &lotta_app_server::ws::command::InputCommand,
+    pending: &crate::production_components::PendingAdmission,
+    active_cancellation: CancellationToken,
+    listener_cancellation: CancellationToken,
+    sink: Arc<dyn lotta_app_server::ws::RuntimeEventSink>,
+) -> Result<lotta_runtime::turn::TurnRunOutcome, lotta_app_server::error::AppServerError> {
+    let run = controller.run_admitted(command, pending, active_cancellation.clone(), sink);
+    tokio::pin!(run);
+    tokio::select! {
+        result = &mut run => result,
+        () = listener_cancellation.cancelled() => {
+            active_cancellation.cancel();
+            run.await
+        }
+    }
+}
+
+fn next_pumped_submission(
+    scope: &lotta_domain::RuntimeScope,
+    item: lotta_domain::QueueItem,
+    continuation: BoundedJsonValue,
+) -> (
+    lotta_app_server::ws::command::InputCommand,
+    lotta_app_server::ws::DeferredInput,
+) {
+    let command = lotta_app_server::ws::command::InputCommand {
+        request_id: None,
+        runtime: scope.clone(),
+        payload: item.content,
+    };
+    let deferred = lotta_app_server::ws::DeferredInput {
+        scope: scope.clone(),
+        disposition: lotta_domain::InputDisposition::Started,
+        continuation: Some(continuation),
+    };
+    (command, deferred)
+}
+
 async fn submit_production_turn(
     controller: &ProductionTurnController,
     command: lotta_app_server::ws::command::InputCommand,
@@ -3218,22 +3273,15 @@ async fn submit_production_turn(
                 Ok(active) => active,
                 Err(error) => return Err(attach_controller_error(primary, error)),
             };
-        let result = {
-            let run = controller.run_admitted(
-                &command,
-                &pending,
-                active_cancellation.clone(),
-                Arc::clone(&sink),
-            );
-            tokio::pin!(run);
-            tokio::select! {
-                result = &mut run => result,
-                () = listener_cancellation.cancelled() => {
-                    active_cancellation.cancel();
-                    run.await
-                }
-            }
-        };
+        let result = run_active_submission(
+            controller,
+            &command,
+            &pending,
+            active_cancellation,
+            listener_cancellation,
+            Arc::clone(&sink),
+        )
+        .await;
         let cancelled = matches!(
             result,
             Ok(lotta_runtime::turn::TurnRunOutcome::Cancelled(_))
@@ -3271,16 +3319,7 @@ async fn submit_production_turn(
         }) {
             primary = None;
         }
-        command = lotta_app_server::ws::command::InputCommand {
-            request_id: None,
-            runtime: command.runtime.clone(),
-            payload: item.content,
-        };
-        deferred = lotta_app_server::ws::DeferredInput {
-            scope: command.runtime.clone(),
-            disposition: lotta_domain::InputDisposition::Started,
-            continuation: Some(continuation),
-        };
+        (command, deferred) = next_pumped_submission(&command.runtime, item, continuation);
         cancellation = CancellationToken::new();
     }
 }

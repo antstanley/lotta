@@ -263,9 +263,8 @@ impl RuntimeConnections {
         values
     }
 
-    /// Returns the current distinct subscription count.
-    #[must_use]
-    pub fn subscription_count(&self, id: ConnectionId) -> Option<usize> {
+    #[cfg(test)]
+    pub(crate) fn subscription_count(&self, id: ConnectionId) -> Option<usize> {
         self.entries.get(&id).map(|entry| entry.subscriptions.len())
     }
 

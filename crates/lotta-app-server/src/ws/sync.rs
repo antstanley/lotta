@@ -131,14 +131,87 @@ mod snapshot_semantics {
                 },
             ],
         };
-        let RuntimeEvent::UpdateQueue { removed, .. } = event else {
-            unreachable!()
+        let removed = match event {
+            RuntimeEvent::UpdateQueue { removed, .. } => removed,
+            _ => Vec::new(),
         };
         let ids: Vec<_> = removed
             .iter()
             .map(|row| row.client_message_id.as_str())
             .collect();
         assert_eq!(ids, ["first", "second"]);
+    }
+}
+
+#[cfg(test)]
+mod recovery_repairs {
+    mod ws {
+        mod recovery {
+            mod repairs_missing_tool_end {
+                use crate::ws::{RuntimeEvent, event::*, test_support::*};
+
+                #[derive(Default)]
+                struct ToolReducer {
+                    executing: std::collections::BTreeSet<String>,
+                }
+
+                impl ToolReducer {
+                    fn apply(&mut self, event: &RuntimeEvent) {
+                        match event {
+                            RuntimeEvent::StreamDelta { delta, .. } => self.apply_delta(delta),
+                            RuntimeEvent::UpdateLoopStatus { loop_status } => {
+                                self.executing = loop_status
+                                    .executing_tool_call_ids
+                                    .iter()
+                                    .map(ToString::to_string)
+                                    .collect();
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    fn apply_delta(&mut self, delta: &StreamDelta) {
+                        match delta {
+                            StreamDelta::ClientToolStart(start) => {
+                                self.executing
+                                    .insert(start.tool_call_id.as_str().to_owned());
+                            }
+                            StreamDelta::ClientToolEnd(end) => {
+                                self.executing.remove(end.tool_call_id.as_str());
+                            }
+                            StreamDelta::Other(_) => {}
+                        }
+                    }
+                }
+
+                #[test]
+                fn authoritative_loop_snapshot_repairs_missing_tool_end() {
+                    let tool_call_id = text("tool-call");
+                    let sequence = [
+                        RuntimeEvent::StreamDelta {
+                            delta: StreamDelta::ClientToolStart(ClientToolStart {
+                                id: text("message"),
+                                date: text("2026-08-18T00:00:00Z"),
+                                message_type: ClientToolStartType::ClientToolStart,
+                                run_id: None,
+                                tool_call_id: tool_call_id.clone(),
+                                tool_name: Some(text("Read")),
+                                tool_args: None,
+                            }),
+                            subagent_id: None,
+                        },
+                        RuntimeEvent::UpdateLoopStatus {
+                            loop_status: loop_state(LoopStatus::WaitingOnInput),
+                        },
+                    ];
+                    let mut reducer = ToolReducer::default();
+                    reducer.apply(&sequence[0]);
+                    assert_eq!(reducer.executing, [tool_call_id.as_str().to_owned()].into());
+                    reducer.apply(&sequence[1]);
+                    assert!(reducer.executing.is_empty());
+                }
+            }
+        }
     }
 }
 
