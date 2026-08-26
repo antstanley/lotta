@@ -96,8 +96,6 @@ mod reconnect {
 #[cfg(test)]
 mod repairs_missing_tool_end {
     use crate::ws::{RuntimeEvent, RuntimeRouter, test_support::*};
-    use serde_json::json;
-
     #[test]
     fn next_loop_snapshot_repairs_client_tool_state() {
         let (router, _, _, connection) = router();
@@ -107,10 +105,17 @@ mod repairs_missing_tool_end {
             .subscribe(connection, scope(1))
             .expect("subscribe");
         let start = RuntimeEvent::StreamDelta {
-            delta: crate::ws::event::StreamDelta::Other(bounded(json!({
-                "message_type": "client_tool_start",
-                "tool_call_id": "tool-1"
-            }))),
+            delta: crate::ws::event::StreamDelta::ClientToolStart(
+                crate::ws::event::ClientToolStart {
+                    id: text("start-1"),
+                    date: text("2026-08-14T00:00:00Z"),
+                    message_type: crate::ws::event::ClientToolStartType::ClientToolStart,
+                    run_id: None,
+                    tool_call_id: text("tool-1"),
+                    tool_name: Some(text("shell")),
+                    tool_args: Some("{}".into()),
+                },
+            ),
             subagent_id: None,
         };
         let started = router.broadcast(&scope(1), &start).expect("tool start");

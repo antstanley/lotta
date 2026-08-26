@@ -172,7 +172,7 @@ async fn execute_any(
             deadline: tool.definition.timeout,
             definition: Arc::clone(&tool.definition),
             model_name: tool.model_name.clone(),
-            secrets: crate::pipeline::test_empty_secret_delivery(),
+            secrets: crate::pipeline::SecretDelivery::empty_for_test(),
         })
         .await
         .unwrap()

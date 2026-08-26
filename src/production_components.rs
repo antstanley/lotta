@@ -1584,9 +1584,6 @@ impl ProductionRuntimeService {
             return Err(AppServerError::Malformed);
         }
         let resolution = approval_resolution_input(&command.runtime, request, decision, payload)?;
-        self.approvals
-            .validate_resolution(&resolution, active.lease.generation())
-            .map_err(runtime_service_error)?;
         let outcome = lotta_runtime::admit_control_snapshot(
             &active.handle,
             &active.handle,
@@ -1598,6 +1595,11 @@ impl ProductionRuntimeService {
         )
         .map_err(runtime_service_error)?;
         let disposition = outcome.disposition();
+        if matches!(outcome, AdmissionOutcome::Control(_)) {
+            self.approvals
+                .resolve(&resolution, active.lease.generation())
+                .map_err(runtime_service_error)?;
+        }
         Ok((outcome, disposition))
     }
 
@@ -1692,51 +1694,6 @@ fn continuation_kind(value: &BoundedJsonValue) -> Option<&str> {
         .as_value()
         .get("kind")
         .and_then(serde_json::Value::as_str)
-}
-
-fn approval_resolution_from_continuation(
-    scope: RuntimeScope,
-    continuation: &BoundedJsonValue,
-) -> Result<lotta_runtime::ApprovalResolutionInput, AppServerError> {
-    let value = continuation.as_value();
-    let text = |name| {
-        value
-            .get(name)
-            .and_then(serde_json::Value::as_str)
-            .ok_or(AppServerError::Malformed)
-    };
-    let lease_generation = value
-        .get("lease_generation")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or(AppServerError::Malformed)?;
-    let revision = value
-        .get("revision")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or(AppServerError::Malformed)?;
-    let decision = value.get("decision").ok_or(AppServerError::Malformed)?;
-    let resolution = match decision.get("behavior").and_then(serde_json::Value::as_str) {
-        Some("allow") => lotta_runtime::ApprovalResolution::Allow,
-        Some("deny") => lotta_runtime::ApprovalResolution::Deny,
-        _ => return Err(AppServerError::Malformed),
-    };
-    let edited_input = value
-        .get("updated_input")
-        .filter(|candidate| !candidate.is_null())
-        .cloned()
-        .map(BoundedJsonValue::new)
-        .transpose()
-        .map_err(|_| AppServerError::Malformed)?;
-    Ok(lotta_runtime::ApprovalResolutionInput {
-        scope,
-        request_id: NonEmptyString::new(text("request_id")?.to_owned())
-            .map_err(|_| AppServerError::Malformed)?,
-        tool_call_id: NonEmptyString::new(text("tool_call_id")?.to_owned())
-            .map_err(|_| AppServerError::Malformed)?,
-        lease_generation,
-        revision,
-        resolution,
-        edited_input,
-    })
 }
 
 fn approval_decision(payload: &serde_json::Value) -> Result<serde_json::Value, AppServerError> {
@@ -2007,20 +1964,6 @@ fn attach_cleanup(primary: AppServerError, cleanup: AppServerError) -> AppServer
         primary: Box::new(primary),
         cleanup: Box::new(cleanup),
     }
-}
-
-fn resolve_approval_continuation(
-    service: &ProductionRuntimeService,
-
-    scope: RuntimeScope,
-    continuation: &BoundedJsonValue,
-) -> Result<(), AppServerError> {
-    let input = approval_resolution_from_continuation(scope, continuation)?;
-    service
-        .approvals
-        .resolve(&input, input.lease_generation)
-        .map(|_| ())
-        .map_err(runtime_service_error)
 }
 
 fn emit_started_continuation(
@@ -2426,7 +2369,7 @@ impl RuntimeCommandService for ProductionRuntimeService {
         Box::pin(async move {
             let continuation = continuation.ok_or(AppServerError::Malformed)?;
             if continuation_kind(&continuation) == Some("approval_response") {
-                return resolve_approval_continuation(self, scope, &continuation);
+                return Ok(());
             }
             emit_started_continuation(self, &scope, &continuation, sink.as_ref())
         })
@@ -4686,34 +4629,50 @@ mod production_tests {
         service
     }
 
+    struct TestNoOverflow;
+
+    impl lotta_tools::clamp::OverflowWriter for TestNoOverflow {
+        fn write(&self, _: &str, _: &str) -> Result<String, lotta_tools::clamp::ClampError> {
+            Err(lotta_tools::clamp::ClampError::OverflowWrite)
+        }
+    }
+
     async fn create_task40_record(service: &ProductionRuntimeService, target: &RuntimeScope) {
-        use lotta_runtime::ports::{ToolCallId, ValidatedToolInput};
-        use lotta_tools::pipeline::{RawToolExecutionRequest, RawToolOutcome};
-        let registration =
+        use lotta_runtime::ports::{ToolApprovalGrant, ToolCallId};
+        let registry = lotta_tools::ToolRegistry::new(
             lotta_tools::builtin::task::registrations(Arc::clone(&service.tasks), target.clone())
-                .unwrap()
-                .into_iter()
-                .find(|row| row.definition.internal_name.as_str() == "TaskCreate")
-                .unwrap();
-        let outcome = registration
-            .executor
-            .execute(RawToolExecutionRequest::without_secrets(
-                ToolCallId::from_name(ProviderName::new("task40-sync-call".into()).unwrap()),
-                ValidatedToolInput::new(
-                    BoundedJsonValue::new(serde_json::json!({
-                        "subject": "Production sync child", "description": "Task40 scoped fixture"
-                    }))
-                    .unwrap(),
-                )
                 .unwrap(),
-                CancellationToken::new(),
-                registration.definition.timeout,
-                Arc::clone(&registration.definition),
-                registration.definition.model_name.clone(),
-            ))
-            .await
+        )
+        .unwrap();
+        let snapshot = registry
+            .update(lotta_tools::ToolsetId::Default, &[], Some(&["TaskCreate"]))
             .unwrap();
-        assert!(matches!(outcome, RawToolOutcome::Success(_)));
+        let model_name = snapshot.model_names()[0].to_owned();
+        let outcome = lotta_tools::execute(lotta_tools::PipelineRequest {
+            tool_call_id: ToolCallId::from_name(
+                ProviderName::new("task40-sync-call".into()).unwrap(),
+            ),
+            approval_grant: ToolApprovalGrant::None,
+            registry: snapshot,
+            model_name: &model_name,
+            input: BoundedJsonValue::new(serde_json::json!({
+                "subject": "Production sync child",
+                "description": "Task40 scoped fixture"
+            }))
+            .unwrap(),
+            cancellation: CancellationToken::new(),
+            hook_runtime: service.hooks.as_ref(),
+            permissions: &lotta_tools::AllowAllPermissions,
+            sandbox: &lotta_tools::AllowAllSandbox,
+            secrets: &NoSecrets,
+            trace: &NoTrace,
+            overflow: &TestNoOverflow,
+            persistence: &NoOutcome,
+            emit: &NoOutcome,
+        })
+        .await
+        .unwrap();
+        assert!(matches!(outcome, ToolOutcome::Success { .. }));
     }
 
     async fn prepare_production_sync_state(

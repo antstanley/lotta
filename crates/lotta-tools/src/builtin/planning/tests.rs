@@ -140,5 +140,5 @@ async fn execute(tool: &crate::registry::RegisteredTool, value: serde_json::Valu
 }
 
 fn empty_delivery() -> crate::pipeline::SecretDelivery {
-    crate::pipeline::test_empty_secret_delivery()
+    crate::pipeline::SecretDelivery::empty_for_test()
 }

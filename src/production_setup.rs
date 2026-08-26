@@ -3107,6 +3107,7 @@ fn activate_submission(
     (
         crate::production_components::PendingAdmission,
         CancellationToken,
+        CancellationToken,
     ),
     lotta_app_server::error::AppServerError,
 > {
@@ -3136,12 +3137,11 @@ fn activate_submission(
     if replaced {
         return Err(lotta_app_server::error::AppServerError::Internal);
     }
-    let watcher = active_cancellation.clone();
-    tokio::spawn(async move {
-        listener_cancellation.cancelled().await;
-        watcher.cancel();
-    });
-    Ok((pending, active_cancellation))
+    Ok((
+        pending,
+        active_cancellation.child_token(),
+        listener_cancellation,
+    ))
 }
 
 async fn submit_production_turn(
@@ -3156,14 +3156,27 @@ async fn submit_production_turn(
     let mut cancellation = cancellation;
     let mut primary = None;
     loop {
-        let (pending, active_cancellation) =
+        let (pending, active_cancellation, listener_cancellation) =
             match activate_submission(controller, &command, &deferred, cancellation) {
                 Ok(active) => active,
                 Err(error) => return Err(attach_controller_error(primary, error)),
             };
-        let result = controller
-            .run_admitted(&command, &pending, active_cancellation, Arc::clone(&sink))
-            .await;
+        let result = {
+            let run = controller.run_admitted(
+                &command,
+                &pending,
+                active_cancellation.clone(),
+                Arc::clone(&sink),
+            );
+            tokio::pin!(run);
+            tokio::select! {
+                result = &mut run => result,
+                () = listener_cancellation.cancelled() => {
+                    active_cancellation.cancel();
+                    run.await
+                }
+            }
+        };
         let cancelled = matches!(
             result,
             Ok(lotta_runtime::turn::TurnRunOutcome::Cancelled(_))

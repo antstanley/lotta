@@ -210,7 +210,7 @@ pub mod timeout {
             deadline: ToolTimeout::new(std::time::Duration::from_millis(1)).unwrap(),
             definition: Arc::clone(&tool.definition),
             model_name: tool.model_name.clone(),
-            secrets: crate::pipeline::test_empty_secret_delivery(),
+            secrets: crate::pipeline::SecretDelivery::empty_for_test(),
         };
         let task = tokio::spawn(async move { executor.execute(request).await });
         let _request = receiver.recv().await.unwrap();
