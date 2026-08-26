@@ -230,6 +230,7 @@ impl RuntimeCommandService for RejectingService {
                 disposition: InputDisposition::Rejected,
                 error: None,
                 continuation: None,
+                work: crate::ws::InputAdmissionWork::None,
                 after_ack: BoundedVec::new(Vec::new()).expect("empty batch"),
             })))
         }

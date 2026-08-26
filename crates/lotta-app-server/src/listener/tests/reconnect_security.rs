@@ -190,6 +190,7 @@ impl RuntimeCommandService for ReconnectService {
                 disposition: InputDisposition::Started,
                 error: None,
                 continuation: None,
+                work: crate::ws::InputAdmissionWork::None,
                 after_ack: events(Vec::new()),
             })
         })

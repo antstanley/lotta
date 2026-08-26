@@ -354,7 +354,8 @@ impl RuntimeCommandService for Service {
             Ok(InputAdmission {
                 disposition: InputDisposition::Started,
                 error: None,
-                continuation: Some(command.payload),
+                continuation: Some(command.payload.clone()),
+                work: lotta_app_server::ws::InputAdmissionWork::NewStarted(command.payload),
                 after_ack: events(Vec::new()),
             })
         })

@@ -42,14 +42,24 @@ pub struct RuntimeStartOutcome {
     pub broadcasts: RuntimeEventBatch,
 }
 
+/// Execution work associated with an admitted input.
+pub enum InputAdmissionWork {
+    /// A newly started input owns this continuation.
+    NewStarted(BoundedJsonValue),
+    /// No turn may be spawned, including for a replayed `Started` acknowledgement.
+    None,
+}
+
 /// Admission result with all execution effects deferred until after acknowledgement.
 pub struct InputAdmission {
     /// Admission disposition.
     pub disposition: InputDisposition,
     /// Optional rejection detail.
     pub error: Option<NonEmptyString>,
-    /// Opaque bounded continuation state.
+    /// Compatibility projection of newly started continuation state.
     pub continuation: Option<BoundedJsonValue>,
+    /// Explicit execution ownership, distinct from the wire disposition.
+    pub work: InputAdmissionWork,
     /// Immediate events emitted after acknowledgement and before continuation.
     pub after_ack: RuntimeEventBatch,
 }

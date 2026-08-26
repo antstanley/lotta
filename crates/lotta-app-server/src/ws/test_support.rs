@@ -161,6 +161,7 @@ impl RuntimeCommandService for RecordingService {
                 disposition: InputDisposition::Started,
                 error: None,
                 continuation: Some(bounded(json!({"continue":true}))),
+                work: super::InputAdmissionWork::NewStarted(bounded(json!({"continue":true}))),
                 after_ack: events(vec![RuntimeEvent::UpdateQueue {
                     queue: Vec::new(),
                     removed: Vec::new(),

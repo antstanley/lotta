@@ -77,6 +77,23 @@ impl AdmissionHistory {
         disposition
     }
 
+    /// Rolls back the newest admission when downstream start registration fails.
+    #[must_use]
+    pub fn rollback(&mut self, client_message_id: &NonEmptyString) -> bool {
+        if self.order.back().map(String::as_str) != Some(client_message_id.as_str()) {
+            return false;
+        }
+        let Some(key) = self.order.pop_back() else {
+            return false;
+        };
+        let removed = self.entries.remove(&key).is_some();
+        if removed {
+            self.admissions = self.admissions.saturating_sub(1);
+        }
+        debug_assert_eq!(self.entries.len(), self.order.len());
+        removed
+    }
+
     /// Returns the number of distinct admissions observed.
     #[must_use]
     pub const fn admission_count(&self) -> u64 {

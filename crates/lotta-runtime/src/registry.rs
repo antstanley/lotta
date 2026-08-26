@@ -363,6 +363,20 @@ impl ListenerRuntime {
             .map(|entry| &mut entry.admission_history)
     }
 
+    /// Rolls back the newest admission history record for an exact handle.
+    ///
+    /// # Errors
+    /// Returns [`RuntimeError::NotFound`] for a missing or stale generation.
+    pub fn rollback_admission(
+        &mut self,
+        handle: &RuntimeHandle,
+        client_message_id: &NonEmptyString,
+    ) -> Result<bool, RuntimeError> {
+        Ok(self
+            .admission_history_mut(handle)?
+            .rollback(client_message_id))
+    }
+
     /// Returns the exact handle's mutable lifecycle owner.
     ///
     /// # Errors

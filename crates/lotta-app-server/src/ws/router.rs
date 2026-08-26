@@ -7,7 +7,7 @@ use super::{
     command::RuntimeCommand,
     connection::{ConnectionId, EventDelivery, RuntimeConnections},
     event::RuntimeEvent,
-    service::{RuntimeCommandService, RuntimeEventBatch, RuntimeEventSink},
+    service::{InputAdmissionWork, RuntimeCommandService, RuntimeEventBatch, RuntimeEventSink},
 };
 
 /// Maximum response frames produced by one Runtime command.
@@ -141,11 +141,11 @@ pub struct RouteOutput {
     pub response_after_events: bool,
 }
 
-/// Deferred phase-two input work returned after admission application.
+/// Deferred phase-two input work returned only for a newly started admission.
 pub struct DeferredInput {
     /// Runtime scope for continuation.
     pub scope: RuntimeScope,
-    /// Accepted disposition controlling whether a new turn starts.
+    /// Accepted wire disposition; always `Started` for deferred work.
     pub disposition: InputDisposition,
     /// Opaque bounded continuation state.
     pub continuation: Option<BoundedJsonValue>,
@@ -155,8 +155,8 @@ pub struct DeferredInput {
 pub struct RouteAdmission {
     /// Physical frames to dispatch before continuation.
     pub output: RouteOutput,
-    /// Deferred continuation descriptor.
-    pub deferred: DeferredInput,
+    /// Deferred continuation descriptor, present only for newly started work.
+    pub deferred: Option<DeferredInput>,
 }
 
 /// Synchronous owner-local Runtime routing state.
@@ -232,14 +232,15 @@ impl RuntimeRouter {
         });
         let output =
             self.response_then_broadcast(response, &command.runtime, &admission.after_ack)?;
-        Ok(RouteAdmission {
-            output,
-            deferred: DeferredInput {
+        let deferred = match admission.work {
+            InputAdmissionWork::NewStarted(continuation) => Some(DeferredInput {
                 scope: command.runtime.clone(),
-                disposition: admission.disposition,
-                continuation: admission.continuation,
-            },
-        })
+                disposition: InputDisposition::Started,
+                continuation: Some(continuation),
+            }),
+            InputAdmissionWork::None => None,
+        };
+        Ok(RouteAdmission { output, deferred })
     }
 
     /// Applies a successful sync replay and optional response.
@@ -449,7 +450,7 @@ pub async fn route_command(
         RuntimeCommand::Input(command) => {
             let admission = service.admit_input(command.clone()).await?;
             let admission_route = lock_router(&router)?.apply_input(&command, admission)?;
-            Ok((admission_route.output, Some(admission_route.deferred)))
+            Ok((admission_route.output, admission_route.deferred))
         }
         RuntimeCommand::Sync(command) => {
             let outcome = service.sync(connection, command.clone()).await?;

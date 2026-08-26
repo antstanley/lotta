@@ -1092,9 +1092,7 @@ async fn handle_text(
     if dispatch_output(state, connection_id, &output).is_err() {
         return false;
     }
-    if let Some(deferred) = deferred
-        && deferred.disposition == lotta_domain::InputDisposition::Started
-    {
+    if let Some(deferred) = deferred {
         let sink = event_sink(state);
         let Ok(command) = serde_json::from_value(frame.value.clone()) else {
             return dispatch_typed_failure(state, connection_id, &frame).is_ok();

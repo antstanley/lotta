@@ -1536,7 +1536,11 @@ impl ProductionRuntimeService {
         Ok(InputAdmission {
             disposition,
             error: None,
-            continuation,
+            continuation: continuation.clone(),
+            work: continuation.map_or(
+                lotta_app_server::ws::InputAdmissionWork::None,
+                lotta_app_server::ws::InputAdmissionWork::NewStarted,
+            ),
             after_ack: RuntimeEventBatch::new(Vec::new()).map_err(|_| AppServerError::Internal)?,
         })
     }
@@ -1689,49 +1693,38 @@ impl ProductionRuntimeService {
         }
         let key = (RuntimeKey::from(scope), client_message_id.to_owned());
         if state.pending.contains_key(&key) {
-            return continuation_value(client_message_id);
+            return Err(AppServerError::Internal);
         }
-        let run_sequence = u64::try_from(state.sequence).map_err(|_| AppServerError::Internal)?;
-        state.sequence = state
+        let next_sequence = state
             .sequence
             .checked_add(1)
             .ok_or(AppServerError::Internal)?;
+        let run_sequence = u64::try_from(state.sequence).map_err(|_| AppServerError::Internal)?;
         let run_id = lotta_domain::RunId::generate_sequence(run_sequence)
             .map_err(|_| AppServerError::Internal)?;
         let continuation = continuation_value(client_message_id)?;
+        let queue = state
+            .registry
+            .queue(&handle)
+            .ok_or(AppServerError::Internal)?;
         let lease = state
             .registry
             .lifecycle_mut(&handle)
             .map_err(runtime_service_error)?
             .begin_turn(format!("admission-{client_message_id}"), run_id)
             .map_err(runtime_service_error)?;
-        match state.pending.entry(key) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let queue = state
-                    .registry
-                    .queue(&handle)
-                    .ok_or(AppServerError::Internal)?;
-                entry.insert(PendingAdmission {
-                    handle,
-                    lease,
-                    item,
-                    cancellation: CancellationToken::new(),
-                    queue,
-                });
-                Ok(continuation)
-            }
-            std::collections::hash_map::Entry::Occupied(_) => {
-                let stop = lotta_domain::StopReason::new("admission_collision")
-                    .map_err(|_| AppServerError::Internal)?;
-                state
-                    .registry
-                    .lifecycle_mut(&handle)
-                    .map_err(runtime_service_error)?
-                    .finish_turn(&lease, stop)
-                    .map_err(runtime_service_error)?;
-                Err(AppServerError::Internal)
-            }
-        }
+        state.pending.insert(
+            key,
+            PendingAdmission {
+                handle,
+                lease,
+                item,
+                cancellation: CancellationToken::new(),
+                queue,
+            },
+        );
+        state.sequence = next_sequence;
+        Ok(continuation)
     }
 }
 fn continuation_kind(value: &BoundedJsonValue) -> Option<&str> {
@@ -1999,6 +1992,7 @@ fn input_admission(
         disposition,
         error,
         continuation: None,
+        work: lotta_app_server::ws::InputAdmissionWork::None,
         after_ack: RuntimeEventBatch::new(Vec::new()).map_err(|_| AppServerError::Internal)?,
     })
 }
@@ -2403,21 +2397,38 @@ impl RuntimeCommandService for ProductionRuntimeService {
                 ),
                 _ => None,
             };
-            let continuation = if disposition == InputDisposition::Started {
-                Some(Self::start_admission(
+            let work = match outcome {
+                AdmissionOutcome::Start(_) => match Self::start_admission(
                     &mut state,
                     &command.runtime,
                     &client_message_id,
-                    handle,
+                    handle.clone(),
                     item,
-                )?)
-            } else {
-                None
+                ) {
+                    Ok(continuation) => {
+                        lotta_app_server::ws::InputAdmissionWork::NewStarted(continuation)
+                    }
+                    Err(error) => {
+                        let id = NonEmptyString::new(client_message_id.clone())
+                            .map_err(|_| AppServerError::Malformed)?;
+                        state
+                            .registry
+                            .rollback_admission(&handle, &id)
+                            .map_err(runtime_service_error)?;
+                        return Err(error);
+                    }
+                },
+                _ => lotta_app_server::ws::InputAdmissionWork::None,
+            };
+            let continuation = match &work {
+                lotta_app_server::ws::InputAdmissionWork::NewStarted(value) => Some(value.clone()),
+                lotta_app_server::ws::InputAdmissionWork::None => None,
             };
             Ok(InputAdmission {
                 disposition,
                 error,
                 continuation,
+                work,
                 after_ack: RuntimeEventBatch::new(Vec::new())
                     .map_err(|_| AppServerError::Internal)?,
             })
