@@ -40,6 +40,23 @@ impl super::oauth::OAuthBrowser for BrowserPort {
     }
 }
 
+#[test]
+fn host_script_materialization_is_restart_idempotent_and_tamper_evident() {
+    let fixture = std::env::temp_dir().join(format!(
+        "lotta-host-restart-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&fixture);
+    std::fs::create_dir(&fixture).expect("create host restart fixture");
+    let script = fixture.join("pi-ai-host.mjs");
+    materialize_host_script(&script).expect("first materialization");
+    materialize_host_script(&script).expect("restart materialization");
+    std::fs::write(&script, "tampered").expect("tamper fixture");
+    assert!(materialize_host_script(&script).is_err());
+    let _ = std::fs::remove_dir_all(fixture);
+}
+
 pub(super) fn config() -> (HostConfig, PathBuf) {
     let source = source_root();
     let bun = bun();
@@ -330,4 +347,76 @@ fn fixture_stream_is_explicit_test_only_capability() {
     assert!(host.contains("provider.streamSimple"));
     assert!(!host.contains("fixture_events"));
     assert!(!host.contains("fixture_error"));
+}
+
+#[cfg(unix)]
+fn stalled_handshake_config() -> (HostConfig, PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = std::env::temp_dir().join(format!(
+        "lotta-host-cancel-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("package")).expect("package root");
+    std::fs::create_dir(root.join("scratch")).expect("scratch root");
+    std::fs::write(
+        root.join("package/package.json"),
+        r#"{"name":"@earendil-works/pi-ai","version":"0.82.1"}"#,
+    )
+    .expect("package manifest");
+    let pid = root.join("host.pid");
+    let executable = root.join("stalled-host");
+    std::fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nread blocked\n",
+            pid.display()
+        ),
+    )
+    .expect("host executable");
+    let mut permissions = std::fs::metadata(&executable)
+        .expect("host metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&executable, permissions).expect("host permissions");
+    let canonical = root.canonicalize().expect("fixture root");
+    let executable = canonical.join("stalled-host");
+    let config = HostConfig {
+        bun_executable: executable.clone(),
+        host_script: executable,
+        package_root: canonical.join("package"),
+        scratch_cwd: canonical.join("scratch"),
+        test_mode: false,
+    };
+    (config, canonical, pid)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_handshake_reaps_the_owned_child() {
+    let (config, root, pid_path) = stalled_handshake_config();
+    let spawning = tokio::spawn(HostClient::spawn(config, owner()));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !pid_path.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("host started");
+    let pid = std::fs::read_to_string(&pid_path).expect("host pid");
+    spawning.abort();
+    let _ = spawning.await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while std::process::Command::new("kill")
+            .args(["-0", pid.as_str()])
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("owned child reaped after cancellation");
+    std::fs::remove_dir_all(root).expect("remove cancellation fixture");
 }

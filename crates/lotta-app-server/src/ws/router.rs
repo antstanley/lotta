@@ -141,6 +141,16 @@ pub struct RouteOutput {
     pub response_after_events: bool,
 }
 
+impl RouteOutput {
+    fn approval_recovery_scope(&self) -> Option<RuntimeScope> {
+        self.event_batches
+            .as_slice()
+            .iter()
+            .find(|batch| matches!(&batch.event, RuntimeEvent::ApprovalRecovery { .. }))
+            .map(|batch| batch.scope.clone())
+    }
+}
+
 /// Deferred phase-two input work returned only for a newly started admission.
 pub struct DeferredInput {
     /// Runtime scope for continuation.
@@ -425,6 +435,17 @@ fn empty_output(
     })
 }
 
+/// Clears retained recovery evidence only after the caller queues the route successfully.
+pub(crate) async fn acknowledge_recovery(
+    service: &dyn RuntimeCommandService,
+    output: &RouteOutput,
+) -> Result<(), crate::error::AppServerError> {
+    if let Some(scope) = output.approval_recovery_scope() {
+        service.approval_recovery_surfaced(scope).await?;
+    }
+    Ok(())
+}
+
 /// Executes service work outside the router mutex, then applies it synchronously.
 ///
 /// # Errors
@@ -443,8 +464,17 @@ pub async fn route_command(
                 .map_err(|_| crate::error::AppServerError::Malformed)?;
             let request_id = command.request_id.as_str().to_owned();
             let outcome = service.runtime_start(connection, *command).await?;
-            let output =
-                lock_router(&router)?.apply_runtime_start(connection, request_id, outcome)?;
+            let runtime = outcome.runtime.clone();
+            let (output, subscriptions) = {
+                let mut router = lock_router(&router)?;
+                let output = router.apply_runtime_start(connection, request_id, outcome);
+                let subscriptions = router.connections.subscription_count_for(&runtime);
+                (output, subscriptions)
+            };
+            service
+                .runtime_subscription_changed(runtime.clone(), subscriptions)
+                .await?;
+            let output = output?;
             Ok((output, None))
         }
         RuntimeCommand::Input(command) => {
@@ -455,6 +485,12 @@ pub async fn route_command(
         RuntimeCommand::Sync(command) => {
             let outcome = service.sync(connection, command.clone()).await?;
             let output = lock_router(&router)?.apply_sync(connection, &command, &outcome)?;
+            let subscriptions = lock_router(&router)?
+                .connections
+                .subscription_count_for(&command.runtime);
+            service
+                .runtime_subscription_changed(command.runtime.clone(), subscriptions)
+                .await?;
             Ok((output, None))
         }
         RuntimeCommand::AbortMessage(command) => {

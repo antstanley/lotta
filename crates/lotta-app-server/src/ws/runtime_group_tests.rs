@@ -113,7 +113,7 @@ async fn runtime_start_routes_response_subscribe_initial() {
     let (router, _, _, id) = router();
     let service = Arc::new(RecordingService::default());
     let command = decode_wire(&json!({"type":"runtime_start","request_id":"r1","agent_id":"a"}));
-    let (output, _) = route_command(router.clone(), service, id, command)
+    let (output, _) = route_command(router.clone(), service.clone(), id, command)
         .await
         .unwrap_or_else(|e| panic!("route: {e}"));
     assert_eq!(response_json(&output)["type"], "runtime_start_response");
@@ -124,6 +124,14 @@ async fn runtime_start_routes_response_subscribe_initial() {
             .connections
             .subscription_count(id),
         Some(1)
+    );
+    assert_eq!(
+        service
+            .subscriptions
+            .lock()
+            .unwrap_or_else(|error| panic!("subscriptions: {error}"))
+            .as_slice(),
+        &[(scope(1), 1)]
     );
 }
 #[tokio::test]
@@ -263,6 +271,47 @@ async fn input_without_request_has_no_ack() {
         .unwrap_or_else(|e| panic!("route: {e}"));
     assert!(output.responses.is_empty());
 }
+
+#[tokio::test]
+async fn recovery_evidence_is_acknowledged_only_after_route_dispatch_boundary() {
+    let (router, _, _, id) = router();
+    let runtime = scope(1);
+    lock_router(&router)
+        .unwrap_or_else(|error| panic!("lock: {error}"))
+        .connections
+        .subscribe(id, runtime.clone())
+        .unwrap_or_else(|error| panic!("subscribe: {error}"));
+    let command = command::InputCommand {
+        request_id: Some(text("recovery-input")),
+        runtime,
+        payload: bounded(json!({"kind":"approval_response"})),
+    };
+    let admission = InputAdmission {
+        disposition: lotta_domain::InputDisposition::Started,
+        error: None,
+        continuation: None,
+        work: InputAdmissionWork::None,
+        after_ack: events(vec![RuntimeEvent::ApprovalRecovery {
+            request_id: text("approval"),
+            tool_call_id: text("tool-call"),
+            state: lotta_runtime::ApprovalState::Interrupted,
+            original_state: Some(lotta_runtime::ApprovalState::Executing),
+            revision: 2,
+        }]),
+    };
+    let output = lock_router(&router)
+        .unwrap_or_else(|error| panic!("lock: {error}"))
+        .apply_input(&command, admission)
+        .unwrap_or_else(|error| panic!("route: {error}"))
+        .output;
+    let service = RecordingService::default();
+    assert_eq!(service.recoveries_surfaced.load(Ordering::SeqCst), 0);
+    crate::ws::router::acknowledge_recovery(&service, &output)
+        .await
+        .unwrap_or_else(|error| panic!("acknowledge: {error}"));
+    assert_eq!(service.recoveries_surfaced.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn input_ack_physically_precedes_after_ack_and_continue() {
     let (router, _, _, id) = router();

@@ -17,6 +17,30 @@ fn rejects_at_subscription_max() {
     assert_eq!(r.connections.subscription_count(id), Some(256));
 }
 #[test]
+fn sandbox_subscription_count_tracks_non_resumable_close() {
+    let (router, _, _, connection) = router();
+    let mut router = lock_router(&router).unwrap_or_else(|error| panic!("lock:{error}"));
+    let target = scope(1);
+    router
+        .connections
+        .subscribe(connection, target.clone())
+        .unwrap_or_else(|error| panic!("subscribe:{error}"));
+    assert_eq!(router.connections.subscription_count_for(&target), 1);
+    router.connections.suspend(connection);
+    assert_eq!(router.connections.subscription_count_for(&target), 0);
+}
+
+#[test]
+fn failed_subscription_update_is_retained_once_for_retry() {
+    let (router, _, _, _) = router();
+    let mut router = lock_router(&router).unwrap_or_else(|error| panic!("lock:{error}"));
+    let target = scope(1);
+    router.connections.retry_subscription_update(target.clone());
+    router.connections.retry_subscription_update(target.clone());
+    assert_eq!(router.connections.take_expired_subscriptions(), [target]);
+}
+
+#[test]
 fn broadcast_preserves_ordinal_order() {
     let (router, _, _, first) = router();
     let mut r = lock_router(&router).unwrap_or_else(|e| panic!("lock:{e}"));

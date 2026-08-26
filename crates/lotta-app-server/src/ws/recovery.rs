@@ -40,6 +40,7 @@ mod reconnect {
     fn restores_subscriptions() {
         let (router, connection) = resumed();
         assert_eq!(router.connections.subscriptions_of(connection), [scope(1)]);
+        assert_eq!(router.connections.subscription_count_for(&scope(1)), 1);
     }
 
     #[test]
@@ -112,12 +113,18 @@ mod reconnect {
             .open_authenticated(Some(&identity))
             .unwrap_or_else(|error| panic!("open: {error}"));
         connections.set_event_seq(original, 7);
+        connections
+            .subscribe(original, scope(1))
+            .unwrap_or_else(|error| panic!("subscribe: {error}"));
         connections.suspend(original);
         clock
             .advance(Duration::seconds(
                 crate::ws::connection::SUSPENDED_CONNECTION_TTL_SECONDS,
             ))
             .unwrap_or_else(|error| panic!("advance: {error}"));
+        connections.expire_suspended();
+        assert_eq!(connections.take_expired_subscriptions(), [scope(1)]);
+        assert_eq!(connections.subscription_count_for(&scope(1)), 0);
         let renewed = connections
             .open_authenticated(Some(&identity))
             .unwrap_or_else(|error| panic!("renew: {error}"));

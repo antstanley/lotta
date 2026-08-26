@@ -79,6 +79,24 @@ impl RuntimeResidency {
         }
     }
 
+    /// Returns the number of durable approvals awaiting a decision.
+    #[must_use]
+    pub const fn pending_approval_count(self) -> usize {
+        self.pending_approval_count
+    }
+
+    /// Returns whether interrupted-result evidence still needs to be surfaced.
+    #[must_use]
+    pub const fn interrupted_result_present(self) -> bool {
+        self.interrupted_result_present
+    }
+
+    /// Returns the number of live sandbox subscriptions.
+    #[must_use]
+    pub const fn sandbox_subscription_count(self) -> usize {
+        self.sandbox_subscription_count
+    }
+
     /// ORs live lifecycle and queue state with the exact three auxiliary terms.
     #[must_use]
     pub fn requires_residency(self, lifecycle: TurnStateKind, queue_len: usize) -> bool {

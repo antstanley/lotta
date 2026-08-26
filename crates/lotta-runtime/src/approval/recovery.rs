@@ -7,7 +7,7 @@ use super::APPROVAL_SYNC_REPLAY_MAX;
 /// Explicit restart/reconnect action for one durable approval.
 #[derive(Clone, Debug)]
 pub enum RecoveryAction {
-    /// Re-emit a still-pending request on reconnect.
+    /// Re-emit a still-pending request on reconnect or restart recovery.
     Replay(ApprovalRequest),
     /// Emit an explicit expired terminal state.
     Expired(ApprovalRequest),
@@ -67,7 +67,8 @@ impl ApprovalRecovery {
         let mut actions = Vec::new();
         for request in self.journal.port().list(scope)? {
             match request.state {
-                ApprovalState::Pending | ApprovalState::Executing => {
+                ApprovalState::Pending => actions.push(RecoveryAction::Replay(request)),
+                ApprovalState::Executing => {
                     let interrupted = self.interrupt(&request)?;
                     actions.push(RecoveryAction::Interrupted {
                         original: request,

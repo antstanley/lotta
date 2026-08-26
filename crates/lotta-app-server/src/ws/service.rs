@@ -155,6 +155,18 @@ pub trait RuntimeCommandService: Send + Sync {
     ) -> ServiceFuture<'_, SyncOutcome>;
     /// Installs the listener-owned authoritative device snapshot source.
     fn register_device_snapshot_source(&self, _source: DeviceSnapshotSource) {}
+    /// Publishes the exact live and suspended subscription count for one runtime.
+    fn runtime_subscription_changed(
+        &self,
+        _scope: RuntimeScope,
+        _count: usize,
+    ) -> ServiceFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    /// Acknowledges that explicit approval-recovery evidence entered an outbound batch.
+    fn approval_recovery_surfaced(&self, _scope: RuntimeScope) -> ServiceFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
     /// Aborts runtime work.
     fn abort_message(&self, command: AbortMessageCommand) -> ServiceFuture<'_, AbortOutcome>;
     /// Applies a device-state change.

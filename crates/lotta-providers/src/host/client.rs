@@ -110,31 +110,37 @@ impl HostClient {
         #[cfg(unix)]
         command.process_group(0);
         let mut child = command.spawn().map_err(|_| HostError::Unavailable)?;
-        let mut writer = child.stdin.take().ok_or(HostError::Unavailable)?;
-        let mut reader = child.stdout.take().ok_or(HostError::Unavailable)?;
+        let writer = child.stdin.take().ok_or(HostError::Unavailable)?;
+        let reader = child.stdout.take().ok_or(HostError::Unavailable)?;
         let stderr = child.stderr.take().ok_or(HostError::Unavailable)?;
         let stderr_task = tokio::spawn(read_stderr(stderr));
-        let initialize = envelope(
-            &owner,
-            SidecarEnvelopeKind::Request,
-            "initialize",
-            json!({"command":"host.initialize","params":{"nonce":nonce}}),
-        );
-        write_frame(&mut writer, SidecarFrameLimit::provider_host(), &initialize)
-            .await
-            .map_err(|_| HostError::Unavailable)?;
-        verify_hello(&mut reader, &owner, &nonce).await?;
-        Ok(Self {
+        let mut client = Self {
             child,
             reader,
             writer: Some(writer),
             stderr_task: Some(stderr_task),
             owner,
             next_id: 1,
-            usable: true,
+            usable: false,
             request_timeout: HOST_REQUEST_TIMEOUT_MAX,
             oauth: None,
-        })
+        };
+        let initialize = envelope(
+            &client.owner,
+            SidecarEnvelopeKind::Request,
+            "initialize",
+            json!({"command":"host.initialize","params":{"nonce":nonce}}),
+        );
+        write_frame(
+            client.writer.as_mut().ok_or(HostError::Unavailable)?,
+            SidecarFrameLimit::provider_host(),
+            &initialize,
+        )
+        .await
+        .map_err(|_| HostError::Unavailable)?;
+        verify_hello(&mut client.reader, &client.owner, &nonce).await?;
+        client.usable = true;
+        Ok(client)
     }
 
     /// Sets the absolute remaining deadline used by every subsequent host operation.
@@ -667,10 +673,32 @@ async fn read_stderr(stderr: tokio::process::ChildStderr) -> Vec<u8> {
 /// Materializes the embedded production host script at an explicit caller-owned path.
 ///
 /// # Errors
-/// Returns configuration if the path is non-absolute, exists, or cannot be written.
+/// Returns configuration if the path is non-absolute, differs from an existing pinned script,
+/// or cannot be created without replacement.
 pub fn materialize_host_script(path: &Path) -> Result<(), HostError> {
-    if !path.is_absolute() || path.exists() {
+    use std::io::Write as _;
+    if !path.is_absolute() {
         return Err(HostError::Configuration);
     }
-    std::fs::write(path, HOST_SCRIPT).map_err(|_| HostError::Configuration)
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.len() != HOST_SCRIPT.len() as u64 {
+                return Err(HostError::Configuration);
+            }
+            return std::fs::read_to_string(path)
+                .is_ok_and(|source| source == HOST_SCRIPT)
+                .then_some(())
+                .ok_or(HostError::Configuration);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(HostError::Configuration),
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|_| HostError::Configuration)?;
+    file.write_all(HOST_SCRIPT.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|_| HostError::Configuration)
 }

@@ -1,7 +1,8 @@
-use super::RecoveryAction;
-use super::{ApprovalJournal, ApprovalRequest, ApprovalState};
+use super::{
+    APPROVAL_SYNC_REPLAY_MAX, ApprovalJournal, ApprovalRequest, ApprovalState, RecoveryAction,
+};
 use crate::RuntimeError;
-use lotta_domain::{BoundedJsonValue, NonEmptyString, RuntimeScope};
+use lotta_domain::{BoundedJsonValue, NonEmptyString, RuntimeScope, Timestamp};
 use tokio::sync::oneshot;
 
 /// Typed client decision for one approval.
@@ -415,6 +416,34 @@ impl ApprovalManager {
             .collect())
     }
 
+    /// Snapshots replayable approval state for one reconnect.
+    ///
+    /// # Errors
+    /// Returns durable journal failures.
+    pub fn recovery_snapshot(
+        &self,
+        scope: &RuntimeScope,
+        lease_generation: Option<u64>,
+    ) -> Result<Vec<RecoveryAction>, RuntimeError> {
+        let _transaction = self.transaction()?;
+        Ok(self
+            .list_requests_unlocked(scope)?
+            .into_iter()
+            .filter_map(|request| match request.state {
+                ApprovalState::Pending if lease_generation == Some(request.lease_generation) => {
+                    Some(RecoveryAction::Replay(request))
+                }
+                ApprovalState::Expired => Some(RecoveryAction::Expired(request)),
+                ApprovalState::Interrupted => Some(RecoveryAction::Interrupted {
+                    original: request.clone(),
+                    interrupted: Box::new(request),
+                }),
+                _ => None,
+            })
+            .take(APPROVAL_SYNC_REPLAY_MAX)
+            .collect())
+    }
+
     fn list_requests_unlocked(
         &self,
         scope: &RuntimeScope,
@@ -428,7 +457,7 @@ impl ApprovalManager {
         Ok(requests)
     }
 
-    /// Returns the number of pending or executing approvals retaining this runtime.
+    /// Returns the number of pending approvals retaining this runtime.
     ///
     /// # Errors
     /// Returns durable journal failures.
@@ -436,32 +465,94 @@ impl ApprovalManager {
         self.list_requests(scope).map(|requests| {
             requests
                 .iter()
+                .filter(|request| request.state == ApprovalState::Pending)
+                .count()
+        })
+    }
+
+    /// Returns the number of pending approvals whose durable deadline has not elapsed.
+    ///
+    /// # Errors
+    /// Returns durable journal failures.
+    pub fn actionable_pending_count(
+        &self,
+        scope: &RuntimeScope,
+        now: Timestamp,
+    ) -> Result<usize, RuntimeError> {
+        self.list_requests(scope).map(|requests| {
+            requests
+                .iter()
                 .filter(|request| {
-                    matches!(
-                        request.state,
-                        ApprovalState::Pending | ApprovalState::Executing
-                    )
+                    request.state == ApprovalState::Pending && request.expires_at > now
                 })
                 .count()
         })
     }
 
+    /// Returns whether durable interrupted approval evidence retains this runtime.
+    ///
+    /// # Errors
+    /// Returns durable journal failures.
+    pub fn interrupted_result_present(&self, scope: &RuntimeScope) -> Result<bool, RuntimeError> {
+        self.list_requests(scope).map(|requests| {
+            requests
+                .iter()
+                .any(|request| request.state == ApprovalState::Interrupted)
+        })
+    }
+
     /// Recovers one newly-created runtime exactly once.
     ///
-    /// Pending requests are safe only when their exact continuation can be reconstructed for the
-    /// same live lease. Production runtime recreation cannot do so, and executing requests are
-    /// always uncertain.
+    /// Without a reconstructed owner lease, pending work becomes explicitly interrupted.
+    /// Executing work is always uncertain and never reruns.
     ///
     /// # Errors
     /// Returns revision overflow or durable journal failures.
     pub fn restart(&self, scope: &RuntimeScope) -> Result<Vec<RecoveryAction>, RuntimeError> {
+        self.restart_inner(scope, None, None)
+    }
+
+    /// Recovers restart state and rebinds pending requests to a reconstructed owner lease.
+    ///
+    /// # Errors
+    /// Returns revision overflow or durable journal failures.
+    pub fn restart_with_pending_lease(
+        &self,
+        scope: &RuntimeScope,
+        pending_lease_generation: Option<u64>,
+    ) -> Result<Vec<RecoveryAction>, RuntimeError> {
+        self.restart_inner(scope, pending_lease_generation, None)
+    }
+
+    /// Recovers restart state while expiring pending requests at the supplied durable time.
+    ///
+    /// # Errors
+    /// Returns revision overflow or durable journal failures.
+    pub fn restart_with_pending_lease_at(
+        &self,
+        scope: &RuntimeScope,
+        pending_lease_generation: Option<u64>,
+        now: Timestamp,
+    ) -> Result<Vec<RecoveryAction>, RuntimeError> {
+        self.restart_inner(scope, pending_lease_generation, Some(now))
+    }
+
+    fn restart_inner(
+        &self,
+        scope: &RuntimeScope,
+        generation: Option<u64>,
+        now: Option<Timestamp>,
+    ) -> Result<Vec<RecoveryAction>, RuntimeError> {
         let _transaction = self.transaction()?;
         let mut actions = Vec::new();
         for request in self.sorted_requests(scope)? {
             match request.state {
-                ApprovalState::Pending => actions.push(RecoveryAction::Replay(request)),
+                ApprovalState::Pending => {
+                    actions.push(self.recover_pending(&request, generation, now)?);
+                }
                 ApprovalState::Executing => {
-                    let interrupted = self.interrupt_for_restart(&request)?;
+                    let interrupted =
+                        self.set_state_for_restart(&request, ApprovalState::Interrupted)?;
                     actions.push(RecoveryAction::Interrupted {
                         original: request,
                         interrupted: Box::new(interrupted),
@@ -478,6 +569,28 @@ impl ApprovalManager {
         Ok(actions)
     }
 
+    fn recover_pending(
+        &self,
+        request: &ApprovalRequest,
+        generation: Option<u64>,
+        now: Option<Timestamp>,
+    ) -> Result<RecoveryAction, RuntimeError> {
+        if now.is_some_and(|now| request.expires_at <= now) {
+            return self
+                .set_state_for_restart(request, ApprovalState::Expired)
+                .map(RecoveryAction::Expired);
+        }
+        let Some(generation) = generation else {
+            let interrupted = self.set_state_for_restart(request, ApprovalState::Interrupted)?;
+            return Ok(RecoveryAction::Interrupted {
+                original: request.clone(),
+                interrupted: Box::new(interrupted),
+            });
+        };
+        self.rebind_pending_for_restart(request, generation)
+            .map(RecoveryAction::Replay)
+    }
+
     fn sorted_requests(&self, scope: &RuntimeScope) -> Result<Vec<ApprovalRequest>, RuntimeError> {
         let mut requests = self.journal.port().list(scope)?;
         requests.sort_by(|left, right| {
@@ -488,12 +601,31 @@ impl ApprovalManager {
         Ok(requests)
     }
 
-    fn interrupt_for_restart(
+    fn rebind_pending_for_restart(
         &self,
         request: &ApprovalRequest,
+        generation: u64,
     ) -> Result<ApprovalRequest, RuntimeError> {
         let mut next = request.clone();
-        next.state = ApprovalState::Interrupted;
+        next.lease_generation = generation;
+        self.replace_for_restart(request, next)
+    }
+
+    fn set_state_for_restart(
+        &self,
+        request: &ApprovalRequest,
+        state: ApprovalState,
+    ) -> Result<ApprovalRequest, RuntimeError> {
+        let mut next = request.clone();
+        next.state = state;
+        self.replace_for_restart(request, next)
+    }
+
+    fn replace_for_restart(
+        &self,
+        request: &ApprovalRequest,
+        mut next: ApprovalRequest,
+    ) -> Result<ApprovalRequest, RuntimeError> {
         next.revision = next
             .revision
             .checked_add(1)
@@ -509,30 +641,19 @@ impl ApprovalManager {
         }
     }
 
-    /// Restores restart transitions when runtime initialization is rolled back.
+    /// Makes rebound pending requests terminal when runtime initialization is rolled back.
+    ///
+    /// Safety recovery transitions are never reversed into possibly executable states.
     ///
     /// # Errors
     /// Returns a durable conflict or journal failure.
     pub fn rollback_restart(&self, actions: &[RecoveryAction]) -> Result<(), RuntimeError> {
         let _transaction = self.transaction()?;
         for action in actions.iter().rev() {
-            let RecoveryAction::Interrupted {
-                original,
-                interrupted,
-            } = action
-            else {
+            let RecoveryAction::Replay(recovered) = action else {
                 continue;
             };
-            if original.revision == interrupted.revision {
-                continue;
-            }
-            if !self
-                .journal
-                .port()
-                .compare_and_set(interrupted.revision, original.clone())?
-            {
-                return Err(conflict("approval restart rollback"));
-            }
+            self.set_state_for_restart(recovered, ApprovalState::Interrupted)?;
         }
         Ok(())
     }

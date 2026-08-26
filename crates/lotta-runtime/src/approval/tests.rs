@@ -340,7 +340,7 @@ pub mod recovery {
         assert_eq!(actions.len(), 2);
     }
     #[test]
-    fn restart_does_not_assume_execution() {
+    fn restart_replays_pending_without_assuming_execution() {
         let (journal, manager) = manager();
         let row = manager
             .store_request(request("restart", scope("a")))
@@ -350,8 +350,49 @@ pub mod recovery {
             .unwrap();
         assert!(matches!(
             &actions[0],
-            RecoveryAction::Interrupted { interrupted: r, .. }
-                if r.state == ApprovalState::Interrupted
+            RecoveryAction::Replay(replayed) if replayed.state == ApprovalState::Pending
+        ));
+    }
+    #[test]
+    fn manager_restart_rebinds_pending_to_recovered_lease() {
+        let (_, manager) = manager();
+        let row = manager
+            .store_request(request("manager-restart", scope("a")))
+            .unwrap();
+        let actions = manager
+            .restart_with_pending_lease(&row.scope, Some(11))
+            .unwrap();
+        let RecoveryAction::Replay(replayed) = &actions[0] else {
+            panic!("pending request was not replayed");
+        };
+        assert_eq!(replayed.lease_generation, 11);
+        assert_eq!(replayed.revision, row.revision + 1);
+    }
+    #[test]
+    fn manager_restart_without_owner_interrupts_pending() {
+        let (_, manager) = manager();
+        let row = manager
+            .store_request(request("manager-interrupt", scope("a")))
+            .unwrap();
+        let actions = manager.restart(&row.scope).unwrap();
+        assert!(matches!(
+            &actions[0],
+            RecoveryAction::Interrupted { interrupted, .. }
+                if interrupted.state == ApprovalState::Interrupted
+        ));
+    }
+    #[test]
+    fn manager_restart_expires_elapsed_pending() {
+        let (_, manager) = manager();
+        let row = manager
+            .store_request(request("manager-expired", scope("a")))
+            .unwrap();
+        let actions = manager
+            .restart_with_pending_lease_at(&row.scope, Some(11), timestamp(3))
+            .unwrap();
+        assert!(matches!(
+            &actions[0],
+            RecoveryAction::Expired(expired) if expired.state == ApprovalState::Expired
         ));
     }
     #[test]
@@ -412,17 +453,13 @@ pub mod timeout_interrupts {
         );
     }
     #[test]
-    fn above_wait_bound_restart_is_interrupted_not_denied() {
+    fn above_wait_bound_restart_remains_actionable_until_deadline_owner_runs() {
         let (journal, manager) = manager();
         let row = manager.store_request(request("above", scope("a"))).unwrap();
         let actions = ApprovalRecovery::new(ApprovalJournal::new(journal))
             .restart(&row.scope)
             .unwrap();
-        assert!(matches!(
-            &actions[0],
-            RecoveryAction::Interrupted { interrupted: r, .. }
-                if r.state == ApprovalState::Interrupted
-        ));
+        assert!(matches!(&actions[0], RecoveryAction::Replay(_)));
     }
 }
 

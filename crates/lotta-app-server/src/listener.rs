@@ -314,14 +314,9 @@ async fn start_listener_with_state_for_test(
         shutdown.clone(),
     )?;
     register_device_runtime_ports(&state);
-    let server_shutdown = state.shutdown.clone();
     let router = build_router(&path, Arc::clone(&state));
-    let task = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .with_graceful_shutdown(server_shutdown.cancelled_owned())
-            .await
-            .map_err(|_| AppServerError::Listener)
-    });
+    let server_state = Arc::clone(&state);
+    let task = tokio::spawn(run_listener(listener, router, server_state));
     let handle = ListenerHandle {
         address,
         base_url,
@@ -600,13 +595,7 @@ async fn start_listener_with_limits(
 
     register_device_runtime_ports(&state);
     let router = build_router(&websocket_path, Arc::clone(&state));
-    let server_shutdown = state.shutdown.clone();
-    let task = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .with_graceful_shutdown(server_shutdown.cancelled_owned())
-            .await
-            .map_err(|_| AppServerError::Listener)
-    });
+    let task = tokio::spawn(run_listener(listener, router, state));
     Ok(ListenerHandle {
         address,
         base_url,
@@ -615,6 +604,30 @@ async fn start_listener_with_limits(
         shutdown,
         task,
     })
+}
+
+const SUBSCRIPTION_LEASE_SWEEP_SECONDS: u64 = 1;
+
+async fn run_listener(
+    listener: TcpListener,
+    router: Router,
+    state: Arc<ListenerState>,
+) -> Result<(), AppServerError> {
+    let shutdown = state.shutdown.clone();
+    let server = std::future::IntoFuture::into_future(
+        axum::serve(listener, router).with_graceful_shutdown(shutdown.cancelled_owned()),
+    );
+    tokio::pin!(server);
+    let mut sweep = tokio::time::interval(std::time::Duration::from_secs(
+        SUBSCRIPTION_LEASE_SWEEP_SECONDS,
+    ));
+    sweep.tick().await;
+    loop {
+        tokio::select! {
+            result = &mut server => return result.map_err(|_| AppServerError::Listener),
+            _ = sweep.tick() => publish_expired_subscription_updates(&state).await,
+        }
+    }
 }
 
 /// Runtime command endpoints handed to every composed listener state.
@@ -917,6 +930,7 @@ async fn serve_socket(
     let Ok(connection_id) = open_connection(&state, sender, reconnect_identity.as_ref()) else {
         return;
     };
+    publish_expired_subscription_updates(&state).await;
     let mut heartbeat = Heartbeat::new(state.clock.as_ref());
     let connection_cancellation = state.shutdown.child_token();
     let mut turns = JoinSet::new();
@@ -1000,6 +1014,40 @@ fn prepare_outbound(
     Ok(())
 }
 
+async fn publish_expired_subscription_updates(state: &ListenerState) {
+    let updates = if let Ok(mut router) = state.runtime_router.lock() {
+        router.connections.expire_suspended();
+        let scopes = router.connections.take_expired_subscriptions();
+        scopes
+            .into_iter()
+            .map(|scope| {
+                let count = router.connections.subscription_count_for(&scope);
+                (scope, count)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    publish_subscription_updates(state, updates).await;
+}
+
+async fn publish_subscription_updates(
+    state: &ListenerState,
+    updates: Vec<(lotta_domain::RuntimeScope, usize)>,
+) {
+    for (scope, count) in updates {
+        if state
+            .runtime_service
+            .runtime_subscription_changed(scope.clone(), count)
+            .await
+            .is_err()
+            && let Ok(mut router) = state.runtime_router.lock()
+        {
+            router.connections.retry_subscription_update(scope);
+        }
+    }
+}
+
 async fn close_connection(state: &ListenerState, id: crate::ws::ConnectionId) {
     state.external_tools.disconnect(id);
     state.terminals.disconnect(id);
@@ -1010,9 +1058,25 @@ async fn close_connection(state: &ListenerState, id: crate::ws::ConnectionId) {
     if let Ok(mut outbound) = state.outbound.lock() {
         outbound.remove(&id);
     }
-    if let Ok(mut router) = state.runtime_router.lock() {
+    let updates = if let Ok(mut router) = state.runtime_router.lock() {
+        let mut scopes = router.connections.subscriptions_of(id);
         router.connections.suspend(id);
-    }
+        for expired in router.connections.take_expired_subscriptions() {
+            if !scopes.contains(&expired) {
+                scopes.push(expired);
+            }
+        }
+        scopes
+            .into_iter()
+            .map(|scope| {
+                let count = router.connections.subscription_count_for(&scope);
+                (scope, count)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    publish_subscription_updates(state, updates).await;
 }
 
 async fn handle_incoming(
@@ -1090,6 +1154,12 @@ async fn handle_text(
         return dispatch_typed_failure(state, connection_id, &frame).is_ok();
     };
     if dispatch_output(state, connection_id, &output).is_err() {
+        return false;
+    }
+    if crate::ws::router::acknowledge_recovery(state.runtime_service.as_ref(), &output)
+        .await
+        .is_err()
+    {
         return false;
     }
     if let Some(deferred) = deferred {

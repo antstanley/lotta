@@ -45,6 +45,7 @@ pub struct EventDelivery {
 pub struct RuntimeConnections {
     entries: HashMap<ConnectionId, RuntimeConnection>,
     suspended: HashMap<ReconnectIdentity, SuspendedConnection>,
+    expired_subscriptions: Vec<RuntimeScope>,
     clock: std::sync::Arc<dyn lotta_domain::Clock + Send + Sync>,
     next_id: ConnectionId,
     next_ordinal: u64,
@@ -76,6 +77,7 @@ impl RuntimeConnections {
         Self {
             entries: HashMap::new(),
             suspended: HashMap::new(),
+            expired_subscriptions: Vec::new(),
             clock,
             next_id: 1,
             next_ordinal: 1,
@@ -201,12 +203,25 @@ impl RuntimeConnections {
 
     fn purge_expired(&mut self) {
         let now = self.clock.now();
-        self.suspended.retain(|_, lease| {
-            now.as_utc()
-                .signed_duration_since(lease.suspended_at.as_utc())
-                .num_seconds()
-                < SUSPENDED_CONNECTION_TTL_SECONDS
-        });
+        let expired: Vec<_> = self
+            .suspended
+            .iter()
+            .filter(|(_, lease)| {
+                now.as_utc()
+                    .signed_duration_since(lease.suspended_at.as_utc())
+                    .num_seconds()
+                    >= SUSPENDED_CONNECTION_TTL_SECONDS
+            })
+            .map(|(identity, _)| identity.clone())
+            .collect();
+        for identity in expired {
+            self.remove_suspended(&identity);
+        }
+    }
+
+    /// Expires suspended reconnect leases against the authoritative clock.
+    pub fn expire_suspended(&mut self) {
+        self.purge_expired();
     }
 
     fn evict_oldest_suspended(&mut self) {
@@ -216,8 +231,30 @@ impl RuntimeConnections {
             .min_by_key(|(_, lease)| lease.suspended_at)
             .map(|(identity, _)| identity.clone());
         if let Some(identity) = oldest {
-            self.suspended.remove(&identity);
+            self.remove_suspended(&identity);
         }
+    }
+
+    fn remove_suspended(&mut self, identity: &ReconnectIdentity) {
+        let Some(expired) = self.suspended.remove(identity) else {
+            return;
+        };
+        for scope in expired.connection.subscriptions.as_slice() {
+            self.retry_subscription_update(scope.clone());
+        }
+    }
+
+    /// Retains one subscription-count update for a later listener retry.
+    pub(crate) fn retry_subscription_update(&mut self, scope: RuntimeScope) {
+        if !self.expired_subscriptions.contains(&scope) {
+            self.expired_subscriptions.push(scope);
+        }
+    }
+
+    /// Drains scopes whose resumable subscription lease expired or was evicted.
+    #[must_use]
+    pub fn take_expired_subscriptions(&mut self) -> Vec<RuntimeScope> {
+        std::mem::take(&mut self.expired_subscriptions)
     }
 
     /// Adds one idempotent exact-scope subscription before mutation.
@@ -275,6 +312,20 @@ impl RuntimeConnections {
             .get(&id)
             .map(|entry| entry.subscriptions.as_slice().to_vec())
             .unwrap_or_default()
+    }
+
+    /// Counts live and resumable subscriptions retaining one runtime sandbox.
+    #[must_use]
+    pub fn subscription_count_for(&self, scope: &RuntimeScope) -> usize {
+        let active = self
+            .entries
+            .values()
+            .filter(|connection| connection.subscriptions.as_slice().contains(scope));
+        let suspended = self
+            .suspended
+            .values()
+            .filter(|lease| lease.connection.subscriptions.as_slice().contains(scope));
+        active.count() + suspended.count()
     }
 
     /// Stamps one logical event for exactly one connection.

@@ -126,6 +126,8 @@ pub(super) struct RecordingService {
     pub(super) calls: AtomicUsize,
     pub(super) writes: AtomicUsize,
     pub(super) stages: Mutex<Vec<String>>,
+    pub(super) subscriptions: Mutex<Vec<(RuntimeScope, usize)>>,
+    pub(super) recoveries_surfaced: AtomicUsize,
 }
 impl RecordingService {
     pub(super) fn stage(&self, value: &str) {
@@ -204,6 +206,20 @@ impl RuntimeCommandService for RecordingService {
                 broadcasts: events(vec![status_event("SYNC")]),
             })
         })
+    }
+    fn runtime_subscription_changed(
+        &self,
+        scope: RuntimeScope,
+        count: usize,
+    ) -> ServiceFuture<'_, ()> {
+        if let Ok(mut subscriptions) = self.subscriptions.lock() {
+            subscriptions.push((scope, count));
+        }
+        Box::pin(async { Ok(()) })
+    }
+    fn approval_recovery_surfaced(&self, _: RuntimeScope) -> ServiceFuture<'_, ()> {
+        self.recoveries_surfaced.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
     }
     fn abort_message(&self, _: command::AbortMessageCommand) -> ServiceFuture<'_, AbortOutcome> {
         self.calls.fetch_add(1, Ordering::SeqCst);

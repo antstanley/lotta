@@ -1024,15 +1024,15 @@ mod tests {
             ),
             (
                 "approval/resolve.rs",
-                "for request in self.journal.port().list(scope)? {",
+                "for request in self.sorted_requests(scope)? {",
                 0,
-                LoopClass::BoundedIterator("list(scope)?"),
+                LoopClass::BoundedIterator("sorted_requests(scope)?"),
             ),
             (
                 "approval/resolve.rs",
-                "for (prior, interrupted) in recovered {",
+                "for action in actions.iter().rev() {",
                 0,
-                LoopClass::BoundedIterator("recovered"),
+                LoopClass::BoundedIterator("actions.iter().rev()"),
             ),
             (
                 "boundary.rs",

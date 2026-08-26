@@ -1,7 +1,7 @@
 use std::{
     fs,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -42,6 +42,7 @@ struct Harness {
     handle: Option<ListenerHandle>,
     state: Arc<ListenerState>,
     clock: Arc<FakeClock>,
+    service: Arc<ReconnectService>,
     url: String,
 }
 
@@ -64,8 +65,9 @@ impl Harness {
         let _ = fs::remove_file(secret);
         let start = Timestamp::parse_persisted_rfc3339("2026-08-14T00:00:00Z").expect("time");
         let clock = Arc::new(FakeClock::new(start));
+        let service = Arc::new(ReconnectService::default());
         let (handle, state) =
-            start_listener_with_state_for_test(prepared, clock.clone(), Arc::new(ReconnectService))
+            start_listener_with_state_for_test(prepared, clock.clone(), service.clone())
                 .await
                 .expect("listener");
         let url = handle.websocket_url().to_owned();
@@ -73,6 +75,7 @@ impl Harness {
             handle: Some(handle),
             state,
             clock,
+            service,
             url,
         }
     }
@@ -156,7 +159,10 @@ impl Drop for Harness {
     }
 }
 
-struct ReconnectService;
+#[derive(Default)]
+struct ReconnectService {
+    subscriptions: Mutex<Vec<(RuntimeScope, usize)>>,
+}
 
 impl RuntimeCommandService for ReconnectService {
     fn runtime_start(
@@ -224,6 +230,19 @@ impl RuntimeCommandService for ReconnectService {
                     removed: Vec::new(),
                 }]),
             })
+        })
+    }
+    fn runtime_subscription_changed(
+        &self,
+        scope: RuntimeScope,
+        count: usize,
+    ) -> ServiceFuture<'_, ()> {
+        Box::pin(async move {
+            self.subscriptions
+                .lock()
+                .map_err(|_| AppServerError::Internal)?
+                .push((scope, count));
+            Ok(())
         })
     }
     fn abort_message(
@@ -413,6 +432,21 @@ async fn deterministic_clock_ttl_exact_boundary_and_expiry() {
         .expect("advance");
     let mut exact = h.connect("ttl", 2, Some("exact")).await;
     assert_eq!(h.sync_seq(&mut exact, "exact").await, 1);
+}
+
+#[tokio::test]
+async fn expired_subscription_publishes_zero_without_later_connection() {
+    let h = Harness::new().await;
+    let target = scope("agent-expiry", "conversation-expiry");
+    let mut socket = h.connect("expiry", 1, Some("device")).await;
+    h.subscribe(&mut socket, "expiry").await;
+    h.close(socket).await;
+    h.clock
+        .advance(chrono::Duration::seconds(TTL))
+        .expect("advance");
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let updates = h.service.subscriptions.lock().expect("subscriptions");
+    assert!(updates.contains(&(target, 0)));
 }
 
 #[tokio::test]

@@ -261,6 +261,16 @@ fn production_observer() -> Arc<lotta_runtime::observe::RuntimeObserver> {
     Arc::new(lotta_runtime::observe::RuntimeObserver::new(sink))
 }
 
+fn production_runtime_state(
+    observer: &Arc<lotta_runtime::observe::RuntimeObserver>,
+    approvals: &Arc<lotta_runtime::ApprovalManager>,
+) -> Arc<ProductionRuntimeState> {
+    Arc::new(ProductionRuntimeState::new(
+        Arc::clone(observer),
+        Arc::clone(approvals),
+    ))
+}
+
 fn production_device_authority(
     state: &Arc<ProductionRuntimeState>,
     approvals: &Arc<lotta_runtime::ApprovalManager>,
@@ -361,7 +371,7 @@ impl ProductionComponents {
         let tooling = production_tooling(&root, &workspace)?;
         let (store_paths, provider_runtime, setup, tools, approvals, shell, tasks) = tooling;
         let provider = Arc::new(provider_runtime);
-        let runtime_state = Arc::new(ProductionRuntimeState::new(Arc::clone(&observer)));
+        let runtime_state = production_runtime_state(&observer, &approvals);
         let brokers = Arc::new(ProductionTurnBrokers::new());
         register_turn_authorities(&shared, &provider, &setup, &runtime_state, &brokers, &shell);
         let device = production_device_authority(
@@ -842,11 +852,13 @@ pub(crate) struct PendingAdmission {
     pub(crate) queue: Arc<std::sync::Mutex<lotta_runtime::ConversationQueue>>,
 }
 
+#[derive(Clone)]
 pub(crate) struct ActiveAdmission {
     pub(crate) handle: lotta_runtime::RuntimeHandle,
     pub(crate) lease: lotta_domain::TurnLease,
     pub(crate) cancellation: CancellationToken,
     pub(crate) queue: Arc<std::sync::Mutex<lotta_runtime::ConversationQueue>>,
+    pub(crate) recovered_approval: bool,
 }
 
 #[cfg(test)]
@@ -882,17 +894,28 @@ pub(crate) struct RuntimeServiceState {
     sequence: u128,
 }
 
+#[derive(Clone, Copy, Default)]
+struct ResidencyEvidence {
+    interrupted_result_present: bool,
+    sandbox_subscriptions: usize,
+}
+
 pub(crate) struct ProductionRuntimeState {
     pub(crate) inner: tokio::sync::Mutex<RuntimeServiceState>,
     pub(crate) active: std::sync::Mutex<HashMap<RuntimeKey, ActiveAdmission>>,
+    approvals: Arc<lotta_runtime::ApprovalManager>,
     runtime_starts: tokio::sync::Mutex<()>,
     executing_tools: std::sync::Mutex<HashMap<RuntimeKey, Vec<String>>>,
+    residency_evidence: std::sync::Mutex<HashMap<RuntimeKey, ResidencyEvidence>>,
     #[cfg(test)]
     pub(crate) cancellation_observer: std::sync::Mutex<Option<Arc<ProductionCancellationObserver>>>,
 }
 
 impl ProductionRuntimeState {
-    fn new(observer: Arc<lotta_runtime::observe::RuntimeObserver>) -> Self {
+    fn new(
+        observer: Arc<lotta_runtime::observe::RuntimeObserver>,
+        approvals: Arc<lotta_runtime::ApprovalManager>,
+    ) -> Self {
         Self {
             inner: tokio::sync::Mutex::new(RuntimeServiceState {
                 registry: ListenerRuntime::with_observer(observer.as_ref().clone()),
@@ -900,11 +923,106 @@ impl ProductionRuntimeState {
                 sequence: 1,
             }),
             active: std::sync::Mutex::new(HashMap::new()),
+            approvals,
             runtime_starts: tokio::sync::Mutex::new(()),
             executing_tools: std::sync::Mutex::new(HashMap::new()),
+            residency_evidence: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             cancellation_observer: std::sync::Mutex::new(None),
         }
+    }
+
+    fn residency_snapshot(
+        &self,
+        scope: &RuntimeScope,
+    ) -> Result<lotta_runtime::RuntimeResidency, AppServerError> {
+        let approvals = self
+            .approvals
+            .residency_count(scope)
+            .map_err(runtime_service_error)?;
+        let evidence = self
+            .residency_evidence
+            .lock()
+            .map_err(|_| AppServerError::Internal)?
+            .get(&RuntimeKey::from(scope))
+            .copied()
+            .unwrap_or_default();
+        Ok(lotta_runtime::RuntimeResidency::new(
+            approvals,
+            evidence.interrupted_result_present,
+            evidence.sandbox_subscriptions,
+        ))
+    }
+
+    pub(crate) fn set_interrupted_result(
+        &self,
+        scope: &RuntimeScope,
+        present: bool,
+    ) -> Result<(), AppServerError> {
+        let key = RuntimeKey::from(scope);
+        let mut evidence = self
+            .residency_evidence
+            .lock()
+            .map_err(|_| AppServerError::Internal)?;
+        let entry = evidence.entry(key.clone()).or_default();
+        entry.interrupted_result_present = present;
+        if !entry.interrupted_result_present && entry.sandbox_subscriptions == 0 {
+            evidence.remove(&key);
+        }
+        Ok(())
+    }
+
+    fn set_sandbox_subscriptions(
+        &self,
+        scope: &RuntimeScope,
+        count: usize,
+    ) -> Result<(), AppServerError> {
+        let key = RuntimeKey::from(scope);
+        let mut evidence = self
+            .residency_evidence
+            .lock()
+            .map_err(|_| AppServerError::Internal)?;
+        let entry = evidence.entry(key.clone()).or_default();
+        entry.sandbox_subscriptions = count;
+        if !entry.interrupted_result_present && entry.sandbox_subscriptions == 0 {
+            evidence.remove(&key);
+        }
+        Ok(())
+    }
+
+    fn publish_residency_locked(
+        &self,
+        scope: &RuntimeScope,
+        state: &mut RuntimeServiceState,
+    ) -> Result<(), AppServerError> {
+        let Some(handle) = state.registry.lookup(&RuntimeKey::from(scope)) else {
+            return Ok(());
+        };
+        publish_residency(state, &handle, self.residency_snapshot(scope)?)
+    }
+
+    pub(crate) fn update_residency_now(&self, scope: &RuntimeScope) -> Result<(), AppServerError> {
+        let mut state = self
+            .inner
+            .try_lock()
+            .map_err(|_| AppServerError::Internal)?;
+        self.publish_residency_locked(scope, &mut state)
+    }
+
+    fn try_update_residency_now(&self, scope: &RuntimeScope) -> Result<bool, AppServerError> {
+        let Ok(mut state) = self.inner.try_lock() else {
+            return Ok(false);
+        };
+        self.publish_residency_locked(scope, &mut state)?;
+        Ok(true)
+    }
+
+    pub(crate) async fn update_residency(
+        &self,
+        scope: &RuntimeScope,
+    ) -> Result<(), AppServerError> {
+        let mut state = self.inner.lock().await;
+        self.publish_residency_locked(scope, &mut state)
     }
 
     pub(crate) async fn take_pending(
@@ -982,6 +1100,7 @@ impl ProductionRuntimeState {
         }
         let mut state = self.inner.lock().await;
         let pumped = release_and_pump_locked(&mut state, scope, pending, reason)?;
+        self.publish_residency_locked(scope, &mut state)?;
         #[cfg(test)]
         if _cancellation_terminal_persisted {
             self.record_cancellation("release");
@@ -1028,7 +1147,13 @@ impl ConversationsProductionAuthority {
                 .ok_or(RuntimeError::NotFound {
                     context: "conversation lifecycle registry lookup".into(),
                 })?;
-        state.registry.lifecycle_mut(&handle)?.finish_command(lease)
+        state
+            .registry
+            .lifecycle_mut(&handle)?
+            .finish_command(lease)?;
+        self.state
+            .publish_residency_locked(scope, &mut state)
+            .map_err(|_| runtime_residency_error())
     }
 }
 
@@ -1120,12 +1245,17 @@ impl lotta_app_server::ws::device::QueueAuthority for ProductionQueueAuthority {
                 .get(&RuntimeKey::from(scope))
                 .map(|active| Arc::clone(&active.queue));
             if let Some(queue) = active_queue {
-                return queue
+                let mutation = queue
                     .lock()
                     .map_err(|_| RuntimeError::Conflict {
                         context: "device queue active queue".into(),
                     })?
-                    .cancel(item_id);
+                    .cancel(item_id)?;
+                self.state
+                    .update_residency(scope)
+                    .await
+                    .map_err(|_| runtime_residency_error())?;
+                return Ok(mutation);
             }
             let mut state = self.state.inner.lock().await;
             let handle =
@@ -1135,7 +1265,11 @@ impl lotta_app_server::ws::device::QueueAuthority for ProductionQueueAuthority {
                     .ok_or(RuntimeError::NotFound {
                         context: "device queue registry lookup".into(),
                     })?;
-            state.registry.cancel_queued(&handle, item_id)
+            let mutation = state.registry.cancel_queued(&handle, item_id)?;
+            self.state
+                .publish_residency_locked(scope, &mut state)
+                .map_err(|_| runtime_residency_error())?;
+            Ok(mutation)
         })
     }
 }
@@ -1365,6 +1499,12 @@ struct RuntimeInstall {
     recovered: Vec<lotta_runtime::RecoveryAction>,
 }
 
+type ApprovalControlOutcome = (
+    AdmissionOutcome,
+    InputDisposition,
+    Option<lotta_runtime::approval::ApprovalResolveOutcome>,
+);
+
 impl ProductionRuntimeService {
     fn new(store_paths: StorePaths, dependencies: ProductionRuntimeDependencies) -> Self {
         Self {
@@ -1481,7 +1621,16 @@ impl ProductionRuntimeService {
             .map_err(|_| AppServerError::Internal)
     }
 
-    fn ensure_runtime(&self, scope: &RuntimeScope) -> Result<RuntimeInstall, AppServerError> {
+    async fn ensure_runtime(&self, scope: &RuntimeScope) -> Result<RuntimeInstall, AppServerError> {
+        let _guard = self.state.runtime_starts.lock().await;
+        self.ensure_runtime_under_guard(scope)
+    }
+
+    fn ensure_runtime_under_guard(
+        &self,
+        scope: &RuntimeScope,
+    ) -> Result<RuntimeInstall, AppServerError> {
+        let now = self.clock.now();
         let mut state = self
             .state
             .inner
@@ -1500,17 +1649,28 @@ impl ProductionRuntimeService {
             .registry
             .get_or_create(scope, owner)
             .map_err(runtime_service_error)?;
+        let actionable = self
+            .approvals
+            .actionable_pending_count(scope, now)
+            .map_err(runtime_service_error)?;
+        let recovery_lease = if existed || actionable == 0 {
+            None
+        } else {
+            recovered_approval_lease(&mut state, scope, &handle)?
+        };
         drop(state);
         let recovered = if existed {
             Vec::new()
         } else {
             self.approvals
-                .restart(scope)
+                .restart_with_pending_lease_at(
+                    scope,
+                    recovery_lease.as_ref().map(TurnLease::generation),
+                    now,
+                )
                 .map_err(runtime_service_error)?
         };
-        if !recovered.is_empty() {
-            self.update_residency(scope, &handle)?;
-        }
+        self.install_recovery(scope, &handle, recovery_lease, &recovered)?;
         Ok(RuntimeInstall {
             handle,
             created: !existed,
@@ -1518,14 +1678,97 @@ impl ProductionRuntimeService {
         })
     }
 
+    fn install_recovery(
+        &self,
+        scope: &RuntimeScope,
+        handle: &lotta_runtime::RuntimeHandle,
+        lease: Option<TurnLease>,
+        recovered: &[lotta_runtime::RecoveryAction],
+    ) -> Result<(), AppServerError> {
+        let replayed = recovered
+            .iter()
+            .any(|action| matches!(action, lotta_runtime::RecoveryAction::Replay(_)));
+        if let Some(lease) = lease {
+            if replayed {
+                self.install_recovered_owner(scope, handle, lease)?;
+            } else {
+                self.finish_unused_recovery_lease(handle, &lease)?;
+            }
+        }
+        if !recovered.is_empty() {
+            let interrupted = recovered
+                .iter()
+                .any(|action| !matches!(action, lotta_runtime::RecoveryAction::Replay(_)));
+            self.state.set_interrupted_result(scope, interrupted)?;
+            self.update_residency(scope, handle)?;
+        }
+        Ok(())
+    }
+
+    fn finish_unused_recovery_lease(
+        &self,
+        handle: &lotta_runtime::RuntimeHandle,
+        lease: &TurnLease,
+    ) -> Result<(), AppServerError> {
+        let stop = lotta_domain::StopReason::new("approval_recovery_terminal")
+            .map_err(|_| AppServerError::Internal)?;
+        self.state
+            .inner
+            .try_lock()
+            .map_err(|_| AppServerError::Internal)?
+            .registry
+            .lifecycle_mut(handle)
+            .map_err(runtime_service_error)?
+            .finish_turn(lease, stop)
+            .map_err(runtime_service_error)
+    }
+
+    fn install_recovered_owner(
+        &self,
+        scope: &RuntimeScope,
+        handle: &lotta_runtime::RuntimeHandle,
+        lease: TurnLease,
+    ) -> Result<(), AppServerError> {
+        let state = self
+            .state
+            .inner
+            .try_lock()
+            .map_err(|_| AppServerError::Internal)?;
+        let queue = state
+            .registry
+            .queue(handle)
+            .ok_or(AppServerError::Internal)?;
+        drop(state);
+        self.state
+            .active
+            .lock()
+            .map_err(|_| AppServerError::Internal)?
+            .insert(
+                RuntimeKey::from(scope),
+                ActiveAdmission {
+                    handle: handle.clone(),
+                    lease,
+                    cancellation: CancellationToken::new(),
+                    queue,
+                    recovered_approval: true,
+                },
+            );
+        Ok(())
+    }
+
     fn rollback_runtime_start(
         &self,
-        _scope: &RuntimeScope,
+        scope: &RuntimeScope,
         install: &RuntimeInstall,
     ) -> Result<(), AppServerError> {
         self.approvals
             .rollback_restart(&install.recovered)
             .map_err(runtime_service_error)?;
+        self.state
+            .active
+            .lock()
+            .map_err(|_| AppServerError::Internal)?
+            .remove(&RuntimeKey::from(scope));
         let mut state = self
             .state
             .inner
@@ -1542,31 +1785,20 @@ impl ProductionRuntimeService {
         scope: &RuntimeScope,
         handle: &lotta_runtime::RuntimeHandle,
     ) -> Result<(), AppServerError> {
-        let count = self
-            .approvals
-            .residency_count(scope)
-            .map_err(runtime_service_error)?;
+        let residency = self.state.residency_snapshot(scope)?;
         let mut state = self
             .state
             .inner
             .try_lock()
             .map_err(|_| AppServerError::Internal)?;
-        publish_residency(&mut state, handle, count)
+        publish_residency(&mut state, handle, residency)
     }
 
     async fn update_residency_after_transition(
         &self,
         scope: &RuntimeScope,
     ) -> Result<(), AppServerError> {
-        let count = self
-            .approvals
-            .residency_count(scope)
-            .map_err(runtime_service_error)?;
-        let mut state = self.state.inner.lock().await;
-        let Some(handle) = state.registry.lookup(&RuntimeKey::from(scope)) else {
-            return Ok(());
-        };
-        publish_residency(&mut state, &handle, count)
+        self.state.update_residency(scope).await
     }
 
     async fn admit_input_inner(
@@ -1580,7 +1812,7 @@ impl ProductionRuntimeService {
             .and_then(serde_json::Value::as_str)
             == Some("approval_response")
         {
-            return self.admit_approval_response(&command);
+            return self.admit_approval_response(&command).await;
         }
         if let Some(admission) = self.admit_active_ordinary(&command)? {
             self.update_residency_after_transition(&command.runtime)
@@ -1611,6 +1843,8 @@ impl ProductionRuntimeService {
             item,
             outcome,
         )?;
+        self.state
+            .publish_residency_locked(&command.runtime, &mut state)?;
         let continuation = match &work {
             lotta_app_server::ws::InputAdmissionWork::NewStarted(value) => Some(value.clone()),
             lotta_app_server::ws::InputAdmissionWork::None => None,
@@ -1626,6 +1860,7 @@ impl ProductionRuntimeService {
 
     async fn start_runtime(
         &self,
+        _connection: lotta_app_server::ws::ConnectionId,
         command: RuntimeStartCommand,
     ) -> Result<RuntimeStartOutcome, AppServerError> {
         let agent_id = command.agent_id.as_ref().ok_or(AppServerError::Malformed)?;
@@ -1646,12 +1881,10 @@ impl ProductionRuntimeService {
             ConversationStore::load(&self.store, &runtime.agent_id, &runtime.conversation_id)
                 .await
                 .map_err(runtime_service_error)?;
-        let _start_guard = self.state.runtime_starts.lock().await;
-        let install = self.ensure_runtime(&runtime)?;
+        let install = self.ensure_runtime(&runtime).await?;
         self.run_session_start_hook(&runtime, &install).await?;
         let generation = self.lease_generation(&install).await;
         let broadcasts = self.start_broadcasts(&runtime, &install, generation, &command)?;
-        self.update_residency(&runtime, &install.handle)?;
         Ok(RuntimeStartOutcome {
             runtime,
             created_agent: false,
@@ -1731,7 +1964,7 @@ impl ProductionRuntimeService {
         })
     }
 
-    fn admit_approval_response(
+    async fn admit_approval_response(
         &self,
         command: &InputCommand,
     ) -> Result<InputAdmission, AppServerError> {
@@ -1739,9 +1972,21 @@ impl ProductionRuntimeService {
         let request = self.pending_approval(command, payload)?;
         let decision = approval_decision(payload)?;
         let item = self.approval_queue_item(command, &request)?;
-        let (outcome, disposition) =
-            self.admit_approval_control(command, &request, &decision, payload, item)?;
-        let continuation = approval_continuation(outcome, &request, decision, payload)?;
+        let (outcome, disposition, recovered) = self
+            .admit_approval_control(command, &request, &decision, payload, item)
+            .await?;
+        if recovered.is_none() {
+            let _published = self.state.try_update_residency_now(&command.runtime)?;
+        }
+        let continuation = if recovered.is_some() {
+            None
+        } else {
+            approval_continuation(outcome, &request, decision, payload)?
+        };
+        let after_ack = recovered
+            .map(recovered_approval_events)
+            .transpose()?
+            .unwrap_or_default();
         Ok(InputAdmission {
             disposition,
             error: None,
@@ -1750,7 +1995,7 @@ impl ProductionRuntimeService {
                 lotta_app_server::ws::InputAdmissionWork::None,
                 lotta_app_server::ws::InputAdmissionWork::NewStarted,
             ),
-            after_ack: RuntimeEventBatch::new(Vec::new()).map_err(|_| AppServerError::Internal)?,
+            after_ack: RuntimeEventBatch::new(after_ack).map_err(|_| AppServerError::Internal)?,
         })
     }
 
@@ -1800,21 +2045,23 @@ impl ProductionRuntimeService {
         })
     }
 
-    fn admit_approval_control(
+    async fn admit_approval_control(
         &self,
         command: &InputCommand,
         request: &lotta_runtime::ApprovalRequest,
         decision: &serde_json::Value,
         payload: &serde_json::Value,
         item: QueueItem,
-    ) -> Result<(AdmissionOutcome, InputDisposition), AppServerError> {
+    ) -> Result<ApprovalControlOutcome, AppServerError> {
         let key = RuntimeKey::from(&command.runtime);
-        let active_state = self
+        let active = self
             .state
             .active
             .lock()
-            .map_err(|_| AppServerError::Internal)?;
-        let active = active_state.get(&key).ok_or(AppServerError::Malformed)?;
+            .map_err(|_| AppServerError::Internal)?
+            .get(&key)
+            .cloned()
+            .ok_or(AppServerError::Malformed)?;
         if request.lease_generation != active.lease.generation() {
             return Err(AppServerError::Malformed);
         }
@@ -1830,12 +2077,61 @@ impl ProductionRuntimeService {
         )
         .map_err(runtime_service_error)?;
         let disposition = outcome.disposition();
+        let mut recovered = None;
         if matches!(outcome, AdmissionOutcome::Control(_)) {
-            self.approvals
+            let resolved = self
+                .approvals
                 .resolve(&resolution, active.lease.generation())
                 .map_err(runtime_service_error)?;
+            if recovered_owner(&active, request) {
+                recovered = Some(
+                    self.finish_recovered_approval(command, &active, resolved)
+                        .await?,
+                );
+            }
         }
-        Ok((outcome, disposition))
+        Ok((outcome, disposition, recovered))
+    }
+
+    async fn finish_recovered_approval(
+        &self,
+        command: &InputCommand,
+        active: &ActiveAdmission,
+        mut resolved: lotta_runtime::approval::ApprovalResolveOutcome,
+    ) -> Result<lotta_runtime::approval::ApprovalResolveOutcome, AppServerError> {
+        if resolved.request.state == lotta_runtime::ApprovalState::Executing {
+            if !self
+                .approvals
+                .interrupt(&resolved.request)
+                .map_err(runtime_service_error)?
+            {
+                return Err(AppServerError::Malformed);
+            }
+            resolved.request.state = lotta_runtime::ApprovalState::Interrupted;
+            resolved.request.revision = resolved
+                .request
+                .revision
+                .checked_add(1)
+                .ok_or(AppServerError::Internal)?;
+        }
+        let stop = lotta_domain::StopReason::new("approval_recovery_interrupted")
+            .map_err(|_| AppServerError::Internal)?;
+        let mut state = self.state.inner.lock().await;
+        state
+            .registry
+            .lifecycle_mut(&active.handle)
+            .map_err(runtime_service_error)?
+            .finish_turn(&active.lease, stop)
+            .map_err(runtime_service_error)?;
+        self.state
+            .active
+            .lock()
+            .map_err(|_| AppServerError::Internal)?
+            .remove(&RuntimeKey::from(&command.runtime));
+        self.state.set_interrupted_result(&command.runtime, true)?;
+        self.state
+            .publish_residency_locked(&command.runtime, &mut state)?;
+        Ok(resolved)
     }
 
     fn admit_active_ordinary(
@@ -1865,6 +2161,17 @@ impl ProductionRuntimeService {
             .ok_or(AppServerError::Internal)?;
         if let Some(prior) = history.prior(&client_message_id) {
             return Ok(Some(input_admission(prior, None)?));
+        }
+        if active.recovered_approval {
+            let disposition = InputDisposition::Rejected;
+            let _recorded = state
+                .registry
+                .admission_history_mut(&active.handle)
+                .map_err(runtime_service_error)?
+                .admit(&client_message_id, disposition);
+            let reason = NonEmptyString::new("approval recovery pending".to_owned())
+                .map_err(|_| AppServerError::Internal)?;
+            return Ok(Some(input_admission(disposition, Some(reason))?));
         }
         let item = self.admission_item(command, client_message_id.as_str())?;
         let mutation = active
@@ -1985,6 +2292,26 @@ fn approval_continuation(
     }
 }
 
+fn recovered_approval_events(
+    outcome: lotta_runtime::approval::ApprovalResolveOutcome,
+) -> Result<Vec<lotta_app_server::ws::RuntimeEvent>, AppServerError> {
+    let request = outcome.request;
+    Ok(vec![
+        approval_terminal_event(
+            request.clone(),
+            request.state,
+            Some(lotta_runtime::ApprovalState::Pending),
+        )?,
+        lotta_app_server::ws::RuntimeEvent::TurnFinished {
+            turn_id: request.turn_id,
+            run_id: Some(request.run_id),
+            stop_reason: NonEmptyString::new("approval_recovery_interrupted")
+                .map_err(|_| AppServerError::Internal)?,
+            error: None,
+        },
+    ])
+}
+
 fn approval_resolution_input(
     scope: &RuntimeScope,
     request: &lotta_runtime::ApprovalRequest,
@@ -2013,6 +2340,44 @@ fn approval_resolution_input(
         resolution,
         edited_input,
     })
+}
+
+fn recovered_owner(active: &ActiveAdmission, request: &lotta_runtime::ApprovalRequest) -> bool {
+    active.recovered_approval && active.lease.generation() == request.lease_generation
+}
+
+fn recovered_approval_lease(
+    state: &mut RuntimeServiceState,
+    scope: &RuntimeScope,
+    handle: &lotta_runtime::RuntimeHandle,
+) -> Result<Option<TurnLease>, AppServerError> {
+    let has_pending = state
+        .registry
+        .lifecycle(handle)
+        .ok_or(AppServerError::Internal)?
+        .projection()
+        .state()
+        == lotta_domain::TurnStateKind::Idle;
+    if !has_pending {
+        return Ok(None);
+    }
+    let run_sequence = u64::try_from(state.sequence).map_err(|_| AppServerError::Internal)?;
+    state.sequence = state
+        .sequence
+        .checked_add(1)
+        .ok_or(AppServerError::Internal)?;
+    let run_id = lotta_domain::RunId::generate_sequence(run_sequence)
+        .map_err(|_| AppServerError::Internal)?;
+    let lease = state
+        .registry
+        .lifecycle_mut(handle)
+        .map_err(runtime_service_error)?
+        .begin_turn(
+            format!("recovered-approval-{}", scope.conversation_id.as_str()),
+            run_id,
+        )
+        .map_err(runtime_service_error)?;
+    Ok(Some(lease))
 }
 
 fn runtime_handle(
@@ -2078,14 +2443,11 @@ fn admission_work(
 fn publish_residency(
     state: &mut RuntimeServiceState,
     handle: &lotta_runtime::RuntimeHandle,
-    approvals: usize,
+    residency: lotta_runtime::RuntimeResidency,
 ) -> Result<(), AppServerError> {
     state
         .registry
-        .set_residency(
-            handle,
-            lotta_runtime::RuntimeResidency::new(approvals, false, 0),
-        )
+        .set_residency(handle, residency)
         .map(|_| ())
         .map_err(runtime_service_error)
 }
@@ -2342,10 +2704,10 @@ async fn sync_outcome(
     command: SyncCommand,
 ) -> Result<SyncOutcome, AppServerError> {
     let key = RuntimeKey::from(&command.runtime);
-    let active = service.active_snapshot(&key)?;
-    if active.is_none() {
-        let _ = service.ensure_runtime(&command.runtime)?;
+    if service.active_snapshot(&key)?.is_none() {
+        let _ = service.ensure_runtime(&command.runtime).await?;
     }
+    let active = service.active_snapshot(&key)?;
     let status = authoritative_status_snapshot(service, &key, active.as_ref()).await?;
     let device = service.device_snapshot(connection, &command.runtime)?;
     let mut broadcasts = vec![lotta_app_server::ws::RuntimeEvent::UpdateDeviceStatus {
@@ -2532,14 +2894,11 @@ fn sync_approval_broadcasts(
     scope: &RuntimeScope,
     lease_generation: Option<u64>,
 ) -> Result<Vec<lotta_app_server::ws::RuntimeEvent>, AppServerError> {
-    let requests = service
+    let actions = service
         .approvals
-        .pending_snapshot(scope, lease_generation)
+        .recovery_snapshot(scope, lease_generation)
         .map_err(runtime_service_error)?;
-    requests
-        .into_iter()
-        .map(|request| approval_replay_event(scope, request))
-        .collect()
+    recovery_broadcasts(scope, &actions)
 }
 
 fn recovery_broadcasts(
@@ -2611,10 +2970,10 @@ impl RuntimeCommandService for ProductionRuntimeService {
 
     fn runtime_start(
         &self,
-        _connection: lotta_app_server::ws::ConnectionId,
+        connection: lotta_app_server::ws::ConnectionId,
         command: RuntimeStartCommand,
     ) -> ServiceFuture<'_, RuntimeStartOutcome> {
-        Box::pin(async move { self.start_runtime(command).await })
+        Box::pin(async move { self.start_runtime(connection, command).await })
     }
 
     fn admit_input(&self, command: InputCommand) -> ServiceFuture<'_, InputAdmission> {
@@ -2656,6 +3015,24 @@ impl RuntimeCommandService for ProductionRuntimeService {
         Box::pin(async move { sync_outcome(self, connection, command).await })
     }
 
+    fn runtime_subscription_changed(
+        &self,
+        scope: RuntimeScope,
+        count: usize,
+    ) -> ServiceFuture<'_, ()> {
+        Box::pin(async move {
+            self.state.set_sandbox_subscriptions(&scope, count)?;
+            self.state.update_residency(&scope).await
+        })
+    }
+
+    fn approval_recovery_surfaced(&self, scope: RuntimeScope) -> ServiceFuture<'_, ()> {
+        Box::pin(async move {
+            self.state.set_interrupted_result(&scope, false)?;
+            self.state.update_residency(&scope).await
+        })
+    }
+
     fn abort_message(&self, command: AbortMessageCommand) -> ServiceFuture<'_, AbortOutcome> {
         Box::pin(async move {
             let key = RuntimeKey::from(&command.runtime);
@@ -2687,9 +3064,10 @@ impl RuntimeCommandService for ProductionRuntimeService {
                         .map_err(runtime_service_error)?;
                 }
                 active_cancellation.cancel();
+                self.state.update_residency(&command.runtime).await?;
                 return Ok(AbortOutcome { aborted: true });
             }
-            let _ = self.ensure_runtime(&command.runtime)?;
+            let _ = self.ensure_runtime(&command.runtime).await?;
             let mut state = self.state.inner.lock().await;
             let pending_key = state
                 .pending
@@ -2697,6 +3075,8 @@ impl RuntimeCommandService for ProductionRuntimeService {
                 .find(|(scope, _)| scope == &key)
                 .cloned();
             let Some(pending_key) = pending_key else {
+                self.state
+                    .publish_residency_locked(&command.runtime, &mut state)?;
                 return Ok(AbortOutcome { aborted: false });
             };
             let pending = state
@@ -2716,6 +3096,8 @@ impl RuntimeCommandService for ProductionRuntimeService {
                 .finish_turn(&pending.lease, stop)
                 .map_err(runtime_service_error)?;
             pending.cancellation.cancel();
+            self.state
+                .publish_residency_locked(&command.runtime, &mut state)?;
             Ok(AbortOutcome { aborted: true })
         })
     }
@@ -2725,7 +3107,7 @@ impl RuntimeCommandService for ProductionRuntimeService {
         command: ChangeDeviceStateCommand,
     ) -> ServiceFuture<'_, DeviceStateOutcome> {
         Box::pin(async move {
-            let _ = self.ensure_runtime(&command.runtime)?;
+            let _ = self.ensure_runtime(&command.runtime).await?;
             // A cwd change persists into the shared settings bridge's scoped
             // map so the next turn resolves the new directory. No websocket
             // connection owns this service-level command, so the status
@@ -3635,6 +4017,13 @@ fn effect_error(error: impl std::fmt::Display) -> lotta_runtime::RuntimeError {
     }
 }
 
+fn runtime_residency_error() -> lotta_runtime::RuntimeError {
+    lotta_runtime::RuntimeError::AdapterFailure {
+        code: "runtime_residency",
+        context: "production runtime residency".into(),
+    }
+}
+
 fn runtime_service_error(error: lotta_runtime::RuntimeError) -> AppServerError {
     match error {
         lotta_runtime::RuntimeError::NotFound { .. } => AppServerError::Malformed,
@@ -3658,7 +4047,7 @@ mod production_tests {
         BackgroundProcessSource, DeviceBridge, DeviceForwarder, DeviceMessage,
     };
     use lotta_app_server::ws::service::{RuntimeCommandService, RuntimeEventSink, TurnController};
-    use lotta_domain::{ConversationId, DomainError, RunId, Timestamp, TurnStateKind};
+    use lotta_domain::{ConversationId, DomainError, RunId, Timestamp};
 
     struct TestClock;
     impl Clock for TestClock {
@@ -3714,10 +4103,13 @@ mod production_tests {
             })
     }
     fn unique_test_id() -> u128 {
-        std::time::SystemTime::now()
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos();
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (timestamp << 64) | u128::from(sequence)
     }
     fn assert_exact_toolsets(config: &crate::production_setup::ProductionSetupConfig) {
         for toolset in ToolsetId::ALL {
@@ -4095,9 +4487,10 @@ mod production_tests {
             ProductionRuntimeDependencies {
                 clock: Arc::new(TestClock),
                 hooks: Arc::new(lotta_runtime::hooks::NoopHookRuntime),
-                state: Arc::new(ProductionRuntimeState::new(Arc::new(
-                    lotta_runtime::observe::RuntimeObserver::default(),
-                ))),
+                state: Arc::new(ProductionRuntimeState::new(
+                    Arc::new(lotta_runtime::observe::RuntimeObserver::default()),
+                    Arc::clone(&approvals),
+                )),
                 approvals,
                 brokers: Arc::new(ProductionTurnBrokers::new()),
                 settings,
@@ -4305,18 +4698,20 @@ mod production_tests {
             )
             .unwrap(),
         );
+        let approvals = Arc::new(lotta_runtime::ApprovalManager::new(
+            store.approval_journal(),
+            Arc::new(crate::production_setup::ProductionEditedInputValidator),
+        ));
         ControllerParts {
             setup,
             provider,
             tools,
-            state: Arc::new(ProductionRuntimeState::new(Arc::new(
-                lotta_runtime::observe::RuntimeObserver::default(),
-            ))),
-            brokers: Arc::new(ProductionTurnBrokers::new()),
-            approvals: Arc::new(lotta_runtime::ApprovalManager::new(
-                store.approval_journal(),
-                Arc::new(crate::production_setup::ProductionEditedInputValidator),
+            state: Arc::new(ProductionRuntimeState::new(
+                Arc::new(lotta_runtime::observe::RuntimeObserver::default()),
+                Arc::clone(&approvals),
             )),
+            brokers: Arc::new(ProductionTurnBrokers::new()),
+            approvals,
             tasks,
         }
     }
@@ -4333,16 +4728,18 @@ mod production_tests {
             .unwrap();
     }
 
-    async fn production_controller_fixture(
-        label: &str,
-        provider_port: Arc<dyn ProviderPort>,
-    ) -> (
+    type ProductionControllerFixture = (
         std::path::PathBuf,
         Arc<ProductionRuntimeService>,
         Arc<ProductionTurnController>,
         Arc<SkillsBridge>,
         Arc<SettingsBridge>,
-    ) {
+    );
+
+    async fn production_controller_fixture(
+        label: &str,
+        provider_port: Arc<dyn ProviderPort>,
+    ) -> ProductionControllerFixture {
         let root = std::env::temp_dir().join(format!("lotta-cancel-{label}-{}", unique_test_id()));
         ["workspace", "artifacts", ".letta/skills", "bundled-skills"]
             .iter()
@@ -4702,7 +5099,6 @@ mod production_tests {
             seed_transcript(&store, &scope).await;
 
             let lease = authority.begin_command(&scope).expect("command begins");
-            let settled = lease.clone();
             let progress = authority.compact(contention_command(&scope, &lease)).await;
             assert_eq!(progress.expect("compaction runs").messages_before, 2);
 
@@ -4727,20 +5123,21 @@ mod production_tests {
                 .expect("release task")
                 .expect("deterministic release");
 
-            // The lifecycle returned to idle once the lock freed.
+            // The lifecycle returned to idle once the lock freed, so the
+            // now-quiescent runtime was evicted.
             {
                 let state = service.state.inner.lock().await;
-                let owner = registered_owner(&state, &scope);
-                assert_eq!(owner.projection().state(), TurnStateKind::Idle);
-                assert!(!owner.is_current(&settled));
+                assert!(state.registry.lookup(&RuntimeKey::from(&scope)).is_none());
             }
 
-            // The idle scope admits a fresh command lease again.
+            // The evicted scope admits a fresh command lease again.
             let probe = authority.begin_command(&scope).expect("idle again");
             let state = service.state.inner.lock().await;
             assert!(registered_owner(&state, &scope).is_current(&probe));
             drop(state);
             assert!(authority.finish_command(&scope, &probe).await.is_ok());
+            let state = service.state.inner.lock().await;
+            assert!(state.registry.lookup(&RuntimeKey::from(&scope)).is_none());
         }
     }
 
@@ -5590,7 +5987,7 @@ mod production_tests {
     }
 
     #[tokio::test]
-    async fn ordinary_runtime_start_evicts_quiescent_idle_runtime() {
+    async fn runtime_start_tracks_real_subscription_then_evicts_after_disconnect() {
         let service = service();
         let target = scope("idle-start-eviction");
         seed_controller_store(&service.store.paths().clone(), &target).await;
@@ -5622,16 +6019,32 @@ mod production_tests {
             .await
             .unwrap();
         assert_eq!(outcome.runtime, target);
-        assert!(
-            service
-                .state
-                .inner
-                .lock()
-                .await
-                .registry
-                .lookup(&RuntimeKey::from(&target))
-                .is_none()
-        );
+        service
+            .runtime_subscription_changed(target.clone(), 1)
+            .await
+            .unwrap();
+        let handle = service
+            .state
+            .inner
+            .lock()
+            .await
+            .registry
+            .lookup(&RuntimeKey::from(&target))
+            .expect("subscription retains runtime");
+        let residency = service
+            .state
+            .inner
+            .lock()
+            .await
+            .registry
+            .residency(&handle)
+            .expect("residency snapshot");
+        assert_eq!(residency.sandbox_subscription_count(), 1);
+        service
+            .runtime_subscription_changed(target.clone(), 0)
+            .await
+            .unwrap();
+        assert!(service.state.inner.lock().await.registry.is_empty());
     }
 
     #[tokio::test]
@@ -5697,6 +6110,259 @@ mod production_tests {
         let _ = std::fs::remove_dir_all(fixture.root);
     }
 
+    fn restarted_service(
+        paths: StorePaths,
+        approvals: Arc<lotta_runtime::ApprovalManager>,
+    ) -> ProductionRuntimeService {
+        ProductionRuntimeService::new(
+            paths.clone(),
+            ProductionRuntimeDependencies {
+                clock: Arc::new(TestClock),
+                hooks: Arc::new(lotta_runtime::hooks::NoopHookRuntime),
+                state: Arc::new(ProductionRuntimeState::new(
+                    Arc::new(lotta_runtime::observe::RuntimeObserver::default()),
+                    Arc::clone(&approvals),
+                )),
+                approvals,
+                brokers: Arc::new(ProductionTurnBrokers::new()),
+                settings: test_settings_bridge(paths.root(), paths.root()),
+                tasks: Arc::new(TaskLifecyclePort::new()),
+                device_authority: None,
+            },
+        )
+    }
+
+    fn assert_recovered_approval(
+        accepted: &InputAdmission,
+        expected: lotta_runtime::ApprovalState,
+    ) {
+        assert_eq!(accepted.disposition, InputDisposition::Started);
+        assert!(accepted.continuation.is_none());
+        assert_eq!(accepted.after_ack.len(), 2);
+        assert!(matches!(
+            &accepted.after_ack.as_slice()[0],
+            RuntimeEvent::ApprovalRecovery { state, .. } if *state == expected
+        ));
+        assert!(matches!(
+            &accepted.after_ack.as_slice()[1],
+            RuntimeEvent::TurnFinished { stop_reason, .. }
+                if stop_reason.as_str() == "approval_recovery_interrupted"
+        ));
+    }
+
+    async fn assert_recovery_residency(service: &ProductionRuntimeService, owner: &RuntimeScope) {
+        let state = service.state.inner.lock().await;
+        let handle = state
+            .registry
+            .lookup(&RuntimeKey::from(owner))
+            .expect("interrupted evidence retains runtime");
+        let residency = state
+            .registry
+            .residency(&handle)
+            .expect("recovery residency");
+        assert_eq!(residency.pending_approval_count(), 0);
+        assert!(residency.interrupted_result_present());
+    }
+
+    async fn pending_restart_fixture(
+        label: &str,
+    ) -> (
+        ProductionRuntimeService,
+        RuntimeScope,
+        Arc<lotta_runtime::ApprovalManager>,
+        RuntimeInstall,
+    ) {
+        let first = service();
+        let owner = scope(&format!("restart-approval-{label}"));
+        let first_install = first.ensure_runtime(&owner).await.unwrap();
+        let lease = {
+            let mut state = first.state.inner.lock().await;
+            recovered_approval_lease(&mut state, &owner, &first_install.handle)
+                .unwrap()
+                .unwrap()
+        };
+        first
+            .approvals
+            .store_request(approval_request(owner.clone(), lease.generation()))
+            .unwrap();
+        let paths = first.store.paths().clone();
+        drop(first);
+        let approvals = Arc::new(lotta_runtime::ApprovalManager::new(
+            LocalStore::new(paths.clone()).approval_journal(),
+            Arc::new(crate::production_setup::ProductionEditedInputValidator),
+        ));
+        let restarted = restarted_service(paths, Arc::clone(&approvals));
+        let install = restarted.ensure_runtime(&owner).await.unwrap();
+        assert!(matches!(
+            install.recovered.as_slice(),
+            [lotta_runtime::RecoveryAction::Replay(_)]
+        ));
+        (restarted, owner, approvals, install)
+    }
+
+    #[tokio::test]
+    async fn restart_pending_response_is_meaningful_and_exactly_once() {
+        let cases = [
+            (
+                "allow",
+                serde_json::json!({"behavior":"allow"}),
+                lotta_runtime::ApprovalState::Interrupted,
+            ),
+            (
+                "edit",
+                serde_json::json!({"behavior":"allow","updated_input":{"path":"edited"}}),
+                lotta_runtime::ApprovalState::Interrupted,
+            ),
+            (
+                "deny",
+                serde_json::json!({"behavior":"deny"}),
+                lotta_runtime::ApprovalState::Denied,
+            ),
+        ];
+        for (label, decision, expected) in cases {
+            let (restarted, owner, approvals, install) = pending_restart_fixture(label).await;
+            let pending_residency = restarted
+                .state
+                .inner
+                .lock()
+                .await
+                .registry
+                .residency(&install.handle)
+                .expect("pending recovery residency");
+            assert_eq!(pending_residency.pending_approval_count(), 1);
+            assert!(!pending_residency.interrupted_result_present());
+            let response = InputCommand {
+                request_id: Some(NonEmptyString::new(format!("restart-{label}")).unwrap()),
+                runtime: owner.clone(),
+                payload: BoundedJsonValue::new(serde_json::json!({
+                    "kind":"approval_response", "request_id":"approval-held",
+                    "decision": decision
+                }))
+                .unwrap(),
+            };
+            let accepted = restarted.admit_input(response.clone()).await.unwrap();
+            assert_recovered_approval(&accepted, expected);
+            assert!(restarted.admit_input(response).await.is_err());
+            let terminal = approvals
+                .get_request(&owner, &NonEmptyString::new("approval-held").unwrap())
+                .unwrap();
+            assert_eq!(
+                terminal.as_ref().map(|row| row.state),
+                (expected != lotta_runtime::ApprovalState::Denied).then_some(expected)
+            );
+            assert_recovery_residency(&restarted, &owner).await;
+            restarted.approval_recovery_surfaced(owner).await.unwrap();
+            assert!(restarted.state.inner.lock().await.registry.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_owner_rejects_ordinary_input_without_stranding_queue() {
+        let (restarted, owner, _, install) = pending_restart_fixture("control-only").await;
+        let rejected = restarted
+            .admit_input(command(owner.clone(), "ordinary-during-recovery"))
+            .await
+            .unwrap();
+        assert_eq!(rejected.disposition, InputDisposition::Rejected);
+        assert_eq!(
+            rejected.error.as_ref().map(NonEmptyString::as_str),
+            Some("approval recovery pending")
+        );
+        let state = restarted.state.inner.lock().await;
+        assert!(
+            state
+                .registry
+                .queue(&install.handle)
+                .expect("recovery queue")
+                .lock()
+                .expect("queue")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_restart_install_rebinds_pending_once() {
+        let first = service();
+        let owner = scope("restart-concurrent");
+        first
+            .approvals
+            .store_request(approval_request(owner.clone(), 7))
+            .unwrap();
+        let paths = first.store.paths().clone();
+        drop(first);
+        let approvals = Arc::new(lotta_runtime::ApprovalManager::new(
+            LocalStore::new(paths.clone()).approval_journal(),
+            Arc::new(crate::production_setup::ProductionEditedInputValidator),
+        ));
+        let restarted = Arc::new(restarted_service(paths, Arc::clone(&approvals)));
+        let (left, right) = tokio::join!(
+            restarted.ensure_runtime(&owner),
+            restarted.ensure_runtime(&owner)
+        );
+        let installs = [left.unwrap(), right.unwrap()];
+        assert_eq!(installs.iter().filter(|install| install.created).count(), 1);
+        let pending = approvals
+            .get_request(&owner, &NonEmptyString::new("approval-held").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.state, lotta_runtime::ApprovalState::Pending);
+        assert_eq!(pending.revision, 1);
+        let active = restarted.state.active.lock().unwrap();
+        let owner = active.get(&RuntimeKey::from(&owner)).expect("owner");
+        assert_eq!(pending.lease_generation, owner.lease.generation());
+    }
+
+    #[tokio::test]
+    async fn restart_executing_is_interrupted_without_recovered_owner() {
+        let first = service();
+        let owner = scope("restart-executing");
+        let install = first.ensure_runtime(&owner).await.unwrap();
+        let lease = {
+            let mut state = first.state.inner.lock().await;
+            recovered_approval_lease(&mut state, &owner, &install.handle)
+                .unwrap()
+                .unwrap()
+        };
+        let pending = first
+            .approvals
+            .store_request(approval_request(owner.clone(), lease.generation()))
+            .unwrap();
+        let resolution = approval_resolution_input(
+            &owner,
+            &pending,
+            &serde_json::json!({"behavior":"allow"}),
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        first
+            .approvals
+            .resolve(&resolution, lease.generation())
+            .unwrap();
+        let paths = first.store.paths().clone();
+        drop(first);
+        let approvals = Arc::new(lotta_runtime::ApprovalManager::new(
+            LocalStore::new(paths.clone()).approval_journal(),
+            Arc::new(crate::production_setup::ProductionEditedInputValidator),
+        ));
+        let restarted = restarted_service(paths, Arc::clone(&approvals));
+        let install = restarted.ensure_runtime(&owner).await.unwrap();
+        assert!(matches!(
+            install.recovered.as_slice(),
+            [lotta_runtime::RecoveryAction::Interrupted { original, interrupted }]
+                if original.state == lotta_runtime::ApprovalState::Executing
+                    && interrupted.state == lotta_runtime::ApprovalState::Interrupted
+        ));
+        assert!(
+            !restarted
+                .state
+                .active
+                .lock()
+                .unwrap()
+                .contains_key(&RuntimeKey::from(&owner))
+        );
+        assert_recovery_residency(&restarted, &owner).await;
+    }
+
     #[tokio::test]
     async fn production_approval_response_resolves_while_turn_lock_is_held() {
         let service = service();
@@ -5721,6 +6387,7 @@ mod production_tests {
                 lease: pending.lease,
                 cancellation: pending.cancellation,
                 queue: Arc::clone(&pending.queue),
+                recovered_approval: false,
             },
         );
         let _held = service.state.inner.lock().await;
@@ -5768,6 +6435,7 @@ mod production_tests {
                 lease: pending.lease.clone(),
                 cancellation: pending.cancellation.clone(),
                 queue: Arc::clone(&pending.queue),
+                recovered_approval: false,
             },
         );
         let second = service
@@ -6199,12 +6867,13 @@ mod production_tests {
         root: &std::path::Path,
     ) -> (Arc<ProductionRuntimeService>, Arc<ProductionRuntimeState>) {
         let paths = StorePaths::new(root.to_path_buf()).unwrap();
-        let state = Arc::new(ProductionRuntimeState::new(Arc::new(
-            lotta_runtime::observe::RuntimeObserver::default(),
-        )));
         let approvals = Arc::new(lotta_runtime::ApprovalManager::new(
             LocalStore::new(paths.clone()).approval_journal(),
             Arc::new(crate::production_setup::ProductionEditedInputValidator),
+        ));
+        let state = Arc::new(ProductionRuntimeState::new(
+            Arc::new(lotta_runtime::observe::RuntimeObserver::default()),
+            Arc::clone(&approvals),
         ));
         let settings = test_settings_bridge(paths.root(), paths.root());
         let service = ProductionRuntimeService::new(
@@ -6389,10 +7058,9 @@ mod production_tests {
         target: &RuntimeScope,
     ) {
         let state = service.state.inner.lock().await;
-        let handle = state
-            .registry
-            .lookup(&RuntimeKey::from(target))
-            .expect("held-turn registry entry");
+        let Some(handle) = state.registry.lookup(&RuntimeKey::from(target)) else {
+            return;
+        };
         assert!(
             state
                 .registry

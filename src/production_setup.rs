@@ -1909,17 +1909,45 @@ impl lotta_runtime::EditedInputValidator for ProductionEditedInputValidator {
     }
 }
 
+type ApprovalReceiver =
+    tokio::sync::oneshot::Receiver<lotta_runtime::approval::ApprovalResolveOutcome>;
+
 struct ApprovalBrokerAdapter {
     manager: Arc<lotta_runtime::ApprovalManager>,
+    runtime_state: Arc<crate::production_components::ProductionRuntimeState>,
     scope: lotta_domain::RuntimeScope,
     run_id: lotta_domain::RunId,
     turn_id: NonEmptyString,
     input_id: NonEmptyString,
     lease_generation: u64,
     clock: Arc<dyn lotta_domain::Clock + Send + Sync>,
-    receiver: std::sync::Mutex<
-        Option<tokio::sync::oneshot::Receiver<lotta_runtime::approval::ApprovalResolveOutcome>>,
-    >,
+    receiver: std::sync::Mutex<Option<ApprovalReceiver>>,
+}
+
+impl ApprovalBrokerAdapter {
+    fn take_receiver(&self) -> Result<ApprovalReceiver, RuntimeError> {
+        self.receiver
+            .lock()
+            .map_err(|_| broker_error("approval receiver lock"))?
+            .take()
+            .ok_or_else(|| broker_error("approval waiter missing"))
+    }
+}
+
+async fn publish_approval_residency(
+    state: &crate::production_components::ProductionRuntimeState,
+    scope: &lotta_domain::RuntimeScope,
+    interrupted: bool,
+) -> Result<(), RuntimeError> {
+    if interrupted {
+        state
+            .set_interrupted_result(scope, true)
+            .map_err(|_| broker_error("approval evidence"))?;
+    }
+    state
+        .update_residency(scope)
+        .await
+        .map_err(|_| broker_error("approval residency"))
 }
 
 fn delivered_resolution(
@@ -1970,6 +1998,9 @@ impl lotta_runtime::turn::ApprovalPort for ApprovalBrokerAdapter {
             state: lotta_runtime::ApprovalState::Pending,
             revision: 0,
         })?;
+        self.runtime_state
+            .update_residency_now(&self.scope)
+            .map_err(|_| broker_error("approval residency"))?;
         Ok(())
     }
 
@@ -1997,7 +2028,10 @@ impl lotta_runtime::turn::ApprovalPort for ApprovalBrokerAdapter {
             .manager
             .get_request(&self.scope, &request.request_id)?
             .ok_or_else(|| broker_error("approval request missing"))?;
-        self.manager.rollback_request(&canonical)
+        self.manager.rollback_request(&canonical)?;
+        self.runtime_state
+            .update_residency_now(&self.scope)
+            .map_err(|_| broker_error("approval residency"))
     }
 
     fn await_resolution(
@@ -2006,17 +2040,10 @@ impl lotta_runtime::turn::ApprovalPort for ApprovalBrokerAdapter {
         cancellation: CancellationToken,
     ) -> lotta_runtime::ports::PortFuture<'_, lotta_runtime::turn::ApprovalResolution> {
         let manager = Arc::clone(&self.manager);
+        let runtime_state = Arc::clone(&self.runtime_state);
         let scope = self.scope.clone();
         let lease_generation = self.lease_generation;
-        let receiver = self
-            .receiver
-            .lock()
-            .map_err(|_| broker_error("approval receiver lock"))
-            .and_then(|mut receiver| {
-                receiver
-                    .take()
-                    .ok_or_else(|| broker_error("approval waiter missing"))
-            });
+        let receiver = self.take_receiver();
         Box::pin(async move {
             let mut receiver = receiver?;
             if request.lease_generation != lease_generation {
@@ -2027,7 +2054,8 @@ impl lotta_runtime::turn::ApprovalPort for ApprovalBrokerAdapter {
                 .ok_or_else(|| broker_error("approval request missing"))?;
             let now = self.clock.now();
             if canonical.expires_at <= now {
-                let _ = manager.expire_waiter(&canonical)?;
+                let changed = manager.expire_waiter(&canonical)?;
+                publish_approval_residency(&runtime_state, &scope, changed).await?;
                 return Err(RuntimeError::Timeout {
                     context: "approval expired".into(),
                 });
@@ -2048,12 +2076,14 @@ impl lotta_runtime::turn::ApprovalPort for ApprovalBrokerAdapter {
                         .get_request(&scope, &request.request_id)?
                         .ok_or_else(|| broker_error("approval request missing"))?;
                     if latest.state == lotta_runtime::ApprovalState::Pending {
-                        let _ = manager.interrupt_pending(&latest)?;
+                        let changed = manager.interrupt_pending(&latest)?;
+                        publish_approval_residency(&runtime_state, &scope, changed).await?;
                     }
                     Err(RuntimeError::Cancelled { context: "approval wait".into() })
                 },
                 () = tokio::time::sleep(timeout) => {
                     if manager.expire_waiter(&canonical)? {
+                        publish_approval_residency(&runtime_state, &scope, true).await?;
                         Err(RuntimeError::Timeout { context: "approval expired".into() })
                     } else {
                         (&mut receiver).await.map(delivered_resolution)
@@ -2077,10 +2107,12 @@ impl lotta_runtime::turn::ApprovalPort for ApprovalBrokerAdapter {
             .manager
             .get_request(&self.scope, &request.request_id)?
             .ok_or_else(|| broker_error("approval request missing"))?;
-        self.manager
-            .mark_allowed(&canonical)?
-            .then_some(())
-            .ok_or_else(|| broker_error("approval finalization conflict"))
+        if !self.manager.mark_allowed(&canonical)? {
+            return Err(broker_error("approval finalization conflict"));
+        }
+        self.runtime_state
+            .update_residency_now(&self.scope)
+            .map_err(|_| broker_error("approval residency"))
     }
 
     fn mark_interrupted(
@@ -2091,10 +2123,15 @@ impl lotta_runtime::turn::ApprovalPort for ApprovalBrokerAdapter {
             .manager
             .get_request(&self.scope, &request.request_id)?
             .ok_or_else(|| broker_error("approval request missing"))?;
-        self.manager
-            .interrupt(&canonical)?
-            .then_some(())
-            .ok_or_else(|| broker_error("approval interruption conflict"))
+        if !self.manager.interrupt(&canonical)? {
+            return Err(broker_error("approval interruption conflict"));
+        }
+        self.runtime_state
+            .set_interrupted_result(&self.scope, true)
+            .map_err(|_| broker_error("approval evidence"))?;
+        self.runtime_state
+            .update_residency_now(&self.scope)
+            .map_err(|_| broker_error("approval residency"))
     }
 }
 
@@ -3103,6 +3140,7 @@ impl ProductionTurnController {
     ) -> ApprovalBrokerAdapter {
         ApprovalBrokerAdapter {
             manager: Arc::clone(&self.approvals),
+            runtime_state: Arc::clone(&self.runtime_state),
             scope: scope.clone(),
             run_id: effects.run_id.clone(),
             turn_id: effects.turn_id.clone(),
@@ -3219,6 +3257,7 @@ async fn activate_submission(
         lease: pending.lease.clone(),
         cancellation: active_cancellation.clone(),
         queue: Arc::clone(&pending.queue),
+        recovered_approval: false,
     };
     let replaced = {
         let mut active_state = controller
