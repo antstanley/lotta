@@ -424,9 +424,12 @@ impl ApprovalManager {
     ///
     /// # Errors
     /// Returns revision overflow or durable journal failures.
-    pub fn restart(&self, scope: &RuntimeScope) -> Result<Vec<ApprovalRequest>, RuntimeError> {
+    pub fn restart(
+        &self,
+        scope: &RuntimeScope,
+    ) -> Result<Vec<(ApprovalRequest, ApprovalRequest)>, RuntimeError> {
         let _transaction = self.transaction()?;
-        let mut interrupted = Vec::new();
+        let mut recovered = Vec::new();
         for request in self.journal.port().list(scope)? {
             if !matches!(
                 request.state,
@@ -445,29 +448,26 @@ impl ApprovalManager {
                 .port()
                 .compare_and_set(request.revision, next.clone())?
             {
-                interrupted.push(next);
+                recovered.push((request, next));
             }
         }
-        Ok(interrupted)
+        Ok(recovered)
     }
 
     /// Restores restart transitions when runtime initialization is rolled back.
     ///
     /// # Errors
     /// Returns a durable conflict or journal failure.
-    pub fn rollback_restart(&self, recovered: &[ApprovalRequest]) -> Result<(), RuntimeError> {
+    pub fn rollback_restart(
+        &self,
+        recovered: &[(ApprovalRequest, ApprovalRequest)],
+    ) -> Result<(), RuntimeError> {
         let _transaction = self.transaction()?;
-        for request in recovered {
-            let mut prior = request.clone();
-            prior.state = ApprovalState::Pending;
-            prior.revision = prior
-                .revision
-                .checked_sub(1)
-                .ok_or_else(|| conflict("approval revision"))?;
+        for (prior, interrupted) in recovered {
             if !self
                 .journal
                 .port()
-                .compare_and_set(request.revision, prior)?
+                .compare_and_set(interrupted.revision, prior.clone())?
             {
                 return Err(conflict("approval restart rollback"));
             }

@@ -694,12 +694,14 @@ impl SetupPorts for ProductionSetupPorts {
                         match ConversationStore::load(&store, &agent.id, &conversation).await {
                             Ok(value) => {
                                 producer.abort();
+                                let _ = producer.await;
                                 return Ok(value);
                             }
                             Err(RuntimeError::NotFound { .. })
                             | Err(RuntimeError::InvalidData { .. }) => {}
                             Err(error) => {
                                 producer.abort();
+                                let _ = producer.await;
                                 return Err(error);
                             }
                         }

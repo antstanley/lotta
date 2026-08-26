@@ -835,6 +835,7 @@ pub(crate) struct RuntimeServiceState {
 pub(crate) struct ProductionRuntimeState {
     pub(crate) inner: tokio::sync::Mutex<RuntimeServiceState>,
     pub(crate) active: std::sync::Mutex<HashMap<RuntimeKey, ActiveAdmission>>,
+    runtime_starts: tokio::sync::Mutex<()>,
     executing_tools: std::sync::Mutex<HashMap<RuntimeKey, Vec<String>>>,
     #[cfg(test)]
     pub(crate) cancellation_observer: std::sync::Mutex<Option<Arc<ProductionCancellationObserver>>>,
@@ -849,6 +850,7 @@ impl ProductionRuntimeState {
                 sequence: 1,
             }),
             active: std::sync::Mutex::new(HashMap::new()),
+            runtime_starts: tokio::sync::Mutex::new(()),
             executing_tools: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             cancellation_observer: std::sync::Mutex::new(None),
@@ -1300,7 +1302,10 @@ pub(crate) struct ProductionRuntimeService {
 struct RuntimeInstall {
     handle: lotta_runtime::RuntimeHandle,
     created: bool,
-    recovered: Vec<lotta_runtime::ApprovalRequest>,
+    recovered: Vec<(
+        lotta_runtime::ApprovalRequest,
+        lotta_runtime::ApprovalRequest,
+    )>,
 }
 
 impl ProductionRuntimeService {
@@ -1628,6 +1633,11 @@ impl ProductionRuntimeService {
         let client_message_id = input_client_message_id(command.payload.as_value())?;
         let client_message_id =
             NonEmptyString::new(client_message_id).map_err(|_| AppServerError::Malformed)?;
+        let mut state = self
+            .state
+            .inner
+            .try_lock()
+            .map_err(|_| AppServerError::Internal)?;
         let mut active_state = self
             .state
             .active
@@ -1636,11 +1646,6 @@ impl ProductionRuntimeService {
         let Some(active) = active_state.get_mut(&key) else {
             return Ok(None);
         };
-        let state = self
-            .state
-            .inner
-            .try_lock()
-            .map_err(|_| AppServerError::Internal)?;
         let history = state
             .registry
             .current_admission_history(&active.handle)
@@ -1664,13 +1669,6 @@ impl ProductionRuntimeService {
             InputDisposition::Queued
         };
         let handle = active.handle.clone();
-        drop(active_state);
-        drop(state);
-        let mut state = self
-            .state
-            .inner
-            .try_lock()
-            .map_err(|_| AppServerError::Internal)?;
         let _recorded = state
             .registry
             .admission_history_mut(&handle)
@@ -2305,6 +2303,7 @@ impl RuntimeCommandService for ProductionRuntimeService {
                 ConversationStore::load(&self.store, &runtime.agent_id, &runtime.conversation_id)
                     .await
                     .map_err(runtime_service_error)?;
+            let _start_guard = self.state.runtime_starts.lock().await;
             let install = self.ensure_runtime(&runtime)?;
             if install.created {
                 let payload = lotta_extensions::hooks::events::lifecycle_payload(
@@ -3287,6 +3286,17 @@ impl TurnEffectPort for ProductionEffects {
     fn emit(&self, event: TurnEvent) -> EffectResult {
         #[cfg(test)]
         let cancelled = matches!(&event, TurnEvent::Cancelled);
+        let terminal = matches!(
+            &event,
+            TurnEvent::Finished { .. } | TurnEvent::Cancelled | TurnEvent::Failed { .. }
+        );
+        if terminal {
+            self.runtime_state
+                .executing_tools
+                .lock()
+                .map_err(|_| effect_error("executing tool state"))?
+                .remove(&RuntimeKey::from(&self.scope));
+        }
         let tool_end = match &event {
             TurnEvent::ToolResult(result) => Some(result.call_id.as_str().to_owned()),
             _ => None,

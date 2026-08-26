@@ -276,11 +276,14 @@ impl RuntimeRouter {
         batches
             .try_reserve_exact(events.len())
             .map_err(|_| crate::error::AppServerError::Unavailable)?;
-        for event in events.as_slice() {
-            let delivery = self.connections.deliver_to(
+        for (index, event) in events.as_slice().iter().enumerate() {
+            let offset =
+                u64::try_from(index + 1).map_err(|_| crate::error::AppServerError::Internal)?;
+            let delivery = self.connections.stage_delivery(
                 connection,
                 runtime,
                 event,
+                offset,
                 self.clock.as_ref(),
                 self.ids.as_ref(),
             )?;
@@ -290,10 +293,17 @@ impl RuntimeRouter {
                 deliveries: bounded_deliveries(vec![delivery])?,
             });
         }
+        let responses = bounded_responses(response)?;
+        let event_batches =
+            BoundedVec::new(batches).map_err(|_| crate::error::AppServerError::PayloadTooLarge)?;
+        if let Some(last) = event_batches.as_slice().last() {
+            let sequence = last.deliveries.as_slice()[0].frame.event_seq;
+            self.connections
+                .commit_sequences(&[(connection, sequence)])?;
+        }
         Ok(RouteOutput {
-            responses: bounded_responses(response)?,
-            event_batches: BoundedVec::new(batches)
-                .map_err(|_| crate::error::AppServerError::PayloadTooLarge)?,
+            responses,
+            event_batches,
             response_after_events: true,
         })
     }

@@ -304,6 +304,48 @@ impl RuntimeConnections {
         })
     }
 
+    /// Commits staged event sequences after an entire routing batch succeeds.
+    ///
+    /// # Errors
+    /// Returns when a connection disappeared or its sequence changed meanwhile.
+    pub(crate) fn commit_sequences(
+        &mut self,
+        staged: &[(ConnectionId, u64)],
+    ) -> Result<(), crate::error::AppServerError> {
+        for (id, sequence) in staged {
+            if self.entry_mut(*id)?.event_seq >= *sequence {
+                return Err(crate::error::AppServerError::Internal);
+            }
+        }
+        for (id, sequence) in staged {
+            self.entry_mut(*id)?.event_seq = *sequence;
+        }
+        Ok(())
+    }
+
+    /// Stamps a replay frame without advancing the authoritative sequence.
+    pub(crate) fn stage_delivery(
+        &mut self,
+        id: ConnectionId,
+        scope: &RuntimeScope,
+        event: &RuntimeEvent,
+        offset: u64,
+        clock: &(dyn lotta_domain::Clock + Send + Sync),
+        ids: &dyn super::envelope::EventIdGenerator,
+    ) -> Result<EventDelivery, crate::error::AppServerError> {
+        let connection = self.entry_mut(id)?;
+        let sequence = connection
+            .event_seq
+            .checked_add(offset)
+            .ok_or(crate::error::AppServerError::Internal)?;
+        let ordinal = connection.ordinal;
+        let frame = super::envelope::stamp(event.clone(), scope.clone(), sequence, clock, ids)?;
+        Ok(EventDelivery {
+            connection_id: id,
+            ordinal,
+            frame,
+        })
+    }
     /// Stamps one logical event independently for subscribers in ordinal order.
     ///
     /// # Errors
