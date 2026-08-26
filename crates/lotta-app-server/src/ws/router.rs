@@ -175,7 +175,7 @@ impl RuntimeRouter {
         ids: Arc<dyn super::envelope::EventIdGenerator>,
     ) -> Self {
         Self {
-            connections: RuntimeConnections::default(),
+            connections: RuntimeConnections::with_clock(Arc::clone(&clock)),
             clock,
             ids,
         }

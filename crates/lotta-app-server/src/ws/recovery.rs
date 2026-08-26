@@ -91,6 +91,38 @@ mod reconnect {
             .expect_err("live identity cannot be replaced");
         assert!(matches!(error, crate::error::AppServerError::Forbidden));
     }
+
+    #[test]
+    fn deterministic_clock_expires_suspended_lease_at_ttl() {
+        use chrono::Duration;
+        use lotta_domain::{Clock, Timestamp};
+        use lotta_testkit::clock::FakeClock;
+        let start = Timestamp::parse_persisted_rfc3339("2026-08-14T12:00:00Z")
+            .unwrap_or_else(|error| panic!("timestamp: {error}"));
+        let clock = std::sync::Arc::new(FakeClock::new(start));
+        let mut connections = crate::ws::connection::RuntimeConnections::with_clock(
+            clock.clone() as std::sync::Arc<dyn Clock + Send + Sync>
+        );
+        let identity = ReconnectIdentity {
+            listener_instance: "listener".into(),
+            principal: "principal".into(),
+            client_id: "device".into(),
+        };
+        let original = connections
+            .open_authenticated(Some(&identity))
+            .unwrap_or_else(|error| panic!("open: {error}"));
+        connections.set_event_seq(original, 7);
+        connections.suspend(original);
+        clock
+            .advance(Duration::seconds(
+                crate::ws::connection::SUSPENDED_CONNECTION_TTL_SECONDS,
+            ))
+            .unwrap_or_else(|error| panic!("advance: {error}"));
+        let renewed = connections
+            .open_authenticated(Some(&identity))
+            .unwrap_or_else(|error| panic!("renew: {error}"));
+        assert_eq!(connections.event_seq(renewed), Some(0));
+    }
 }
 
 #[cfg(test)]

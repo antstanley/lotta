@@ -1,15 +1,12 @@
 use std::collections::HashMap;
 
 use lotta_domain::bounds::{CONNECTIONS_MAX, RUNTIME_SUBSCRIPTIONS_PER_CONNECTION_MAX};
-use std::{
-    hash::Hash,
-    time::{Duration, Instant},
-};
+use std::hash::Hash;
 
 /// Maximum suspended reconnect leases retained by one listener instance.
 pub const SUSPENDED_CONNECTIONS_MAX: usize = 1_024;
 /// Time after close during which an authenticated client can resume its lease.
-pub const SUSPENDED_CONNECTION_TTL: Duration = Duration::from_secs(300);
+pub const SUSPENDED_CONNECTION_TTL_SECONDS: i64 = 300;
 use lotta_domain::{BoundedVec, NonEmptyString, RuntimeConnection, RuntimeScope};
 
 use super::{envelope::StampedRuntimeEvent, event::RuntimeEvent};
@@ -30,7 +27,7 @@ pub struct ReconnectIdentity {
 
 struct SuspendedConnection {
     connection: RuntimeConnection,
-    suspended_at: Instant,
+    suspended_at: lotta_domain::Timestamp,
 }
 
 /// One ordered, connection-specific delivery.
@@ -48,6 +45,7 @@ pub struct EventDelivery {
 pub struct RuntimeConnections {
     entries: HashMap<ConnectionId, RuntimeConnection>,
     suspended: HashMap<ReconnectIdentity, SuspendedConnection>,
+    clock: std::sync::Arc<dyn lotta_domain::Clock + Send + Sync>,
     next_id: ConnectionId,
     next_ordinal: u64,
 }
@@ -71,18 +69,19 @@ fn reconnect_identity_from_name(value: &str) -> Option<ReconnectIdentity> {
     })
 }
 
-impl Default for RuntimeConnections {
-    fn default() -> Self {
+impl RuntimeConnections {
+    /// Creates a registry using the supplied deterministic lease clock.
+    #[must_use]
+    pub fn with_clock(clock: std::sync::Arc<dyn lotta_domain::Clock + Send + Sync>) -> Self {
         Self {
             entries: HashMap::new(),
             suspended: HashMap::new(),
+            clock,
             next_id: 1,
             next_ordinal: 1,
         }
     }
-}
 
-impl RuntimeConnections {
     /// Opens an uninitialized stable connection.
     ///
     /// # Errors
@@ -195,14 +194,19 @@ impl RuntimeConnections {
             identity,
             SuspendedConnection {
                 connection,
-                suspended_at: Instant::now(),
+                suspended_at: self.clock.now(),
             },
         );
     }
 
     fn purge_expired(&mut self) {
-        self.suspended
-            .retain(|_, lease| lease.suspended_at.elapsed() < SUSPENDED_CONNECTION_TTL);
+        let now = self.clock.now();
+        self.suspended.retain(|_, lease| {
+            now.as_utc()
+                .signed_duration_since(lease.suspended_at.as_utc())
+                .num_seconds()
+                < SUSPENDED_CONNECTION_TTL_SECONDS
+        });
     }
 
     fn evict_oldest_suspended(&mut self) {

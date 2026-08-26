@@ -257,6 +257,60 @@ fn post_turn_capabilities() -> PostTurnCapabilities {
     (reflection, memory_push, reflection_port, memory_port)
 }
 
+fn production_observer() -> Arc<lotta_runtime::observe::RuntimeObserver> {
+    let sink: Arc<dyn lotta_runtime::observe::events::RuntimeEventSink> =
+        Arc::new(lotta_runtime::observe::events::FanoutRuntimeEventSink::new(
+            vec![Arc::new(lotta_telemetry::TracingRuntimeEventSink)],
+        ));
+    Arc::new(lotta_runtime::observe::RuntimeObserver::new(sink))
+}
+
+fn production_device_authority(
+    state: &Arc<ProductionRuntimeState>,
+    approvals: &Arc<lotta_runtime::ApprovalManager>,
+    setup: &Arc<ProductionSetupPorts>,
+    shared: &lotta_app_server::listener::SharedGroupBridges,
+    shell: &Arc<ShellToolBundle>,
+    workspace: &Path,
+) -> Arc<ProductionDeviceSnapshotAuthority> {
+    Arc::new(ProductionDeviceSnapshotAuthority {
+        state: Arc::clone(state),
+        approvals: Arc::clone(approvals),
+        setup: Arc::clone(setup),
+        settings: shared.settings(),
+        shell: Arc::clone(shell),
+        workspace: workspace.to_path_buf(),
+    })
+}
+
+struct RuntimeServiceParts<'a> {
+    paths: &'a StorePaths,
+    clock: &'a Arc<dyn Clock + Send + Sync>,
+    setup: &'a Arc<ProductionSetupPorts>,
+    state: &'a Arc<ProductionRuntimeState>,
+    approvals: &'a Arc<lotta_runtime::ApprovalManager>,
+    brokers: &'a Arc<ProductionTurnBrokers>,
+    shared: &'a lotta_app_server::listener::SharedGroupBridges,
+    tasks: Arc<TaskLifecyclePort>,
+    device: &'a Arc<ProductionDeviceSnapshotAuthority>,
+}
+
+fn production_runtime_service(parts: RuntimeServiceParts<'_>) -> Arc<ProductionRuntimeService> {
+    Arc::new(ProductionRuntimeService::new(
+        parts.paths.clone(),
+        ProductionRuntimeDependencies {
+            clock: Arc::clone(parts.clock),
+            hooks: parts.setup.hook_runtime(),
+            state: Arc::clone(parts.state),
+            approvals: Arc::clone(parts.approvals),
+            brokers: Arc::clone(parts.brokers),
+            settings: parts.shared.settings(),
+            tasks: parts.tasks,
+            device_authority: Some(Arc::clone(parts.device)),
+        },
+    ))
+}
+
 impl ProductionComponents {
     /// Builds concrete local production dependencies before listener bind.
     ///
@@ -267,70 +321,63 @@ impl ProductionComponents {
         clock: Arc<dyn Clock + Send + Sync>,
     ) -> Result<Self, SetupError> {
         let root = prepared.storage_dir.clone();
-        let event_sink: Arc<dyn lotta_runtime::observe::events::RuntimeEventSink> =
-            Arc::new(lotta_runtime::observe::events::FanoutRuntimeEventSink::new(
-                vec![Arc::new(lotta_telemetry::TracingRuntimeEventSink)],
-            ));
-        let observer = Arc::new(lotta_runtime::observe::RuntimeObserver::new(event_sink));
         let workspace = prepared.workspace_dir.clone();
+        let observer = production_observer();
         let shared = lotta_app_server::listener::SharedGroupBridges::new(
             &root,
             &workspace,
             Arc::clone(&clock),
         )
         .map_err(|_| SetupError::Adapter("shared group bridge roots".into()))?;
-        let (store_paths, provider_runtime, setup, tools, approval_manager, shell, tasks) =
+        let (store_paths, provider_runtime, setup, tools, approvals, shell, tasks) =
             production_tooling(&root, &workspace)?;
         let provider = Arc::new(provider_runtime);
         let runtime_state = Arc::new(ProductionRuntimeState::new(Arc::clone(&observer)));
         let brokers = Arc::new(ProductionTurnBrokers::new());
         register_turn_authorities(&shared, &provider, &setup, &runtime_state, &brokers, &shell);
-        let device_authority = Arc::new(ProductionDeviceSnapshotAuthority {
-            state: Arc::clone(&runtime_state),
-            approvals: Arc::clone(&approval_manager),
-            setup: Arc::clone(&setup),
-            settings: shared.settings(),
-            shell: Arc::clone(&shell),
-            workspace: workspace.clone(),
+        let device = production_device_authority(
+            &runtime_state,
+            &approvals,
+            &setup,
+            &shared,
+            &shell,
+            &workspace,
+        );
+        let runtime_service = production_runtime_service(RuntimeServiceParts {
+            paths: &store_paths,
+            clock: &clock,
+            setup: &setup,
+            state: &runtime_state,
+            approvals: &approvals,
+            brokers: &brokers,
+            shared: &shared,
+            tasks,
+            device: &device,
         });
-        let runtime_service = Arc::new(ProductionRuntimeService::new(
-            store_paths.clone(),
-            ProductionRuntimeDependencies {
-                clock: Arc::clone(&clock),
-                hooks: setup.hook_runtime(),
-                state: Arc::clone(&runtime_state),
-                approvals: Arc::clone(&approval_manager),
-                brokers: Arc::clone(&brokers),
-                settings: shared.settings(),
-                tasks,
-                device_authority: Some(Arc::clone(&device_authority)),
-            },
-        ));
         shared.register_device_status_authority(Some(Arc::new({
-            let authority = Arc::clone(&device_authority);
+            let authority = Arc::clone(&device);
             move |connection, scope| authority.snapshot(connection, scope)
         })));
         let (reflection, memory_push, reflection_port, memory_port) = post_turn_capabilities();
         let turn_controller = Arc::new(ProductionTurnController::new(
-            Arc::clone(&setup),
-            Arc::clone(&provider),
-            Arc::clone(&tools),
+            setup,
+            provider,
+            tools,
             LocalStore::new(store_paths.clone()),
             Arc::clone(&clock),
             workspace,
-            Arc::clone(&runtime_state),
-            Arc::clone(&brokers),
-            Arc::clone(&approval_manager),
+            runtime_state,
+            brokers,
+            approvals,
             reflection_port,
             memory_port,
             shared.skills(),
             shared.settings(),
         ));
-        let post_turn_queue = lotta_store::PostTurnQueue::new(&LocalStore::new(store_paths));
         let components = Self {
             runtime_service,
             turn_controller,
-            post_turn_queue,
+            post_turn_queue: lotta_store::PostTurnQueue::new(&LocalStore::new(store_paths)),
             _observer: observer,
             reflection,
             memory_push,
