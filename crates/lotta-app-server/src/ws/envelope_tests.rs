@@ -300,8 +300,9 @@ fn overflow_does_not_mutate_or_call_generators() {
         .subscribe(id, scope(1))
         .unwrap_or_else(|e| panic!("sub:{e}"));
     r.connections.set_event_seq(id, u64::MAX);
+    let clock_calls = clock.calls.load(Ordering::SeqCst);
     assert!(r.broadcast(&scope(1), &event(2)).is_err());
-    assert_eq!(clock.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(clock.calls.load(Ordering::SeqCst), clock_calls);
     assert_eq!(ids.calls.load(Ordering::SeqCst), 0);
     assert_eq!(r.connections.event_seq(id), Some(u64::MAX));
     assert!(r.broadcast(&scope(1), &event(2)).is_err());

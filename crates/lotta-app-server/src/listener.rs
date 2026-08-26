@@ -72,6 +72,9 @@ mod url_resolution;
 #[cfg(test)]
 #[path = "listener/tests/websocket.rs"]
 mod websocket;
+#[cfg(test)]
+#[path = "listener/tests/reconnect_security.rs"]
+mod reconnect_security;
 
 /// Compatibility re-export of the canonical WebSocket frame ceiling.
 pub use crate::bounds::WS_FRAME_BYTES_MAX as FRAME_BYTES_MAX;
@@ -278,6 +281,46 @@ async fn start_listener_for_test(
         None,
     )
     .await
+}
+
+#[cfg(test)]
+async fn start_listener_with_state_for_test(
+    prepared: PreparedServer,
+    clock: Arc<dyn Clock + Send + Sync>,
+    runtime_service: Arc<dyn RuntimeCommandService>,
+) -> Result<(ListenerHandle, Arc<ListenerState>), AppServerError> {
+    let listener = TcpListener::bind(format_bind_address(&prepared.host, prepared.port))
+        .await
+        .map_err(|_| AppServerError::Listener)?;
+    let address = listener.local_addr().map_err(|_| AppServerError::Listener)?;
+    let (base_url, websocket_url, openai_url) = resolved_urls(&prepared, address);
+    let shutdown = CancellationToken::new();
+    let path = prepared.websocket_path.clone();
+    let state = compose_listener_state(
+        prepared,
+        &clock,
+        SocketLimits { frame_bytes: WS_FRAME_BYTES_MAX, ping_interval_ms: 3_600_000 },
+        RuntimeEndpoints::from_parts(
+            runtime_service,
+            Arc::new(UnsupportedRuntimeCommandService),
+            Arc::new(crate::observer::InertRuntimeBroadcastObserver),
+        ),
+        None,
+        shutdown.clone(),
+    )?;
+    register_device_runtime_ports(&state);
+    let server_shutdown = state.shutdown.clone();
+    let router = build_router(&path, Arc::clone(&state));
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(server_shutdown.cancelled_owned())
+            .await
+            .map_err(|_| AppServerError::Listener)
+    });
+    let handle = ListenerHandle {
+        address, base_url, websocket_url, openai_url, shutdown, task,
+    };
+    Ok((handle, state))
 }
 
 /// Command-group bridges composed once by the host process and shared with
@@ -839,7 +882,11 @@ fn authenticated_reconnect_identity(
         .to_str()
         .ok()?
         .trim();
-    if client_id.is_empty() || client_id.len() > 256 || !client_id.is_ascii() {
+    if client_id.is_empty()
+        || client_id.len() > 256
+        || !client_id.is_ascii()
+        || client_id.bytes().any(|byte| byte.is_ascii_control())
+    {
         return None;
     }
     let principal = state.auth.principal(headers).ok()?;

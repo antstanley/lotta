@@ -252,6 +252,15 @@ impl RuntimeConnections {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn inspect_active(&self) -> Vec<(ConnectionId, usize, u64)> {
+        let mut values: Vec<_> = self.entries.iter().map(|(id, connection)| {
+            (*id, connection.subscriptions.len(), connection.event_seq)
+        }).collect();
+        values.sort_by_key(|value| value.0);
+        values
+    }
+
     /// Returns the current distinct subscription count.
     #[must_use]
     pub fn subscription_count(&self, id: ConnectionId) -> Option<usize> {
