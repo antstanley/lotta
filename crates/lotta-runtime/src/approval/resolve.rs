@@ -1,3 +1,4 @@
+use super::RecoveryAction;
 use super::{ApprovalJournal, ApprovalRequest, ApprovalState};
 use crate::RuntimeError;
 use lotta_domain::{BoundedJsonValue, NonEmptyString, RuntimeScope};
@@ -424,50 +425,82 @@ impl ApprovalManager {
     ///
     /// # Errors
     /// Returns revision overflow or durable journal failures.
-    pub fn restart(
-        &self,
-        scope: &RuntimeScope,
-    ) -> Result<Vec<(ApprovalRequest, ApprovalRequest)>, RuntimeError> {
+    pub fn restart(&self, scope: &RuntimeScope) -> Result<Vec<RecoveryAction>, RuntimeError> {
         let _transaction = self.transaction()?;
-        let mut recovered = Vec::new();
-        for request in self.journal.port().list(scope)? {
-            if !matches!(
-                request.state,
-                ApprovalState::Pending | ApprovalState::Executing
-            ) {
-                continue;
-            }
-            let mut next = request.clone();
-            next.state = ApprovalState::Interrupted;
-            next.revision = next
-                .revision
-                .checked_add(1)
-                .ok_or_else(|| conflict("approval revision"))?;
-            if self
-                .journal
-                .port()
-                .compare_and_set(request.revision, next.clone())?
-            {
-                recovered.push((request, next));
+        let mut actions = Vec::new();
+        for request in self.sorted_requests(scope)? {
+            match request.state {
+                ApprovalState::Pending => actions.push(RecoveryAction::Replay(request)),
+                ApprovalState::Executing => {
+                    let interrupted = self.interrupt_for_restart(&request)?;
+                    actions.push(RecoveryAction::Interrupted {
+                        original: request,
+                        interrupted: Box::new(interrupted),
+                    });
+                }
+                ApprovalState::Expired => actions.push(RecoveryAction::Expired(request)),
+                ApprovalState::Interrupted => actions.push(RecoveryAction::Interrupted {
+                    original: request.clone(),
+                    interrupted: Box::new(request),
+                }),
+                _ => {}
             }
         }
-        Ok(recovered)
+        Ok(actions)
+    }
+
+    fn sorted_requests(&self, scope: &RuntimeScope) -> Result<Vec<ApprovalRequest>, RuntimeError> {
+        let mut requests = self.journal.port().list(scope)?;
+        requests.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.request_id.as_str().cmp(right.request_id.as_str()))
+        });
+        Ok(requests)
+    }
+
+    fn interrupt_for_restart(
+        &self,
+        request: &ApprovalRequest,
+    ) -> Result<ApprovalRequest, RuntimeError> {
+        let mut next = request.clone();
+        next.state = ApprovalState::Interrupted;
+        next.revision = next
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| conflict("approval revision"))?;
+        if self
+            .journal
+            .port()
+            .compare_and_set(request.revision, next.clone())?
+        {
+            Ok(next)
+        } else {
+            Err(conflict("approval restart revision"))
+        }
     }
 
     /// Restores restart transitions when runtime initialization is rolled back.
     ///
     /// # Errors
     /// Returns a durable conflict or journal failure.
-    pub fn rollback_restart(
-        &self,
-        recovered: &[(ApprovalRequest, ApprovalRequest)],
-    ) -> Result<(), RuntimeError> {
+    pub fn rollback_restart(&self, actions: &[RecoveryAction]) -> Result<(), RuntimeError> {
         let _transaction = self.transaction()?;
-        for (prior, interrupted) in recovered {
+        for action in actions.iter().rev() {
+            let RecoveryAction::Interrupted {
+                original,
+                interrupted,
+            } = action
+            else {
+                continue;
+            };
+            if original.revision == interrupted.revision {
+                continue;
+            }
             if !self
                 .journal
                 .port()
-                .compare_and_set(interrupted.revision, prior.clone())?
+                .compare_and_set(interrupted.revision, original.clone())?
             {
                 return Err(conflict("approval restart rollback"));
             }

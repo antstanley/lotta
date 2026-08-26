@@ -11,8 +11,13 @@ pub enum RecoveryAction {
     Replay(ApprovalRequest),
     /// Emit an explicit expired terminal state.
     Expired(ApprovalRequest),
-    /// Emit an explicit interrupted terminal state; no execution is inferred.
-    Interrupted(ApprovalRequest),
+    /// Emit an explicit interrupted terminal state while retaining the original durable state.
+    Interrupted {
+        /// Exact record before restart recovery mutated it.
+        original: ApprovalRequest,
+        /// Durable interrupted record published to clients.
+        interrupted: Box<ApprovalRequest>,
+    },
 }
 
 /// Recovery policy over the durable journal.
@@ -43,7 +48,10 @@ impl ApprovalRecovery {
                 .filter_map(|request| match request.state {
                     ApprovalState::Pending => Some(RecoveryAction::Replay(request)),
                     ApprovalState::Expired => Some(RecoveryAction::Expired(request)),
-                    ApprovalState::Interrupted => Some(RecoveryAction::Interrupted(request)),
+                    ApprovalState::Interrupted => Some(RecoveryAction::Interrupted {
+                        original: request.clone(),
+                        interrupted: Box::new(request),
+                    }),
                     _ => None,
                 })
                 .take(APPROVAL_SYNC_REPLAY_MAX)
@@ -60,7 +68,11 @@ impl ApprovalRecovery {
         for request in self.journal.port().list(scope)? {
             match request.state {
                 ApprovalState::Pending | ApprovalState::Executing => {
-                    actions.push(RecoveryAction::Interrupted(self.interrupt(&request)?));
+                    let interrupted = self.interrupt(&request)?;
+                    actions.push(RecoveryAction::Interrupted {
+                        original: request,
+                        interrupted: Box::new(interrupted),
+                    });
                 }
                 _ => {}
             }

@@ -290,7 +290,8 @@ pub mod resolutions {
             .unwrap();
         assert!(matches!(
             &actions[0],
-            RecoveryAction::Interrupted(r) if r.state == ApprovalState::Interrupted
+            RecoveryAction::Interrupted { interrupted: r, .. }
+                if r.state == ApprovalState::Interrupted
         ));
     }
 
@@ -361,7 +362,8 @@ pub mod recovery {
             .unwrap();
         assert!(matches!(
             &actions[0],
-            RecoveryAction::Interrupted(r) if r.state == ApprovalState::Interrupted
+            RecoveryAction::Interrupted { interrupted: r, .. }
+                if r.state == ApprovalState::Interrupted
         ));
     }
     #[test]
@@ -430,7 +432,8 @@ pub mod timeout_interrupts {
             .unwrap();
         assert!(matches!(
             &actions[0],
-            RecoveryAction::Interrupted(r) if r.state == ApprovalState::Interrupted
+            RecoveryAction::Interrupted { interrupted: r, .. }
+                if r.state == ApprovalState::Interrupted
         ));
     }
 }

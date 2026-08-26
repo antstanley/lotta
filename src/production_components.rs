@@ -1302,10 +1302,7 @@ pub(crate) struct ProductionRuntimeService {
 struct RuntimeInstall {
     handle: lotta_runtime::RuntimeHandle,
     created: bool,
-    recovered: Vec<(
-        lotta_runtime::ApprovalRequest,
-        lotta_runtime::ApprovalRequest,
-    )>,
+    recovered: Vec<lotta_runtime::RecoveryAction>,
 }
 
 impl ProductionRuntimeService {
@@ -2243,30 +2240,74 @@ fn sync_approval_broadcasts(
     scope: &RuntimeScope,
     lease_generation: Option<u64>,
 ) -> Result<Vec<lotta_app_server::ws::RuntimeEvent>, AppServerError> {
-    let mut broadcasts = Vec::new();
-    for request in service
+    let requests = service
         .approvals
         .pending_snapshot(scope, lease_generation)
-        .map_err(runtime_service_error)?
-    {
-        let payload = lotta_app_server::ws::event::ApprovalRequest {
-            subtype: lotta_app_server::ws::event::ApprovalSubtype::CanUseTool,
-            tool_call_id: request.tool_call_id,
-            tool_name: request.tool_name,
-            input: BoundedJsonValue::new(request.original_input.as_value().clone())
-                .map_err(|_| AppServerError::Internal)?,
-            permission_suggestions: Vec::new(),
-            blocked_path: None,
-            diffs: None,
-        };
-        broadcasts.push(lotta_app_server::ws::RuntimeEvent::ControlRequest {
-            request_id: request.request_id,
-            request: payload,
-            agent_id: NonEmptyString::new(scope.agent_id.as_str().to_owned()).ok(),
-            conversation_id: NonEmptyString::new(scope.conversation_id.as_str().to_owned()).ok(),
-        });
-    }
-    Ok(broadcasts)
+        .map_err(runtime_service_error)?;
+    requests
+        .into_iter()
+        .map(|request| approval_replay_event(scope, request))
+        .collect()
+}
+
+fn recovery_broadcasts(
+    scope: &RuntimeScope,
+    actions: &[lotta_runtime::RecoveryAction],
+) -> Result<Vec<lotta_app_server::ws::RuntimeEvent>, AppServerError> {
+    actions
+        .iter()
+        .cloned()
+        .map(|action| match action {
+            lotta_runtime::RecoveryAction::Replay(request) => approval_replay_event(scope, request),
+            lotta_runtime::RecoveryAction::Expired(request) => {
+                approval_terminal_event(request, lotta_runtime::ApprovalState::Expired, None)
+            }
+            lotta_runtime::RecoveryAction::Interrupted {
+                original,
+                interrupted,
+            } => approval_terminal_event(
+                *interrupted,
+                lotta_runtime::ApprovalState::Interrupted,
+                Some(original.state),
+            ),
+        })
+        .collect()
+}
+
+fn approval_replay_event(
+    scope: &RuntimeScope,
+    request: lotta_runtime::ApprovalRequest,
+) -> Result<lotta_app_server::ws::RuntimeEvent, AppServerError> {
+    let payload = lotta_app_server::ws::event::ApprovalRequest {
+        subtype: lotta_app_server::ws::event::ApprovalSubtype::CanUseTool,
+        tool_call_id: request.tool_call_id,
+        tool_name: request.tool_name,
+        input: BoundedJsonValue::new(request.original_input.as_value().clone())
+            .map_err(|_| AppServerError::Internal)?,
+        permission_suggestions: Vec::new(),
+        blocked_path: None,
+        diffs: None,
+    };
+    Ok(lotta_app_server::ws::RuntimeEvent::ControlRequest {
+        request_id: request.request_id,
+        request: payload,
+        agent_id: NonEmptyString::new(scope.agent_id.as_str().to_owned()).ok(),
+        conversation_id: NonEmptyString::new(scope.conversation_id.as_str().to_owned()).ok(),
+    })
+}
+
+fn approval_terminal_event(
+    request: lotta_runtime::ApprovalRequest,
+    state: lotta_runtime::ApprovalState,
+    original_state: Option<lotta_runtime::ApprovalState>,
+) -> Result<lotta_app_server::ws::RuntimeEvent, AppServerError> {
+    Ok(lotta_app_server::ws::RuntimeEvent::ApprovalRecovery {
+        request_id: request.request_id,
+        tool_call_id: request.tool_call_id,
+        state,
+        original_state,
+        revision: request.revision,
+    })
 }
 
 impl RuntimeCommandService for ProductionRuntimeService {
@@ -2322,7 +2363,11 @@ impl RuntimeCommandService for ProductionRuntimeService {
                     .and_then(|owner| owner.projection().lease_generation())
             };
             let broadcasts = if command.recover_approvals {
-                sync_approval_broadcasts(self, &runtime, lease_generation)?
+                if install.created {
+                    recovery_broadcasts(&runtime, &install.recovered)?
+                } else {
+                    sync_approval_broadcasts(self, &runtime, lease_generation)?
+                }
             } else {
                 Vec::new()
             };

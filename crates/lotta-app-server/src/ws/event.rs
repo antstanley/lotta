@@ -464,6 +464,21 @@ pub enum RuntimeEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         conversation_id: Option<NonEmptyString>,
     },
+    /// Explicit terminal state recovered from the durable approval journal.
+    #[serde(rename = "approval_recovery")]
+    ApprovalRecovery {
+        /// Stable request identifier.
+        request_id: NonEmptyString,
+        /// Provider tool-call identifier.
+        tool_call_id: NonEmptyString,
+        /// Explicit terminal state.
+        state: lotta_runtime::ApprovalState,
+        /// Durable state before restart mutation, when one occurred.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        original_state: Option<lotta_runtime::ApprovalState>,
+        /// Current durable revision.
+        revision: u64,
+    },
     /// Controller-owned external tool execution request.
     #[serde(rename = "controller_tool_request")]
     ControllerToolRequest {
@@ -543,6 +558,7 @@ impl RuntimeEvent {
     pub const fn discriminant(&self) -> &'static str {
         match self {
             Self::ControlRequest { .. } => "control_request",
+            Self::ApprovalRecovery { .. } => "approval_recovery",
             Self::ControllerToolRequest { .. } => "controller_tool_request",
             Self::CompactionRequest { .. } => "compaction_request",
             Self::UpdateDeviceStatus { .. } => "update_device_status",
