@@ -296,42 +296,30 @@ pub mod resolutions {
     }
 
     #[test]
-    fn waiter_registration_and_resolution_have_no_lost_wakeup() {
-        for index in 0..100 {
+    fn registered_waiter_delivers_fast_resolution_after_publication_barrier() {
+        for index in 0..1_000 {
             let (_, manager) = manager();
             let manager = Arc::new(manager);
             let row = manager
                 .store_request(request(&format!("race-{index}"), scope("race")))
                 .unwrap();
+            let receiver = manager.register_waiter(&row).unwrap();
             let barrier = Arc::new(std::sync::Barrier::new(2));
-            let registration = {
+            let resolution = {
                 let manager = Arc::clone(&manager);
                 let row = row.clone();
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    manager.register_waiter(&row)
-                })
-            };
-            let resolution = {
-                let manager = Arc::clone(&manager);
-                let row = row.clone();
-                std::thread::spawn(move || {
-                    barrier.wait();
                     manager.resolve(&input(&row, ApprovalResolution::Allow), 7)
                 })
             };
-            let registered = registration.join().unwrap();
-            let resolved = resolution.join().unwrap();
-            assert!(resolved.is_ok());
-            match registered {
-                Ok(receiver) => assert_eq!(
-                    receiver.blocking_recv().unwrap().resolution,
-                    ApprovalResolution::Allow
-                ),
-                Err(RuntimeError::Conflict { .. }) => {}
-                Err(error) => panic!("unexpected registration error: {error}"),
-            }
+            barrier.wait();
+            assert!(resolution.join().unwrap().is_ok());
+            assert_eq!(
+                receiver.blocking_recv().unwrap().resolution,
+                ApprovalResolution::Allow
+            );
         }
     }
 }

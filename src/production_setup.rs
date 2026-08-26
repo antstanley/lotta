@@ -1917,6 +1917,9 @@ struct ApprovalBrokerAdapter {
     input_id: NonEmptyString,
     lease_generation: u64,
     clock: Arc<dyn lotta_domain::Clock + Send + Sync>,
+    receiver: std::sync::Mutex<
+        Option<tokio::sync::oneshot::Receiver<lotta_runtime::approval::ApprovalResolveOutcome>>,
+    >,
 }
 
 fn delivered_resolution(
@@ -1970,6 +1973,33 @@ impl lotta_runtime::turn::ApprovalPort for ApprovalBrokerAdapter {
         Ok(())
     }
 
+    fn register_waiter(
+        &self,
+        request: &lotta_runtime::turn::ControlRequest,
+    ) -> Result<(), RuntimeError> {
+        let canonical = self
+            .manager
+            .get_request(&self.scope, &request.request_id)?
+            .ok_or_else(|| broker_error("approval request missing"))?;
+        let receiver = self.manager.register_waiter(&canonical)?;
+        *self
+            .receiver
+            .lock()
+            .map_err(|_| broker_error("approval receiver lock"))? = Some(receiver);
+        Ok(())
+    }
+
+    fn rollback_request(
+        &self,
+        request: &lotta_runtime::turn::ControlRequest,
+    ) -> Result<(), RuntimeError> {
+        let canonical = self
+            .manager
+            .get_request(&self.scope, &request.request_id)?
+            .ok_or_else(|| broker_error("approval request missing"))?;
+        self.manager.rollback_request(&canonical)
+    }
+
     fn await_resolution(
         &self,
         request: lotta_runtime::turn::ControlRequest,
@@ -1978,7 +2008,17 @@ impl lotta_runtime::turn::ApprovalPort for ApprovalBrokerAdapter {
         let manager = Arc::clone(&self.manager);
         let scope = self.scope.clone();
         let lease_generation = self.lease_generation;
+        let receiver = self
+            .receiver
+            .lock()
+            .map_err(|_| broker_error("approval receiver lock"))
+            .and_then(|mut receiver| {
+                receiver
+                    .take()
+                    .ok_or_else(|| broker_error("approval waiter missing"))
+            });
         Box::pin(async move {
+            let mut receiver = receiver?;
             if request.lease_generation != lease_generation {
                 return Err(broker_error("stale approval lease"));
             }
@@ -1992,7 +2032,6 @@ impl lotta_runtime::turn::ApprovalPort for ApprovalBrokerAdapter {
                     context: "approval expired".into(),
                 });
             }
-            let mut receiver = manager.register_waiter(&canonical)?;
             let remaining = canonical
                 .expires_at
                 .as_utc()
@@ -3070,6 +3109,7 @@ impl ProductionTurnController {
             input_id: effects.input_id.clone(),
             lease_generation: pending.lease.generation(),
             clock: Arc::clone(&self.clock),
+            receiver: std::sync::Mutex::new(None),
         }
     }
 

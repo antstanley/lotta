@@ -209,6 +209,35 @@ impl ApprovalManager {
         }
     }
 
+    /// Removes one exact unpublished pending request and its transient waiter.
+    ///
+    /// # Errors
+    /// Returns a stale request, durable journal, or waiter lock failure.
+    pub fn rollback_request(&self, request: &ApprovalRequest) -> Result<(), RuntimeError> {
+        let _transaction = self.transaction()?;
+        let canonical = self
+            .journal
+            .port()
+            .get(&request.scope, &request.request_id)?
+            .ok_or_else(|| not_found("approval request"))?;
+        if canonical.state != ApprovalState::Pending
+            || canonical.revision != request.revision
+            || canonical.tool_call_id != request.tool_call_id
+            || canonical.lease_generation != request.lease_generation
+        {
+            return Err(conflict("approval rollback request"));
+        }
+        self.remove_waiter_unlocked(request)?;
+        if !self
+            .journal
+            .port()
+            .remove(&request.scope, &request.request_id)?
+        {
+            return Err(conflict("approval rollback remove"));
+        }
+        Ok(())
+    }
+
     /// Validates one exact pending revision without mutating durable or transient state.
     ///
     /// # Errors

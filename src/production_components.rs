@@ -2362,6 +2362,7 @@ impl RuntimeCommandService for ProductionRuntimeService {
                     .lifecycle(&install.handle)
                     .and_then(|owner| owner.projection().lease_generation())
             };
+            self.update_residency(&runtime, &install.handle)?;
             let broadcasts = if command.recover_approvals {
                 if install.created {
                     recovery_broadcasts(&runtime, &install.recovered)?
@@ -5446,6 +5447,51 @@ mod production_tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn ordinary_runtime_start_evicts_quiescent_idle_runtime() {
+        let service = service();
+        let target = scope("idle-start-eviction");
+        seed_controller_store(&service.store.paths().clone(), &target).await;
+        let outcome = service
+            .runtime_start(
+                1,
+                RuntimeStartCommand {
+                    request_id: NonEmptyString::new("idle-start").unwrap(),
+                    agent_id: NonEmptyString::new(target.agent_id.as_str().to_owned()).ok(),
+                    create_agent: None,
+                    conversation_id: NonEmptyString::new(
+                        target.conversation_id.as_str().to_owned(),
+                    )
+                    .ok(),
+                    create_conversation: None,
+                    cwd: None,
+                    mode: None,
+                    conversation_source_tags: None,
+                    workspace_sandbox: None,
+                    skill_sources: None,
+                    preserve_skill_sources: None,
+                    client_info: None,
+                    recover_approvals: false,
+                    force_device_status: None,
+                    wait_for_replay: None,
+                    external_tools: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.runtime, target);
+        assert!(
+            service
+                .state
+                .inner
+                .lock()
+                .await
+                .registry
+                .lookup(&RuntimeKey::from(&target))
+                .is_none()
+        );
     }
 
     #[tokio::test]

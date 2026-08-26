@@ -164,7 +164,17 @@ pub trait ApprovalPort: Send + Sync {
     /// # Errors
     /// Returns a journal conflict, capacity, or persistence failure.
     fn store_request(&self, request: ControlRequest) -> Result<(), RuntimeError>;
-    /// Waits for a matching resolution, cancellation, or the approval deadline.
+    /// Registers the matching resolution waiter before the request becomes visible.
+    ///
+    /// # Errors
+    /// Returns a missing, stale, duplicate, or backend registration failure.
+    fn register_waiter(&self, request: &ControlRequest) -> Result<(), RuntimeError>;
+    /// Removes the waiter and rolls back an unpublished durable request.
+    ///
+    /// # Errors
+    /// Returns a backend cleanup failure.
+    fn rollback_request(&self, request: &ControlRequest) -> Result<(), RuntimeError>;
+    /// Waits for the previously registered resolution, cancellation, or deadline.
     fn await_resolution(
         &self,
         request: ControlRequest,
@@ -1658,13 +1668,18 @@ async fn approve_branch(
         .approvals
         .ok_or_else(|| unavailable("approval backend"))?;
     approval.store_request(request.clone())?;
-    match turn.guard.apply_after_await(turn.runtime, || {
+    approval.register_waiter(&request)?;
+    let publication = match turn.guard.apply_after_await(turn.runtime, || {
         turn.effects.persist_control_request(&request)?;
         turn.effects
             .emit(TurnEvent::ControlRequest(request.clone()))
     }) {
-        LeaseEffect::Applied(effect) => effect?,
-        LeaseEffect::Suppressed(_) => return Err(cancelled("approval suppressed")),
+        LeaseEffect::Applied(effect) => effect,
+        LeaseEffect::Suppressed(_) => Err(cancelled("approval suppressed")),
+    };
+    if let Err(error) = publication {
+        approval.rollback_request(&request)?;
+        return Err(error);
     }
     let resolution = approval
         .await_resolution(request.clone(), turn.request.cancellation.clone())

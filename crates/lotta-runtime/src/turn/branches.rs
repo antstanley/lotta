@@ -45,6 +45,12 @@ impl ApprovalPort for CapturingApproval {
         self.requests.lock().unwrap().push(request);
         Ok(())
     }
+    fn register_waiter(&self, _: &ControlRequest) -> Result<(), crate::RuntimeError> {
+        Ok(())
+    }
+    fn rollback_request(&self, _: &ControlRequest) -> Result<(), crate::RuntimeError> {
+        Ok(())
+    }
     fn await_resolution(
         &self,
         _: ControlRequest,
@@ -163,6 +169,12 @@ impl ApprovalPort for Approval {
     fn store_request(&self, request: ControlRequest) -> Result<(), crate::RuntimeError> {
         assert_eq!(request.call_id, id("call"));
         self.requests.lock().unwrap().push(request);
+        Ok(())
+    }
+    fn register_waiter(&self, _: &ControlRequest) -> Result<(), crate::RuntimeError> {
+        Ok(())
+    }
+    fn rollback_request(&self, _: &ControlRequest) -> Result<(), crate::RuntimeError> {
         Ok(())
     }
     fn await_resolution(
