@@ -20,8 +20,11 @@ pub type RuntimeEventBatch = BoundedVec<RuntimeEvent, WS_RUNTIME_ROUTE_EVENTS_MA
 pub type ServiceFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, crate::error::AppServerError>> + Send + 'a>>;
 /// Narrow scope-aware authoritative device snapshot port.
-pub type DeviceSnapshotSource =
-    Arc<dyn Fn(&RuntimeScope) -> Result<DeviceStatus, crate::error::AppServerError> + Send + Sync>;
+pub type DeviceSnapshotSource = Arc<
+    dyn Fn(super::ConnectionId, &RuntimeScope) -> Result<DeviceStatus, crate::error::AppServerError>
+        + Send
+        + Sync,
+>;
 
 /// Successful runtime resolution and initial snapshots.
 pub struct RuntimeStartOutcome {
@@ -112,8 +115,11 @@ pub trait TurnController: Send + Sync {
 /// Injectable application seam for the five Runtime-group commands.
 pub trait RuntimeCommandService: Send + Sync {
     /// Resolves or creates a runtime.
-    fn runtime_start(&self, command: RuntimeStartCommand)
-    -> ServiceFuture<'_, RuntimeStartOutcome>;
+    fn runtime_start(
+        &self,
+        connection: super::ConnectionId,
+        command: RuntimeStartCommand,
+    ) -> ServiceFuture<'_, RuntimeStartOutcome>;
     /// Performs bounded input admission only.
     fn admit_input(&self, command: InputCommand) -> ServiceFuture<'_, InputAdmission>;
     /// Continues admitted input after its acknowledgement was dispatched.
@@ -132,7 +138,11 @@ pub trait RuntimeCommandService: Send + Sync {
         request: ProviderRequest,
     ) -> ServiceFuture<'_, CompactionProgress>;
     /// Replays runtime state.
-    fn sync(&self, command: SyncCommand) -> ServiceFuture<'_, SyncOutcome>;
+    fn sync(
+        &self,
+        connection: super::ConnectionId,
+        command: SyncCommand,
+    ) -> ServiceFuture<'_, SyncOutcome>;
     /// Installs the listener-owned authoritative device snapshot source.
     fn register_device_snapshot_source(&self, _source: DeviceSnapshotSource) {}
     /// Aborts runtime work.
@@ -190,7 +200,11 @@ fn unsupported<'a, T>() -> ServiceFuture<'a, T> {
 }
 
 impl RuntimeCommandService for UnsupportedRuntimeCommandService {
-    fn runtime_start(&self, _: RuntimeStartCommand) -> ServiceFuture<'_, RuntimeStartOutcome> {
+    fn runtime_start(
+        &self,
+        _: super::ConnectionId,
+        _: RuntimeStartCommand,
+    ) -> ServiceFuture<'_, RuntimeStartOutcome> {
         unsupported()
     }
     fn admit_input(&self, _: InputCommand) -> ServiceFuture<'_, InputAdmission> {
@@ -213,7 +227,7 @@ impl RuntimeCommandService for UnsupportedRuntimeCommandService {
     ) -> ServiceFuture<'_, CompactionProgress> {
         unsupported()
     }
-    fn sync(&self, _: SyncCommand) -> ServiceFuture<'_, SyncOutcome> {
+    fn sync(&self, _: super::ConnectionId, _: SyncCommand) -> ServiceFuture<'_, SyncOutcome> {
         unsupported()
     }
     fn abort_message(&self, _: AbortMessageCommand) -> ServiceFuture<'_, AbortOutcome> {

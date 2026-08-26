@@ -137,6 +137,7 @@ impl RecordingService {
 impl RuntimeCommandService for RecordingService {
     fn runtime_start(
         &self,
+        _: ConnectionId,
         _: command::RuntimeStartCommand,
     ) -> ServiceFuture<'_, RuntimeStartOutcome> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -195,7 +196,7 @@ impl RuntimeCommandService for RecordingService {
     ) -> ServiceFuture<'_, lotta_runtime::turn::CompactionProgress> {
         Box::pin(async { Err(crate::error::AppServerError::Unavailable) })
     }
-    fn sync(&self, _: command::SyncCommand) -> ServiceFuture<'_, SyncOutcome> {
+    fn sync(&self, _: ConnectionId, _: command::SyncCommand) -> ServiceFuture<'_, SyncOutcome> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async {
             Ok(SyncOutcome {

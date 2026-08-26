@@ -9,7 +9,9 @@ use super::APPROVAL_SYNC_REPLAY_MAX;
 pub enum RecoveryAction {
     /// Re-emit a still-pending request on reconnect.
     Replay(ApprovalRequest),
-    /// Emit an explicit terminal state; no execution is inferred.
+    /// Emit an explicit expired terminal state.
+    Expired(ApprovalRequest),
+    /// Emit an explicit interrupted terminal state; no execution is inferred.
     Interrupted(ApprovalRequest),
 }
 
@@ -38,15 +40,12 @@ impl ApprovalRecovery {
             });
             requests
                 .into_iter()
-                .filter(|request| {
-                    matches!(
-                        request.state,
-                        ApprovalState::Pending
-                            | ApprovalState::Expired
-                            | ApprovalState::Interrupted
-                    )
+                .filter_map(|request| match request.state {
+                    ApprovalState::Pending => Some(RecoveryAction::Replay(request)),
+                    ApprovalState::Expired => Some(RecoveryAction::Expired(request)),
+                    ApprovalState::Interrupted => Some(RecoveryAction::Interrupted(request)),
+                    _ => None,
                 })
-                .map(RecoveryAction::Replay)
                 .take(APPROVAL_SYNC_REPLAY_MAX)
                 .collect()
         })

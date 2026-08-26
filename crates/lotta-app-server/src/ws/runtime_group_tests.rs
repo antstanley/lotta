@@ -18,6 +18,7 @@ struct BlockingService {
 impl RuntimeCommandService for BlockingService {
     fn runtime_start(
         &self,
+        _: ConnectionId,
         _: command::RuntimeStartCommand,
     ) -> ServiceFuture<'_, RuntimeStartOutcome> {
         let entered = self.entered.clone();
@@ -55,7 +56,7 @@ impl RuntimeCommandService for BlockingService {
     ) -> ServiceFuture<'_, lotta_runtime::turn::CompactionProgress> {
         panic!("unused")
     }
-    fn sync(&self, _: command::SyncCommand) -> ServiceFuture<'_, SyncOutcome> {
+    fn sync(&self, _: ConnectionId, _: command::SyncCommand) -> ServiceFuture<'_, SyncOutcome> {
         panic!("unused")
     }
     fn abort_message(&self, _: command::AbortMessageCommand) -> ServiceFuture<'_, AbortOutcome> {

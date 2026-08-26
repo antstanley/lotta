@@ -216,7 +216,11 @@ fn management_row_emits_app_server_info() {
 struct RejectingService;
 
 impl RuntimeCommandService for RejectingService {
-    fn runtime_start(&self, _: RuntimeStartCommand) -> ServiceFuture<'_, RuntimeStartOutcome> {
+    fn runtime_start(
+        &self,
+        _: ConnectionId,
+        _: RuntimeStartCommand,
+    ) -> ServiceFuture<'_, RuntimeStartOutcome> {
         Box::pin(async { Err(AppServerError::Unavailable) })
     }
 
@@ -251,7 +255,7 @@ impl RuntimeCommandService for RejectingService {
         Box::pin(async { Err(AppServerError::Unavailable) })
     }
 
-    fn sync(&self, _: SyncCommand) -> ServiceFuture<'_, SyncOutcome> {
+    fn sync(&self, _: ConnectionId, _: SyncCommand) -> ServiceFuture<'_, SyncOutcome> {
         Box::pin(async { Err(AppServerError::Unavailable) })
     }
 

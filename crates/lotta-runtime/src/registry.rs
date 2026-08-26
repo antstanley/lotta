@@ -344,6 +344,25 @@ impl ListenerRuntime {
             .map_err(|_| queue_lock_error())
     }
 
+    /// Returns the exact handle's canonical admission history.
+    #[must_use]
+    pub fn current_admission_history(&self, handle: &RuntimeHandle) -> Option<&AdmissionHistory> {
+        self.current_entry(handle)
+            .map(|entry| &entry.admission_history)
+    }
+
+    /// Returns the exact handle's mutable canonical admission history.
+    ///
+    /// # Errors
+    /// Returns [`RuntimeError::NotFound`] for a missing or stale generation.
+    pub fn admission_history_mut(
+        &mut self,
+        handle: &RuntimeHandle,
+    ) -> Result<&mut AdmissionHistory, RuntimeError> {
+        self.current_entry_mut(handle)
+            .map(|entry| &mut entry.admission_history)
+    }
+
     /// Returns the exact handle's mutable lifecycle owner.
     ///
     /// # Errors
@@ -393,6 +412,17 @@ impl ListenerRuntime {
         };
         self.entries.insert(key.clone(), entry);
         Ok(RuntimeHandle { key, generation })
+    }
+
+    /// Removes an exact newly installed runtime generation.
+    ///
+    /// Used only to roll back failed initialization before the handle is published.
+    #[must_use]
+    pub fn rollback_create(&mut self, handle: &RuntimeHandle) -> bool {
+        if self.current_entry(handle).is_none() {
+            return false;
+        }
+        self.entries.remove(&handle.key).is_some()
     }
 
     /// Publishes auxiliary state and consults live lifecycle before synchronous eviction.

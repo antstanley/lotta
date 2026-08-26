@@ -80,11 +80,7 @@ const DEFAULT_OUTPUT_TOKENS: u64 = 4_096;
 const TRANSCRIPT_MANIFEST_SCHEMA_VERSION: u8 = 2;
 const TRANSCRIPT_SESSION_SCHEMA_VERSION: u8 = 3;
 
-type DeviceSnapshotSource = Arc<
-    dyn Fn(&RuntimeScope) -> Result<lotta_app_server::ws::event::DeviceStatus, AppServerError>
-        + Send
-        + Sync,
->;
+type DeviceSnapshotSource = lotta_app_server::ws::service::DeviceSnapshotSource;
 
 #[cfg(test)]
 pub(crate) type CancellationStageObserver =
@@ -827,7 +823,6 @@ pub(crate) struct ActiveAdmission {
     pub(crate) lease: lotta_domain::TurnLease,
     pub(crate) cancellation: CancellationToken,
     pub(crate) queue: Arc<std::sync::Mutex<lotta_runtime::ConversationQueue>>,
-    pub(crate) history: lotta_domain::AdmissionHistory,
 }
 
 #[cfg(test)]
@@ -1328,6 +1323,12 @@ pub(crate) struct ProductionRuntimeService {
     device_snapshot: Mutex<Option<DeviceSnapshotSource>>,
 }
 
+struct RuntimeInstall {
+    handle: lotta_runtime::RuntimeHandle,
+    created: bool,
+    recovered: Vec<lotta_runtime::ApprovalRequest>,
+}
+
 impl ProductionRuntimeService {
     fn new(store_paths: StorePaths, dependencies: ProductionRuntimeDependencies) -> Self {
         Self {
@@ -1376,6 +1377,7 @@ impl ProductionRuntimeService {
 
     fn device_snapshot(
         &self,
+        connection: lotta_app_server::ws::ConnectionId,
         scope: &RuntimeScope,
     ) -> Result<lotta_app_server::ws::event::DeviceStatus, AppServerError> {
         let source = self
@@ -1384,10 +1386,12 @@ impl ProductionRuntimeService {
             .map_err(|_| AppServerError::Internal)?
             .clone()
             .ok_or(AppServerError::Unavailable)?;
-        source(scope).or_else(|error| {
+        source(connection, scope).or_else(|error| {
             self.device_authority
                 .as_ref()
-                .map_or(Err(error), |authority| authority.snapshot(None, scope))
+                .map_or(Err(error), |authority| {
+                    authority.snapshot(Some(connection), scope)
+                })
         })
     }
 
@@ -1441,10 +1445,7 @@ impl ProductionRuntimeService {
             .map_err(|_| AppServerError::Internal)
     }
 
-    fn ensure_runtime(
-        &self,
-        scope: &RuntimeScope,
-    ) -> Result<(lotta_runtime::RuntimeHandle, bool), AppServerError> {
+    fn ensure_runtime(&self, scope: &RuntimeScope) -> Result<RuntimeInstall, AppServerError> {
         let mut state = self
             .state
             .inner
@@ -1464,20 +1465,40 @@ impl ProductionRuntimeService {
             .get_or_create(scope, owner)
             .map_err(runtime_service_error)?;
         drop(state);
-        if !existed {
+        let recovered = if existed {
+            Vec::new()
+        } else {
             self.approvals
                 .restart(scope)
-                .map_err(runtime_service_error)?;
-            if self
-                .approvals
-                .residency_count(scope)
                 .map_err(runtime_service_error)?
-                > 0
-            {
-                self.update_residency(scope, &handle)?;
-            }
+        };
+        if !recovered.is_empty() {
+            self.update_residency(scope, &handle)?;
         }
-        Ok((handle, !existed))
+        Ok(RuntimeInstall {
+            handle,
+            created: !existed,
+            recovered,
+        })
+    }
+
+    fn rollback_runtime_start(
+        &self,
+        _scope: &RuntimeScope,
+        install: &RuntimeInstall,
+    ) -> Result<(), AppServerError> {
+        self.approvals
+            .rollback_restart(&install.recovered)
+            .map_err(runtime_service_error)?;
+        let mut state = self
+            .state
+            .inner
+            .try_lock()
+            .map_err(|_| AppServerError::Internal)?;
+        if !state.registry.rollback_create(&install.handle) {
+            return Err(AppServerError::Internal);
+        }
+        Ok(())
     }
 
     fn update_residency(
@@ -1641,7 +1662,16 @@ impl ProductionRuntimeService {
         let Some(active) = active_state.get_mut(&key) else {
             return Ok(None);
         };
-        if let Some(prior) = active.history.prior(&client_message_id) {
+        let state = self
+            .state
+            .inner
+            .try_lock()
+            .map_err(|_| AppServerError::Internal)?;
+        let history = state
+            .registry
+            .current_admission_history(&active.handle)
+            .ok_or(AppServerError::Internal)?;
+        if let Some(prior) = history.prior(&client_message_id) {
             return Ok(Some(input_admission(prior, None)?));
         }
         let item = self.admission_item(command, client_message_id.as_str())?;
@@ -1659,7 +1689,19 @@ impl ProductionRuntimeService {
         } else {
             InputDisposition::Queued
         };
-        let _recorded = active.history.admit(&client_message_id, disposition);
+        let handle = active.handle.clone();
+        drop(active_state);
+        drop(state);
+        let mut state = self
+            .state
+            .inner
+            .try_lock()
+            .map_err(|_| AppServerError::Internal)?;
+        let _recorded = state
+            .registry
+            .admission_history_mut(&handle)
+            .map_err(runtime_service_error)?
+            .admit(&client_message_id, disposition);
         Ok(Some(input_admission(disposition, None)?))
     }
 
@@ -1675,7 +1717,7 @@ impl ProductionRuntimeService {
         }
         let key = (RuntimeKey::from(scope), client_message_id.to_owned());
         if state.pending.contains_key(&key) {
-            return Err(AppServerError::Malformed);
+            return continuation_value(client_message_id);
         }
         let run_sequence = u64::try_from(state.sequence).map_err(|_| AppServerError::Internal)?;
         state.sequence = state
@@ -2041,6 +2083,7 @@ fn emit_started_continuation(
 
 async fn sync_outcome(
     service: &ProductionRuntimeService,
+    connection: lotta_app_server::ws::ConnectionId,
     command: SyncCommand,
 ) -> Result<SyncOutcome, AppServerError> {
     let key = RuntimeKey::from(&command.runtime);
@@ -2049,7 +2092,7 @@ async fn sync_outcome(
         let _ = service.ensure_runtime(&command.runtime)?;
     }
     let status = authoritative_status_snapshot(service, &key, active.as_ref()).await?;
-    let device = service.device_snapshot(&command.runtime)?;
+    let device = service.device_snapshot(connection, &command.runtime)?;
     let mut broadcasts = vec![lotta_app_server::ws::RuntimeEvent::UpdateDeviceStatus {
         device_status: Box::new(device),
     }];
@@ -2269,6 +2312,7 @@ impl RuntimeCommandService for ProductionRuntimeService {
 
     fn runtime_start(
         &self,
+        _connection: lotta_app_server::ws::ConnectionId,
         command: RuntimeStartCommand,
     ) -> ServiceFuture<'_, RuntimeStartOutcome> {
         Box::pin(async move {
@@ -2287,24 +2331,27 @@ impl RuntimeCommandService for ProductionRuntimeService {
                 ConversationStore::load(&self.store, &runtime.agent_id, &runtime.conversation_id)
                     .await
                     .map_err(runtime_service_error)?;
-            let (handle, created_runtime) = self.ensure_runtime(&runtime)?;
-            if created_runtime {
+            let install = self.ensure_runtime(&runtime)?;
+            if install.created {
                 let payload = lotta_extensions::hooks::events::lifecycle_payload(
                     lotta_runtime::hooks::HookEvent::SessionStart,
                 )
                 .map_err(|_| AppServerError::Internal)?;
-                lotta_runtime::hooks::HookLifecycleHost::new(self.hooks.as_ref())
+                let hook = lotta_runtime::hooks::HookLifecycleHost::new(self.hooks.as_ref())
                     .session_start(payload, CancellationToken::new(), || async {
                         Ok::<(), AppServerError>(())
                     })
-                    .await
-                    .map_err(|_| AppServerError::Internal)?;
+                    .await;
+                if hook.is_err() {
+                    self.rollback_runtime_start(&runtime, &install)?;
+                    return Err(AppServerError::Internal);
+                }
             }
             let lease_generation = {
                 let state = self.state.inner.lock().await;
                 state
                     .registry
-                    .lifecycle(&handle)
+                    .lifecycle(&install.handle)
                     .and_then(|owner| owner.projection().lease_generation())
             };
             let broadcasts = if command.recover_approvals {
@@ -2431,8 +2478,12 @@ impl RuntimeCommandService for ProductionRuntimeService {
         ))
     }
 
-    fn sync(&self, command: SyncCommand) -> ServiceFuture<'_, SyncOutcome> {
-        Box::pin(async move { sync_outcome(self, command).await })
+    fn sync(
+        &self,
+        connection: lotta_app_server::ws::ConnectionId,
+        command: SyncCommand,
+    ) -> ServiceFuture<'_, SyncOutcome> {
+        Box::pin(async move { sync_outcome(self, connection, command).await })
     }
 
     fn abort_message(&self, command: AbortMessageCommand) -> ServiceFuture<'_, AbortOutcome> {
@@ -2532,7 +2583,7 @@ impl RuntimeCommandService for ProductionRuntimeService {
                 // and the cwd map simply keeps its previous entry.
                 let _ = self.settings.apply_cwd_change(0, &change);
             }
-            let device_status = self.device_snapshot(&command.runtime)?;
+            let device_status = self.device_snapshot(0, &command.runtime)?;
             Ok(DeviceStateOutcome {
                 broadcasts: RuntimeEventBatch::new(vec![
                     lotta_app_server::ws::RuntimeEvent::UpdateDeviceStatus {
@@ -3869,7 +3920,7 @@ mod production_tests {
                 device_authority: None,
             },
         );
-        service.register_device_snapshot_source(Arc::new(|_| {
+        service.register_device_snapshot_source(Arc::new(|_, _| {
             Ok(lotta_app_server::ws::event::DeviceStatus {
                 current_connection_id: None,
                 connection_name: None,
@@ -4063,7 +4114,7 @@ mod production_tests {
                 device_authority: None,
             },
         ));
-        service.register_device_snapshot_source(Arc::new(|_| {
+        service.register_device_snapshot_source(Arc::new(|_, _| {
             Ok(lotta_app_server::ws::event::DeviceStatus {
                 current_connection_id: None,
                 connection_name: None,
@@ -4674,7 +4725,7 @@ mod production_tests {
                 device_authority: None,
             },
         ));
-        service.register_device_snapshot_source(Arc::new(|scope| {
+        service.register_device_snapshot_source(Arc::new(|_, scope| {
             serde_json::from_value(serde_json::json!({
                 "current_connection_id": "production-sync-device", "connection_name": null,
                 "is_online": true, "is_processing": true,
@@ -4801,7 +4852,6 @@ mod production_tests {
                     ));
                     Arc::new(std::sync::Mutex::new(queue))
                 },
-                history: lotta_domain::AdmissionHistory::default(),
             },
         );
         let _ = continuation;
@@ -5382,7 +5432,6 @@ mod production_tests {
                 lease: pending.lease,
                 cancellation: pending.cancellation,
                 queue: Arc::clone(&pending.queue),
-                history: lotta_domain::AdmissionHistory::default(),
             },
         );
         let _held = service.state.inner.lock().await;
@@ -5430,7 +5479,6 @@ mod production_tests {
                 lease: pending.lease.clone(),
                 cancellation: pending.cancellation.clone(),
                 queue: Arc::clone(&pending.queue),
-                history: lotta_domain::AdmissionHistory::default(),
             },
         );
         let second = service
@@ -5476,12 +5524,15 @@ mod production_tests {
                     .await
                     .expect("release sequential input");
                 let synchronized = service
-                    .sync(SyncCommand {
-                        request_id: None,
-                        runtime: scope.clone(),
-                        recover_approvals: true,
-                        force_device_status: None,
-                    })
+                    .sync(
+                        1,
+                        SyncCommand {
+                            request_id: None,
+                            runtime: scope.clone(),
+                            recover_approvals: true,
+                            force_device_status: None,
+                        },
+                    )
                     .await
                     .expect("sync sequential input");
                 assert!(sync_is_idle(&synchronized));
@@ -6096,12 +6147,15 @@ mod production_tests {
             "the input rides the authoritative active queue"
         );
         let synchronized = service
-            .sync(SyncCommand {
-                request_id: None,
-                runtime: target.clone(),
-                recover_approvals: false,
-                force_device_status: None,
-            })
+            .sync(
+                1,
+                SyncCommand {
+                    request_id: None,
+                    runtime: target.clone(),
+                    recover_approvals: false,
+                    force_device_status: None,
+                },
+            )
             .await
             .expect("sync held turn");
         let queue = synchronized

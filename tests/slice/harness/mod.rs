@@ -255,6 +255,7 @@ fn events(values: Vec<RuntimeEvent>) -> RuntimeEventBatch {
 impl RuntimeCommandService for Service {
     fn runtime_start(
         &self,
+        _: lotta_app_server::ws::ConnectionId,
         command: RuntimeStartCommand,
     ) -> ServiceFuture<'_, RuntimeStartOutcome> {
         Box::pin(async move {
@@ -430,7 +431,11 @@ impl RuntimeCommandService for Service {
         Box::pin(async { Err(lotta_app_server::error::AppServerError::Unavailable) })
     }
 
-    fn sync(&self, _: SyncCommand) -> ServiceFuture<'_, SyncOutcome> {
+    fn sync(
+        &self,
+        _: lotta_app_server::ws::ConnectionId,
+        _: SyncCommand,
+    ) -> ServiceFuture<'_, SyncOutcome> {
         Box::pin(async {
             Ok(SyncOutcome {
                 broadcasts: events(Vec::new()),

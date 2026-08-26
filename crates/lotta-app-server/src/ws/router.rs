@@ -431,7 +431,7 @@ pub async fn route_command(
                 .and_then(|()| command.validate_structure())
                 .map_err(|_| crate::error::AppServerError::Malformed)?;
             let request_id = command.request_id.as_str().to_owned();
-            let outcome = service.runtime_start(*command).await?;
+            let outcome = service.runtime_start(connection, *command).await?;
             let output =
                 lock_router(&router)?.apply_runtime_start(connection, request_id, outcome)?;
             Ok((output, None))
@@ -442,7 +442,7 @@ pub async fn route_command(
             Ok((admission_route.output, Some(admission_route.deferred)))
         }
         RuntimeCommand::Sync(command) => {
-            let outcome = service.sync(command.clone()).await?;
+            let outcome = service.sync(connection, command.clone()).await?;
             let output = lock_router(&router)?.apply_sync(connection, &command, &outcome)?;
             Ok((output, None))
         }

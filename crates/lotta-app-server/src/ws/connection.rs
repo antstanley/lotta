@@ -183,13 +183,13 @@ impl RuntimeConnections {
         let Some(connection) = self.entries.remove(&id) else {
             return;
         };
+        let Some(identity) = reconnect_identity_from_name(connection.id.as_str()) else {
+            return;
+        };
         self.purge_expired();
         if self.suspended.len() >= SUSPENDED_CONNECTIONS_MAX {
             self.evict_oldest_suspended();
         }
-        let Some(identity) = reconnect_identity_from_name(connection.id.as_str()) else {
-            return;
-        };
         self.suspended.insert(
             identity,
             SuspendedConnection {

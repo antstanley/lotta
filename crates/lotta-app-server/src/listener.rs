@@ -751,11 +751,11 @@ fn register_device_runtime_ports(state: &Arc<ListenerState>) {
     let snapshot_devices = Arc::downgrade(&state.devices);
     state
         .runtime_service
-        .register_device_snapshot_source(Arc::new(move |scope| {
+        .register_device_snapshot_source(Arc::new(move |connection, scope| {
             let device = snapshot_devices
                 .upgrade()
                 .ok_or(AppServerError::Unavailable)?;
-            device.status_snapshot_for(None, scope)
+            device.status_snapshot_for(Some(connection), scope)
         }));
     state.devices.register_event_sink(event_sink(state));
     state.devices.register_scope_gate(Arc::new({

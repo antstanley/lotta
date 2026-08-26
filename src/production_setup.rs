@@ -1983,8 +1983,23 @@ impl lotta_runtime::turn::ApprovalPort for ApprovalBrokerAdapter {
             let canonical = manager
                 .get_request(&scope, &request.request_id)?
                 .ok_or_else(|| broker_error("approval request missing"))?;
+            let now = self.clock.now();
+            if canonical.expires_at <= now {
+                let _ = manager.expire_waiter(&canonical)?;
+                return Err(RuntimeError::Timeout {
+                    context: "approval expired".into(),
+                });
+            }
             let mut receiver = manager.register_waiter(&canonical)?;
-            let timeout = std::time::Duration::from_millis(lotta_runtime::APPROVAL_WAIT_MS_MAX);
+            let remaining = canonical
+                .expires_at
+                .as_utc()
+                .signed_duration_since(now.as_utc())
+                .to_std()
+                .map_err(|_| broker_error("approval deadline"))?;
+            let timeout = remaining.min(std::time::Duration::from_millis(
+                lotta_runtime::APPROVAL_WAIT_MS_MAX,
+            ));
             tokio::select! {
                 biased;
                 () = cancellation.cancelled() => {
@@ -3147,7 +3162,6 @@ async fn activate_submission(
         lease: pending.lease.clone(),
         cancellation: active_cancellation.clone(),
         queue: Arc::clone(&pending.queue),
-        history: lotta_domain::AdmissionHistory::default(),
     };
     let replaced = {
         let mut active_state = controller

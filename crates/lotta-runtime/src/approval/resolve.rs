@@ -451,6 +451,30 @@ impl ApprovalManager {
         Ok(interrupted)
     }
 
+    /// Restores restart transitions when runtime initialization is rolled back.
+    ///
+    /// # Errors
+    /// Returns a durable conflict or journal failure.
+    pub fn rollback_restart(&self, recovered: &[ApprovalRequest]) -> Result<(), RuntimeError> {
+        let _transaction = self.transaction()?;
+        for request in recovered {
+            let mut prior = request.clone();
+            prior.state = ApprovalState::Pending;
+            prior.revision = prior
+                .revision
+                .checked_sub(1)
+                .ok_or_else(|| conflict("approval revision"))?;
+            if !self
+                .journal
+                .port()
+                .compare_and_set(request.revision, prior)?
+            {
+                return Err(conflict("approval restart rollback"));
+            }
+        }
+        Ok(())
+    }
+
     /// Marks an executing request allowed after exactly-once execution completes.
     ///
     /// # Errors

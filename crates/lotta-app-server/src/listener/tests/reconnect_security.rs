@@ -151,6 +151,7 @@ struct ReconnectService;
 impl RuntimeCommandService for ReconnectService {
     fn runtime_start(
         &self,
+        _: crate::ws::ConnectionId,
         command: crate::ws::command::RuntimeStartCommand,
     ) -> ServiceFuture<'_, RuntimeStartOutcome> {
         let agent = command.agent_id.expect("agent").as_str().to_owned();
@@ -200,7 +201,11 @@ impl RuntimeCommandService for ReconnectService {
     ) -> ServiceFuture<'_, lotta_runtime::turn::CompactionProgress> {
         Box::pin(async { Err(AppServerError::Unavailable) })
     }
-    fn sync(&self, _: crate::ws::command::SyncCommand) -> ServiceFuture<'_, SyncOutcome> {
+    fn sync(
+        &self,
+        _: crate::ws::ConnectionId,
+        _: crate::ws::command::SyncCommand,
+    ) -> ServiceFuture<'_, SyncOutcome> {
         Box::pin(async {
             Ok(SyncOutcome {
                 broadcasts: events(vec![RuntimeEvent::UpdateQueue {
