@@ -105,6 +105,8 @@ pub struct ProductionSetupConfig {
     pub output_tokens: u64,
     /// Shared Task 32 registry, already populated with built-ins by composition.
     pub registry: Arc<ToolRegistry>,
+    /// Shared runtime-scoped Task 40 lifecycle authority.
+    pub tasks: Arc<lotta_tools::builtin::task::TaskLifecyclePort>,
     /// Shared canonical mod registries over the same Task 32 registry.
     pub mod_registries: Arc<ModRegistries>,
     /// Shared canonical hook registry populated by startup.
@@ -176,6 +178,7 @@ pub struct ProductionSetupPorts {
     server_context_window: u64,
     output_tokens: u64,
     registry: Arc<ToolRegistry>,
+    tasks: Arc<lotta_tools::builtin::task::TaskLifecyclePort>,
     mod_registries: Arc<ModRegistries>,
     hook_registry: Arc<HookRegistry>,
     hook_runtime: Arc<dyn HookRuntime>,
@@ -330,7 +333,7 @@ impl ProductionSetupPorts {
             .ok_or_else(|| RuntimeError::NotFound {
                 context: "turn tool snapshot unavailable".into(),
             })?;
-        let snapshot = Self::scoped_task_snapshot(snapshot, &scope.runtime)?;
+        let snapshot = self.scoped_task_snapshot(snapshot, &scope.runtime)?;
         Ok(tools.scoped(
             snapshot,
             Arc::new(scope.permissions),
@@ -348,18 +351,17 @@ impl ProductionSetupPorts {
     }
 
     fn scoped_task_snapshot(
+        &self,
         snapshot: Arc<lotta_tools::RegistrySnapshot>,
         scope: &lotta_domain::RuntimeScope,
     ) -> Result<Arc<lotta_tools::RegistrySnapshot>, RuntimeError> {
         let (toolset, mut registrations) = snapshot.complete_registrations();
-        let tasks = Arc::new(lotta_tools::builtin::task::TaskLifecyclePort::new());
         let scoped =
-            lotta_tools::builtin::task::registrations(tasks, scope.clone()).map_err(|_| {
-                RuntimeError::AdapterFailure {
+            lotta_tools::builtin::task::registrations(Arc::clone(&self.tasks), scope.clone())
+                .map_err(|_| RuntimeError::AdapterFailure {
                     code: "scoped_task_tools",
                     context: "runtime-scoped task lifecycle".into(),
-                }
-            })?;
+                })?;
         for replacement in scoped {
             let name = replacement.definition.internal_name.as_str();
             if let Some(current) = registrations
@@ -449,6 +451,7 @@ impl ProductionSetupPorts {
             server_context_window: config.server_context_window,
             output_tokens: config.output_tokens,
             registry,
+            tasks: config.tasks,
             mod_registries,
             hook_registry,
             hook_runtime: config.hook_runtime,
@@ -3109,7 +3112,9 @@ fn activate_submission(
         handle: pending.handle.clone(),
         lease: pending.lease.clone(),
         cancellation: active_cancellation.clone(),
-        queue: lotta_runtime::ConversationQueue::default(),
+        queue: Arc::new(std::sync::Mutex::new(
+            lotta_runtime::ConversationQueue::default(),
+        )),
         history: lotta_domain::AdmissionHistory::default(),
     };
     let replaced = {

@@ -103,6 +103,7 @@ impl Fixture {
             server_context_window: 16_384,
             output_tokens: 2_048,
             registry,
+            tasks: Arc::new(lotta_tools::builtin::task::TaskLifecyclePort::new()),
             mod_registries,
             hook_registry: Arc::new(HookRegistry::new()),
             hook_runtime: Arc::new(lotta_runtime::hooks::NoopHookRuntime),

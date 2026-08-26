@@ -542,7 +542,7 @@ fn setup_config(
         &workspace_policy,
         &skill_roots,
         shell,
-        tasks,
+        Arc::clone(&tasks),
     )?;
     let registry = Arc::new(lotta_tools::ToolRegistry::new(builtins).map_err(adapter)?);
     let mod_registries = Arc::new(ModRegistries::new(Arc::clone(&registry)));
@@ -558,6 +558,7 @@ fn setup_config(
         server_context_window: DEFAULT_CONTEXT_WINDOW_TOKENS,
         output_tokens: DEFAULT_OUTPUT_TOKENS,
         registry,
+        tasks,
         mod_registries,
         hook_registry,
         hook_runtime,
@@ -764,7 +765,7 @@ pub(crate) struct ActiveAdmission {
     pub(crate) handle: lotta_runtime::RuntimeHandle,
     pub(crate) lease: lotta_domain::TurnLease,
     pub(crate) cancellation: CancellationToken,
-    pub(crate) queue: lotta_runtime::ConversationQueue,
+    pub(crate) queue: Arc<std::sync::Mutex<lotta_runtime::ConversationQueue>>,
     pub(crate) history: lotta_domain::AdmissionHistory,
 }
 
@@ -899,12 +900,7 @@ impl ProductionRuntimeState {
             return Err(AppServerError::Malformed);
         }
         let mut state = self.inner.lock().await;
-        for item in active.queue.items().cloned() {
-            let _mutation = state
-                .registry
-                .enqueue_retained(&pending.handle, item)
-                .map_err(runtime_service_error)?;
-        }
+        drain_active_queue(&mut state, &pending.handle, &active.queue)?;
         let pumped = release_and_pump_locked(
             &mut state,
             scope,
@@ -922,6 +918,24 @@ impl ProductionRuntimeState {
         }
         Ok(pumped)
     }
+}
+
+fn drain_active_queue(
+    state: &mut RuntimeServiceState,
+    handle: &lotta_runtime::RuntimeHandle,
+    queue: &std::sync::Mutex<lotta_runtime::ConversationQueue>,
+) -> Result<(), AppServerError> {
+    let mut queue = queue.lock().map_err(|_| AppServerError::Internal)?;
+    while let Some(mutation) = queue.dequeue().map_err(runtime_service_error)? {
+        let lotta_runtime::QueueMutationEvent::Removed(item, _) = mutation.event() else {
+            return Err(AppServerError::Internal);
+        };
+        let _mutation = state
+            .registry
+            .enqueue_retained(handle, item.clone())
+            .map_err(runtime_service_error)?;
+    }
+    Ok(())
 }
 
 /// Bridges the WebSocket conversations group to the authoritative production
@@ -1026,9 +1040,8 @@ fn register_device_authority_ports(
 }
 
 /// Bridges the WebSocket device group to the authoritative production runtime:
-/// queue removals mutate the exact `ListenerRuntime` registry the turn path
-/// uses, and items queued onto an in-flight turn's private admission queue —
-/// so a WS-removed item can never be pumped by an active turn afterward.
+/// queue removals mutate the one queue shared by active admission, snapshots,
+/// and post-turn pumping.
 pub(crate) struct ProductionQueueAuthority {
     pub(crate) state: Arc<ProductionRuntimeState>,
 }
@@ -1041,25 +1054,22 @@ impl lotta_app_server::ws::device::QueueAuthority for ProductionQueueAuthority {
     ) -> Pin<Box<dyn Future<Output = Result<Option<QueueMutation>, RuntimeError>> + Send + 'a>>
     {
         Box::pin(async move {
-            // Inputs admitted while a turn runs sit on that turn's active
-            // admission queue, guarded by this std mutex independently of the
-            // registry lock the executing turn holds. Cancelling here deletes
-            // the item before the post-turn transfer can hand it to the
-            // registry pump, so the removal stays authoritative mid-turn.
-            let active_cancel = match self
+            let active_queue = self
                 .state
                 .active
                 .lock()
                 .map_err(|_| RuntimeError::Conflict {
                     context: "device queue active admission".into(),
                 })?
-                .get_mut(&RuntimeKey::from(scope))
-            {
-                Some(admission) => admission.queue.cancel(item_id)?,
-                None => None,
-            };
-            if let Some(mutation) = active_cancel {
-                return Ok(Some(mutation));
+                .get(&RuntimeKey::from(scope))
+                .map(|active| Arc::clone(&active.queue));
+            if let Some(queue) = active_queue {
+                return queue
+                    .lock()
+                    .map_err(|_| RuntimeError::Conflict {
+                        context: "device queue active queue".into(),
+                    })?
+                    .cancel(item_id);
             }
             let mut state = self.state.inner.lock().await;
             let handle =
@@ -1149,18 +1159,22 @@ impl ProductionRuntimeService {
         &self,
         key: &RuntimeKey,
     ) -> Result<Option<(TurnLease, Vec<QueueItem>)>, AppServerError> {
-        self.state
+        let active = self
+            .state
             .active
             .lock()
-            .map_err(|_| AppServerError::Internal)
-            .map(|active| {
-                active.get(key).map(|item| {
-                    (
-                        item.lease.clone(),
-                        item.queue.items().cloned().collect::<Vec<_>>(),
-                    )
-                })
-            })
+            .map_err(|_| AppServerError::Internal)?;
+        let Some(item) = active.get(key) else {
+            return Ok(None);
+        };
+        let queue = item
+            .queue
+            .lock()
+            .map_err(|_| AppServerError::Internal)?
+            .items()
+            .cloned()
+            .collect();
+        Ok(Some((item.lease.clone(), queue)))
     }
 
     fn device_snapshot(
@@ -1413,22 +1427,27 @@ impl ProductionRuntimeService {
         command: &InputCommand,
     ) -> Result<Option<InputAdmission>, AppServerError> {
         let key = RuntimeKey::from(&command.runtime);
-        let mut active = self
+        let client_message_id = input_client_message_id(command.payload.as_value())?;
+        let client_message_id =
+            NonEmptyString::new(client_message_id).map_err(|_| AppServerError::Malformed)?;
+        let mut active_state = self
             .state
             .active
             .lock()
             .map_err(|_| AppServerError::Internal)?;
-        let Some(active) = active.get_mut(&key) else {
+        let Some(active) = active_state.get_mut(&key) else {
             return Ok(None);
         };
-        let client_message_id = input_client_message_id(command.payload.as_value())?;
-        let client_message_id =
-            NonEmptyString::new(client_message_id).map_err(|_| AppServerError::Malformed)?;
         if let Some(prior) = active.history.prior(&client_message_id) {
             return Ok(Some(input_admission(prior, None)?));
         }
         let item = self.admission_item(command, client_message_id.as_str())?;
-        let mutation = active.queue.enqueue(item).map_err(runtime_service_error)?;
+        let mutation = active
+            .queue
+            .lock()
+            .map_err(|_| AppServerError::Internal)?
+            .enqueue(item)
+            .map_err(runtime_service_error)?;
         let disposition = if matches!(
             mutation.event(),
             lotta_runtime::QueueMutationEvent::Dropped(_, _)
@@ -1953,12 +1972,16 @@ struct AuthoritativeStatusSnapshot {
     queue: Vec<QueueItem>,
 }
 
-async fn active_run_ids(
+fn active_run_ids(
     service: &ProductionRuntimeService,
     key: &RuntimeKey,
     lease: &TurnLease,
 ) -> Result<Vec<String>, AppServerError> {
-    let state = service.state.inner.lock().await;
+    let state = service
+        .state
+        .inner
+        .try_lock()
+        .map_err(|_| AppServerError::Internal)?;
     let handle = state.registry.lookup(key).ok_or(AppServerError::Internal)?;
     let lifecycle = state
         .registry
@@ -1983,7 +2006,7 @@ async fn authoritative_status_snapshot(
     if let Some((lease, queue)) = active {
         return Ok(AuthoritativeStatusSnapshot {
             status: "EXECUTING_COMMAND",
-            active_run_ids: active_run_ids(service, key, lease).await?,
+            active_run_ids: active_run_ids(service, key, lease).unwrap_or_default(),
             queue: queue.clone(),
         });
     }
@@ -2936,21 +2959,30 @@ impl ProductionEffects {
         &self,
         result: lotta_runtime::turn::ToolResultRecord,
     ) -> Result<lotta_app_server::ws::RuntimeEvent, lotta_runtime::RuntimeError> {
-        let status = if matches!(&result.outcome, ToolOutcome::Success { .. }) {
-            "success"
-        } else {
-            "error"
+        use lotta_app_server::ws::event::{
+            ClientToolEnd, ClientToolEndType, ClientToolStatus, StreamDelta,
         };
-        let delta = BoundedJsonValue::new(serde_json::json!({
-            "id": format!("{}-tool-end-{}", self.turn_id.as_str(), result.call_id.as_str()),
-            "date": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            "message_type": "client_tool_end",
-            "tool_call_id": result.call_id.as_str(),
-            "status": status,
-        }))
-        .map_err(effect_error)?;
+        let status = if matches!(&result.outcome, ToolOutcome::Success { .. }) {
+            ClientToolStatus::Success
+        } else {
+            ClientToolStatus::Error
+        };
+        let delta = ClientToolEnd {
+            id: NonEmptyString::new(format!(
+                "{}-tool-end-{}",
+                self.turn_id.as_str(),
+                result.call_id.as_str()
+            ))
+            .map_err(effect_error)?,
+            date: lifecycle_date()?,
+            message_type: ClientToolEndType::ClientToolEnd,
+            run_id: Some(self.run_id.clone()),
+            tool_call_id: NonEmptyString::new(result.call_id.as_str().to_owned())
+                .map_err(effect_error)?,
+            status,
+        };
         Ok(lotta_app_server::ws::RuntimeEvent::StreamDelta {
-            delta: lotta_app_server::ws::event::StreamDelta::Other(delta),
+            delta: StreamDelta::ClientToolEnd(delta),
             subagent_id: None,
         })
     }
@@ -2972,6 +3004,11 @@ impl ProductionEffects {
     }
 }
 
+fn lifecycle_date() -> Result<NonEmptyString, lotta_runtime::RuntimeError> {
+    NonEmptyString::new(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .map_err(effect_error)
+}
+
 impl TurnEffectPort for ProductionEffects {
     fn tool_started(
         &self,
@@ -2985,20 +3022,26 @@ impl TurnEffectPort for ProductionEffects {
             .lock()
             .map_err(|_| effect_error("executing tool state"))?
             .insert(key, vec![call_id.as_str().to_owned()]);
-        let delta = BoundedJsonValue::new(serde_json::json!({
-            "id": format!("{}-tool-start-{}", self.turn_id.as_str(), call_id.as_str()),
-            "date": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            "message_type": "client_tool_start",
-            "tool_call_id": call_id.as_str(),
-            "tool_name": tool_name.as_str(),
-            "tool_args": input.as_value(),
-        }))
-        .map_err(effect_error)?;
+        use lotta_app_server::ws::event::{ClientToolStart, ClientToolStartType, StreamDelta};
+        let delta = ClientToolStart {
+            id: NonEmptyString::new(format!(
+                "{}-tool-start-{}",
+                self.turn_id.as_str(),
+                call_id.as_str()
+            ))
+            .map_err(effect_error)?,
+            date: lifecycle_date()?,
+            message_type: ClientToolStartType::ClientToolStart,
+            run_id: Some(self.run_id.clone()),
+            tool_call_id: NonEmptyString::new(call_id.as_str().to_owned()).map_err(effect_error)?,
+            tool_name: Some(tool_name.clone()),
+            tool_args: Some(serde_json::to_string(input.as_value()).map_err(effect_error)?),
+        };
         self.sink
             .emit(
                 &self.scope,
                 lotta_app_server::ws::RuntimeEvent::StreamDelta {
-                    delta: lotta_app_server::ws::event::StreamDelta::Other(delta),
+                    delta: StreamDelta::ClientToolStart(delta),
                     subagent_id: None,
                 },
             )
@@ -3035,11 +3078,16 @@ impl TurnEffectPort for ProductionEffects {
             _ => None,
         };
         let wire = self.wire_event(event)?;
-        self.sink
+        let emitted = self
+            .sink
             .emit(&self.scope, wire)
-            .map_err(|_| effect_error("runtime event sink"))?;
+            .map_err(|_| effect_error("runtime event sink"));
         if let Some(call_id) = tool_end {
-            self.emit_tool_completion_snapshot(&call_id)?;
+            let cleanup = self.emit_tool_completion_snapshot(&call_id);
+            emitted?;
+            cleanup?;
+        } else {
+            emitted?;
         }
         #[cfg(test)]
         if cancelled {
@@ -4516,17 +4564,7 @@ mod production_tests {
             active_item,
         )
         .unwrap();
-        let queued = state
-            .registry
-            .admit(
-                &handle,
-                AdmissionRequest {
-                    item,
-                    route: AdmissionRoute::Ordinary,
-                },
-            )
-            .unwrap();
-        assert_eq!(queued.disposition(), InputDisposition::Queued);
+        let _ = item;
         let pending = state
             .pending
             .remove(&(key.clone(), "sync-active".into()))
@@ -4551,10 +4589,14 @@ mod production_tests {
                 cancellation: pending.cancellation,
                 queue: {
                     let mut queue = lotta_runtime::ConversationQueue::default();
-                    let _ = queue
+                    let mutation = queue
                         .enqueue(service.admission_item(&input, "sync-queued").unwrap())
                         .unwrap();
-                    queue
+                    assert!(matches!(
+                        mutation.event(),
+                        lotta_runtime::QueueMutationEvent::Enqueued(_)
+                    ));
+                    Arc::new(std::sync::Mutex::new(queue))
                 },
                 history: lotta_domain::AdmissionHistory::default(),
             },
@@ -4877,7 +4919,9 @@ mod production_tests {
                 handle: pending.handle,
                 lease: pending.lease,
                 cancellation: pending.cancellation,
-                queue: lotta_runtime::ConversationQueue::default(),
+                queue: Arc::new(std::sync::Mutex::new(
+                    lotta_runtime::ConversationQueue::default(),
+                )),
                 history: lotta_domain::AdmissionHistory::default(),
             },
         );
@@ -4924,7 +4968,9 @@ mod production_tests {
                 handle: pending.handle.clone(),
                 lease: pending.lease.clone(),
                 cancellation: pending.cancellation.clone(),
-                queue: lotta_runtime::ConversationQueue::default(),
+                queue: Arc::new(std::sync::Mutex::new(
+                    lotta_runtime::ConversationQueue::default(),
+                )),
                 history: lotta_domain::AdmissionHistory::default(),
             },
         );
@@ -5550,9 +5596,8 @@ mod production_tests {
     }
 
     /// A WS removal issued while a turn executes cancels the item on the
-    /// active admission's private queue: the post-turn transfer never carries
-    /// it, the pump never runs it, and the removed disposition plus snapshot
-    /// are emitted to subscribers.
+    /// active admission's authoritative queue: snapshots and the post-turn
+    /// pump observe the same removal, and subscribers receive its transition.
     #[tokio::test]
     async fn ws_removal_during_held_turn_cancels_before_pump() {
         use std::sync::atomic::Ordering;
@@ -5570,7 +5615,7 @@ mod production_tests {
         let (turn, connection_cancellation) =
             start_held_turn(controller, service, held, target, "cm-start").await;
 
-        // The next ordinary input queues onto the active admission queue.
+        // The next ordinary input queues through the normal production API.
         assert_eq!(
             service
                 .admit_input(command(target.clone(), "cm-remove"))
@@ -5578,8 +5623,28 @@ mod production_tests {
                 .expect("queue during turn")
                 .disposition,
             InputDisposition::Queued,
-            "the input rides the active admission queue while the lock is held"
+            "the input rides the authoritative active queue"
         );
+        let synchronized = service
+            .sync(SyncCommand {
+                request_id: None,
+                runtime: target.clone(),
+                recover_approvals: false,
+                force_device_status: None,
+            })
+            .await
+            .expect("sync held turn");
+        let queue = synchronized
+            .broadcasts
+            .as_slice()
+            .iter()
+            .find_map(|event| match event {
+                RuntimeEvent::UpdateQueue { queue, .. } => Some(queue),
+                _ => None,
+            })
+            .expect("held queue snapshot");
+        assert_eq!(queue.len(), 1, "sync observes one authoritative item");
+        assert_eq!(queue[0].client_message_id.as_str(), "cm-remove");
 
         let messages: Arc<Mutex<Vec<(u64, DeviceMessage)>>> = Arc::default();
         let queue_events = Arc::new(Sink::default());
