@@ -62,7 +62,7 @@ fn rejects_corrupted_over_capacity_without_harming_existing() {
         RuntimeEntry {
             generation: 99_999,
             owner: LifecycleOwner::new(scope("corrupt", 1), uuid::Uuid::from_u128(99_999)),
-            queue: ConversationQueue::default(),
+            queue: Arc::new(Mutex::new(ConversationQueue::default())),
             admission_history: AdmissionHistory::default(),
             residency: RuntimeResidency::new(0, false, 0),
         },

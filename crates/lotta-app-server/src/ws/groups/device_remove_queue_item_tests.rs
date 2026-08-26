@@ -211,6 +211,8 @@ impl Harness {
             .queue(&handle)
             .map(|queue| {
                 queue
+                    .lock()
+                    .expect("queue lock")
                     .items()
                     .map(|item| item.client_message_id.as_str().to_owned())
                     .collect::<Vec<_>>()

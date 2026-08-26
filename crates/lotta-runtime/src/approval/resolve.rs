@@ -115,6 +115,20 @@ impl ApprovalManager {
         self.transition(request, ApprovalState::Pending, ApprovalState::Expired)
     }
 
+    /// Atomically removes the waiter and expires the exact pending revision.
+    ///
+    /// # Errors
+    /// Returns revision overflow, durable journal, or waiter lock failures.
+    pub fn expire_waiter(&self, request: &ApprovalRequest) -> Result<bool, RuntimeError> {
+        let _transaction = self.transaction()?;
+        let changed =
+            self.transition_unlocked(request, ApprovalState::Pending, ApprovalState::Expired)?;
+        if changed {
+            self.remove_waiter_unlocked(request)?;
+        }
+        Ok(changed)
+    }
+
     /// Aborts one exact pending request without permitting a later resolution.
     ///
     /// # Errors
@@ -301,6 +315,11 @@ impl ApprovalManager {
     /// # Errors
     /// Returns a poisoned waiter-map error.
     pub fn remove_waiter(&self, request: &ApprovalRequest) -> Result<(), RuntimeError> {
+        let _transaction = self.transaction()?;
+        self.remove_waiter_unlocked(request)
+    }
+
+    fn remove_waiter_unlocked(&self, request: &ApprovalRequest) -> Result<(), RuntimeError> {
         let key = (
             request.scope.clone(),
             request.request_id.as_str().to_owned(),
@@ -453,6 +472,16 @@ impl ApprovalManager {
         expected: ApprovalState,
         state: ApprovalState,
     ) -> Result<bool, RuntimeError> {
+        let _transaction = self.transaction()?;
+        self.transition_unlocked(request, expected, state)
+    }
+
+    fn transition_unlocked(
+        &self,
+        request: &ApprovalRequest,
+        expected: ApprovalState,
+        state: ApprovalState,
+    ) -> Result<bool, RuntimeError> {
         if request.state != expected {
             return Ok(false);
         }
@@ -462,7 +491,6 @@ impl ApprovalManager {
             .revision
             .checked_add(1)
             .ok_or_else(|| conflict("approval revision"))?;
-        let _transaction = self.transaction()?;
         self.journal.port().compare_and_set(request.revision, next)
     }
 

@@ -11,7 +11,7 @@ fn started_duplicate_replays_without_second_effect() {
         request(1, QueueItemKind::Message, QueueItemSource::User),
         InputDisposition::Started,
     );
-    assert!(runtime.queue(&handle).unwrap().is_empty());
+    assert!(runtime.queue(&handle).unwrap().lock().unwrap().is_empty());
     assert_eq!(
         runtime
             .current_entry(&handle)
@@ -36,11 +36,13 @@ fn queued_duplicate_replays_without_second_item_or_revision() {
         request(1, QueueItemKind::Message, QueueItemSource::User),
         InputDisposition::Queued,
     );
-    assert_eq!(runtime.queue(&handle).unwrap().len(), 1);
+    assert_eq!(runtime.queue(&handle).unwrap().lock().unwrap().len(), 1);
     let next = runtime
         .current_entry_mut(&handle)
         .unwrap()
         .queue
+        .lock()
+        .unwrap()
         .enqueue(request(2, QueueItemKind::Message, QueueItemSource::User).item)
         .unwrap();
     assert_eq!(next.snapshot().revision(), 2);
@@ -67,6 +69,8 @@ fn hard_rejected_duplicate_replays_without_second_drop() {
             .current_entry_mut(&handle)
             .unwrap()
             .queue
+            .lock()
+            .unwrap()
             .enqueue(
                 request(
                     number,
@@ -83,11 +87,13 @@ fn hard_rejected_duplicate_replays_without_second_drop() {
         request(400, QueueItemKind::Message, QueueItemSource::User),
         InputDisposition::Rejected,
     );
-    assert_eq!(runtime.queue(&handle).unwrap().len(), 300);
+    assert_eq!(runtime.queue(&handle).unwrap().lock().unwrap().len(), 300);
     let mutation = runtime
         .current_entry_mut(&handle)
         .unwrap()
         .queue
+        .lock()
+        .unwrap()
         .enqueue(request(401, QueueItemKind::Message, QueueItemSource::User).item)
         .unwrap();
     assert_eq!(mutation.snapshot().revision(), 302);

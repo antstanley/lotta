@@ -904,17 +904,15 @@ impl ProductionRuntimeState {
         _cancellation_terminal_persisted: bool,
     ) -> Result<Option<(QueueItem, BoundedJsonValue)>, AppServerError> {
         let key = RuntimeKey::from(scope);
-        let active = self
-            .active
-            .lock()
-            .map_err(|_| AppServerError::Internal)?
-            .remove(&key)
-            .ok_or(AppServerError::Malformed)?;
-        if active.handle != pending.handle || active.lease != pending.lease {
-            return Err(AppServerError::Malformed);
+        {
+            let mut admissions = self.active.lock().map_err(|_| AppServerError::Internal)?;
+            let current = admissions.get(&key).ok_or(AppServerError::Malformed)?;
+            if current.handle != pending.handle || current.lease != pending.lease {
+                return Err(AppServerError::Malformed);
+            }
+            admissions.remove(&key).ok_or(AppServerError::Malformed)?;
         }
         let mut state = self.inner.lock().await;
-        drain_active_queue(&mut state, &pending.handle, &active.queue)?;
         let pumped = release_and_pump_locked(&mut state, scope, pending, reason)?;
         #[cfg(test)]
         if _cancellation_terminal_persisted {
@@ -926,24 +924,6 @@ impl ProductionRuntimeState {
         }
         Ok(pumped)
     }
-}
-
-fn drain_active_queue(
-    state: &mut RuntimeServiceState,
-    handle: &lotta_runtime::RuntimeHandle,
-    queue: &std::sync::Mutex<lotta_runtime::ConversationQueue>,
-) -> Result<(), AppServerError> {
-    let mut queue = queue.lock().map_err(|_| AppServerError::Internal)?;
-    while let Some(mutation) = queue.dequeue().map_err(runtime_service_error)? {
-        let lotta_runtime::QueueMutationEvent::Removed(item, _) = mutation.event() else {
-            return Err(AppServerError::Internal);
-        };
-        let _mutation = state
-            .registry
-            .enqueue_retained(handle, item.clone())
-            .map_err(runtime_service_error)?;
-    }
-    Ok(())
 }
 
 /// Bridges the WebSocket conversations group to the authoritative production
@@ -1662,14 +1642,16 @@ impl ProductionRuntimeService {
             .map_err(runtime_service_error)?;
         match state.pending.entry(key) {
             std::collections::hash_map::Entry::Vacant(entry) => {
+                let queue = state
+                    .registry
+                    .queue(&handle)
+                    .ok_or(AppServerError::Internal)?;
                 entry.insert(PendingAdmission {
                     handle,
                     lease,
                     item,
                     cancellation: CancellationToken::new(),
-                    queue: Arc::new(std::sync::Mutex::new(
-                        lotta_runtime::ConversationQueue::default(),
-                    )),
+                    queue,
                 });
                 Ok(continuation)
             }
@@ -1826,7 +1808,7 @@ fn pump_retained_input(
     scope: &RuntimeScope,
     pending: PendingAdmission,
 ) -> Result<Option<(QueueItem, BoundedJsonValue)>, AppServerError> {
-    let Some(peeked) = state.registry.peek_queue(&pending.handle).cloned() else {
+    let Some(peeked) = state.registry.peek_queue(&pending.handle) else {
         return Ok(None);
     };
     let candidate = prepare_pump(state, scope, &pending, &peeked)?;
@@ -2140,6 +2122,8 @@ async fn authoritative_status_snapshot(
         .registry
         .queue(&handle)
         .ok_or(AppServerError::Internal)?
+        .lock()
+        .map_err(|_| AppServerError::Internal)?
         .items()
         .cloned()
         .collect();
@@ -5082,9 +5066,7 @@ mod production_tests {
                 handle: pending.handle,
                 lease: pending.lease,
                 cancellation: pending.cancellation,
-                queue: Arc::new(std::sync::Mutex::new(
-                    lotta_runtime::ConversationQueue::default(),
-                )),
+                queue: Arc::clone(&pending.queue),
                 history: lotta_domain::AdmissionHistory::default(),
             },
         );
@@ -5131,9 +5113,7 @@ mod production_tests {
                 handle: pending.handle.clone(),
                 lease: pending.lease.clone(),
                 cancellation: pending.cancellation.clone(),
-                queue: Arc::new(std::sync::Mutex::new(
-                    lotta_runtime::ConversationQueue::default(),
-                )),
+                queue: Arc::clone(&pending.queue),
                 history: lotta_domain::AdmissionHistory::default(),
             },
         );
@@ -5663,7 +5643,15 @@ mod production_tests {
         // Sync: the production registry's queue is empty after WS removal.
         let guard = state.inner.lock().await;
         let handle = guard.registry.lookup(&RuntimeKey::from(&target)).unwrap();
-        assert!(guard.registry.queue(&handle).expect("entry").is_empty());
+        assert!(
+            guard
+                .registry
+                .queue(&handle)
+                .expect("entry")
+                .lock()
+                .expect("queue")
+                .is_empty()
+        );
     }
 
     /// Admits one input, spawns its real turn against [`HeldProvider`], and
@@ -5754,6 +5742,8 @@ mod production_tests {
                 .registry
                 .queue(&handle)
                 .expect("held-turn queue")
+                .lock()
+                .expect("queue")
                 .is_empty(),
             "removed item stays absent after release"
         );

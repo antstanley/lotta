@@ -1917,6 +1917,22 @@ struct ApprovalBrokerAdapter {
     clock: Arc<dyn lotta_domain::Clock + Send + Sync>,
 }
 
+fn delivered_resolution(
+    outcome: lotta_runtime::approval::ApprovalResolveOutcome,
+) -> Result<lotta_runtime::turn::ApprovalResolution, RuntimeError> {
+    match outcome.resolution {
+        lotta_runtime::ApprovalResolution::Allow => Ok(
+            lotta_runtime::turn::ApprovalResolution::Allow(outcome.edited_input),
+        ),
+        lotta_runtime::ApprovalResolution::Deny => {
+            Ok(lotta_runtime::turn::ApprovalResolution::Deny)
+        }
+        lotta_runtime::ApprovalResolution::Abort => Err(RuntimeError::Cancelled {
+            context: "approval abort".into(),
+        }),
+    }
+}
+
 impl lotta_runtime::turn::ApprovalPort for ApprovalBrokerAdapter {
     fn store_request(
         &self,
@@ -1967,7 +1983,7 @@ impl lotta_runtime::turn::ApprovalPort for ApprovalBrokerAdapter {
             let canonical = manager
                 .get_request(&scope, &request.request_id)?
                 .ok_or_else(|| broker_error("approval request missing"))?;
-            let receiver = manager.register_waiter(&canonical)?;
+            let mut receiver = manager.register_waiter(&canonical)?;
             let timeout = std::time::Duration::from_millis(lotta_runtime::APPROVAL_WAIT_MS_MAX);
             tokio::select! {
                 biased;
@@ -1981,25 +1997,16 @@ impl lotta_runtime::turn::ApprovalPort for ApprovalBrokerAdapter {
                     Err(RuntimeError::Cancelled { context: "approval wait".into() })
                 },
                 () = tokio::time::sleep(timeout) => {
-                    manager.remove_waiter(&canonical)?;
-                    let _ = manager.expire(&canonical)?;
-                    Err(RuntimeError::Timeout { context: "approval expired".into() })
-                },
-                value = receiver => {
-                    let outcome = value.map_err(|_| broker_error("approval waiter dropped"))?;
-                    match outcome.resolution {
-                        lotta_runtime::ApprovalResolution::Allow => Ok(
-                            lotta_runtime::turn::ApprovalResolution::Allow(outcome.edited_input),
-                        ),
-                        lotta_runtime::ApprovalResolution::Deny => {
-                            Ok(lotta_runtime::turn::ApprovalResolution::Deny)
-                        }
-                        lotta_runtime::ApprovalResolution::Abort => Err(
-                            RuntimeError::Cancelled {
-                                context: "approval abort".into(),
-                            },
-                        ),
+                    if manager.expire_waiter(&canonical)? {
+                        Err(RuntimeError::Timeout { context: "approval expired".into() })
+                    } else {
+                        (&mut receiver).await.map(delivered_resolution)
+                            .map_err(|_| broker_error("approval waiter dropped"))?
                     }
+                },
+                value = &mut receiver => {
+                    let outcome = value.map_err(|_| broker_error("approval waiter dropped"))?;
+                    delivered_resolution(outcome)
                 },
             }
         })
@@ -3147,9 +3154,29 @@ fn activate_submission(
             .active
             .lock()
             .map_err(|_| lotta_app_server::error::AppServerError::Internal)?;
-        active_state.insert(key, active).is_some()
+        match active_state.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(active);
+                false
+            }
+            std::collections::hash_map::Entry::Occupied(_) => true,
+        }
     };
     if replaced {
+        pending.cancellation.cancel();
+        let mut state = controller
+            .runtime_state
+            .inner
+            .try_lock()
+            .map_err(|_| lotta_app_server::error::AppServerError::Internal)?;
+        let stop = lotta_domain::StopReason::new("activation_collision")
+            .map_err(|_| lotta_app_server::error::AppServerError::Internal)?;
+        state
+            .registry
+            .lifecycle_mut(&pending.handle)
+            .map_err(|_| lotta_app_server::error::AppServerError::Internal)?
+            .finish_turn(&pending.lease, stop)
+            .map_err(|_| lotta_app_server::error::AppServerError::Internal)?;
         return Err(lotta_app_server::error::AppServerError::Internal);
     }
     Ok((

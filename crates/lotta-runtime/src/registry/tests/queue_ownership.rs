@@ -8,7 +8,7 @@ fn runtime_entry_owns_queue_and_history() {
         .split('}')
         .next()
         .unwrap_or_else(|| panic!("RuntimeEntry body missing"));
-    assert!(entry.contains("queue: ConversationQueue"));
+    assert!(entry.contains("queue: Arc<Mutex<ConversationQueue>>"));
     assert!(entry.contains("admission_history: AdmissionHistory"));
 }
 

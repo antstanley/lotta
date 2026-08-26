@@ -118,7 +118,12 @@ fn registry_pump_uses_live_state_and_rejects_stale_handle() {
             .unwrap_or_else(|error| fail(&error))
             .is_none()
     );
-    assert_eq!(runtime.queue(&handle).map(ConversationQueue::len), Some(1));
+    assert_eq!(
+        runtime
+            .queue(&handle)
+            .map(|queue| queue.lock().unwrap().len()),
+        Some(1)
+    );
     runtime
         .lifecycle_mut(&handle)
         .unwrap_or_else(|error| fail(&error))
@@ -133,7 +138,7 @@ fn registry_pump_uses_live_state_and_rejects_stale_handle() {
     assert!(
         runtime
             .queue(&handle)
-            .is_some_and(ConversationQueue::is_empty)
+            .is_some_and(|queue| queue.lock().unwrap().is_empty())
     );
     let mut replacement = ListenerRuntime::new();
     let other_scope = RuntimeScope::new(

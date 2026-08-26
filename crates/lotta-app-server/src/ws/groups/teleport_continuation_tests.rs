@@ -104,7 +104,11 @@ fn continues_on_active_lease_without_queue_or_new_turn() {
         "continuation branch must admit directly on the lease"
     );
     let queue = active.runtime.queue(&active.handle).expect("queue");
-    assert_eq!(queue.len(), 0, "no queue item may be created");
+    assert_eq!(
+        queue.lock().expect("queue lock").len(),
+        0,
+        "no queue item may be created"
+    );
     let owner = active.runtime.lifecycle(&active.handle).expect("owner");
     assert_eq!(
         owner.projection().state(),

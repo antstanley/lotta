@@ -225,6 +225,8 @@ mod scheduler {
         listener
             .queue(&handle)
             .expect("queue")
+            .lock()
+            .expect("queue lock")
             .items()
             .map(|item| (item.kind, item.source))
             .collect()
@@ -392,7 +394,12 @@ mod scheduler {
         let recreated = ensure_runtime(&lease_world, &lease_task);
         let listener = lock_listener(&lease_world.listener);
         assert_eq!(
-            listener.queue(&recreated).expect("recreated queue").len(),
+            listener
+                .queue(&recreated)
+                .expect("recreated queue")
+                .lock()
+                .expect("queue lock")
+                .len(),
             0,
             "lease loss leaves no fire"
         );

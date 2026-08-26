@@ -68,7 +68,7 @@ async fn queued_message_pumps_and_runs_as_next_turn() {
     )
     .await
     .unwrap();
-    assert!(runtime.queue(&handle).unwrap().is_empty());
+    assert!(runtime.queue(&handle).unwrap().lock().unwrap().is_empty());
     assert_eq!(effects.projections.lock().unwrap().len(), 1);
     assert_eq!(effects.events.lock().unwrap().len(), 2);
     assert_eq!(

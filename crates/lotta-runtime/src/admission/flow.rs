@@ -13,7 +13,7 @@ fn start_idle_empty() {
         .unwrap_or_else(|error| fail(&error));
     assert!(matches!(outcome, AdmissionOutcome::Start(_)));
     assert_eq!(outcome.disposition(), InputDisposition::Started);
-    assert!(runtime.queue(&handle).unwrap().is_empty());
+    assert!(runtime.queue(&handle).unwrap().lock().unwrap().is_empty());
 }
 
 #[test]
@@ -54,7 +54,7 @@ fn occupied_states_enqueue() {
             )
             .unwrap_or_else(|error| fail(&error));
         assert!(matches!(outcome, AdmissionOutcome::Queued(_)));
-        assert_eq!(runtime.queue(&handle).unwrap().len(), 1);
+        assert_eq!(runtime.queue(&handle).unwrap().lock().unwrap().len(), 1);
     }
 }
 
@@ -65,6 +65,8 @@ fn idle_with_pending_enqueues_at_tail() {
         .current_entry_mut(&handle)
         .unwrap()
         .queue
+        .lock()
+        .unwrap()
         .enqueue(request(1, QueueItemKind::Message, QueueItemSource::User).item)
         .unwrap();
     let outcome = runtime
@@ -77,8 +79,10 @@ fn idle_with_pending_enqueues_at_tail() {
     let ids: Vec<_> = runtime
         .queue(&handle)
         .unwrap()
+        .lock()
+        .unwrap()
         .items()
-        .map(|item| item.id.as_str())
+        .map(|item| item.id.as_str().to_owned())
         .collect();
     assert_eq!(ids, ["item-1", "item-2"]);
 }
@@ -103,7 +107,7 @@ fn current_continuation_and_control_are_direct() {
             outcome,
             AdmissionOutcome::Control(_) | AdmissionOutcome::Continue(_)
         ));
-        assert!(runtime.queue(&handle).unwrap().is_empty());
+        assert!(runtime.queue(&handle).unwrap().lock().unwrap().is_empty());
     }
 }
 
@@ -168,5 +172,5 @@ fn stale_handle_is_atomic() {
             )
             .is_err()
     );
-    assert!(runtime.queue(&handle).unwrap().is_empty());
+    assert!(runtime.queue(&handle).unwrap().lock().unwrap().is_empty());
 }

@@ -90,7 +90,14 @@ fn superseded_generation_is_rejected_with_zero_emissions() {
         frames.lock().expect("frames").is_empty(),
         "a stale continuation emits nothing"
     );
-    assert!(runtime.queue(&handle).expect("queue").is_empty());
+    assert!(
+        runtime
+            .queue(&handle)
+            .expect("queue")
+            .lock()
+            .expect("queue lock")
+            .is_empty()
+    );
     let owner = runtime.lifecycle(&handle).expect("owner");
     let projection = owner.projection();
     assert_eq!(

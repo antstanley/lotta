@@ -81,6 +81,8 @@ async fn enqueues_cron_prompt_without_starting_a_turn() {
     let stored: Vec<(QueueItemKind, QueueItemSource)> = locked
         .queue(&handle)
         .expect("queue")
+        .lock()
+        .expect("queue lock")
         .items()
         .map(|item| (item.kind, item.source))
         .collect();

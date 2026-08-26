@@ -1195,6 +1195,8 @@ mod scheduler_service {
         let stored: Vec<_> = listener
             .queue(&handle)
             .expect("queue")
+            .lock()
+            .expect("queue lock")
             .items()
             .map(|item| item.kind)
             .collect();

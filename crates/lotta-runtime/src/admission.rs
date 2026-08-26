@@ -76,7 +76,11 @@ impl ListenerRuntime {
         handle: &RuntimeHandle,
         item: QueueItem,
     ) -> Result<QueueMutation, RuntimeError> {
-        self.current_entry_mut(handle)?.queue.enqueue(item)
+        self.queue(handle)
+            .ok_or_else(stale_handle)?
+            .lock()
+            .map_err(|_| queue_lock_error())?
+            .enqueue(item)
     }
 
     /// Atomically admits against one entry's history, lifecycle, and queue.
@@ -98,35 +102,12 @@ impl ListenerRuntime {
         {
             return Ok(AdmissionOutcome::Duplicate(prior));
         }
+        let mut queue = entry.queue.lock().map_err(|_| queue_lock_error())?;
         let client_message_id = request.item.client_message_id.clone();
-        let outcome = match request.route {
-            AdmissionRoute::Ordinary => {
-                if entry.owner.projection().state() == TurnStateKind::Idle
-                    && entry.queue.is_empty()
-                    && request.item.kind == QueueItemKind::Message
-                {
-                    AdmissionOutcome::Start(request.item)
-                } else {
-                    classify_queue(entry.queue.enqueue(request.item)?)
-                }
-            }
-            AdmissionRoute::Continuation(lease) => {
-                if entry.owner.is_current(&lease) {
-                    AdmissionOutcome::Continue(request.item)
-                } else {
-                    stale_route(&mut entry.queue, request.item)?
-                }
-            }
-            AdmissionRoute::Control(lease) => {
-                if entry.owner.is_current(&lease) {
-                    AdmissionOutcome::Control(request.item)
-                } else {
-                    stale_route(&mut entry.queue, request.item)?
-                }
-            }
-        };
-        let queue_depth = entry.queue.len();
+        let outcome = admit_route(&entry.owner, &mut queue, request)?;
+        let queue_depth = queue.len();
         let active_turns = u64::from(entry.owner.projection().state() != TurnStateKind::Idle);
+        drop(queue);
         let _recorded = entry
             .admission_history
             .admit(&client_message_id, outcome.disposition());
@@ -139,6 +120,45 @@ impl ListenerRuntime {
             active_turns,
         );
         Ok(outcome)
+    }
+}
+
+fn admit_route(
+    owner: &crate::LifecycleOwner,
+    queue: &mut crate::ConversationQueue,
+    request: AdmissionRequest,
+) -> Result<AdmissionOutcome, RuntimeError> {
+    match request.route {
+        AdmissionRoute::Ordinary
+            if owner.projection().state() == TurnStateKind::Idle
+                && queue.is_empty()
+                && request.item.kind == QueueItemKind::Message =>
+        {
+            Ok(AdmissionOutcome::Start(request.item))
+        }
+        AdmissionRoute::Ordinary => queue.enqueue(request.item).map(classify_queue),
+        AdmissionRoute::Continuation(lease) if owner.is_current(&lease) => {
+            Ok(AdmissionOutcome::Continue(request.item))
+        }
+        AdmissionRoute::Control(lease) if owner.is_current(&lease) => {
+            Ok(AdmissionOutcome::Control(request.item))
+        }
+        AdmissionRoute::Continuation(_) | AdmissionRoute::Control(_) => {
+            stale_route(queue, request.item)
+        }
+    }
+}
+
+fn stale_handle() -> RuntimeError {
+    RuntimeError::InvalidData {
+        context: "stale runtime handle".into(),
+    }
+}
+
+fn queue_lock_error() -> RuntimeError {
+    RuntimeError::AdapterFailure {
+        code: "queue_lock",
+        context: "conversation queue".into(),
     }
 }
 

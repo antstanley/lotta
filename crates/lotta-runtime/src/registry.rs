@@ -6,7 +6,10 @@ use lotta_domain::bounds::RUNTIMES_MAX;
 use lotta_domain::{
     AdmissionHistory, AgentId, ConversationId, NonEmptyString, RuntimeScope, TurnStateKind,
 };
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 use uuid::Uuid;
 
 /// Immutable identity of one conversation runtime.
@@ -90,7 +93,7 @@ impl RuntimeResidency {
 pub(crate) struct RuntimeEntry {
     pub(crate) generation: u64,
     pub(crate) owner: LifecycleOwner,
-    pub(crate) queue: ConversationQueue,
+    pub(crate) queue: Arc<Mutex<ConversationQueue>>,
     pub(crate) admission_history: AdmissionHistory,
     pub(crate) residency: RuntimeResidency,
 }
@@ -143,7 +146,10 @@ impl ListenerRuntime {
     }
 
     fn refresh_queue_gauge(&self, handle: &RuntimeHandle) {
-        let depth = self.queue(handle).map_or(0, |queue| queue.len() as u64);
+        let depth = self
+            .queue(handle)
+            .and_then(|queue| queue.lock().ok().map(|queue| queue.len() as u64))
+            .unwrap_or(0);
         self.observer
             .set_gauge(crate::observe::metrics::MetricFamily::QueueDepth, depth);
     }
@@ -200,8 +206,9 @@ impl ListenerRuntime {
 
     /// Returns the exact handle's immutable pending queue.
     #[must_use]
-    pub fn queue(&self, handle: &RuntimeHandle) -> Option<&ConversationQueue> {
-        self.current_entry(handle).map(|entry| &entry.queue)
+    pub fn queue(&self, handle: &RuntimeHandle) -> Option<Arc<Mutex<ConversationQueue>>> {
+        self.current_entry(handle)
+            .map(|entry| Arc::clone(&entry.queue))
     }
 
     /// Dequeues the pending queue head for an exact runtime generation.
@@ -212,7 +219,7 @@ impl ListenerRuntime {
         &mut self,
         handle: &RuntimeHandle,
     ) -> Result<Option<QueueMutation>, RuntimeError> {
-        let result = self.current_entry_mut(handle)?.queue.dequeue()?;
+        let result = self.queue_lock(handle)?.dequeue()?;
         self.refresh_queue_gauge(handle);
         Ok(result)
     }
@@ -226,7 +233,7 @@ impl ListenerRuntime {
         handle: &RuntimeHandle,
         id: &NonEmptyString,
     ) -> Result<Option<QueueMutation>, RuntimeError> {
-        let result = self.current_entry_mut(handle)?.queue.remove(id)?;
+        let result = self.queue_lock(handle)?.remove(id)?;
         self.refresh_queue_gauge(handle);
         Ok(result)
     }
@@ -240,7 +247,7 @@ impl ListenerRuntime {
         handle: &RuntimeHandle,
         id: &NonEmptyString,
     ) -> Result<Option<QueueMutation>, RuntimeError> {
-        let result = self.current_entry_mut(handle)?.queue.cancel(id)?;
+        let result = self.queue_lock(handle)?.cancel(id)?;
         self.refresh_queue_gauge(handle);
         Ok(result)
     }
@@ -254,7 +261,7 @@ impl ListenerRuntime {
         handle: &RuntimeHandle,
         id: &NonEmptyString,
     ) -> Result<Option<QueueMutation>, RuntimeError> {
-        self.current_entry_mut(handle)?.queue.drop_stale(id)
+        self.queue_lock(handle)?.drop_stale(id)
     }
 
     /// Restores one previously removed item to an exact runtime's queue front.
@@ -266,14 +273,19 @@ impl ListenerRuntime {
         handle: &RuntimeHandle,
         item: lotta_domain::QueueItem,
     ) -> Result<QueueMutation, RuntimeError> {
-        self.current_entry_mut(handle)?.queue.requeue_front(item)
+        self.queue_lock(handle)?.requeue_front(item)
     }
 
     /// Returns an exact runtime's FIFO queue head without mutation.
     #[must_use]
-    pub fn peek_queue(&self, handle: &RuntimeHandle) -> Option<&lotta_domain::QueueItem> {
-        self.current_entry(handle)
-            .and_then(|entry| entry.queue.peek())
+    pub fn peek_queue(&self, handle: &RuntimeHandle) -> Option<lotta_domain::QueueItem> {
+        self.current_entry(handle).and_then(|entry| {
+            entry
+                .queue
+                .lock()
+                .ok()
+                .and_then(|queue| queue.peek().cloned())
+        })
     }
 
     /// Pumps exactly one item from an exact runtime's queue using its live lifecycle state.
@@ -284,10 +296,11 @@ impl ListenerRuntime {
         &mut self,
         handle: &RuntimeHandle,
     ) -> Result<Option<lotta_domain::QueueItem>, RuntimeError> {
-        let entry = self.current_entry_mut(handle)?;
+        let entry = self.current_entry(handle).ok_or_else(stale_handle)?;
         let state = entry.owner.projection().state();
-        let result = entry.queue.pump_one(state)?;
-        let depth = entry.queue.len() as u64;
+        let mut queue = entry.queue.lock().map_err(|_| queue_lock_error())?;
+        let result = queue.pump_one(state)?;
+        let depth = queue.len() as u64;
         self.observer
             .set_gauge(crate::observe::metrics::MetricFamily::QueueDepth, depth);
         Ok(result)
@@ -298,10 +311,9 @@ impl ListenerRuntime {
     /// # Panics
     /// Panics if the caller does not provide the same live runtime generation used to pump.
     pub fn rollback_pump_one(&mut self, handle: &RuntimeHandle, item: lotta_domain::QueueItem) {
-        let entry = self
-            .current_entry_mut(handle)
-            .expect("pump rollback requires the same live runtime generation");
-        entry.queue.rollback_pump_one(item);
+        if let Ok(mut queue) = self.queue_lock(handle) {
+            queue.rollback_pump_one(item);
+        }
     }
 
     /// Pumps an exact runtime's queue using its live lifecycle state.
@@ -312,9 +324,24 @@ impl ListenerRuntime {
         &mut self,
         handle: &RuntimeHandle,
     ) -> Result<Option<PumpMutation>, RuntimeError> {
-        let entry = self.current_entry_mut(handle)?;
+        let entry = self.current_entry(handle).ok_or_else(stale_handle)?;
         let state = entry.owner.projection().state();
-        entry.queue.pump(state)
+        entry
+            .queue
+            .lock()
+            .map_err(|_| queue_lock_error())?
+            .pump(state)
+    }
+
+    fn queue_lock(
+        &self,
+        handle: &RuntimeHandle,
+    ) -> Result<std::sync::MutexGuard<'_, ConversationQueue>, RuntimeError> {
+        self.current_entry(handle)
+            .ok_or_else(stale_handle)?
+            .queue
+            .lock()
+            .map_err(|_| queue_lock_error())
     }
 
     /// Returns the exact handle's mutable lifecycle owner.
@@ -360,7 +387,7 @@ impl ListenerRuntime {
         let entry = RuntimeEntry {
             generation,
             owner: LifecycleOwner::new(scope.clone(), owner_id),
-            queue: ConversationQueue::default(),
+            queue: Arc::new(Mutex::new(ConversationQueue::default())),
             admission_history: AdmissionHistory::default(),
             residency: RuntimeResidency::new(0, false, 0),
         };
@@ -379,7 +406,7 @@ impl ListenerRuntime {
     ) -> Result<ResidencyUpdate, RuntimeError> {
         let entry = self.current_entry(handle).ok_or_else(stale_handle)?;
         let lifecycle = entry.owner.projection().state();
-        let queue_len = entry.queue.len();
+        let queue_len = entry.queue.lock().map_err(|_| queue_lock_error())?.len();
         if snapshot.requires_residency(lifecycle, queue_len) {
             self.lifecycle_mut(handle)?;
             if let Some(entry) = self.entries.get_mut(&handle.key) {
@@ -420,6 +447,13 @@ fn stale_handle() -> RuntimeError {
 fn generation_exhausted() -> RuntimeError {
     RuntimeError::InvalidData {
         context: "runtime_generation_exhausted".into(),
+    }
+}
+
+fn queue_lock_error() -> RuntimeError {
+    RuntimeError::AdapterFailure {
+        code: "queue_lock",
+        context: "conversation queue".into(),
     }
 }
 

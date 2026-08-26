@@ -52,6 +52,8 @@ fn all_sources_preserve_fifo() {
     let actual: Vec<_> = runtime
         .queue(&handle)
         .unwrap()
+        .lock()
+        .unwrap()
         .items()
         .map(|item| (item.kind, item.source))
         .collect();
@@ -63,7 +65,15 @@ fn assert_source(kind: QueueItemKind, source: QueueItemSource) {
     let before = runtime.lifecycle(&handle).unwrap().projection().state();
     let outcome = runtime.admit(&handle, request(1, kind, source)).unwrap();
     assert!(matches!(outcome, AdmissionOutcome::Queued(_)));
-    let stored = runtime.queue(&handle).unwrap().items().next().unwrap();
+    let stored = runtime
+        .queue(&handle)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .items()
+        .next()
+        .cloned()
+        .unwrap();
     assert_eq!((stored.kind, stored.source), (kind, source));
     assert_eq!(
         runtime.lifecycle(&handle).unwrap().projection().state(),
