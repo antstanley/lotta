@@ -40,6 +40,29 @@ impl Drop for ChildGuard {
     }
 }
 
+struct RestartTestLock(std::fs::File);
+
+impl RestartTestLock {
+    fn acquire() -> Self {
+        let path = std::env::temp_dir().join("lotta-task73-restart-tests.lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .expect("open restart test lock");
+        file.lock().expect("acquire restart test lock");
+        Self(file)
+    }
+}
+
+impl Drop for RestartTestLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 struct TempRoot(std::path::PathBuf);
 impl TempRoot {
     fn new() -> Self {
@@ -200,8 +223,24 @@ async fn send(socket: &mut Socket, value: Value) {
         .expect("send websocket frame");
 }
 
-async fn receive(socket: &mut Socket) -> Value {
-    tokio::time::timeout(Duration::from_secs(10), async {
+fn approval_diagnostic(paths: &StorePaths, owner: &RuntimeScope) -> String {
+    match manager(paths).get_request(owner, &text("approval-process-restart")) {
+        Ok(Some(request)) => format!(
+            "state={:?}, revision={}, lease_generation={}",
+            request.state, request.revision, request.lease_generation
+        ),
+        Ok(None) => "approval row absent".to_owned(),
+        Err(error) => format!("approval read failed: {error:?}"),
+    }
+}
+
+async fn receive(
+    socket: &mut Socket,
+    phase: &str,
+    paths: &StorePaths,
+    owner: &RuntimeScope,
+) -> Value {
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match socket
                 .next()
@@ -215,18 +254,43 @@ async fn receive(socket: &mut Socket) -> Value {
             }
         }
     })
-    .await
-    .expect("websocket frame timeout")
+    .await;
+    result.unwrap_or_else(|_| {
+        panic!(
+            "websocket frame timeout during {phase}; {}",
+            approval_diagnostic(paths, owner)
+        )
+    })
 }
 
-async fn start_and_replay(socket: &mut Socket, owner: &RuntimeScope) {
-    start_runtime(socket, owner).await;
-    let replay = receive(socket).await;
+async fn start_and_replay(
+    socket: &mut Socket,
+    owner: &RuntimeScope,
+    paths: &StorePaths,
+    phase: &str,
+) {
+    start_runtime(socket, owner, paths, phase).await;
+    let replay = receive(
+        socket,
+        &format!("{phase} control_request replay"),
+        paths,
+        owner,
+    )
+    .await;
     assert_eq!(replay["type"], "control_request");
     assert_eq!(replay["request_id"], "approval-process-restart");
 }
 
-async fn start_runtime(socket: &mut Socket, owner: &RuntimeScope) {
+fn assert_pending_revision(paths: &StorePaths, owner: &RuntimeScope, revision: u64) {
+    let pending = manager(paths)
+        .get_request(owner, &text("approval-process-restart"))
+        .expect("load replayed approval")
+        .expect("replayed approval retained");
+    assert_eq!(pending.state, ApprovalState::Pending);
+    assert_eq!(pending.revision, revision);
+}
+
+async fn start_runtime(socket: &mut Socket, owner: &RuntimeScope, paths: &StorePaths, phase: &str) {
     send(
         socket,
         json!({
@@ -235,32 +299,40 @@ async fn start_runtime(socket: &mut Socket, owner: &RuntimeScope) {
         }),
     )
     .await;
-    let response = receive(socket).await;
+    let response = receive(
+        socket,
+        &format!("{phase} runtime_start_response"),
+        paths,
+        owner,
+    )
+    .await;
     assert_eq!(response["type"], "runtime_start_response");
     assert_eq!(response["success"], true);
 }
 
-async fn exercise_pending_restart(decision: Value, expected_state: &str) {
-    let root = TempRoot::new();
-    let paths = StorePaths::new(root.0.clone()).expect("store paths");
-    let owner = scope();
-    seed(&paths, &owner).await;
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("reserve port")
-        .local_addr()
-        .expect("local address")
-        .port();
-    let url = format!("ws://127.0.0.1:{port}/ws");
+fn assert_runtime_input_wire(value: &Value) {
+    let frame = lotta_app_server::framing::decode_text(&value.to_string())
+        .expect("bounded approval response frame");
+    let decoded =
+        lotta_app_server::ws::command::decode(&frame).expect("typed approval response command");
+    assert!(
+        matches!(
+            decoded,
+            Some(lotta_app_server::ws::RuntimeCommand::Input(_))
+        ),
+        "approval response classification: {:?}",
+        frame.effects.outcome
+    );
+}
 
-    let first = spawn(&root.0, port);
-    let mut first_socket = connect(&url).await;
-    start_and_replay(&mut first_socket, &owner).await;
-    drop(first_socket);
-    drop(first);
-
-    let second = spawn(&root.0, port);
-    let mut second_socket = connect(&url).await;
-    start_and_replay(&mut second_socket, &owner).await;
+async fn resolve_restarted_pending(
+    socket: &mut Socket,
+    paths: &StorePaths,
+    owner: &RuntimeScope,
+    case: &str,
+    decision: Value,
+    expected_state: &str,
+) {
     let response = json!({
         "type":"input", "request_id":"resolve-once", "runtime":owner,
         "payload":{
@@ -268,24 +340,46 @@ async fn exercise_pending_restart(decision: Value, expected_state: &str) {
             "decision":decision
         }
     });
-    send(&mut second_socket, response.clone()).await;
-    assert_eq!(receive(&mut second_socket).await["accepted"], true);
-    let recovery = receive(&mut second_socket).await;
+    assert_runtime_input_wire(&response);
+    send(socket, response.clone()).await;
+    assert_eq!(
+        receive(
+            socket,
+            &format!("{case} resolution input_accepted"),
+            paths,
+            owner,
+        )
+        .await["accepted"],
+        true
+    );
+    let recovery = receive(socket, &format!("{case} approval_recovery"), paths, owner).await;
     assert_eq!(recovery["type"], "approval_recovery");
     assert_eq!(recovery["state"], expected_state);
     assert_eq!(
-        receive(&mut second_socket).await["stop_reason"],
+        receive(
+            socket,
+            &format!("{case} recovery turn_finished"),
+            paths,
+            owner,
+        )
+        .await["stop_reason"],
         "approval_recovery_interrupted"
     );
-    send(&mut second_socket, response).await;
-    let duplicate = receive(&mut second_socket).await;
+    send(socket, response).await;
+    let duplicate = receive(
+        socket,
+        &format!("{case} duplicate input rejection"),
+        paths,
+        owner,
+    )
+    .await;
     assert_eq!(duplicate["type"], "input_accepted");
     assert_eq!(duplicate["accepted"], false);
-    drop(second_socket);
-    drop(second);
+}
 
-    let terminal = manager(&paths)
-        .get_request(&owner, &text("approval-process-restart"))
+fn assert_pending_restart_terminal(paths: &StorePaths, owner: &RuntimeScope, expected_state: &str) {
+    let terminal = manager(paths)
+        .get_request(owner, &text("approval-process-restart"))
         .expect("load terminal");
     if expected_state == "denied" {
         assert!(terminal.is_none());
@@ -296,22 +390,65 @@ async fn exercise_pending_restart(decision: Value, expected_state: &str) {
     }
 }
 
+async fn exercise_pending_restart(case: &str, decision: Value, expected_state: &str) {
+    let root = TempRoot::new();
+    let paths = StorePaths::new(root.0.clone()).expect("store paths");
+    let owner = scope();
+    seed(&paths, &owner).await;
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("reserve port")
+        .local_addr()
+        .expect("local address")
+        .port();
+    let url = format!("ws://127.0.0.1:{port}/ws");
+    let first = spawn(&root.0, port);
+    let mut first_socket = connect(&url).await;
+    start_and_replay(&mut first_socket, &owner, &paths, "first process").await;
+    assert_pending_revision(&paths, &owner, 1);
+    drop(first_socket);
+    drop(first);
+
+    let second = spawn(&root.0, port);
+    let mut second_socket = connect(&url).await;
+    start_and_replay(&mut second_socket, &owner, &paths, "second process").await;
+    assert_pending_revision(&paths, &owner, 2);
+    resolve_restarted_pending(
+        &mut second_socket,
+        &paths,
+        &owner,
+        case,
+        decision,
+        expected_state,
+    )
+    .await;
+    drop(second_socket);
+    drop(second);
+    assert_pending_restart_terminal(&paths, &owner, expected_state);
+}
+
 #[tokio::test]
 async fn real_process_restart_accepts_allow_deny_and_edit_exactly_once() {
-    for (decision, state) in [
-        (json!({"behavior":"allow"}), "interrupted"),
-        (json!({"behavior":"deny"}), "denied"),
+    let _serial = RestartTestLock::acquire();
+    for (case, decision, state) in [
+        ("allow", json!({"behavior":"allow"}), "interrupted"),
         (
+            "deny",
+            json!({"behavior":"deny","message":"denied by restart test"}),
+            "denied",
+        ),
+        (
+            "edit",
             json!({"behavior":"allow","updated_input":{"path":"edited"}}),
             "interrupted",
         ),
     ] {
-        exercise_pending_restart(decision, state).await;
+        exercise_pending_restart(case, decision, state).await;
     }
 }
 
 #[tokio::test]
 async fn real_process_restart_interrupts_executing_without_replay() {
+    let _serial = RestartTestLock::acquire();
     let root = TempRoot::new();
     let paths = StorePaths::new(root.0.clone()).expect("store paths");
     let owner = scope();
@@ -323,8 +460,8 @@ async fn real_process_restart_interrupts_executing_without_replay() {
         .port();
     let server = spawn(&root.0, port);
     let mut socket = connect(&format!("ws://127.0.0.1:{port}/ws")).await;
-    start_runtime(&mut socket, &owner).await;
-    let recovery = receive(&mut socket).await;
+    start_runtime(&mut socket, &owner, &paths, "executing recovery").await;
+    let recovery = receive(&mut socket, "executing approval_recovery", &paths, &owner).await;
     assert_eq!(recovery["type"], "approval_recovery");
     assert_eq!(recovery["state"], "interrupted");
     assert_eq!(recovery["original_state"], "executing");

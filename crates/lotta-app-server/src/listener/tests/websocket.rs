@@ -288,15 +288,17 @@ fn typed_failure_state(
     sender: mpsc::Sender<Vec<String>>,
 ) -> super::ListenerState {
     let storage = storage_bridges(&prepared);
+    let shutdown = tokio_util::sync::CancellationToken::new();
     super::ListenerState {
         auth: prepared.auth,
         listener_instance: "test-listener".to_owned(),
         clock: clock(),
-        shutdown: tokio_util::sync::CancellationToken::new(),
+        shutdown: shutdown.clone(),
         limits: super::SocketLimits::default(),
         runtime_router: router,
         runtime_service: Arc::new(crate::ws::UnsupportedRuntimeCommandService),
         turn_controller: Arc::new(crate::ws::UnsupportedRuntimeCommandService),
+        turns: super::turn_supervisor::RuntimeTurnSupervisor::new(shutdown),
         observer: Arc::new(crate::observer::InertRuntimeBroadcastObserver),
         external_tools: Arc::new(crate::ws::external_tools::ExternalToolBridge::new(
             crate::ws::external_tools::inert_forwarder(),
@@ -380,6 +382,46 @@ async fn typed_runtime_failures_are_unstamped_and_sent_to_origin() {
             assert!(value.get(field).is_none(), "{field}");
         }
     }
+}
+
+#[test]
+fn runtime_event_survives_transport_disappearing_after_routing() {
+    let args = ServerArgs {
+        listen_enabled: true,
+        ..ServerArgs::default()
+    };
+    let prepared = args.prepare().expect("prepared server");
+    let mut runtime_router =
+        crate::ws::RuntimeRouter::new(clock(), Arc::new(crate::ws::RandomEventIdGenerator));
+    let origin = runtime_router.connections.open().expect("open connection");
+    runtime_router
+        .connections
+        .initialize(origin)
+        .expect("initialize connection");
+    let scope = lotta_domain::RuntimeScope::new(
+        lotta_domain::AgentId::accept("agent-transport-race").expect("agent id"),
+        lotta_domain::ConversationId::accept("conversation-transport-race")
+            .expect("conversation id"),
+        None,
+    );
+    runtime_router
+        .connections
+        .subscribe(origin, scope.clone())
+        .expect("subscribe connection");
+    let router = Arc::new(Mutex::new(runtime_router));
+    let (sender, receiver) = mpsc::channel::<Vec<String>>(1);
+    let state = Arc::new(typed_failure_state(prepared, router, origin, sender));
+    drop(receiver);
+
+    let result = super::event_sink(&state).emit(
+        &scope,
+        RuntimeEvent::UpdateQueue {
+            queue: Vec::new(),
+            removed: Vec::new(),
+        },
+    );
+
+    assert!(result.is_ok());
 }
 
 #[test]

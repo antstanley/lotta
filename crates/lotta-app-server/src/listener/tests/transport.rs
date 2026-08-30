@@ -142,11 +142,12 @@ fn inert_storage_bridges() -> StorageBridges {
 
 fn router() -> axum::Router {
     let storage = inert_storage_bridges();
+    let shutdown = tokio_util::sync::CancellationToken::new();
     let state = Arc::new(ListenerState {
         auth: AuthPolicy::None,
         listener_instance: "test-listener".to_owned(),
         clock: Arc::new(TestClock),
-        shutdown: tokio_util::sync::CancellationToken::new(),
+        shutdown: shutdown.clone(),
         limits: SocketLimits::default(),
         runtime_router: Arc::new(std::sync::Mutex::new(crate::ws::RuntimeRouter::new(
             Arc::new(TestClock),
@@ -154,6 +155,7 @@ fn router() -> axum::Router {
         ))),
         runtime_service: Arc::new(crate::ws::UnsupportedRuntimeCommandService),
         turn_controller: Arc::new(crate::ws::UnsupportedRuntimeCommandService),
+        turns: super::turn_supervisor::RuntimeTurnSupervisor::new(shutdown),
         observer: Arc::new(crate::observer::InertRuntimeBroadcastObserver),
         external_tools: Arc::new(crate::ws::external_tools::ExternalToolBridge::new(
             crate::ws::external_tools::inert_forwarder(),

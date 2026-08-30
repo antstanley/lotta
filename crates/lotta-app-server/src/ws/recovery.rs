@@ -130,4 +130,47 @@ mod reconnect {
             .unwrap_or_else(|error| panic!("renew: {error}"));
         assert_eq!(connections.event_seq(renewed), Some(0));
     }
+
+    #[test]
+    fn listener_shutdown_drains_live_and_suspended_subscriptions_once() {
+        let (router, _, _, _) = router();
+        let live_scope = scope(1);
+        let suspended_scope = scope(2);
+        let suspended_identity = ReconnectIdentity {
+            listener_instance: "listener".into(),
+            principal: "principal".into(),
+            client_id: "suspended".into(),
+        };
+        let mut locked = router.lock().expect("router");
+        locked
+            .connections
+            .subscribe(1, live_scope.clone())
+            .expect("subscribe live");
+        locked
+            .connections
+            .subscribe(1, suspended_scope.clone())
+            .expect("subscribe second live scope");
+        let suspended = locked
+            .connections
+            .open_authenticated(Some(&suspended_identity))
+            .expect("open suspended identity");
+        locked
+            .connections
+            .subscribe(suspended, suspended_scope.clone())
+            .expect("subscribe suspended");
+        locked.connections.suspend(suspended);
+
+        let drained = locked.connections.shutdown();
+
+        assert_eq!(drained.len(), 2);
+        assert!(drained.contains(&live_scope));
+        assert!(drained.contains(&suspended_scope));
+        assert_eq!(locked.connections.subscription_count_for(&live_scope), 0);
+        assert_eq!(
+            locked.connections.subscription_count_for(&suspended_scope),
+            0
+        );
+        assert!(locked.connections.inspect_active().is_empty());
+        assert!(locked.connections.shutdown().is_empty());
+    }
 }

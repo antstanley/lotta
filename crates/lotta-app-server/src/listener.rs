@@ -19,12 +19,10 @@ use axum::{
     routing::get,
 };
 use lotta_domain::Clock;
-use tokio::{
-    net::TcpListener,
-    sync::mpsc,
-    task::{JoinHandle, JoinSet},
-};
+use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
+
+mod turn_supervisor;
 
 use crate::{
     auth::origin,
@@ -107,6 +105,7 @@ struct ListenerState {
     runtime_router: Arc<std::sync::Mutex<RuntimeRouter>>,
     runtime_service: Arc<dyn RuntimeCommandService>,
     turn_controller: Arc<dyn TurnController>,
+    turns: turn_supervisor::RuntimeTurnSupervisor,
     observer: Arc<dyn crate::observer::RuntimeBroadcastObserver>,
     agents: Arc<AgentsBridge>,
     conversations: Arc<ConversationsBridge>,
@@ -622,12 +621,16 @@ async fn run_listener(
         SUBSCRIPTION_LEASE_SWEEP_SECONDS,
     ));
     sweep.tick().await;
-    loop {
+    let server_result = loop {
         tokio::select! {
-            result = &mut server => return result.map_err(|_| AppServerError::Listener),
+            result = &mut server => break result.map_err(|_| AppServerError::Listener),
             _ = sweep.tick() => publish_expired_subscription_updates(&state).await,
         }
-    }
+    };
+    state.shutdown.cancel();
+    let turn_result = state.turns.shutdown().await;
+    publish_shutdown_subscription_updates(&state).await;
+    server_result.and(turn_result)
 }
 
 /// Runtime command endpoints handed to every composed listener state.
@@ -663,12 +666,9 @@ fn compose_listener_state(
     shared: Option<SharedGroupBridges>,
     shutdown: CancellationToken,
 ) -> Result<Arc<ListenerState>, AppServerError> {
-    let shared = match shared {
-        Some(shared) => shared,
-        None => compose_shared_bridges(&prepared, clock)?,
-    };
+    let shared = resolve_shared_bridges(shared, &prepared, clock)?;
     let conversations_authority = shared.conversations_authority();
-    let device_ports = DevicePorts::from_shared(&shared);
+    let mut device_ports = DevicePorts::from_shared(&shared);
     let SharedGroupBridges {
         outbound,
         skills,
@@ -685,12 +685,10 @@ fn compose_listener_state(
         &artifacts_dir,
         conversations_authority,
     )?;
-    let devices = compose_device_bridges(&outbound, &prepared, device_ports.queue_authority)?;
-    devices.register_mod_commands_if_set(device_ports.mod_commands);
-    devices.register_background_processes_if_set(device_ports.background);
-    if let Some(authority) = device_ports.status_authority {
-        devices.register_status_authority(authority);
-    }
+    let queue_authority = device_ports.queue_authority.take();
+    let devices = compose_device_bridges(&outbound, &prepared, queue_authority)?;
+    register_composed_device_ports(&devices, device_ports);
+    let turns = turn_supervisor::RuntimeTurnSupervisor::new(shutdown.clone());
     Ok(Arc::new(ListenerState {
         auth: prepared.auth,
         listener_instance: listener_instance(clock),
@@ -703,6 +701,7 @@ fn compose_listener_state(
         ))),
         runtime_service: endpoints.service,
         turn_controller: endpoints.turn_controller,
+        turns,
         observer: endpoints.observer,
         external_tools: Arc::new(ExternalToolBridge::new(external_forwarder(&outbound))),
         teleports: Arc::new(TeleportBridge::new(teleport_forwarder(&outbound))),
@@ -723,6 +722,25 @@ fn compose_listener_state(
         next_observation: AtomicU64::new(1),
         outbound,
     }))
+}
+
+fn resolve_shared_bridges(
+    shared: Option<SharedGroupBridges>,
+    prepared: &PreparedServer,
+    clock: &Arc<dyn Clock + Send + Sync>,
+) -> Result<SharedGroupBridges, AppServerError> {
+    match shared {
+        Some(shared) => Ok(shared),
+        None => compose_shared_bridges(prepared, clock),
+    }
+}
+
+fn register_composed_device_ports(devices: &Arc<DeviceBridge>, ports: DevicePorts) {
+    devices.register_mod_commands_if_set(ports.mod_commands);
+    devices.register_background_processes_if_set(ports.background);
+    if let Some(authority) = ports.status_authority {
+        devices.register_status_authority(authority);
+    }
 }
 
 fn listener_instance(clock: &Arc<dyn Clock + Send + Sync>) -> String {
@@ -932,8 +950,6 @@ async fn serve_socket(
     };
     publish_expired_subscription_updates(&state).await;
     let mut heartbeat = Heartbeat::new(state.clock.as_ref());
-    let connection_cancellation = state.shutdown.child_token();
-    let mut turns = JoinSet::new();
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(
         state.limits.ping_interval_ms,
     ));
@@ -965,8 +981,6 @@ async fn serve_socket(
                     &mut heartbeat,
                     &state,
                     connection_id,
-                    &connection_cancellation,
-                    &mut turns,
                 ).await;
                 if !keep_open {
                     break;
@@ -974,8 +988,6 @@ async fn serve_socket(
             }
         }
     }
-    connection_cancellation.cancel();
-    while turns.join_next().await.is_some() {}
     close_connection(&state, connection_id).await;
 }
 
@@ -986,16 +998,22 @@ fn open_connection(
 ) -> Result<crate::ws::ConnectionId, AppServerError> {
     let id = {
         let mut router = lock_router(&state.runtime_router)?;
-        let id = router.connections.open_authenticated(reconnect_identity)?;
-        router.connections.initialize(id)?;
-        id
+        router.connections.open_authenticated(reconnect_identity)?
     };
-    state.introspection.register_authenticated(id);
-    let inserted = prepare_outbound(state, id, sender);
-    if inserted.is_err() {
+    if let Err(error) = prepare_outbound(state, id, sender) {
         lock_router(&state.runtime_router)?.connections.close(id);
+        return Err(error);
     }
-    inserted.map(|()| id)
+    if let Err(error) = lock_router(&state.runtime_router)?
+        .connections
+        .initialize(id)
+    {
+        remove_outbound(state, id)?;
+        lock_router(&state.runtime_router)?.connections.close(id);
+        return Err(error);
+    }
+    state.introspection.register_authenticated(id);
+    Ok(id)
 }
 
 fn prepare_outbound(
@@ -1014,6 +1032,18 @@ fn prepare_outbound(
     Ok(())
 }
 
+fn remove_outbound(
+    state: &ListenerState,
+    id: crate::ws::ConnectionId,
+) -> Result<(), AppServerError> {
+    state
+        .outbound
+        .lock()
+        .map_err(|_| AppServerError::Internal)?
+        .remove(&id);
+    Ok(())
+}
+
 async fn publish_expired_subscription_updates(state: &ListenerState) {
     let updates = if let Ok(mut router) = state.runtime_router.lock() {
         router.connections.expire_suspended();
@@ -1025,6 +1055,20 @@ async fn publish_expired_subscription_updates(state: &ListenerState) {
                 (scope, count)
             })
             .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    publish_subscription_updates(state, updates).await;
+}
+
+async fn publish_shutdown_subscription_updates(state: &ListenerState) {
+    let updates = if let Ok(mut router) = state.runtime_router.lock() {
+        router
+            .connections
+            .shutdown()
+            .into_iter()
+            .map(|scope| (scope, 0))
+            .collect()
     } else {
         Vec::new()
     };
@@ -1055,12 +1099,13 @@ async fn close_connection(state: &ListenerState, id: crate::ws::ConnectionId) {
     state.introspection.unregister(id);
     // Device work is cancellation-bound: cancel first, then reap its joins.
     state.devices.disconnect(id).await;
-    if let Ok(mut outbound) = state.outbound.lock() {
-        outbound.remove(&id);
-    }
     let updates = if let Ok(mut router) = state.runtime_router.lock() {
         let mut scopes = router.connections.subscriptions_of(id);
-        router.connections.suspend(id);
+        if state.shutdown.is_cancelled() {
+            router.connections.close(id);
+        } else {
+            router.connections.suspend(id);
+        }
         for expired in router.connections.take_expired_subscriptions() {
             if !scopes.contains(&expired) {
                 scopes.push(expired);
@@ -1076,6 +1121,7 @@ async fn close_connection(state: &ListenerState, id: crate::ws::ConnectionId) {
     } else {
         Vec::new()
     };
+    let _ = remove_outbound(state, id);
     publish_subscription_updates(state, updates).await;
 }
 
@@ -1085,8 +1131,6 @@ async fn handle_incoming(
     heartbeat: &mut Heartbeat,
     state: &Arc<ListenerState>,
     connection_id: crate::ws::ConnectionId,
-    cancellation: &CancellationToken,
-    turns: &mut JoinSet<()>,
 ) -> bool {
     match incoming {
         Some(Ok(Message::Pong(_))) => {
@@ -1094,9 +1138,7 @@ async fn handle_incoming(
             true
         }
         Some(Ok(Message::Ping(payload))) => socket.send(Message::Pong(payload)).await.is_ok(),
-        Some(Ok(Message::Text(text))) => {
-            handle_text(&text, state, connection_id, cancellation, turns).await
-        }
+        Some(Ok(Message::Text(text))) => handle_text(&text, state, connection_id).await,
         Some(Ok(Message::Binary(_))) => {
             send_close(socket, close_code::UNSUPPORTED, "binary unsupported").await;
             false
@@ -1131,8 +1173,6 @@ async fn handle_text(
     text: &str,
     state: &Arc<ListenerState>,
     connection_id: crate::ws::ConnectionId,
-    cancellation: &CancellationToken,
-    turns: &mut JoinSet<()>,
 ) -> bool {
     let frame = match crate::framing::decode_text(text) {
         Ok(frame) => frame,
@@ -1168,12 +1208,12 @@ async fn handle_text(
             return dispatch_typed_failure(state, connection_id, &frame).is_ok();
         };
         let controller = state.turn_controller.clone();
-        let state = state.clone();
+        let task_state = state.clone();
         let failure_frame = frame.clone();
-        let turn_cancellation = cancellation.child_token();
-        turns.spawn(async move {
+        let turn_cancellation = state.turns.cancellation();
+        let turn = Box::pin(async move {
             let result = if controller.is_control_continuation(&deferred) {
-                state
+                task_state
                     .runtime_service
                     .continue_input(deferred.scope, deferred.continuation, sink)
                     .await
@@ -1183,9 +1223,12 @@ async fn handle_text(
                     .await
             };
             if result.is_err() {
-                let _ = dispatch_typed_failure(&state, connection_id, &failure_frame);
+                let _ = dispatch_typed_failure(&task_state, connection_id, &failure_frame);
             }
         });
+        if state.turns.spawn(turn).await.is_err() {
+            return false;
+        }
     }
     true
 }
@@ -1195,9 +1238,21 @@ fn event_sink(state: &Arc<ListenerState>) -> Arc<dyn crate::ws::RuntimeEventSink
     Arc::new(RouterEventSink::new(
         state.runtime_router.clone(),
         Arc::new(move |scope, event, deliveries| {
-            dispatch_event_batch(&observer_state, scope, event, &deliveries)
+            dispatch_runtime_event_batch(&observer_state, scope, event, &deliveries)
         }),
     ))
+}
+
+fn dispatch_runtime_event_batch(
+    state: &ListenerState,
+    scope: lotta_domain::RuntimeScope,
+    event: crate::ws::RuntimeEvent,
+    deliveries: &EventDeliveryBatch,
+) -> Result<(), AppServerError> {
+    match dispatch_event_batch(state, scope, event, deliveries) {
+        Err(AppServerError::Unavailable) => Ok(()),
+        result => result,
+    }
 }
 
 async fn send_outbound_batch(

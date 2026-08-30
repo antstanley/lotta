@@ -5353,7 +5353,8 @@ mod production_tests {
     struct ProductionSyncProvider {
         emitted: std::sync::atomic::AtomicBool,
         task_executed: tokio::sync::Semaphore,
-        release: tokio::sync::Notify,
+        continued: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
     }
 
     impl Default for ProductionSyncProvider {
@@ -5361,7 +5362,8 @@ mod production_tests {
             Self {
                 emitted: std::sync::atomic::AtomicBool::new(false),
                 task_executed: tokio::sync::Semaphore::new(0),
-                release: tokio::sync::Notify::new(),
+                continued: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Semaphore::new(0),
             }
         }
     }
@@ -5396,7 +5398,7 @@ mod production_tests {
                         "sync-approval-call",
                         "Write",
                         serde_json::json!({
-                            "file_path": "/tmp/production-sync-approval",
+                            "file_path": "production-sync-approval",
                             "content": "held"
                         }),
                     )
@@ -5408,13 +5410,28 @@ mod production_tests {
                         })
                         .await;
                 }
+                self.continued.add_permits(1);
                 tokio::select! {
-                    () = request.cancellation.cancelled() => {},
-                    () = self.release.notified() => {},
+                    () = request.cancellation.cancelled() => {
+                        Err(lotta_runtime::RuntimeError::Cancelled {
+                            context: "production sync fixture".into(),
+                        })
+                    },
+                    permit = self.release.acquire() => {
+                        permit.map_err(|_| lotta_runtime::RuntimeError::AdapterFailure {
+                            code: "production_sync_release",
+                            context: "release semaphore closed".into(),
+                        })?.forget();
+                        events.send(ProviderEvent::TextDelta {
+                            text: lotta_runtime::boundary::ProviderEventText::new(
+                                "approved write completed".into(),
+                            )?,
+                        }).await?;
+                        events.send(ProviderEvent::Stop {
+                            reason: lotta_runtime::ports::StopReason::EndTurn,
+                        }).await
+                    },
                 }
-                Err(lotta_runtime::RuntimeError::Cancelled {
-                    context: "production sync fixture".into(),
-                })
             })
         }
     }
@@ -5600,13 +5617,207 @@ mod production_tests {
     async fn connect_authenticated(
         handle: &lotta_app_server::listener::ListenerHandle,
     ) -> TestSocket {
+        connect_authenticated_as(handle, None).await
+    }
+
+    async fn connect_authenticated_as(
+        handle: &lotta_app_server::listener::ListenerHandle,
+        reconnect_id: Option<&str>,
+    ) -> TestSocket {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let mut request = handle.websocket_url().into_client_request().unwrap();
         request.headers_mut().insert(
             "authorization",
             "Bearer production-sync-token".parse().unwrap(),
         );
+        if let Some(reconnect_id) = reconnect_id {
+            request.headers_mut().insert(
+                "x-lotta-reconnect-id",
+                reconnect_id.parse().expect("reconnect identity header"),
+            );
+        }
         tokio_tungstenite::connect_async(request).await.unwrap().0
+    }
+
+    async fn disconnect_socket(mut socket: TestSocket) {
+        socket.close(None).await.expect("send close frame");
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(frame) = socket.next().await {
+                match frame {
+                    Ok(tokio_tungstenite::tungstenite::Message::Close(_)) | Err(_) => break,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "server completed close handshake");
+    }
+
+    async fn connect_resumed_authenticated_as(
+        handle: &lotta_app_server::listener::ListenerHandle,
+        reconnect_id: &str,
+    ) -> TestSocket {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let mut socket = connect_authenticated_as(handle, Some(reconnect_id)).await;
+                if socket
+                    .send(tokio_tungstenite::tungstenite::Message::Ping(
+                        Vec::new().into(),
+                    ))
+                    .await
+                    .is_ok()
+                    && matches!(
+                        socket.next().await,
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(_)))
+                    )
+                {
+                    return socket;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("authenticated reconnect lease became resumable")
+    }
+
+    struct PendingReplay {
+        request_id: String,
+        request: serde_json::Value,
+        revision: u64,
+    }
+
+    async fn begin_pending_approval_then_disconnect(
+        fixture: &ProductionSyncFixture,
+        handle: &lotta_app_server::listener::ListenerHandle,
+        target: &RuntimeScope,
+        identity: &str,
+    ) -> PendingReplay {
+        let mut socket = connect_authenticated_as(handle, Some(identity)).await;
+        send_runtime_start(&mut socket, target).await;
+        receive_until_phase(&mut socket, "initial runtime_start_response", |frame| {
+            frame["type"] == "runtime_start_response"
+        })
+        .await;
+        send_input(&mut socket, target).await;
+        let initial = receive_until_phase(&mut socket, "initial control_request", |frame| {
+            frame["type"] == "control_request"
+        })
+        .await;
+        let request_id = initial["request_id"]
+            .as_str()
+            .expect("approval request id")
+            .to_owned();
+        let pending = fixture
+            .service
+            .approvals
+            .list_requests(target)
+            .expect("pending journal row");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].state, lotta_runtime::ApprovalState::Pending);
+        assert_eq!(pending[0].revision, 0);
+        disconnect_socket(socket).await;
+        PendingReplay {
+            request_id,
+            request: initial["request"].clone(),
+            revision: pending[0].revision,
+        }
+    }
+
+    async fn reconnect_and_replay_pending(
+        handle: &lotta_app_server::listener::ListenerHandle,
+        target: &RuntimeScope,
+        identity: &str,
+        pending: &PendingReplay,
+        fixture: &ProductionSyncFixture,
+    ) -> TestSocket {
+        let mut socket = connect_resumed_authenticated_as(handle, identity).await;
+        send_sync(&mut socket, target, "reconnect-sync").await;
+        let mut replayed = Vec::new();
+        receive_until_phase(&mut socket, "reconnect sync_response", |frame| {
+            if frame["type"] == "control_request" {
+                replayed.push(frame.clone());
+            }
+            frame["type"] == "sync_response"
+        })
+        .await;
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0]["request_id"], pending.request_id);
+        assert_eq!(replayed[0]["request"], pending.request);
+        let journal = fixture
+            .service
+            .approvals
+            .list_requests(target)
+            .expect("replayed journal row");
+        assert_eq!(journal[0].revision, pending.revision);
+        assert_eq!(journal[0].state, lotta_runtime::ApprovalState::Pending);
+        socket
+    }
+
+    async fn resolve_replayed_approval(
+        socket: &mut TestSocket,
+        fixture: &ProductionSyncFixture,
+        target: &RuntimeScope,
+        request_id: &str,
+    ) {
+        send_json(
+            socket,
+            serde_json::json!({
+                "type": "input", "request_id": "approval-resolution",
+                "runtime": target,
+                "payload": {
+                    "kind": "approval_response", "request_id": request_id,
+                    "decision": {"behavior": "allow"}
+                }
+            }),
+        )
+        .await;
+        let accepted = receive_until_phase(socket, "approval input_accepted", |frame| {
+            frame["type"] == "input_accepted" && frame["request_id"] == "approval-resolution"
+        })
+        .await;
+        assert_eq!(accepted["accepted"], true);
+        let continued = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fixture.provider.continued.acquire(),
+        )
+        .await
+        .expect("approved turn did not resume provider")
+        .expect("provider continuation semaphore closed");
+        continued.forget();
+        fixture.provider.release.add_permits(1);
+        let mut terminal_count = 0;
+        receive_until_phase(socket, "turn terminal and idle status", |frame| {
+            terminal_count += usize::from(frame["type"] == "turn_finished");
+            frame["type"] == "update_loop_status"
+                && frame["loop_status"]["status"] == "WAITING_ON_INPUT"
+        })
+        .await;
+        assert_eq!(terminal_count, 1);
+        assert_eq!(fixture.provider.continued.available_permits(), 0);
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("workspace/production-sync-approval"))
+                .expect("approved write output"),
+            "held"
+        );
+        let settled = fixture
+            .service
+            .approvals
+            .list_requests(target)
+            .expect("settled approval journal");
+        assert!(settled.is_empty());
+        assert_eq!(
+            fixture.service.approvals.residency_count(target).unwrap(),
+            0
+        );
+        assert!(
+            !fixture
+                .service
+                .state
+                .active
+                .lock()
+                .unwrap()
+                .contains_key(&RuntimeKey::from(target))
+        );
     }
 
     async fn send_sync(
@@ -5688,7 +5899,7 @@ mod production_tests {
         socket: &mut tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
-        done: impl Fn(&serde_json::Value) -> bool,
+        mut done: impl FnMut(&serde_json::Value) -> bool,
     ) -> serde_json::Value {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
@@ -5700,6 +5911,29 @@ mod production_tests {
         })
         .await
         .expect("expected socket frame")
+    }
+
+    async fn receive_until_phase(
+        socket: &mut TestSocket,
+        phase: &str,
+        mut done: impl FnMut(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        let mut frames = Vec::new();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let frame = receive_json(socket).await;
+                let complete = done(&frame);
+                frames.push(frame);
+                if complete {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(result.is_ok(), "{phase} absent after frames {frames:#?}");
+        frames
+            .pop()
+            .unwrap_or_else(|| panic!("{phase} produced no frame"))
     }
 
     async fn receive_until_apply(
@@ -5982,6 +6216,43 @@ mod production_tests {
                     handle.shutdown();
                     handle.wait().await.unwrap();
                 }
+
+                #[tokio::test]
+                async fn pending_approval_survives_authenticated_socket_reconnect() {
+                    for repetition in 0..3 {
+                        let label = format!("pending-approval-reconnect-{repetition}");
+                        let fixture = production_sync_fixture(&label).await;
+                        let target = scope(&label);
+                        let mut handle = start_production_listener(
+                            &fixture.root,
+                            Arc::clone(&fixture.service),
+                            Arc::clone(&fixture.controller),
+                        )
+                        .await;
+                        let identity = format!("pending-approval-client-{repetition}");
+                        let pending = begin_pending_approval_then_disconnect(
+                            &fixture, &handle, &target, &identity,
+                        )
+                        .await;
+                        let mut second = reconnect_and_replay_pending(
+                            &handle, &target, &identity, &pending, &fixture,
+                        )
+                        .await;
+                        resolve_replayed_approval(
+                            &mut second,
+                            &fixture,
+                            &target,
+                            &pending.request_id,
+                        )
+                        .await;
+
+                        handle.shutdown();
+                        handle.wait().await.unwrap();
+                        assert!(fixture.service.state.inner.lock().await.registry.is_empty());
+                        drop(second);
+                        let _ = std::fs::remove_dir_all(&fixture.root);
+                    }
+                }
             }
         }
     }
@@ -6200,8 +6471,28 @@ mod production_tests {
         (restarted, owner, approvals, install)
     }
 
+    fn restart_response_command(
+        owner: &RuntimeScope,
+        label: &str,
+        decision: serde_json::Value,
+    ) -> InputCommand {
+        let value = serde_json::json!({
+            "type":"input", "request_id":format!("restart-{label}"), "runtime":owner,
+            "payload":{
+                "kind":"approval_response", "request_id":"approval-held",
+                "decision":decision
+            }
+        });
+        let frame = lotta_app_server::framing::decode_text(&value.to_string())
+            .expect("bounded restart response frame");
+        match lotta_app_server::ws::command::decode(&frame).expect("valid restart response") {
+            Some(lotta_app_server::ws::RuntimeCommand::Input(command)) => command,
+            _ => panic!("restart response did not decode as runtime input"),
+        }
+    }
+
     #[tokio::test]
-    async fn restart_pending_response_is_meaningful_and_exactly_once() {
+    async fn restart_pending_wire_response_is_meaningful_and_exactly_once() {
         let cases = [
             (
                 "allow",
@@ -6215,7 +6506,7 @@ mod production_tests {
             ),
             (
                 "deny",
-                serde_json::json!({"behavior":"deny"}),
+                serde_json::json!({"behavior":"deny","message":"denied after restart"}),
                 lotta_runtime::ApprovalState::Denied,
             ),
         ];
@@ -6231,15 +6522,7 @@ mod production_tests {
                 .expect("pending recovery residency");
             assert_eq!(pending_residency.pending_approval_count(), 1);
             assert!(!pending_residency.interrupted_result_present());
-            let response = InputCommand {
-                request_id: Some(NonEmptyString::new(format!("restart-{label}")).unwrap()),
-                runtime: owner.clone(),
-                payload: BoundedJsonValue::new(serde_json::json!({
-                    "kind":"approval_response", "request_id":"approval-held",
-                    "decision": decision
-                }))
-                .unwrap(),
-            };
+            let response = restart_response_command(&owner, label, decision);
             let accepted = restarted.admit_input(response.clone()).await.unwrap();
             assert_recovered_approval(&accepted, expected);
             assert!(restarted.admit_input(response).await.is_err());

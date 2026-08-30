@@ -180,6 +180,21 @@ impl RuntimeConnections {
         self.entries.remove(&id);
     }
 
+    /// Removes every live and suspended connection during listener shutdown.
+    ///
+    /// Returns each formerly subscribed scope exactly once so runtime residency
+    /// can be recomputed after transport ownership ends.
+    pub fn shutdown(&mut self) -> Vec<RuntimeScope> {
+        let mut scopes = std::mem::take(&mut self.expired_subscriptions);
+        for (_, connection) in self.entries.drain() {
+            append_unique_scopes(&mut scopes, connection.subscriptions.as_slice());
+        }
+        for (_, suspended) in self.suspended.drain() {
+            append_unique_scopes(&mut scopes, suspended.connection.subscriptions.as_slice());
+        }
+        scopes
+    }
+
     /// Suspends an authenticated connection for a later same-identity reconnect.
     pub fn suspend(&mut self, id: ConnectionId) {
         let Some(connection) = self.entries.remove(&id) else {
@@ -469,5 +484,13 @@ impl RuntimeConnections {
     #[cfg(test)]
     pub(crate) fn event_seq(&self, id: ConnectionId) -> Option<u64> {
         self.entries.get(&id).map(|connection| connection.event_seq)
+    }
+}
+
+fn append_unique_scopes(scopes: &mut Vec<RuntimeScope>, candidates: &[RuntimeScope]) {
+    for scope in candidates {
+        if !scopes.contains(scope) {
+            scopes.push(scope.clone());
+        }
     }
 }

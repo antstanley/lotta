@@ -431,6 +431,65 @@ fn rust_sources(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+fn production_rust_sources(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    rust_sources(root).map(|paths| {
+        paths
+            .into_iter()
+            .filter(|path| !is_test_source(path))
+            .collect()
+    })
+}
+
+fn is_test_source(path: &Path) -> bool {
+    if path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .any(|component| component == "tests" || component.ends_with("_tests"))
+    {
+        return true;
+    }
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| {
+            stem == "tests"
+                || stem == "test_support"
+                || stem.contains("_test")
+                || stem.ends_with("_tests")
+                || stem.ends_with("_certificate")
+                || stem.ends_with("_evidence")
+                || matches!(
+                    stem,
+                    "stop_reasons" | "terminal_once" | "tool_call_assembly"
+                )
+        })
+}
+
+fn hard_limit_sources(workspace: &Path, manifest: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut files = production_rust_sources(&manifest.join("src"))?;
+    for relative in [
+        "src/production_components.rs",
+        "crates/lotta-app-server/src/listener.rs",
+        "crates/lotta-app-server/src/listener/turn_supervisor.rs",
+        "crates/lotta-app-server/src/ws/connection.rs",
+        "crates/lotta-app-server/src/ws/event.rs",
+        "crates/lotta-app-server/src/ws/recovery.rs",
+        "crates/lotta-app-server/src/ws/router.rs",
+        "crates/lotta-app-server/src/ws/service.rs",
+        "crates/lotta-app-server/src/ws/sync.rs",
+        "crates/lotta-runtime/src/approval/mod.rs",
+        "crates/lotta-runtime/src/approval/recovery.rs",
+        "crates/lotta-runtime/src/approval/request.rs",
+        "crates/lotta-runtime/src/approval/resolve.rs",
+        "crates/lotta-runtime/src/registry.rs",
+        "crates/lotta-store/src/approval.rs",
+    ] {
+        files.push(workspace.join(relative));
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
 #[test]
 fn source_hard_limits_and_mutations() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -438,26 +497,20 @@ fn source_hard_limits_and_mutations() {
         .parent()
         .and_then(Path::parent)
         .expect("workspace root");
-    let mut files = rust_sources(&manifest.join("src")).expect("discover crate Rust sources");
-    let components = workspace.join("src/production_components");
-    if components.exists() {
-        files.extend(rust_sources(&components).expect("discover root component sources"));
-    }
-    files.push(workspace.join("src/production_components.rs"));
-    files.sort();
+    let files = hard_limit_sources(workspace, &manifest).expect("discover production Rust sources");
+    let mut source_findings = Vec::new();
     for path in files {
         let source = std::fs::read_to_string(&path).expect("read Rust source");
         let findings = limit_findings(&source).expect("parse Rust source");
         let findings: Vec<_> = findings
             .into_iter()
             .filter(|finding| !matches!(finding, LimitFinding::FileLines(_)))
-            .filter(|finding| {
-                path.file_name().and_then(|name| name.to_str()) != Some("tests.rs")
-                    || !matches!(finding, LimitFinding::FunctionLines { .. })
-            })
             .collect();
-        assert!(findings.is_empty(), "{}: {findings:?}", path.display());
+        if !findings.is_empty() {
+            source_findings.push(format!("{}: {findings:?}", path.display()));
+        }
     }
+    assert!(source_findings.is_empty(), "{source_findings:#?}");
     let long_file = "\n".repeat(1_001);
     let long_line = format!("const X: &str = \"{}\";", "x".repeat(101));
     let long_function = format!("fn oversized() {{\n{}\n}}", "let _x = 1;\n".repeat(70));

@@ -100,15 +100,17 @@ fn state(
     let mut outbound = HashMap::new();
     outbound.insert(id, sender);
     let group = compose_group_bridges();
+    let shutdown = tokio_util::sync::CancellationToken::new();
     let state = Arc::new(ListenerState {
         auth: AuthPolicy::None,
         listener_instance: "test-listener".to_owned(),
         clock,
-        shutdown: tokio_util::sync::CancellationToken::new(),
+        shutdown: shutdown.clone(),
         limits: SocketLimits::default(),
         runtime_router: Arc::new(Mutex::new(router)),
         runtime_service: Arc::new(UnsupportedRuntimeCommandService),
         turn_controller: Arc::new(UnsupportedRuntimeCommandService),
+        turns: super::turn_supervisor::RuntimeTurnSupervisor::new(shutdown),
         observer,
         external_tools: Arc::new(crate::ws::external_tools::ExternalToolBridge::new(
             crate::ws::external_tools::inert_forwarder(),
