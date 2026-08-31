@@ -708,28 +708,109 @@ mod errors {
     }
 
     const ISOLATED_LOG_CAPTURE: &str = "LOTTA_STORE_ISOLATED_LOG_CAPTURE";
+    const ISOLATED_MARKER: &str = "LOTTA_STORE_LOG_CAPTURE_CHILD_EXECUTED";
+
+    fn child_output(
+        mut command: std::process::Command,
+        deadline: std::time::Duration,
+    ) -> (std::process::Output, bool) {
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().expect("spawn isolated trace child");
+        let started = std::time::Instant::now();
+        loop {
+            if child
+                .try_wait()
+                .expect("poll isolated trace child")
+                .is_some()
+            {
+                return (
+                    child.wait_with_output().expect("reap isolated trace child"),
+                    false,
+                );
+            }
+            if started.elapsed() >= deadline {
+                child.kill().expect("kill timed out isolated trace child");
+                return (
+                    child
+                        .wait_with_output()
+                        .expect("reap timed out isolated trace child"),
+                    true,
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn validate_one_child(output: &std::process::Output) -> Result<(), String> {
+        let diagnostics = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !output.status.success() {
+            return Err(format!("isolated trace test failed: {diagnostics}"));
+        }
+        if diagnostics.matches(ISOLATED_MARKER).count() != 1
+            || !diagnostics.contains("running 1 test")
+        {
+            return Err(format!(
+                "selector did not execute exactly one intended child: {diagnostics}"
+            ));
+        }
+        Ok(())
+    }
 
     #[test]
     fn logs_exclude_contents() {
         if std::env::var_os(ISOLATED_LOG_CAPTURE).is_some() {
+            eprintln!("{ISOLATED_MARKER}");
             assert_log_capture();
             return;
         }
-        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));
+        command
             .args([
                 "--exact",
                 "tests::errors::logs_exclude_contents",
                 "--nocapture",
                 "--test-threads=1",
             ])
-            .env(ISOLATED_LOG_CAPTURE, "1")
-            .output()
-            .expect("isolated trace test");
+            .env(ISOLATED_LOG_CAPTURE, "1");
+        let (output, timed_out) = child_output(command, std::time::Duration::from_secs(20));
         assert!(
-            output.status.success(),
-            "isolated trace test failed: {}{}",
+            !timed_out,
+            "isolated trace test timed out: {}{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+        validate_one_child(&output).unwrap_or_else(|diagnostics| panic!("{diagnostics}"));
+    }
+
+    #[test]
+    fn isolated_child_helper_detects_selector_miss_and_reaps_timeout() {
+        let mut miss = std::process::Command::new(std::env::current_exe().expect("test binary"));
+        miss.args([
+            "--exact",
+            "tests::errors::selector_does_not_exist",
+            "--nocapture",
+        ]);
+        let (miss, timed_out) = child_output(miss, std::time::Duration::from_secs(10));
+        assert!(!timed_out);
+        assert!(
+            validate_one_child(&miss).is_err(),
+            "zero-test selector must not pass validation"
+        );
+
+        let command = std::process::Command::new("/bin/sleep");
+        let mut command = command;
+        command.arg("10");
+        let (timed, timed_out) = child_output(command, std::time::Duration::from_millis(20));
+        assert!(timed_out);
+        assert!(
+            !timed.status.success(),
+            "killed child unexpectedly succeeded"
         );
     }
 

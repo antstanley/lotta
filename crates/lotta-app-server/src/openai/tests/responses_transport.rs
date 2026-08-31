@@ -167,7 +167,7 @@ fn conversations(root: &std::path::Path) -> usize {
 async fn wait_clean(state: &crate::openai::responses::ResponsesState) {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if state.owner_count().await == 0 && state.setup_lock_count().await == 0 {
+            if state.owner_count().await == 0 && state.setup_lock_count() == 0 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -527,7 +527,7 @@ mod previous_response_id {
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
         assert_eq!(conversations(&roots.storage), before);
         assert_eq!(state.owner_count().await, 0);
-        assert_eq!(state.setup_lock_count().await, 0);
+        assert_eq!(state.setup_lock_count(), 0);
         listener.shutdown();
         listener.wait().await.unwrap();
     }
@@ -554,6 +554,80 @@ mod previous_response_id {
         assert_eq!(value["error"]["code"], "response_not_found");
         handle.shutdown();
         handle.wait().await.unwrap();
+    }
+}
+
+mod setup_lock_recovery {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_tcp_allocation_panic_releases_waiter_prunes_lock_and_retries() {
+        let roots = roots("responses-setup-panic");
+        let agent_id = "agent-local-responses-setup-panic";
+        seed(&roots.storage, &[agent(agent_id, "memo", false)]).await;
+        let runtime = Arc::new(crate::ws::test_support::RecordingService::default());
+        let controller = Arc::new(crate::ws::ServiceBackedTurnController::new(runtime.clone()));
+        let (mut listener, state) = launch_responses_custom(
+            &roots, None, runtime.clone(), controller, None, 3,
+        ).await;
+        let (entered, release) =
+            crate::ws::conversations::gate_next_openai_create_panic(agent_id);
+        let address = listener.address();
+        let body = r#"{"model":"memo","input":"serialized","store":false}"#;
+        let owner = tokio::spawn(post_at(address, "/v1/responses", "", body));
+        tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+            .await.unwrap().unwrap().forget();
+        let waiter = tokio::spawn(post_at(address, "/v1/responses", "", body));
+        tokio::task::yield_now().await;
+        assert_eq!(state.setup_lock_count(), 1);
+        release.add_permits(1);
+        let owner = owner.await.unwrap();
+        let waiter = waiter.await.unwrap();
+        assert_eq!(owner.status, 500, "{}", owner.body);
+        assert_eq!(waiter.status, 200, "{}", waiter.body);
+        wait_clean(&state).await;
+        assert_eq!(state.setup_lock_count(), 0);
+        assert_eq!(state.owner_count().await, 0);
+
+        let retry = post(&listener, "/v1/responses", "", body).await;
+        assert_eq!(retry.status, 200, "{}", retry.body);
+        wait_clean(&state).await;
+        assert_eq!(state.setup_lock_count(), 0);
+        assert_eq!(conversations(&roots.storage), 0);
+        listener.shutdown();
+        listener.wait().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_during_repository_setup_drops_lock_and_joins_owner() {
+        let roots = roots("responses-setup-shutdown");
+        let agent_id = "agent-local-responses-setup-shutdown";
+        seed(&roots.storage, &[agent(agent_id, "memo", false)]).await;
+        let runtime = Arc::new(crate::ws::test_support::RecordingService::default());
+        let controller = Arc::new(crate::ws::ServiceBackedTurnController::new(runtime.clone()));
+        let (mut listener, state) =
+            launch_responses_custom(&roots, None, runtime, controller, None, 1).await;
+        let (entered, _release) =
+            crate::ws::conversations::gate_next_openai_create_panic(agent_id);
+        let address = listener.address();
+        let request = tokio::spawn(post_at(
+            address,
+            "/v1/responses",
+            "",
+            r#"{"model":"memo","input":"shutdown","store":false}"#,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+            .await.unwrap().unwrap().forget();
+        assert_eq!(state.setup_lock_count(), 1);
+        listener.shutdown();
+        let response = tokio::time::timeout(Duration::from_secs(5), request)
+            .await.unwrap().unwrap();
+        assert_eq!(response.status, 500, "{}", response.body);
+        tokio::time::timeout(Duration::from_secs(5), listener.wait())
+            .await.unwrap().unwrap();
+        assert_eq!(state.setup_lock_count(), 0);
+        assert_eq!(state.owner_count().await, 0);
+        assert_eq!(conversations(&roots.storage), 0);
     }
 }
 
@@ -624,7 +698,7 @@ mod streaming {
         assert_eq!(subsequent.status, 200, "{}", subsequent.body);
         assert_eq!(controller.exited.load(Ordering::SeqCst), TEST_OWNERS_MAX);
         assert_eq!(state.owner_count().await, 0);
-        assert_eq!(state.setup_lock_count().await, 0);
+        assert_eq!(state.setup_lock_count(), 0);
         assert_eq!(conversations(&roots.storage), 0);
         listener.shutdown();
         listener.wait().await.unwrap();
@@ -680,7 +754,7 @@ mod streaming {
             .unwrap()
             .unwrap();
         assert_eq!(state.owner_count().await, 0);
-        assert_eq!(state.setup_lock_count().await, 0);
+        assert_eq!(state.setup_lock_count(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -720,7 +794,7 @@ mod streaming {
         assert_eq!(controller.exited.load(Ordering::SeqCst), 1);
         assert_eq!(runtime.ephemeral_teardowns.load(Ordering::SeqCst), 1);
         assert_eq!(state.owner_count().await, 0);
-        assert_eq!(state.setup_lock_count().await, 0);
+        assert_eq!(state.setup_lock_count(), 0);
         assert_eq!(conversations(&roots.storage), 0);
     }
 

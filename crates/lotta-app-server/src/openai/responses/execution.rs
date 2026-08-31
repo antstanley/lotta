@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     panic::AssertUnwindSafe,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -31,13 +31,44 @@ struct SetupLock {
     refs: AtomicUsize,
 }
 
+/// Synchronous ownership of one setup-lock reference. The reference exists before
+/// waiting on the async gate, so cancellation and task abort release it immediately.
+/// Unwinding allocation drops the gate and prunes the exact map entry without
+/// depending on an async destructor or another runtime poll.
+struct SetupLease<'a> {
+    locks: &'a StdMutex<HashMap<String, Arc<SetupLock>>>,
+    key: String,
+    entry: Arc<SetupLock>,
+    gate: Option<OwnedMutexGuard<()>>,
+}
+
+impl Drop for SetupLease<'_> {
+    fn drop(&mut self) {
+        self.gate.take();
+        if self.entry.refs.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        let mut locks = self
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if locks
+            .get(&self.key)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.entry))
+            && self.entry.refs.load(Ordering::Acquire) == 0
+        {
+            locks.remove(&self.key);
+        }
+    }
+}
+
 /// Listener-owned Responses execution state sharing Task 75 runtime/repository adapters.
 pub struct ResponsesState {
     /// Shared canonical Chat infrastructure and persistent key cache.
     pub chat: Arc<chat::ChatState>,
     owners: Mutex<JoinSet<()>>,
     owner_capacity: Arc<Semaphore>,
-    setup_locks: Mutex<HashMap<String, Arc<SetupLock>>>,
+    setup_locks: StdMutex<HashMap<String, Arc<SetupLock>>>,
     conversations: Arc<dyn crate::ws::conversations::ConversationCommandRepository>,
     fork_supported: bool,
 }
@@ -69,7 +100,7 @@ impl ResponsesState {
             chat,
             owners: Mutex::new(JoinSet::new()),
             owner_capacity: Arc::new(Semaphore::new(owner_capacity)),
-            setup_locks: Mutex::new(HashMap::new()),
+            setup_locks: StdMutex::new(HashMap::new()),
             conversations: repository,
             fork_supported,
         }
@@ -84,10 +115,14 @@ impl ResponsesState {
         Self::with_repository_and_bound(chat, repository, owner_capacity)
     }
 
-    async fn acquire_setup(&self, key: &str) -> (Arc<SetupLock>, OwnedMutexGuard<()>) {
+    async fn acquire_setup(&self, key: &str) -> SetupLease<'_> {
+        let key = key.to_owned();
         let entry = {
-            let mut locks = self.setup_locks.lock().await;
-            let entry = Arc::clone(locks.entry(key.to_owned()).or_insert_with(|| {
+            let mut locks = self
+                .setup_locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = Arc::clone(locks.entry(key.clone()).or_insert_with(|| {
                 Arc::new(SetupLock {
                     gate: Arc::new(Mutex::new(())),
                     refs: AtomicUsize::new(0),
@@ -96,22 +131,14 @@ impl ResponsesState {
             entry.refs.fetch_add(1, Ordering::AcqRel);
             entry
         };
-        let guard = Arc::clone(&entry.gate).lock_owned().await;
-        (entry, guard)
-    }
-
-    async fn release_setup(&self, key: &str, entry: &Arc<SetupLock>) {
-        if entry.refs.fetch_sub(1, Ordering::AcqRel) != 1 {
-            return;
-        }
-        let mut locks = self.setup_locks.lock().await;
-        if locks
-            .get(key)
-            .is_some_and(|current| Arc::ptr_eq(current, entry))
-            && entry.refs.load(Ordering::Acquire) == 0
-        {
-            locks.remove(key);
-        }
+        let mut lease = SetupLease {
+            locks: &self.setup_locks,
+            key,
+            entry,
+            gate: None,
+        };
+        lease.gate = Some(Arc::clone(&lease.entry.gate).lock_owned().await);
+        lease
     }
 
     /// Cancels through the shared listener token and joins every Responses owner.
@@ -128,8 +155,11 @@ impl ResponsesState {
     }
 
     #[cfg(test)]
-    pub(crate) async fn setup_lock_count(&self) -> usize {
-        self.setup_locks.lock().await.len()
+    pub(crate) fn setup_lock_count(&self) -> usize {
+        self.setup_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 }
 
@@ -230,7 +260,10 @@ async fn run_owner(
     previous: Option<PreviousState>,
     cell: Arc<ResponseCell>,
 ) -> ResponseOutcome {
-    let allocated = allocate_serialized(state, agent, &request, previous.as_ref()).await;
+    let allocated = tokio::select! {
+        () = state.chat.shutdown.cancelled() => Err(()),
+        allocated = allocate_serialized(state, agent, &request, previous.as_ref()) => allocated,
+    };
     let Ok((conversation, owned, created_fork)) = allocated else {
         cell.start(None);
         return ResponseOutcome::failed();
@@ -282,11 +315,8 @@ async fn allocate_serialized(
     previous: Option<&PreviousState>,
 ) -> Result<(ConversationId, bool, bool), ()> {
     let key = setup_key(agent);
-    let (entry, guard) = state.acquire_setup(&key).await;
-    let result = allocate(state, agent, request, previous).await;
-    drop(guard);
-    state.release_setup(&key, &entry).await;
-    result
+    let _lease = state.acquire_setup(&key).await;
+    allocate(state, agent, request, previous).await
 }
 
 async fn allocate(
@@ -381,13 +411,10 @@ async fn cleanup(
     // Local repository artifact deletion shares only the short setup critical section,
     // preventing it from racing prompt compilation for another conversation.
     let key = setup_key(agent);
-    let (entry, guard) = state.acquire_setup(&key).await;
-    let result = state
+    let _lease = state.acquire_setup(&key).await;
+    state
         .conversations
         .delete_for_openai(&agent.id, conversation)
         .await
-        .map_err(|_| ());
-    drop(guard);
-    state.release_setup(&key, &entry).await;
-    result
+        .map_err(|_| ())
 }

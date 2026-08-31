@@ -6209,6 +6209,77 @@ mod production_tests {
         }
     }
 
+    struct ResponsesToolProvider {
+        calls: std::sync::atomic::AtomicU64,
+        name: &'static str,
+        call_id: &'static str,
+        input: serde_json::Value,
+        gate_continuation: bool,
+        continued: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl ResponsesToolProvider {
+        fn new(
+            name: &'static str,
+            call_id: &'static str,
+            input: serde_json::Value,
+            gate_continuation: bool,
+        ) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicU64::new(0),
+                name,
+                call_id,
+                input,
+                gate_continuation,
+                continued: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    impl ProviderPort for ResponsesToolProvider {
+        fn stream(
+            &self,
+            request: ProviderRequest,
+            events: ProviderEventSink,
+        ) -> PortFuture<'_, ()> {
+            Box::pin(async move {
+                let _advertised_tools = request.tools.len();
+                let attempt = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    send_sync_tool_call(&events, self.call_id, self.name, self.input.clone())
+                        .await?;
+                    return events
+                        .send(ProviderEvent::Stop {
+                            reason: lotta_runtime::ports::StopReason::ToolUse,
+                        })
+                        .await;
+                }
+                self.continued.add_permits(1);
+                if self.gate_continuation {
+                    self.release
+                        .acquire()
+                        .await
+                        .map_err(|_| lotta_runtime::RuntimeError::Cancelled {
+                            context: "Responses tool continuation gate".into(),
+                        })?
+                        .forget();
+                }
+                events
+                    .send(ProviderEvent::TextDelta {
+                        text: ProviderEventText::new("after tool".into())?,
+                    })
+                    .await?;
+                events
+                    .send(ProviderEvent::Stop {
+                        reason: lotta_runtime::ports::StopReason::EndTurn,
+                    })
+                    .await
+            })
+        }
+    }
+
     struct OpenAiTerminalErrorProvider;
 
     impl ProviderPort for OpenAiTerminalErrorProvider {
@@ -6488,6 +6559,26 @@ mod production_tests {
         assert_eq!(first_value["output"][0]["content"][0]["text"], "one-two");
         let first_id = first_value["id"].as_str().unwrap();
         let first_cursor = lotta_app_server::openai::cursor::parse(first_id).unwrap();
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read_dir(root.join("conversations"))
+                .unwrap()
+                .count(),
+            2
+        );
+        assert!(service.state.inner.lock().await.registry.is_empty());
+        let paths = lotta_store::StorePaths::new(root.clone()).unwrap();
+        let first_messages = std::fs::read_to_string(
+            paths
+                .conversation_dir(&first_cursor.agent_id, &first_cursor.conversation_id)
+                .unwrap()
+                .join("messages.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(first_messages.matches("\"role\":\"user\"").count(), 1);
+        assert_eq!(first_messages.matches("remember green").count(), 1);
+        assert_eq!(first_messages.matches("\"role\":\"assistant\"").count(), 2);
+        assert!(service.state.active.lock().unwrap().is_empty());
 
         let second = completed_gated_response(
             handle.address(),
@@ -6503,6 +6594,14 @@ mod production_tests {
         let second_cursor =
             lotta_app_server::openai::cursor::parse(second_value["id"].as_str().unwrap()).unwrap();
         assert_ne!(first_cursor.conversation_id, second_cursor.conversation_id);
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            std::fs::read_dir(root.join("conversations"))
+                .unwrap()
+                .count(),
+            3
+        );
+        assert!(service.state.inner.lock().await.registry.is_empty());
         {
             let requests = provider.requests.lock().unwrap();
             assert_eq!(requests.len(), 2);
@@ -6571,11 +6670,37 @@ mod production_tests {
         )
         .unwrap();
         assert_eq!(fork["hidden"], true);
+        let first_record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                paths
+                    .conversation_dir(&first_cursor.agent_id, &first_cursor.conversation_id)
+                    .unwrap()
+                    .join("conversation.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(first_record["hidden"], true);
+        let fork_messages = std::fs::read_to_string(
+            paths
+                .conversation_dir(&second_cursor.agent_id, &second_cursor.conversation_id)
+                .unwrap()
+                .join("messages.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(fork_messages.matches("\"role\":\"user\"").count(), 2);
+        assert_eq!(fork_messages.matches("what color?").count(), 1);
+        assert_eq!(fork_messages.matches("\"role\":\"assistant\"").count(), 4);
+        assert!(service.state.active.lock().unwrap().is_empty());
 
         let stream = completed_gated_response(
             handle.address(),
             &provider,
-            serde_json::json!({"model":model,"input":"stream","stream":true}),
+            serde_json::json!({
+                "model":model,"input":"stream fork","stream":true,"store":false,
+                "instructions":"third instruction",
+                "previous_response_id":second_value["id"]
+            }),
             "",
         )
         .await;
@@ -6590,6 +6715,209 @@ mod production_tests {
         );
         assert!(!stream.contains("[DONE]"));
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        {
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            let third_text = requests[2]
+                .messages
+                .as_slice()
+                .iter()
+                .flat_map(|message| message.content.as_slice())
+                .filter_map(|part| match part {
+                    lotta_runtime::ports::ProviderContentPart::Text(value) => Some(value.as_str()),
+                    lotta_runtime::ports::ProviderContentPart::Image { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(third_text.contains("remember green"), "{third_text}");
+            assert!(third_text.contains("stream fork"), "{third_text}");
+            assert!(third_text.contains("third instruction"), "{third_text}");
+        }
+        assert!(service.state.active.lock().unwrap().is_empty());
+        assert!(service.state.inner.lock().await.registry.is_empty());
+        assert_eq!(
+            std::fs::read_dir(root.join("conversations"))
+                .unwrap()
+                .count(),
+            3
+        );
+        handle.shutdown();
+        handle.wait().await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn production_responses_executes_real_tools_for_json_and_live_sse() {
+        let success_provider = Arc::new(ResponsesToolProvider::new(
+            "TaskCreate",
+            "responses-success-call",
+            serde_json::json!({
+                "subject":"Production response tool",
+                "description":"canonical execution"
+            }),
+            false,
+        ));
+        let (root, service, controller, ..) = production_controller_fixture(
+            "local-chat-o7",
+            success_provider.clone() as Arc<dyn ProviderPort>,
+        )
+        .await;
+        let mut handle = start_production_listener(&root, Arc::clone(&service), controller).await;
+        let response = responses_request(
+            handle.address(),
+            serde_json::json!({
+                "model":"agent-local-chat-o7","input":"run success","store":false
+            }),
+            "",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "calls={} {response}",
+            success_provider
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        let value = response_json(&response);
+        let output = value["output"].as_array().unwrap();
+        assert_eq!(output.len(), 3);
+        assert_eq!(output[0]["type"], "function_call");
+        assert_eq!(output[0]["call_id"], "responses-success-call");
+        assert_eq!(output[0]["status"], "completed");
+        assert_eq!(output[1]["type"], "function_call_output");
+        assert_eq!(output[1]["call_id"], "responses-success-call");
+        assert_eq!(output[1]["status"], "completed");
+        assert_eq!(
+            output[1]["output"][0]["text"],
+            concat!(
+                r#"{"taskId":"task_1","subject":"Production response tool","#,
+                r#""description":"canonical execution","status":"pending","blocks":[],"#,
+                r#""blockedBy":[],"metadata":{},"createdAt":1,"updatedAt":1}"#
+            )
+        );
+        assert_eq!(output[2]["content"][0]["text"], "after tool");
+        assert_eq!(
+            success_provider
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        handle.shutdown();
+        handle.wait().await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
+
+        let error_provider = Arc::new(ResponsesToolProvider::new(
+            "TaskGet",
+            "responses-error-call",
+            serde_json::json!({"taskId":"missing"}),
+            true,
+        ));
+        let (root, service, controller, ..) = production_controller_fixture(
+            "local-chat-o7",
+            error_provider.clone() as Arc<dyn ProviderPort>,
+        )
+        .await;
+        let mut handle = start_production_listener(&root, Arc::clone(&service), controller).await;
+        let mut stream = responses_stream_request(
+            handle.address(),
+            serde_json::json!({
+                "model":"agent-local-chat-o7","input":"run error",
+                "store":false,"stream":true
+            }),
+        )
+        .await;
+        let prefix = read_http_until(&mut stream, "\"type\":\"function_call_output\"").await;
+        error_provider.continued.acquire().await.unwrap().forget();
+        assert!(prefix.contains("responses-error-call"), "{prefix}");
+        assert!(prefix.contains("Task not found."), "{prefix}");
+        assert!(prefix.contains("\"status\":\"incomplete\""), "{prefix}");
+        assert!(!prefix.contains("response.completed"), "{prefix}");
+        error_provider.release.add_permits(1);
+        let complete = read_http_rest(stream, prefix).await;
+        let events = sse_values(&complete);
+        assert!(
+            events
+                .iter()
+                .enumerate()
+                .all(|(index, event)| event["sequence_number"] == serde_json::json!(index))
+        );
+        let added = events
+            .iter()
+            .find(|event| {
+                event["type"] == "response.output_item.added"
+                    && event["item"]["type"] == "function_call_output"
+            })
+            .unwrap();
+        assert_eq!(added["output_index"], 1);
+        assert_eq!(added["item"]["call_id"], "responses-error-call");
+        assert_eq!(added["item"]["status"], "incomplete");
+        assert_eq!(added["item"]["output"][0]["text"], "Task not found.");
+        let done = events
+            .iter()
+            .find(|event| {
+                event["type"] == "response.output_item.done"
+                    && event["item"]["type"] == "function_call_output"
+            })
+            .unwrap();
+        assert_eq!(done["item"], added["item"]);
+        assert_eq!(events.last().unwrap()["type"], "response.completed");
+        assert_eq!(
+            error_provider
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        handle.shutdown();
+        handle.wait().await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
+
+        let ws_provider = Arc::new(ResponsesToolProvider::new(
+            "TaskCreate",
+            "public-frame-call",
+            serde_json::json!({"subject":"wire","description":"no internal result"}),
+            false,
+        ));
+        let (root, service, controller, ..) =
+            production_controller_fixture("local-chat-o7", ws_provider as Arc<dyn ProviderPort>)
+                .await;
+        let target = scope("local-chat-o7");
+        let mut handle = start_production_listener(&root, Arc::clone(&service), controller).await;
+        let mut socket = connect_authenticated(&handle).await;
+        send_runtime_start(&mut socket, &target).await;
+        receive_until(&mut socket, |frame| {
+            frame["type"] == "runtime_start_response"
+        })
+        .await;
+        send_input(&mut socket, &target).await;
+        let frame = receive_until(&mut socket, |frame| {
+            frame["type"] == "stream_delta" && frame["delta"]["message_type"] == "client_tool_end"
+        })
+        .await;
+        let keys = frame["delta"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            [
+                "date",
+                "id",
+                "message_type",
+                "run_id",
+                "status",
+                "tool_call_id"
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(frame["delta"]["tool_call_id"], "public-frame-call");
+        assert_eq!(frame["delta"]["status"], "success");
+        let bytes = serde_json::to_vec(&frame).unwrap();
+        assert!(!bytes.windows(b"output".len()).any(|part| part == b"output"));
+        assert!(!bytes.windows(b"task_1".len()).any(|part| part == b"task_1"));
+        drop(socket);
         handle.shutdown();
         handle.wait().await.unwrap();
         let _ = std::fs::remove_dir_all(root);

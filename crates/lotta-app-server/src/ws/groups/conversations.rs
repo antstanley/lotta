@@ -760,13 +760,43 @@ pub struct ConversationsBridge {
 }
 
 #[cfg(test)]
-static OPENAI_CREATE_PANIC_AGENT: Mutex<Option<String>> = Mutex::new(None);
+enum OpenAiCreatePanic {
+    Immediate,
+    Gated {
+        entered: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+    },
+}
+
+#[cfg(test)]
+static OPENAI_CREATE_PANIC: std::sync::LazyLock<Mutex<HashMap<String, OpenAiCreatePanic>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(test)]
 pub(crate) fn panic_next_openai_create_for_agent(agent_id: &str) {
-    *OPENAI_CREATE_PANIC_AGENT
+    OPENAI_CREATE_PANIC
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(agent_id.to_owned());
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(agent_id.to_owned(), OpenAiCreatePanic::Immediate);
+}
+
+#[cfg(test)]
+pub(crate) fn gate_next_openai_create_panic(
+    agent_id: &str,
+) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    OPENAI_CREATE_PANIC
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            agent_id.to_owned(),
+            OpenAiCreatePanic::Gated {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+        );
+    (entered, release)
 }
 
 impl ConversationCommandRepository for ConversationsBridge {
@@ -855,18 +885,27 @@ impl ConversationsBridge {
     ) -> Result<ConversationId, AppServerError> {
         #[cfg(test)]
         {
-            let should_panic = OPENAI_CREATE_PANIC_AGENT
+            let injected = OPENAI_CREATE_PANIC
                 .lock()
                 .ok()
-                .and_then(|mut target| {
-                    (target.as_deref() == Some(agent_id.as_str())).then(|| target.take())
-                })
-                .flatten()
-                .is_some();
-            assert!(
-                !should_panic,
-                "injected canonical conversation repository panic"
-            );
+                .and_then(|mut targets| targets.remove(agent_id.as_str()));
+            match injected {
+                Some(OpenAiCreatePanic::Gated {
+                    entered, release, ..
+                }) => {
+                    entered.add_permits(1);
+                    release
+                        .acquire()
+                        .await
+                        .expect("panic gate remains open")
+                        .forget();
+                    panic!("injected canonical conversation repository panic");
+                }
+                Some(OpenAiCreatePanic::Immediate) => {
+                    panic!("injected canonical conversation repository panic");
+                }
+                None => {}
+            }
         }
         let body = ConversationCreateBody {
             agent_id: Some(agent_id.as_str().to_owned()),
