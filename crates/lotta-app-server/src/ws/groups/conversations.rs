@@ -1735,8 +1735,14 @@ impl CompactionEffects for StoreCompactionEffects {
         })
     }
 
-    fn lease_is_current(&self, scope: &RuntimeScope, lease: &TurnLease) -> bool {
-        lease_is_current(&self.leases, scope, lease)
+    fn lease_is_current(
+        &self,
+        scope: &RuntimeScope,
+        lease: &TurnLease,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        let scope = scope.clone();
+        let lease = lease.clone();
+        Box::pin(async move { lease_is_current(&self.leases, &scope, &lease) })
     }
 
     fn pre_compact(

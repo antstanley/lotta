@@ -2404,8 +2404,14 @@ impl CompactionEffects for ProductionCompactionEffects {
         })
     }
 
-    fn lease_is_current(&self, scope: &lotta_domain::RuntimeScope, lease: &TurnLease) -> bool {
-        self.runtime_state.lease_is_current(scope, lease)
+    fn lease_is_current(
+        &self,
+        scope: &lotta_domain::RuntimeScope,
+        lease: &TurnLease,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        let scope = scope.clone();
+        let lease = lease.clone();
+        Box::pin(async move { self.runtime_state.lease_is_current(&scope, &lease).await })
     }
 
     fn pre_compact(

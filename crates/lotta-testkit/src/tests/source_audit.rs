@@ -1,9 +1,12 @@
 use quote::ToTokens;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
-use syn::{Attribute, ExprCall, ExprMethodCall, ImplItem, Item, Macro, TraitItem, UseTree};
+use syn::{
+    Attribute, ExprCall, ExprMethodCall, ImplItem, Item, Macro, Meta, Token, TraitItem, UseTree,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum Effect {
@@ -310,7 +313,7 @@ enum LimitFinding {
     FileLines(usize),
     LineWidth { line: usize, bytes: usize },
     FunctionLines { name: String, lines: usize },
-    AllowSuppression { line: usize },
+    LintSuppression { line: usize },
 }
 
 #[derive(Default)]
@@ -331,16 +334,20 @@ impl LimitVisitor {
             });
         }
     }
+}
 
-    fn suppressions(&mut self, attrs: &[Attribute]) {
-        for attr in attrs {
-            if attr.path().is_ident("allow") {
-                self.findings.push(LimitFinding::AllowSuppression {
-                    line: attr.span().start().line,
-                });
-            }
-        }
+fn has_lint_suppression(meta: &Meta) -> bool {
+    if meta.path().is_ident("allow") || meta.path().is_ident("expect") {
+        return true;
     }
+    let Meta::List(list) = meta else {
+        return false;
+    };
+    if !list.path.is_ident("cfg_attr") {
+        return false;
+    }
+    list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+        .is_ok_and(|items| items.iter().skip(1).any(has_lint_suppression))
 }
 
 impl<'ast> Visit<'ast> for LimitVisitor {
@@ -349,7 +356,6 @@ impl<'ast> Visit<'ast> for LimitVisitor {
         if cfg_test(attrs) || matches!(item, Item::Mod(module) if module.ident == "tests") {
             return;
         }
-        self.suppressions(attrs);
         if let Item::Fn(function) = item {
             self.function(
                 &function.sig.ident.to_string(),
@@ -365,7 +371,6 @@ impl<'ast> Visit<'ast> for LimitVisitor {
             if cfg_test(&function.attrs) {
                 return;
             }
-            self.suppressions(&function.attrs);
             self.function(
                 &function.sig.ident.to_string(),
                 function.span(),
@@ -380,7 +385,6 @@ impl<'ast> Visit<'ast> for LimitVisitor {
             if cfg_test(&function.attrs) {
                 return;
             }
-            self.suppressions(&function.attrs);
             if function.default.is_some() {
                 self.function(
                     &function.sig.ident.to_string(),
@@ -390,6 +394,15 @@ impl<'ast> Visit<'ast> for LimitVisitor {
             }
         }
         visit::visit_trait_item(self, item);
+    }
+
+    fn visit_attribute(&mut self, attribute: &'ast Attribute) {
+        if has_lint_suppression(&attribute.meta) {
+            self.findings.push(LimitFinding::LintSuppression {
+                line: attribute.span().start().line,
+            });
+        }
+        visit::visit_attribute(self, attribute);
     }
 }
 
@@ -464,27 +477,207 @@ fn is_test_source(path: &Path) -> bool {
         })
 }
 
+const TASK73_CHANGED_PRODUCTION_SOURCES: &[&str] = &[
+    "crates/lotta-app-server/src/auth/mod.rs",
+    "crates/lotta-app-server/src/auth/signed_bearer.rs",
+    "crates/lotta-app-server/src/listener.rs",
+    "crates/lotta-app-server/src/listener/turn_supervisor.rs",
+    "crates/lotta-app-server/src/ws.rs",
+    "crates/lotta-app-server/src/ws/command.rs",
+    "crates/lotta-app-server/src/ws/connection.rs",
+    "crates/lotta-app-server/src/ws/event.rs",
+    "crates/lotta-app-server/src/ws/groups/conversations.rs",
+    "crates/lotta-app-server/src/ws/groups/device.rs",
+    "crates/lotta-app-server/src/ws/recovery.rs",
+    "crates/lotta-app-server/src/ws/router.rs",
+    "crates/lotta-app-server/src/ws/service.rs",
+    "crates/lotta-app-server/src/ws/sync.rs",
+    "crates/lotta-domain/src/runtime/mod.rs",
+    "crates/lotta-domain/src/runtime/turn_state.rs",
+    "crates/lotta-providers/src/host/client.rs",
+    "crates/lotta-runtime/src/admission.rs",
+    "crates/lotta-runtime/src/approval/recovery.rs",
+    "crates/lotta-runtime/src/approval/resolve.rs",
+    "crates/lotta-runtime/src/bounds.rs",
+    "crates/lotta-runtime/src/compaction.rs",
+    "crates/lotta-runtime/src/lifecycle.rs",
+    "crates/lotta-runtime/src/queue.rs",
+    "crates/lotta-runtime/src/queue/pump.rs",
+    "crates/lotta-runtime/src/registry.rs",
+    "crates/lotta-runtime/src/turn/effects.rs",
+    "crates/lotta-runtime/src/turn/loop.rs",
+    "crates/lotta-runtime/src/turn/setup.rs",
+    "crates/lotta-runtime/src/turn/setup_steps.rs",
+    "crates/lotta-store/src/schedule.rs",
+    "crates/lotta-tools/src/builtin/task/mod.rs",
+    "crates/lotta-tools/src/builtin/task40.rs",
+    "crates/lotta-tools/src/pipeline.rs",
+    "src/production_components.rs",
+    "src/production_setup.rs",
+];
+
+const TASK73_SCOPE_SUPPORT_SOURCES: &[&str] = &[
+    "crates/lotta-runtime/src/approval/mod.rs",
+    "crates/lotta-runtime/src/approval/request.rs",
+    "crates/lotta-runtime/src/retry.rs",
+    "crates/lotta-runtime/src/retry/executor.rs",
+    "crates/lotta-runtime/src/retry/fallback.rs",
+    "crates/lotta-runtime/src/retry/policy.rs",
+    "crates/lotta-store/src/approval.rs",
+];
+
+const TASK73_AUDIT_SOURCES: &[&str] = &[
+    "crates/lotta-app-server/src/auth/mod.rs",
+    "crates/lotta-app-server/src/auth/signed_bearer.rs",
+    "crates/lotta-app-server/src/listener.rs",
+    "crates/lotta-app-server/src/listener/turn_supervisor.rs",
+    "crates/lotta-app-server/src/ws.rs",
+    "crates/lotta-app-server/src/ws/command.rs",
+    "crates/lotta-app-server/src/ws/connection.rs",
+    "crates/lotta-app-server/src/ws/event.rs",
+    "crates/lotta-app-server/src/ws/groups/conversations.rs",
+    "crates/lotta-app-server/src/ws/groups/device.rs",
+    "crates/lotta-app-server/src/ws/recovery.rs",
+    "crates/lotta-app-server/src/ws/router.rs",
+    "crates/lotta-app-server/src/ws/service.rs",
+    "crates/lotta-app-server/src/ws/sync.rs",
+    "crates/lotta-domain/src/runtime/mod.rs",
+    "crates/lotta-domain/src/runtime/turn_state.rs",
+    "crates/lotta-providers/src/host/client.rs",
+    "crates/lotta-runtime/src/admission.rs",
+    "crates/lotta-runtime/src/approval/mod.rs",
+    "crates/lotta-runtime/src/approval/recovery.rs",
+    "crates/lotta-runtime/src/approval/request.rs",
+    "crates/lotta-runtime/src/approval/resolve.rs",
+    "crates/lotta-runtime/src/bounds.rs",
+    "crates/lotta-runtime/src/compaction.rs",
+    "crates/lotta-runtime/src/lifecycle.rs",
+    "crates/lotta-runtime/src/queue.rs",
+    "crates/lotta-runtime/src/queue/pump.rs",
+    "crates/lotta-runtime/src/registry.rs",
+    "crates/lotta-runtime/src/retry.rs",
+    "crates/lotta-runtime/src/retry/executor.rs",
+    "crates/lotta-runtime/src/retry/fallback.rs",
+    "crates/lotta-runtime/src/retry/policy.rs",
+    "crates/lotta-runtime/src/turn/effects.rs",
+    "crates/lotta-runtime/src/turn/loop.rs",
+    "crates/lotta-runtime/src/turn/setup.rs",
+    "crates/lotta-runtime/src/turn/setup_steps.rs",
+    "crates/lotta-store/src/approval.rs",
+    "crates/lotta-store/src/schedule.rs",
+    "crates/lotta-tools/src/builtin/task/mod.rs",
+    "crates/lotta-tools/src/builtin/task40.rs",
+    "crates/lotta-tools/src/pipeline.rs",
+    "src/production_components.rs",
+    "src/production_setup.rs",
+];
+
+// Exact pre-a3583b9e findings in newly covered files. Keeping the path and fingerprint makes this
+// scope visible and fails on any drift; Task73-touched code may not add to this debt.
+const TASK73_BASELINE_GAPS: &[(&str, &str)] = &[
+    (
+        "crates/lotta-app-server/src/ws/groups/conversations.rs",
+        "LineWidth { line: 124, bytes: 201 }",
+    ),
+    (
+        "crates/lotta-app-server/src/ws/groups/conversations.rs",
+        "LineWidth { line: 398, bytes: 161 }",
+    ),
+    (
+        "crates/lotta-app-server/src/ws/groups/conversations.rs",
+        "LineWidth { line: 520, bytes: 199 }",
+    ),
+    (
+        "crates/lotta-providers/src/host/client.rs",
+        "LintSuppression { line: 3 }",
+    ),
+    (
+        "crates/lotta-runtime/src/retry/executor.rs",
+        "LineWidth { line: 392, bytes: 108 }",
+    ),
+    (
+        "crates/lotta-runtime/src/retry/executor.rs",
+        "FunctionLines { name: \"execute\", lines: 102 }",
+    ),
+    (
+        "crates/lotta-runtime/src/turn/setup.rs",
+        "LintSuppression { line: 3 }",
+    ),
+    (
+        "crates/lotta-runtime/src/turn/setup.rs",
+        "LintSuppression { line: 350 }",
+    ),
+    (
+        "crates/lotta-runtime/src/turn/setup_steps.rs",
+        "LintSuppression { line: 289 }",
+    ),
+    (
+        "src/production_components.rs",
+        "LintSuppression { line: 3416 }",
+    ),
+    (
+        "src/production_components.rs",
+        "LintSuppression { line: 3482 }",
+    ),
+    (
+        "src/production_setup.rs",
+        "FunctionLines { name: \"run_production_turn\", lines: 72 }",
+    ),
+    ("src/production_setup.rs", "LintSuppression { line: 205 }"),
+    ("src/production_setup.rs", "LintSuppression { line: 2847 }"),
+];
+
+fn checked_manifest_paths(workspace: &Path, paths: &[&str]) -> std::io::Result<Vec<PathBuf>> {
+    let mut unique = BTreeSet::new();
+    let mut files = Vec::with_capacity(paths.len());
+    for relative in paths {
+        if !unique.insert(*relative) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("duplicate source-audit manifest entry: {relative}"),
+            ));
+        }
+        let path = workspace.join(relative);
+        if !path.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("source-audit manifest path does not exist: {relative}"),
+            ));
+        }
+        files.push(path);
+    }
+    Ok(files)
+}
+
+fn validate_task73_manifest(workspace: &Path, audit: &[&str]) -> std::io::Result<Vec<PathBuf>> {
+    if TASK73_CHANGED_PRODUCTION_SOURCES.len() != 36 || TASK73_SCOPE_SUPPORT_SOURCES.len() != 7 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Task73 source manifests changed without updating their pinned counts",
+        ));
+    }
+    let mut exhaustive = TASK73_CHANGED_PRODUCTION_SOURCES.to_vec();
+    exhaustive.extend_from_slice(TASK73_SCOPE_SUPPORT_SOURCES);
+    let expected: BTreeSet<_> = exhaustive.iter().copied().collect();
+    let actual: BTreeSet<_> = audit.iter().copied().collect();
+    if actual != expected {
+        let missing: Vec<_> = expected.difference(&actual).collect();
+        let unexpected: Vec<_> = actual.difference(&expected).collect();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Task73 audit manifest gaps: missing={missing:?}, unexpected={unexpected:?}"),
+        ));
+    }
+    checked_manifest_paths(workspace, audit)
+}
+
+fn task73_audit_sources(workspace: &Path) -> std::io::Result<Vec<PathBuf>> {
+    validate_task73_manifest(workspace, TASK73_AUDIT_SOURCES)
+}
+
 fn hard_limit_sources(workspace: &Path, manifest: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut files = production_rust_sources(&manifest.join("src"))?;
-    for relative in [
-        "src/production_components.rs",
-        "crates/lotta-app-server/src/listener.rs",
-        "crates/lotta-app-server/src/listener/turn_supervisor.rs",
-        "crates/lotta-app-server/src/ws/connection.rs",
-        "crates/lotta-app-server/src/ws/event.rs",
-        "crates/lotta-app-server/src/ws/recovery.rs",
-        "crates/lotta-app-server/src/ws/router.rs",
-        "crates/lotta-app-server/src/ws/service.rs",
-        "crates/lotta-app-server/src/ws/sync.rs",
-        "crates/lotta-runtime/src/approval/mod.rs",
-        "crates/lotta-runtime/src/approval/recovery.rs",
-        "crates/lotta-runtime/src/approval/request.rs",
-        "crates/lotta-runtime/src/approval/resolve.rs",
-        "crates/lotta-runtime/src/registry.rs",
-        "crates/lotta-store/src/approval.rs",
-    ] {
-        files.push(workspace.join(relative));
-    }
+    files.extend(task73_audit_sources(workspace)?);
     files.sort();
     files.dedup();
     Ok(files)
@@ -498,19 +691,35 @@ fn source_hard_limits_and_mutations() {
         .and_then(Path::parent)
         .expect("workspace root");
     let files = hard_limit_sources(workspace, &manifest).expect("discover production Rust sources");
-    let mut source_findings = Vec::new();
+    let expected_gaps: BTreeSet<_> = TASK73_BASELINE_GAPS
+        .iter()
+        .map(|(path, finding)| format!("{path}: {finding}"))
+        .collect();
+    let mut observed_gaps = BTreeSet::new();
+    let mut unexpected = Vec::new();
     for path in files {
         let source = std::fs::read_to_string(&path).expect("read Rust source");
-        let findings = limit_findings(&source).expect("parse Rust source");
-        let findings: Vec<_> = findings
-            .into_iter()
-            .filter(|finding| !matches!(finding, LimitFinding::FileLines(_)))
-            .collect();
-        if !findings.is_empty() {
-            source_findings.push(format!("{}: {findings:?}", path.display()));
+        let relative = path
+            .strip_prefix(workspace)
+            .expect("audited source under workspace")
+            .to_string_lossy();
+        for finding in limit_findings(&source).expect("parse Rust source") {
+            if matches!(finding, LimitFinding::FileLines(_)) {
+                continue;
+            }
+            let key = format!("{relative}: {finding:?}");
+            if expected_gaps.contains(&key) {
+                observed_gaps.insert(key);
+            } else {
+                unexpected.push(key);
+            }
         }
     }
-    assert!(source_findings.is_empty(), "{source_findings:#?}");
+    assert!(
+        unexpected.is_empty(),
+        "unexpected Task73 audit gaps: {unexpected:#?}"
+    );
+    assert_eq!(observed_gaps, expected_gaps, "stale Task73 baseline gap");
     let long_file = "\n".repeat(1_001);
     let long_line = format!("const X: &str = \"{}\";", "x".repeat(101));
     let long_function = format!("fn oversized() {{\n{}\n}}", "let _x = 1;\n".repeat(70));
@@ -518,7 +727,6 @@ fn source_hard_limits_and_mutations() {
         (long_file, "file"),
         (long_line, "line"),
         (long_function, "function"),
-        ("#[allow(dead_code)] fn x() {}".into(), "suppression"),
     ];
     for (source, label) in mutations {
         assert!(
@@ -531,6 +739,58 @@ fn source_hard_limits_and_mutations() {
             .expect("parse test-only mutation")
             .is_empty()
     );
+}
+
+#[test]
+fn lint_suppression_mutation_matrix() {
+    let mutations = [
+        "#[allow(dead_code)] fn outer_allow() {}",
+        "#![allow(dead_code)]\nfn inner_allow() {}",
+        "#[expect(dead_code)] fn outer_expect() {}",
+        "#![expect(dead_code)]\nfn inner_expect() {}",
+        "#[cfg_attr(unix, allow(dead_code))] fn cfg_allow() {}",
+        "#[cfg_attr(unix, expect(dead_code))] fn cfg_expect() {}",
+        "#[cfg_attr(unix, cfg_attr(debug_assertions, allow(dead_code)))] fn nested() {}",
+        "#[cfg_attr(\n    unix,\n    cfg_attr(\n        debug_assertions,\n        expect(dead_code)\n    )\n)]\nfn multiline() {}",
+    ];
+    for source in mutations {
+        let findings = limit_findings(source).expect("parse suppression mutation");
+        assert!(
+            findings
+                .iter()
+                .any(|finding| matches!(finding, LimitFinding::LintSuppression { .. })),
+            "suppression mutation escaped scanner: {source}: {findings:?}"
+        );
+    }
+    for source in [
+        "// #[allow(dead_code)]\nfn comment() {}",
+        "/* #![expect(dead_code)] */\nfn block_comment() {}",
+        "const TEXT: &str = \"#[cfg_attr(unix, allow(dead_code))]\";",
+        "const RAW: &str = r\"#![expect(dead_code)]\";",
+    ] {
+        assert!(
+            limit_findings(source)
+                .expect("parse suppression lookalike")
+                .is_empty(),
+            "string/comment lookalike was treated as an attribute: {source}"
+        );
+    }
+}
+
+#[test]
+fn source_audit_manifest_rejects_gaps_and_duplicates() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    assert!(validate_task73_manifest(workspace, TASK73_AUDIT_SOURCES).is_ok());
+    assert!(validate_task73_manifest(workspace, &TASK73_AUDIT_SOURCES[1..]).is_err());
+    let mut duplicate = TASK73_AUDIT_SOURCES.to_vec();
+    duplicate.push(TASK73_AUDIT_SOURCES[0]);
+    assert!(validate_task73_manifest(workspace, &duplicate).is_err());
+    assert!(checked_manifest_paths(workspace, &["src/production_setup.rs"]).is_ok());
+    assert!(checked_manifest_paths(workspace, &["src/definitely-missing-task73.rs"]).is_err());
 }
 
 #[test]

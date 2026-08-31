@@ -1260,35 +1260,9 @@ async fn send_outbound_batch(
     batch: OutboundBatch,
 ) -> Result<(), axum::Error> {
     for body in batch {
-        if outbound_frame_allowed(&body) {
-            socket.send(Message::Text(body.into())).await?;
-        }
+        socket.send(Message::Text(body.into())).await?;
     }
     Ok(())
-}
-
-type OutboundFrameFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
-type SharedOutboundFrameFilter = std::sync::Mutex<Option<OutboundFrameFilter>>;
-
-static OUTBOUND_FRAME_FILTER: std::sync::OnceLock<SharedOutboundFrameFilter> =
-    std::sync::OnceLock::new();
-
-#[doc(hidden)]
-pub fn set_test_outbound_frame_filter(filter: Option<OutboundFrameFilter>) {
-    let slot = OUTBOUND_FRAME_FILTER.get_or_init(|| std::sync::Mutex::new(None));
-    if let Ok(mut guard) = slot.lock() {
-        *guard = filter;
-    }
-}
-
-fn outbound_frame_allowed(body: &str) -> bool {
-    let slot = OUTBOUND_FRAME_FILTER.get_or_init(|| std::sync::Mutex::new(None));
-    if let Ok(guard) = slot.lock()
-        && let Some(filter) = guard.as_ref()
-    {
-        return filter(body);
-    }
-    true
 }
 
 fn dispatch_atomic_output(

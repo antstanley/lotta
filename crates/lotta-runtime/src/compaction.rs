@@ -187,7 +187,11 @@ pub trait CompactionEffects: Send + Sync {
         progress: CompactionProgress,
     ) -> Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send + '_>>;
     /// Confirms that the lease remains canonical before any externally visible effect.
-    fn lease_is_current(&self, scope: &RuntimeScope, lease: &TurnLease) -> bool;
+    fn lease_is_current(
+        &self,
+        scope: &RuntimeScope,
+        lease: &TurnLease,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
     /// Fires the pre-compact lifecycle callbacks.
     fn pre_compact(
         &self,
@@ -279,12 +283,12 @@ where
         &self,
         command: &CompactionCommand,
     ) -> Result<CompactionProgress, RuntimeError> {
-        ensure_live(command, &self.effects)?;
+        ensure_live(command, &self.effects).await?;
         match self.effects.claim(command).await? {
             CompactionRecovery::Published(progress) => return Ok(progress),
             CompactionRecovery::Appended(progress) => {
                 self.effects.publish(command).await?;
-                ensure_live(command, &self.effects)?;
+                ensure_live(command, &self.effects).await?;
                 self.effects.post_compact(command).await?;
                 return Ok(progress);
             }
@@ -298,7 +302,7 @@ where
                     )
                     .await?;
                 self.effects.publish(command).await?;
-                ensure_live(command, &self.effects)?;
+                ensure_live(command, &self.effects).await?;
                 self.effects.post_compact(command).await?;
                 return Ok(progress);
             }
@@ -306,7 +310,7 @@ where
         }
         let planned = plan(command.request.messages.as_slice(), command.mode)?;
         self.effects.pre_compact(command).await?;
-        ensure_live(command, &self.effects)?;
+        ensure_live(command, &self.effects).await?;
         let summary = self
             .summarizer
             .summarize(
@@ -315,7 +319,7 @@ where
                 command.cancellation.clone(),
             )
             .await?;
-        ensure_live(command, &self.effects)?;
+        ensure_live(command, &self.effects).await?;
         let progress = progress(command, &summary, &planned.keep)?;
         self.effects
             .record_projection(command, summary.clone(), planned.keep.clone(), progress)
@@ -324,18 +328,20 @@ where
             .append(command, summary, planned.keep, progress)
             .await?;
         self.effects.publish(command).await?;
-        ensure_live(command, &self.effects)?;
+        ensure_live(command, &self.effects).await?;
         self.effects.post_compact(command).await?;
         Ok(progress)
     }
 }
 
-fn ensure_live(
+async fn ensure_live(
     command: &CompactionCommand,
     effects: &impl CompactionEffects,
 ) -> Result<(), RuntimeError> {
     if command.cancellation.is_cancelled()
-        || !effects.lease_is_current(&command.scope, &command.lease)
+        || !effects
+            .lease_is_current(&command.scope, &command.lease)
+            .await
     {
         return Err(RuntimeError::Cancelled {
             context: "stale compaction lease".into(),
@@ -516,8 +522,13 @@ mod tests {
             self.trace.lock().expect("trace").push("record".into());
             Box::pin(async { Ok(()) })
         }
-        fn lease_is_current(&self, _: &RuntimeScope, lease: &TurnLease) -> bool {
-            self.current(lease)
+        fn lease_is_current(
+            &self,
+            _: &RuntimeScope,
+            lease: &TurnLease,
+        ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+            let lease = lease.clone();
+            Box::pin(async move { self.current(&lease) })
         }
         fn pre_compact(
             &self,

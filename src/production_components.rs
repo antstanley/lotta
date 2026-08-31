@@ -1038,7 +1038,7 @@ impl ProductionRuntimeState {
             .ok_or(AppServerError::Malformed)
     }
 
-    pub(crate) fn lease_is_current(&self, scope: &RuntimeScope, lease: &TurnLease) -> bool {
+    pub(crate) async fn lease_is_current(&self, scope: &RuntimeScope, lease: &TurnLease) -> bool {
         let active_current = self.active.lock().ok().and_then(|active| {
             active
                 .get(&RuntimeKey::from(scope))
@@ -1050,11 +1050,7 @@ impl ProductionRuntimeState {
         // No active admission holds this scope, so the lease can only be a
         // management command begun directly on the authoritative lifecycle
         // registry (for example a WebSocket conversation compaction).
-        // ponytail: try_lock only; registry contention is sub-millisecond and
-        // treated conservatively as "not current".
-        let Ok(state) = self.inner.try_lock() else {
-            return false;
-        };
+        let state = self.inner.lock().await;
         let registry = &state.registry;
         registry
             .lookup(&RuntimeKey::from(scope))
@@ -1586,7 +1582,7 @@ impl ProductionRuntimeService {
             .get(&RuntimeKey::from(&scope))
             .map(|active| (active.lease.clone(), active.cancellation.clone()))
             .ok_or(AppServerError::Malformed)?;
-        if !self.state.lease_is_current(&scope, &active.0) {
+        if !self.state.lease_is_current(&scope, &active.0).await {
             return Err(AppServerError::Malformed);
         }
         let service = self
@@ -5080,6 +5076,65 @@ mod production_tests {
                 .expect("registered owner")
         }
 
+        /// An accepted management compaction lease waits for the authoritative
+        /// registry lock, then remains current once contention clears; a
+        /// superseded management lease remains stale.
+        #[tokio::test]
+        async fn management_compaction_lease_awaits_registry_contention() {
+            use lotta_app_server::ws::conversations::ConversationAuthority as _;
+            let label = "compaction-lease-contention";
+            let held = Arc::new(HeldProvider::default());
+            let (_, service, ..) =
+                production_controller_fixture(label, held as Arc<dyn ProviderPort>).await;
+            let authority = ConversationsProductionAuthority {
+                state: Arc::clone(&service.state),
+                brokers: Arc::clone(&service.brokers),
+            };
+            let scope = scope(label);
+
+            let stale = authority
+                .begin_command(&scope)
+                .expect("stale command begins");
+            authority
+                .finish_command(&scope, &stale)
+                .await
+                .expect("stale command finishes");
+            let current = authority
+                .begin_command(&scope)
+                .expect("current command begins");
+
+            let guard = service.state.inner.lock().await;
+            let mut check = {
+                let state = Arc::clone(&service.state);
+                let scope = scope.clone();
+                let current = current.clone();
+                tokio::spawn(async move { state.lease_is_current(&scope, &current).await })
+            };
+            if tokio::time::timeout(std::time::Duration::from_millis(250), &mut check)
+                .await
+                .is_ok()
+            {
+                panic!("accepted lease check completed while the registry lock was held");
+            }
+            drop(guard);
+
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), check)
+                    .await
+                    .expect("lease check settles once the lock frees")
+                    .expect("lease check task"),
+                "accepted management lease remains current"
+            );
+            assert!(
+                !service.state.lease_is_current(&scope, &stale).await,
+                "superseded management lease remains stale"
+            );
+            authority
+                .finish_command(&scope, &current)
+                .await
+                .expect("current command finishes");
+        }
+
         /// While an unrelated operation holds the authoritative registry, the
         /// authority release waits for the lock and then finishes the command:
         /// the lifecycle lands idle instead of being silently stranded busy.
@@ -6045,6 +6100,8 @@ mod production_tests {
     #[derive(Default)]
     struct ClientReducer {
         executing: std::collections::BTreeSet<String>,
+        ignore_client_tool_end: bool,
+        ignored_client_tool_end_frames: usize,
     }
 
     impl ClientReducer {
@@ -6054,6 +6111,9 @@ mod production_tests {
                     Some("client_tool_start") => {
                         self.executing
                             .insert(frame["delta"]["tool_call_id"].as_str().unwrap().into());
+                    }
+                    Some("client_tool_end") if self.ignore_client_tool_end => {
+                        self.ignored_client_tool_end_frames += 1;
                     }
                     Some("client_tool_end") => {
                         self.executing
@@ -6105,10 +6165,10 @@ mod production_tests {
                         "input rejected; state lock available={}, frame={accepted:#?}",
                         service.state.inner.try_lock().is_ok()
                     );
-                    lotta_app_server::listener::set_test_outbound_frame_filter(Some(Arc::new(
-                        |body| !body.contains("\"message_type\":\"client_tool_end\""),
-                    )));
-                    let mut reducer = ClientReducer::default();
+                    let mut reducer = ClientReducer {
+                        ignore_client_tool_end: true,
+                        ..Default::default()
+                    };
                     receive_until_apply(&mut socket, &mut reducer, |frame| {
                         frame["delta"]["message_type"] == "client_tool_start"
                     })
@@ -6122,8 +6182,11 @@ mod production_tests {
                         frame["type"] == "sync_response"
                     })
                     .await;
+                    assert_eq!(
+                        reducer.ignored_client_tool_end_frames, 1,
+                        "the real production listener sends the intentionally ignored tool end"
+                    );
                     assert!(reducer.executing.is_empty());
-                    lotta_app_server::listener::set_test_outbound_frame_filter(None);
                     drop(socket);
                     handle.shutdown();
                     handle.wait().await.unwrap();
