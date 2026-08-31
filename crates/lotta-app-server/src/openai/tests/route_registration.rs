@@ -19,6 +19,7 @@ async fn v1_present_with_flag() {
     let handle = launch(&roots, true, None).await;
     let response = get(&handle, "/v1/models", "").await;
     assert_eq!(response.status, 200);
+    assert_eq!(response.content_type.as_deref(), Some("application/json"));
     assert_eq!(response.body, r#"{"object":"list","data":[]}"#);
     handle
         .wait()

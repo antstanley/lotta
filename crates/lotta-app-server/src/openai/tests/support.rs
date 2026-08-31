@@ -108,6 +108,7 @@ pub(super) async fn launch(roots: &Roots, openai_api: bool, token: Option<&str>)
 
 pub(super) struct HttpResponse {
     pub status: u16,
+    pub content_type: Option<String>,
     pub body: String,
 }
 
@@ -150,8 +151,14 @@ fn parse_response(bytes: &[u8]) -> HttpResponse {
         .unwrap_or_else(|| panic!("HTTP status"))
         .parse()
         .unwrap_or_else(|error| panic!("status number: {error}"));
+    let content_type = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-type")
+            .then(|| value.trim().to_owned())
+    });
     HttpResponse {
         status,
+        content_type,
         body: body.to_owned(),
     }
 }

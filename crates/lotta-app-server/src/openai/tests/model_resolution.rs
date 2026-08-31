@@ -4,7 +4,7 @@ use super::{resolve, test_support::agent};
 fn unique_name_advertised() {
     let agents = vec![agent("agent-local-alpha", "friendly", false)];
     assert_eq!(resolve::advertised_ids(&agents), ["friendly"]);
-    let found = resolve::resolve(&agents, "friendly").unwrap_or_else(|| panic!("unique name"));
+    let found = resolve::resolve(&agents, "friendly").unwrap_or_else(|_| panic!("unique name"));
     assert_eq!(found.id.as_str(), "agent-local-alpha");
 }
 
@@ -18,14 +18,14 @@ fn colliding_name_falls_back_to_id() {
         resolve::advertised_ids(&agents),
         ["agent-local-alpha", "agent-local-beta"]
     );
-    assert!(resolve::resolve(&agents, "shared").is_none());
+    assert!(resolve::resolve(&agents, "shared").is_err());
 }
 
 #[test]
 fn raw_agent_id_resolves() {
     let agents = vec![agent("agent-local-alpha", "friendly", false)];
     let found =
-        resolve::resolve(&agents, "agent-local-alpha").unwrap_or_else(|| panic!("raw agent id"));
+        resolve::resolve(&agents, "agent-local-alpha").unwrap_or_else(|_| panic!("raw agent id"));
     assert_eq!(found.name.as_str(), "friendly");
 }
 
@@ -40,27 +40,30 @@ fn name_cannot_shadow_another_raw_agent_id() {
         ["agent-local-alpha", "other"]
     );
     let found =
-        resolve::resolve(&agents, "agent-local-beta").unwrap_or_else(|| panic!("raw id wins"));
+        resolve::resolve(&agents, "agent-local-beta").unwrap_or_else(|_| panic!("raw id wins"));
     assert_eq!(found.id.as_str(), "agent-local-beta");
 }
 
 #[test]
-fn model_id_bound_below() {
-    let name = "n".repeat(resolve::OPENAI_MODEL_ID_BYTES_MAX - 1);
-    let agents = vec![agent("agent-local-below", &name, false)];
-    assert!(resolve::resolve(&agents, &name).is_some());
+fn hidden_raw_id_does_not_resolve() {
+    let agents = vec![agent("agent-local-hidden", "secret", true)];
+    assert!(resolve::resolve(&agents, "agent-local-hidden").is_err());
 }
 
 #[test]
-fn model_id_bound_at() {
-    let name = "n".repeat(resolve::OPENAI_MODEL_ID_BYTES_MAX);
-    let agents = vec![agent("agent-local-at", &name, false)];
-    assert!(resolve::resolve(&agents, &name).is_some());
+fn hidden_name_does_not_resolve_or_advertise() {
+    let agents = vec![agent("agent-local-hidden", "secret", true)];
+    assert!(resolve::advertised_ids(&agents).is_empty());
+    assert!(resolve::resolve(&agents, "secret").is_err());
 }
 
 #[test]
-fn model_id_bound_above() {
-    let model = "n".repeat(resolve::OPENAI_MODEL_ID_BYTES_MAX + 1);
-    let agents = vec![agent("agent-local-above", "short", false)];
-    assert!(resolve::resolve(&agents, &model).is_none());
+fn hidden_duplicate_does_not_make_visible_name_ambiguous() {
+    let agents = vec![
+        agent("agent-local-visible", "shared", false),
+        agent("agent-local-hidden", "shared", true),
+    ];
+    assert_eq!(resolve::advertised_ids(&agents), ["shared"]);
+    let found = resolve::resolve(&agents, "shared").unwrap_or_else(|_| panic!("visible name"));
+    assert_eq!(found.id.as_str(), "agent-local-visible");
 }

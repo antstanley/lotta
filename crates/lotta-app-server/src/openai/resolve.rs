@@ -1,4 +1,4 @@
-//! Shared collision-free model identifier resolution.
+//! Visible-agent model advertisement and shared resolution.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -7,8 +7,8 @@ use lotta_store::{AGENTS_MAX, query::QUERY_PAGE_ITEMS_MAX};
 
 use crate::{errors::AppServerError, ws::agents::AgentsBridge};
 
-/// Largest model identifier accepted by a future `OpenAI` request decoder.
-pub const OPENAI_MODEL_ID_BYTES_MAX: usize = 8 * 1_024 * 1_024;
+use super::errors::{ErrorEnvelope, model_not_found};
+
 /// Maximum repository pages needed to inspect the bounded complete agent set.
 const VISIBLE_AGENT_PAGES_MAX: usize = AGENTS_MAX.div_ceil(QUERY_PAGE_ITEMS_MAX);
 
@@ -35,12 +35,35 @@ pub async fn visible_agents(bridge: &AgentsBridge) -> Result<Vec<Agent>, AppServ
     Ok(agents)
 }
 
-/// Returns the collision-free advertised identifier for every visible agent.
+/// Returns collision-free advertised identifiers for visible agents only.
 ///
 /// # Panics
 /// Panics when the caller supplies more than the canonical agent bound.
 #[must_use]
 pub fn advertised_ids(agents: &[Agent]) -> Vec<String> {
+    let visible = agents
+        .iter()
+        .filter(|agent| is_visible(agent))
+        .collect::<Vec<_>>();
+    advertised_ids_for_visible(&visible)
+}
+
+/// Resolves a raw ID or one unambiguous name among visible agents only.
+///
+/// Missing and hidden models produce the exact shared `model_not_found` contract.
+/// Request-size bounds belong at the future model-taking HTTP decoder trust boundary.
+///
+/// # Errors
+/// Returns the stable `OpenAI` missing-model envelope when no visible agent resolves.
+///
+/// # Panics
+/// Panics when the caller supplies more than the canonical agent bound.
+pub fn resolve<'a>(agents: &'a [Agent], model: &str) -> Result<&'a Agent, ErrorEnvelope> {
+    assert!(agents.len() <= AGENTS_MAX);
+    resolve_visible(agents, model).ok_or_else(|| model_not_found(model))
+}
+
+fn advertised_ids_for_visible(agents: &[&Agent]) -> Vec<String> {
     assert!(agents.len() <= AGENTS_MAX);
     let ids: BTreeSet<&str> = agents.iter().map(|agent| agent.id.as_str()).collect();
     let mut counts = BTreeMap::<&str, usize>::new();
@@ -63,19 +86,16 @@ fn advertised_id(agent: &Agent, ids: &BTreeSet<&str>, counts: &BTreeMap<&str, us
     }
 }
 
-/// Resolves raw agent IDs first, then one unambiguous advertised name.
-#[must_use]
-pub fn resolve<'a>(agents: &'a [Agent], model: &str) -> Option<&'a Agent> {
-    if model.len() > OPENAI_MODEL_ID_BYTES_MAX || agents.len() > AGENTS_MAX {
-        return None;
-    }
-    if let Some(agent) = agents.iter().find(|agent| agent.id.as_str() == model) {
+fn resolve_visible<'a>(agents: &'a [Agent], model: &str) -> Option<&'a Agent> {
+    let visible = agents.iter().filter(|agent| is_visible(agent));
+    if let Some(agent) = visible.clone().find(|agent| agent.id.as_str() == model) {
         return Some(agent);
     }
-    let mut matches = agents.iter().filter(|agent| agent.name.as_str() == model);
+    let mut matches = visible.filter(|agent| agent.name.as_str() == model);
     let agent = matches.next()?;
-    if matches.next().is_some() {
-        return None;
-    }
-    Some(agent)
+    matches.next().is_none().then_some(agent)
+}
+
+fn is_visible(agent: &Agent) -> bool {
+    !agent.hidden.flatten().unwrap_or(false)
 }

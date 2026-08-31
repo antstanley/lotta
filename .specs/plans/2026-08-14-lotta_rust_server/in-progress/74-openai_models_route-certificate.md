@@ -15,7 +15,7 @@ obligation names (a file location, a named test result, or an execution trace) �
 
 ## Premises
 
-- **P1 — Goal.** `GET /v1/models` listing up to 1,000 visible agents as OpenAI model objects, with agent-name and agent-ID resolution and `model_not_found` errors.
+- **P1 — Goal.** `GET /v1/models` listing up to 1,000 visible agents as OpenAI model objects, with visible agent-name and agent-ID resolution plus the exact pure/shared `model_not_found` contract consumed by future model-taking routes.
 - **P2 — Obligations.** Done iff O1…O6 all hold, one per definition-of-done item in DoD order; O6 is the `Reviewable:` item.
 - **P3 — Invariants.** Must use the shared listener authentication policy: `02-app-server-api.md` §Assumptions states HTTP and WebSocket share one listener and authentication policy.
 
@@ -37,9 +37,9 @@ obligation names (a file location, a named test result, or an execution trace) �
   - *Evidence to collect:* Run `cargo nextest run -p lotta-app-server -E 'test(openai::listing_cap)'` — expect the cap case and a `hidden_excluded` case.
   - *Status:* ☐ unverified
 
-- **O4 — A missing model returns OpenAI `invalid_request_error` with code `model_not_found`, and the route uses the shared listener authentication policy**
-  - *Claim:* The error envelope matches the baseline shape and an unauthenticated request is rejected by the same policy as `/ws`.
-  - *Evidence to collect:* Run `cargo nextest run -p lotta-app-server -E 'test(openai::errors) + test(openai::auth_is_shared)'` — expect the error-shape case (compare with `../letta-code/src/websocket/app-server-openai.ts:146`) and an auth case asserting rejection without route-local credentials.
+- **O4 — The pure/shared missing-model contract exactly composes OpenAI `invalid_request_error` with code `model_not_found`, while `GET /v1/models` uses the shared listener authentication policy; HTTP error emission is deferred to Task 75**
+  - *Claim:* Resolver misses compose the complete, untruncated model value into the exact baseline envelope, and unauthenticated model listing is rejected by the same policy as `/ws`; Task 74 adds no model-taking HTTP route.
+  - *Evidence to collect:* Run `cargo nextest run -p lotta-app-server -E 'test(openai::errors) + test(openai::model_resolution) + test(openai::auth_is_shared)'` — expect exact basic, Unicode, and long-value JSON contract cases; hidden ID/name misses and visible-only ambiguity cases; and shared-auth rejection. Trace `resolve::resolve` calling `errors::model_not_found`; reserve response conversion and the first external missing-model curl for Task 75.
   - *Status:* ☐ unverified
 
 - **O5 — Meets the repo definition of done (tests, lint/format, named-constant limits — see plan.md baseline)**
@@ -47,9 +47,9 @@ obligation names (a file location, a named test result, or an execution trace) �
   - *Evidence to collect:* Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo nextest run --workspace --all-features`, and `cargo deny check` — expect exit code 0 from each. Read every constant this task introduces and confirm it is a `const` whose name puts units last (`development-guidelines.md` §Naming), and that each function the task added stays within 70 lines and 100 columns.
   - *Status:* ☐ unverified
 
-- **O6 — Reviewable: a reviewer starts the server with and without `--openai-api` and runs `curl /v1/models` and `curl /healthz`, seeing the models route present only with the flag, names advertised correctly, and `model_not_found` for a missing model**
-  - *Claim:* The route behaves as specified from outside the process.
-  - *Evidence to collect:* Run the two startups and the three curls; confirm 404 versus 200 on `/v1/models`, 200 on `/healthz` in both, and the `model_not_found` envelope for an unknown model.
+- **O6 — Reviewable: a reviewer starts the server with and without `--openai-api` and curls `/v1/models`, `/healthz`, and `/app-server-info`, verifying flag gating, health/info availability, and listing wire shape, names, collisions, and visibility; Task 75 owns the first external `model_not_found` curl**
+  - *Claim:* Task 74's only OpenAI HTTP route behaves as specified from outside the process, without claiming HTTP behavior for a model-taking route that does not yet exist.
+  - *Evidence to collect:* Run both startups and curl `/v1/models`, `/healthz`, and `/app-server-info`: confirm 404 versus 200 for listing under flag off/on, 200 for health and info in both modes, `application/json` plus exact model-list wire fields, unique-name advertisement, collision fallback, and hidden-agent exclusion. Do not attempt or certify an external missing-model response until Task 75.
   - *Status:* ☐ unverified
 
 ## Regression check
@@ -60,7 +60,7 @@ For each unit this task changes, the validator traces one downstream caller:
 
 ## Residue
 
-Chat and Responses routes are Tasks 75 and 76.
+Chat and Responses routes are Tasks 75 and 76. Task 75's first model-taking route owns request-parser size bounds, OpenAI HTTP error conversion/emission, and the first external `model_not_found` curl; Task 74 proves only the exact pure/shared resolver-to-error contract.
 
 ## Conclusion
 
