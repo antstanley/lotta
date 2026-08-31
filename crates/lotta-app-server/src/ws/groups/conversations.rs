@@ -835,6 +835,47 @@ impl ConversationsBridge {
             .map_err(|()| AppServerError::Unavailable)
     }
 
+    /// Confirms that a conversation exists under the exact agent scope.
+    ///
+    /// # Errors
+    /// Returns an opaque repository failure when lookup cannot complete.
+    pub async fn contains_for_openai(
+        &self,
+        agent_id: &AgentId,
+        conversation_id: &ConversationId,
+    ) -> Result<bool, AppServerError> {
+        match self.resolve(Some(agent_id.as_str()), conversation_id).await {
+            Lookup::Found(found) => Ok(found.agent_id == *agent_id),
+            Lookup::Missing => Ok(false),
+            Lookup::Failed => Err(AppServerError::Unavailable),
+        }
+    }
+
+    /// Creates a hidden canonical transcript-rewrite fork for Responses.
+    ///
+    /// # Errors
+    /// Returns an opaque repository failure when fork setup cannot complete atomically.
+    pub async fn fork_for_openai(
+        &self,
+        agent_id: &AgentId,
+        conversation_id: &ConversationId,
+    ) -> Result<ConversationId, AppServerError> {
+        let command = ConversationForkCommand {
+            request_id: "openai-response-fork".to_owned(),
+            conversation_id: conversation_id.as_str().to_owned(),
+            body: Some(ConversationForkBody {
+                agent_id: Some(agent_id.as_str().to_owned()),
+                hidden: Some(true),
+                message_id: None,
+            }),
+        };
+        let forked = self
+            .fork_core(&command)
+            .await
+            .map_err(|_| AppServerError::Unavailable)?;
+        ConversationId::accept(forked.id).map_err(|_| AppServerError::Unavailable)
+    }
+
     async fn delete_conversation_artifacts(
         &self,
         agent_id: &AgentId,
@@ -1080,8 +1121,16 @@ impl ConversationsBridge {
                 .await
                 .map_err(|error| fork_store_failure(&error))?
         };
-        self.write_fork_transcript(&target_agent, &forked.id, &kept)
-            .await?;
+        if self
+            .write_fork_transcript(&target_agent, &forked.id, &kept)
+            .await
+            .is_err()
+        {
+            self.delete_conversation_artifacts(&target_agent, &forked.id)
+                .await
+                .map_err(|()| FORK_FAILURE.to_owned())?;
+            return Err(FORK_FAILURE.to_owned());
+        }
         Ok(ForkedConversationReference {
             id: forked.id.as_str().to_owned(),
         })

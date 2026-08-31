@@ -9,6 +9,8 @@ use serde::Serialize;
 
 const INVALID_REQUEST_ERROR: &str = "invalid_request_error";
 const MODEL_NOT_FOUND: &str = "model_not_found";
+const RESPONSE_NOT_FOUND: &str = "response_not_found";
+const UNSUPPORTED_BACKEND: &str = "unsupported_backend";
 
 /// Stable `OpenAI` error envelope shared by model-taking handlers.
 #[derive(Clone, Debug, Serialize)]
@@ -62,6 +64,40 @@ pub fn invalid_request(message: impl Into<String>) -> ErrorEnvelope {
             error_type: INVALID_REQUEST_ERROR,
             param: None,
             code: None,
+        },
+    }
+}
+
+/// Builds the pinned missing stored-Response envelope.
+#[must_use]
+pub fn response_not_found(response_id: &str, model: Option<&str>) -> ErrorEnvelope {
+    let message = model.map_or_else(
+        || format!("The response '{response_id}' does not exist or is no longer stored."),
+        |model| format!("The response '{response_id}' does not exist for model '{model}'."),
+    );
+    ErrorEnvelope {
+        error: ErrorBody {
+            message,
+            error_type: INVALID_REQUEST_ERROR,
+            param: None,
+            code: Some(RESPONSE_NOT_FOUND),
+        },
+    }
+}
+
+/// Builds the pinned unavailable-fork backend envelope.
+#[must_use]
+pub fn unsupported_backend() -> ErrorEnvelope {
+    ErrorEnvelope {
+        error: ErrorBody {
+            message: concat!(
+                "previous_response_id is unavailable because this backend ",
+                "cannot fork conversations"
+            )
+            .to_owned(),
+            error_type: "server_error",
+            param: None,
+            code: Some(UNSUPPORTED_BACKEND),
         },
     }
 }

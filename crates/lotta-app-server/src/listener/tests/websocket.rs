@@ -299,6 +299,12 @@ fn typed_failure_state(
             clock(),
             shutdown.clone(),
         ),
+        openai_responses: super::test_openai_responses(
+            &storage.agents,
+            &storage.conversations,
+            clock(),
+            shutdown.clone(),
+        ),
         clock: clock(),
         shutdown: shutdown.clone(),
         limits: super::SocketLimits::default(),

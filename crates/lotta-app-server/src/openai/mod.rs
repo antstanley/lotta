@@ -8,6 +8,8 @@
 pub mod chat;
 /// Bounded header-keyed conversation cache.
 pub mod chat_keys;
+/// Unsigned bounded stored-Response cursors.
+pub mod cursor;
 /// Stable OpenAI error envelopes.
 pub mod errors;
 /// Bounded in-flight and settled idempotency outcomes.
@@ -16,6 +18,8 @@ pub mod idempotency;
 pub mod models;
 /// Shared advertised-model resolver for OpenAI routes.
 pub mod resolve;
+/// OpenAI Responses route and runtime projection.
+pub mod responses;
 
 #[cfg(test)]
 #[path = "tests/auth_is_shared.rs"]

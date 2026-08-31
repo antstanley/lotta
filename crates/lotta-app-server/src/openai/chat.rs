@@ -106,6 +106,42 @@ impl ChatState {
         }
     }
 
+    /// Rebinds a persistent chat identity after a successful Responses fork.
+    pub(crate) async fn remember_conversation(
+        &self,
+        agent: &Agent,
+        chat_id: &str,
+        conversation: lotta_domain::ConversationId,
+    ) -> Result<(), ()> {
+        self.chat_keys
+            .remember(
+                ChatScopeKey {
+                    agent_id: agent.id.as_str().to_owned(),
+                    chat_id: chat_id.to_owned(),
+                },
+                conversation,
+            )
+            .await
+    }
+
+    /// Removes a failed request's newly allocated persistent-key mapping.
+    pub(crate) async fn forget_conversation(
+        &self,
+        agent: &Agent,
+        chat_id: &str,
+        conversation: &lotta_domain::ConversationId,
+    ) {
+        self.chat_keys
+            .forget(
+                &ChatScopeKey {
+                    agent_id: agent.id.as_str().to_owned(),
+                    chat_id: chat_id.to_owned(),
+                },
+                conversation,
+            )
+            .await;
+    }
+
     /// Cancels and joins every listener-owned Chat execution.
     pub async fn shutdown(&self) {
         self.shutdown.cancel();
@@ -129,13 +165,13 @@ struct ChatMessage {
 }
 
 #[derive(Clone)]
-struct TurnMessage {
-    role: &'static str,
-    content: Vec<Value>,
-    client_message_id: String,
+pub(crate) struct TurnMessage {
+    pub(crate) role: &'static str,
+    pub(crate) content: Vec<Value>,
+    pub(crate) client_message_id: String,
 }
 
-struct ChatInputError(String);
+pub(crate) struct ChatInputError(String);
 
 impl ChatInputError {
     fn new(message: impl Into<String>) -> Self {
@@ -401,7 +437,10 @@ fn assistant_parts(content: Option<&Value>) -> Vec<Value> {
     }
 }
 
-fn chat_key(headers: &HeaderMap, streaming: bool) -> Result<Option<String>, ChatInputError> {
+pub(crate) fn chat_key(
+    headers: &HeaderMap,
+    streaming: bool,
+) -> Result<Option<String>, ChatInputError> {
     if let Some(value) = normalized_header(headers, CHAT_KEY_HEADER, OPENAI_CHAT_KEY_BYTES_MAX)? {
         return Ok(Some(value));
     }
@@ -472,16 +511,29 @@ async fn dispatch(state: Arc<ChatState>, agent: Agent, request: PreparedRequest)
     .await
 }
 
-async fn resolve_conversation(
+/// Conversation selection plus ownership information for exact failure cleanup.
+pub(crate) struct ConversationResolution {
+    /// Selected canonical conversation.
+    pub(crate) id: lotta_domain::ConversationId,
+    /// Whether this request allocated the conversation.
+    pub(crate) newly_created: bool,
+}
+
+/// Resolves a conversation while preserving newly-created ownership.
+pub(crate) async fn resolve_conversation_status(
     state: &ChatState,
     agent: &Agent,
     chat_key: Option<&str>,
-) -> Result<lotta_domain::ConversationId, ()> {
+) -> Result<ConversationResolution, ()> {
     let Some(chat_key) = chat_key else {
         return state
             .conversations
             .create_for_openai(&agent.id)
             .await
+            .map(|id| ConversationResolution {
+                id,
+                newly_created: true,
+            })
             .map_err(|_| ());
     };
     let key = ChatScopeKey {
@@ -489,7 +541,10 @@ async fn resolve_conversation(
         chat_id: chat_key.to_owned(),
     };
     match state.chat_keys.claim(key.clone()).await {
-        ChatKeyClaim::Existing(slot) => slot.wait().await,
+        ChatKeyClaim::Existing(slot) => slot.wait().await.map(|id| ConversationResolution {
+            id,
+            newly_created: false,
+        }),
         ChatKeyClaim::Full => Err(()),
         ChatKeyClaim::Owner(slot) => {
             // The slot owner contains every abnormal exit from the repository
@@ -508,13 +563,26 @@ async fn resolve_conversation(
             .unwrap_or(Err(()));
             if let Ok(conversation) = created {
                 slot.settle(Ok(conversation.clone())).await;
-                Ok(conversation)
+                Ok(ConversationResolution {
+                    id: conversation,
+                    newly_created: true,
+                })
             } else {
                 state.chat_keys.remove_failed_and_settle(&key, &slot).await;
                 Err(())
             }
         }
     }
+}
+
+async fn resolve_conversation(
+    state: &ChatState,
+    agent: &Agent,
+    chat_key: Option<&str>,
+) -> Result<lotta_domain::ConversationId, ()> {
+    resolve_conversation_status(state, agent, chat_key)
+        .await
+        .map(|resolved| resolved.id)
 }
 
 async fn spawn_owner(
@@ -540,66 +608,86 @@ async fn spawn_owner(
         }
         return;
     }
-    owners.spawn(async move {
-        let state = task_state;
-        let resolved = AssertUnwindSafe(resolve_conversation(&state, &agent, chat_key.as_deref()))
-            .catch_unwind()
+    owners.spawn(run_chat_owner(
+        task_state, agent, messages, chat_key, cache_key, cell,
+    ));
+}
+
+async fn run_chat_owner(
+    state: Arc<ChatState>,
+    agent: Agent,
+    messages: Vec<TurnMessage>,
+    chat_key: Option<String>,
+    cache_key: Option<OutcomeKey>,
+    cell: Arc<OutcomeCell>,
+) {
+    let resolved = AssertUnwindSafe(resolve_conversation(&state, &agent, chat_key.as_deref()))
+        .catch_unwind()
+        .await;
+    let mut outcome = if let Ok(Ok(conversation)) = resolved {
+        execute_owned_chat(
+            &state,
+            &agent,
+            conversation,
+            messages,
+            chat_key.is_none(),
+            &cell,
+        )
+        .await
+    } else {
+        failed_outcome()
+    };
+    if outcome.error.is_some() {
+        outcome = failed_outcome();
+    }
+    if outcome.error.is_some()
+        && let Some(key) = cache_key
+    {
+        state
+            .outcomes
+            .evict_failed_and_settle(&key, &cell, outcome)
             .await;
-        let mut outcome = if let Ok(Ok(conversation)) = resolved {
-            let scope = RuntimeScope::new(agent.id.clone(), conversation.clone(), None);
-            let execution = AssertUnwindSafe(async {
-                tokio::select! {
-                    () = state.shutdown.cancelled() => failed_outcome(),
-                    outcome = execute_turn(
-                        &state,
-                        &agent,
-                        &conversation,
-                        messages,
-                        Arc::clone(&cell),
-                    ) => outcome,
-                }
-            })
-            .catch_unwind()
+    } else {
+        cell.settle(outcome).await;
+    }
+}
+
+async fn execute_owned_chat(
+    state: &ChatState,
+    agent: &Agent,
+    conversation: lotta_domain::ConversationId,
+    messages: Vec<TurnMessage>,
+    ephemeral: bool,
+    cell: &Arc<OutcomeCell>,
+) -> TurnOutcome {
+    let scope = RuntimeScope::new(agent.id.clone(), conversation.clone(), None);
+    let execution = AssertUnwindSafe(async {
+        let turn = execute_turn(state, agent, &conversation, messages, Arc::clone(cell));
+        tokio::select! {
+            () = state.shutdown.cancelled() => failed_outcome(),
+            outcome = turn => outcome,
+        }
+    })
+    .catch_unwind()
+    .await
+    .unwrap_or_else(|_| failed_outcome());
+    if !ephemeral {
+        return execution;
+    }
+    let cleanup = AssertUnwindSafe(async {
+        state
+            .runtime_service
+            .teardown_ephemeral_runtime(scope)
+            .await?;
+        state
+            .conversations
+            .delete_for_openai(&agent.id, &conversation)
             .await
-            .unwrap_or_else(|_| failed_outcome());
-            let cleanup = if chat_key.is_none() {
-                AssertUnwindSafe(async {
-                    // Durable artifacts are removed only after the canonical
-                    // runtime owner confirms lifecycle/queue/approval/subscription
-                    // quiescence and removes the registry entry.
-                    state
-                        .runtime_service
-                        .teardown_ephemeral_runtime(scope)
-                        .await?;
-                    state
-                        .conversations
-                        .delete_for_openai(&agent.id, &conversation)
-                        .await
-                })
-                .catch_unwind()
-                .await
-                .is_ok_and(|result| result.is_ok())
-            } else {
-                true
-            };
-            if cleanup { execution } else { failed_outcome() }
-        } else {
-            failed_outcome()
-        };
-        // No provider/runtime detail is retained in cache or sent on the wire.
-        if outcome.error.is_some() {
-            outcome = failed_outcome();
-        }
-        let failed = outcome.error.is_some();
-        if failed && let Some(key) = cache_key {
-            state
-                .outcomes
-                .evict_failed_and_settle(&key, &cell, outcome)
-                .await;
-        } else {
-            cell.settle(outcome).await;
-        }
-    });
+    })
+    .catch_unwind()
+    .await
+    .is_ok_and(|result| result.is_ok());
+    if cleanup { execution } else { failed_outcome() }
 }
 
 async fn execute_turn(
@@ -640,7 +728,7 @@ async fn execute_turn(
     sink.outcome(result.is_err())
 }
 
-async fn start_runtime(state: &ChatState, scope: &RuntimeScope) -> Result<(), ()> {
+pub(crate) async fn start_runtime(state: &ChatState, scope: &RuntimeScope) -> Result<(), ()> {
     let request_id =
         NonEmptyString::new(format!("openai-start-{}", fresh_uuid())).map_err(|_| ())?;
     let command = RuntimeStartCommand {
@@ -669,7 +757,10 @@ async fn start_runtime(state: &ChatState, scope: &RuntimeScope) -> Result<(), ()
         .map_err(|_| ())
 }
 
-fn input_command(scope: RuntimeScope, messages: &[TurnMessage]) -> Result<InputCommand, ()> {
+pub(crate) fn input_command(
+    scope: RuntimeScope,
+    messages: &[TurnMessage],
+) -> Result<InputCommand, ()> {
     let values = messages
         .iter()
         .map(|message| {
@@ -1025,7 +1116,7 @@ fn chunk(id: &str, created: i64, model: &str, delta: &Value, finish_reason: &Val
     )
 }
 
-fn fresh_uuid() -> Uuid {
+pub(crate) fn fresh_uuid() -> Uuid {
     static FALLBACK: AtomicU64 = AtomicU64::new(1);
     let mut bytes = [0_u8; 16];
     if getrandom::fill(&mut bytes).is_ok() {

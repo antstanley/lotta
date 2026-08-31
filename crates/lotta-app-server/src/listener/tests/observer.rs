@@ -111,6 +111,12 @@ fn state(
             Arc::clone(&clock),
             shutdown.clone(),
         ),
+        openai_responses: super::test_openai_responses(
+            &group.agents,
+            &group.conversations,
+            Arc::clone(&clock),
+            shutdown.clone(),
+        ),
         clock,
         shutdown: shutdown.clone(),
         limits: SocketLimits::default(),

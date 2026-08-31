@@ -123,6 +123,7 @@ struct ListenerState {
     devices: Arc<DeviceBridge>,
     introspection: Arc<IntrospectionBridge>,
     openai_chat: Arc<crate::openai::chat::ChatState>,
+    openai_responses: Arc<crate::openai::responses::ResponsesState>,
     next_observation: AtomicU64,
     outbound: SharedOutbound,
 }
@@ -143,6 +144,18 @@ fn test_openai_chat(
         controller,
         clock,
         shutdown,
+    ))
+}
+
+#[cfg(test)]
+fn test_openai_responses(
+    agents: &Arc<AgentsBridge>,
+    conversations: &Arc<ConversationsBridge>,
+    clock: Arc<dyn Clock + Send + Sync>,
+    shutdown: CancellationToken,
+) -> Arc<crate::openai::responses::ResponsesState> {
+    Arc::new(crate::openai::responses::ResponsesState::new(
+        test_openai_chat(agents, conversations, clock, shutdown),
     ))
 }
 
@@ -650,6 +663,7 @@ async fn run_listener(
         }
     };
     state.shutdown.cancel();
+    state.openai_responses.shutdown().await;
     state.openai_chat.shutdown().await;
     let turn_result = state.turns.shutdown().await;
     publish_shutdown_subscription_updates(&state).await;
@@ -690,7 +704,6 @@ fn compose_listener_state(
     shutdown: CancellationToken,
 ) -> Result<Arc<ListenerState>, AppServerError> {
     let shared = resolve_shared_bridges(shared, &prepared, clock)?;
-    let openai_api = prepared.openai_api;
     let conversations_authority = shared.conversations_authority();
     let mut device_ports = DevicePorts::from_shared(&shared);
     let SharedGroupBridges {
@@ -699,8 +712,7 @@ fn compose_listener_state(
         settings,
         ..
     } = shared;
-    // The artifacts root backs Task 37 tool artifact operations; the files
-    // group creates it on first bind next to the canonical storage root.
+    // Task 37 artifacts live beside canonical storage.
     let artifacts_dir = prepared.storage_dir.join("artifacts");
     let storage = compose_storage_bridges(
         &outbound,
@@ -713,10 +725,11 @@ fn compose_listener_state(
     let devices = compose_device_bridges(&outbound, &prepared, queue_authority)?;
     register_composed_device_ports(&devices, device_ports);
     let turns = turn_supervisor::RuntimeTurnSupervisor::new(shutdown.clone());
-    let openai_chat = compose_openai_chat(&storage, &endpoints, clock, &shutdown);
+    let (openai_chat, openai_responses) =
+        compose_openai_states(&storage, &endpoints, clock, &shutdown);
     Ok(Arc::new(ListenerState {
         auth: prepared.auth,
-        openai_api,
+        openai_api: prepared.openai_api,
         listener_instance: listener_instance(clock),
         clock: Arc::clone(clock),
         shutdown,
@@ -743,25 +756,33 @@ fn compose_listener_state(
         devices,
         introspection: Arc::new(IntrospectionBridge::new(introspection_forwarder(&outbound))),
         openai_chat,
+        openai_responses,
         next_observation: AtomicU64::new(1),
         outbound,
     }))
 }
 
-fn compose_openai_chat(
+fn compose_openai_states(
     storage: &StorageBridges,
     endpoints: &RuntimeEndpoints,
     clock: &Arc<dyn Clock + Send + Sync>,
     shutdown: &CancellationToken,
-) -> Arc<crate::openai::chat::ChatState> {
-    Arc::new(crate::openai::chat::ChatState::new(
+) -> (
+    Arc<crate::openai::chat::ChatState>,
+    Arc<crate::openai::responses::ResponsesState>,
+) {
+    let chat = Arc::new(crate::openai::chat::ChatState::new(
         Arc::clone(&storage.agents),
         Arc::clone(&storage.conversations),
         Arc::clone(&endpoints.service),
         Arc::clone(&endpoints.turn_controller),
         Arc::clone(clock),
         shutdown.clone(),
-    ))
+    ));
+    let responses = Arc::new(crate::openai::responses::ResponsesState::new(Arc::clone(
+        &chat,
+    )));
+    (chat, responses)
 }
 
 fn compose_runtime_router(
@@ -946,6 +967,10 @@ fn protected_http_router(state: &Arc<ListenerState>) -> Router<Arc<ListenerState
                 "/v1/chat/completions",
                 post(openai_chat_completions).fallback(openai_method_not_allowed),
             )
+            .route(
+                "/v1/responses",
+                post(openai_responses).fallback(openai_method_not_allowed),
+            )
     } else {
         router
     };
@@ -989,6 +1014,14 @@ async fn openai_chat_completions(
     body: crate::openai::chat::ChatJson,
 ) -> Response {
     crate::openai::chat::complete(Arc::clone(&state.openai_chat), headers, body).await
+}
+
+async fn openai_responses(
+    State(state): State<Arc<ListenerState>>,
+    headers: HeaderMap,
+    body: crate::openai::responses::ResponsesJson,
+) -> Response {
+    crate::openai::responses::respond(Arc::clone(&state.openai_responses), headers, body).await
 }
 
 async fn openai_method_not_allowed() -> Response {

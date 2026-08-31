@@ -572,6 +572,20 @@ const TASK73_AUDIT_SOURCES: &[&str] = &[
     "src/production_setup.rs",
 ];
 
+const TASK76_PRODUCTION_SOURCES: &[&str] = &[
+    "crates/lotta-app-server/src/openai/chat.rs",
+    "crates/lotta-app-server/src/openai/chat_keys.rs",
+    "crates/lotta-app-server/src/openai/cursor.rs",
+    "crates/lotta-app-server/src/openai/errors.rs",
+    "crates/lotta-app-server/src/openai/responses.rs",
+    "crates/lotta-app-server/src/openai/responses/execution.rs",
+    "crates/lotta-app-server/src/openai/responses/input.rs",
+    "crates/lotta-app-server/src/openai/responses/output.rs",
+    "crates/lotta-app-server/src/openai/responses/render.rs",
+    "crates/lotta-app-server/src/openai/responses/state.rs",
+    "crates/lotta-store/src/conversation.rs",
+];
+
 // Exact pre-a3583b9e findings in newly covered files. Keeping the path and fingerprint makes this
 // scope visible and fails on any drift; Task73-touched code may not add to this debt.
 const TASK73_BASELINE_GAPS: &[(&str, &str)] = &[
@@ -678,6 +692,10 @@ fn task73_audit_sources(workspace: &Path) -> std::io::Result<Vec<PathBuf>> {
 fn hard_limit_sources(workspace: &Path, manifest: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut files = production_rust_sources(&manifest.join("src"))?;
     files.extend(task73_audit_sources(workspace)?);
+    files.extend(checked_manifest_paths(
+        workspace,
+        TASK76_PRODUCTION_SOURCES,
+    )?);
     files.sort();
     files.dedup();
     Ok(files)

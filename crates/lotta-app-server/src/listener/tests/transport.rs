@@ -153,6 +153,12 @@ fn router() -> axum::Router {
             Arc::new(TestClock),
             shutdown.clone(),
         ),
+        openai_responses: super::test_openai_responses(
+            &storage.agents,
+            &storage.conversations,
+            Arc::new(TestClock),
+            shutdown.clone(),
+        ),
         clock: Arc::new(TestClock),
         shutdown: shutdown.clone(),
         limits: SocketLimits::default(),

@@ -1,7 +1,7 @@
 use crate::adapter::{read_record, write_record_locked};
 use crate::atomic::FileRevision;
 use crate::refresh::{RecordCache, Snapshot};
-use crate::{LottaStorageLock, StoreError, StoreErrorKind, StorePaths};
+use crate::{LottaStorageLock, StoreError, StoreErrorKind, StorePaths, WriteMode};
 use lotta_domain::{
     AgentId, BoundedMap, Conversation, ConversationId, InContextMessageIds, Timestamp,
 };
@@ -65,9 +65,7 @@ pub(crate) fn create(
     let lock = LottaStorageLock::try_acquire(paths.root())?;
     let directory = paths.conversations();
     ensure_create_capacity(paths, agent, limit, &directory)?;
-    let sequence = crate::adapter::max_conversation_sequence(&directory)?
-        .checked_add(1)
-        .ok_or_else(|| StoreError::new(StoreErrorKind::Limit, &directory))?;
+    let sequence = allocate_sequence(paths, &directory, &lock)?;
     let id = ConversationId::generate(sequence)
         .map_err(|_| StoreError::new(StoreErrorKind::Limit, &directory))?;
     let value = build(id.clone())?;
@@ -79,6 +77,34 @@ pub(crate) fn create(
     write_record_locked(&path, &value, &revision, &lock)?;
     refresh_after_write(&path, &value, cache)?;
     Ok(value)
+}
+
+fn allocate_sequence(
+    paths: &StorePaths,
+    directory: &Path,
+    lock: &LottaStorageLock,
+) -> Result<u64, StoreError> {
+    let counter = paths.root().join(".conversation-sequence");
+    let recorded = match std::fs::read_to_string(&counter) {
+        Ok(text) => text
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| StoreError::new(StoreErrorKind::Parse, &counter))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(_) => return Err(StoreError::new(StoreErrorKind::Io, &counter)),
+    };
+    let existing = crate::adapter::max_conversation_sequence(directory)?;
+    let next = recorded
+        .max(existing)
+        .checked_add(1)
+        .ok_or_else(|| StoreError::new(StoreErrorKind::Limit, directory))?;
+    crate::atomic::atomic_write_locked(
+        &counter,
+        next.to_string().as_bytes(),
+        WriteMode::Standard,
+        lock,
+    )?;
+    Ok(next)
 }
 
 pub(crate) fn archive(

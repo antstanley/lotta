@@ -117,6 +117,51 @@ impl ChatKeyCache {
         ChatKeyClaim::Owner(slot)
     }
 
+    /// Replaces a settled key with a known persistent conversation.
+    ///
+    /// # Errors
+    /// Returns an opaque capacity or active-allocation conflict.
+    pub async fn remember(
+        &self,
+        key: ChatScopeKey,
+        conversation: ConversationId,
+    ) -> Result<(), ()> {
+        let slot = Arc::new(ConversationSlot::new());
+        slot.settle(Ok(conversation)).await;
+        let mut inner = self.inner.lock().await;
+        if inner.values.get(&key).is_some_and(|slot| slot.is_active()) {
+            return Err(());
+        }
+        if !inner.values.contains_key(&key)
+            && inner.values.len() == OPENAI_CHAT_KEYS_MAX
+            && !evict_one_settled(&mut inner)
+        {
+            return Err(());
+        }
+        inner.values.insert(key.clone(), slot);
+        inner.order.retain(|candidate| candidate != &key);
+        inner.order.push_back(key);
+        Ok(())
+    }
+
+    /// Removes a settled mapping only when it still names the supplied conversation.
+    pub async fn forget(&self, key: &ChatScopeKey, conversation: &ConversationId) {
+        let mut inner = self.inner.lock().await;
+        let matches = inner.values.get(key).is_some_and(|slot| {
+            !slot.is_active()
+                && slot
+                    .value
+                    .try_lock()
+                    .ok()
+                    .and_then(|value| value.as_ref().cloned())
+                    .is_some_and(|value| value.as_ref() == Ok(conversation))
+        });
+        if matches {
+            inner.values.remove(key);
+            inner.order.retain(|candidate| candidate != key);
+        }
+    }
+
     /// Removes the exact failed allocation slot before waking its existing waiters.
     pub async fn remove_failed_and_settle(&self, key: &ChatScopeKey, slot: &Arc<ConversationSlot>) {
         {

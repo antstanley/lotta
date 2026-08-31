@@ -6187,6 +6187,24 @@ mod production_tests {
         }
     }
 
+    struct OpenAiTerminalErrorProvider;
+
+    impl ProviderPort for OpenAiTerminalErrorProvider {
+        fn stream(&self, _: ProviderRequest, events: ProviderEventSink) -> PortFuture<'_, ()> {
+            Box::pin(async move {
+                let context = ProviderErrorContext::new(
+                    ProviderName::new("responses_terminal_failure".into())?,
+                    ProviderEventText::new("injected Responses terminal failure".into())?,
+                );
+                events
+                    .send(ProviderEvent::Error {
+                        error: ProviderError::Unavailable(context),
+                    })
+                    .await
+            })
+        }
+    }
+
     #[derive(Default)]
     struct OpenAiGatedProvider {
         calls: std::sync::atomic::AtomicU64,
@@ -6317,6 +6335,30 @@ mod production_tests {
         String::from_utf8(bytes).unwrap()
     }
 
+    async fn responses_request(
+        address: std::net::SocketAddr,
+        body: serde_json::Value,
+        headers: &str,
+    ) -> String {
+        let body = body.to_string();
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            concat!(
+                "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\n",
+                "Connection: close\r\nContent-Type: application/json\r\n",
+                "Authorization: Bearer production-sync-token\r\n{}",
+                "Content-Length: {}\r\n\r\n{}"
+            ),
+            headers,
+            body.len(),
+            body
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await.unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
     fn response_json(response: &str) -> serde_json::Value {
         let body = response.split_once("\r\n\r\n").unwrap().1;
         let start = body.find('{').unwrap();
@@ -6348,6 +6390,180 @@ mod production_tests {
             terminal["created"].as_i64().unwrap(),
             terminal["usage"].clone(),
         )
+    }
+
+    async fn completed_gated_response(
+        address: std::net::SocketAddr,
+        provider: &Arc<OpenAiGatedProvider>,
+        body: serde_json::Value,
+        headers: &str,
+    ) -> String {
+        let before = provider.calls.load(std::sync::atomic::Ordering::SeqCst);
+        let headers = headers.to_owned();
+        let request = tokio::spawn(async move { responses_request(address, body, &headers).await });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while provider.calls.load(std::sync::atomic::Ordering::SeqCst) == before
+                && !request.is_finished()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        provider.release.notify_one();
+        request.await.unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn production_responses_store_cursor_hidden_fork_and_sse_are_exact() {
+        let provider = Arc::new(OpenAiGatedProvider::default());
+        let (root, service, controller, ..) = production_controller_fixture(
+            "local-chat-o7",
+            provider.clone() as Arc<dyn ProviderPort>,
+        )
+        .await;
+        let mut handle = start_production_listener(&root, Arc::clone(&service), controller).await;
+        let model = "agent-local-chat-o7";
+        let first = completed_gated_response(
+            handle.address(),
+            &provider,
+            serde_json::json!({"model":model,"input":"remember green","store":true}),
+            "",
+        )
+        .await;
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        let first_value = response_json(&first);
+        assert_eq!(first_value["status"], "completed");
+        assert_eq!(first_value["output"][0]["content"][0]["text"], "one-two");
+        let first_id = first_value["id"].as_str().unwrap();
+        let first_cursor = lotta_app_server::openai::cursor::parse(first_id).unwrap();
+
+        let second = completed_gated_response(
+            handle.address(),
+            &provider,
+            serde_json::json!({
+                "model":model,"input":"what color?","store":true,
+                "previous_response_id":first_id
+            }),
+            "",
+        )
+        .await;
+        let second_value = response_json(&second);
+        let second_cursor =
+            lotta_app_server::openai::cursor::parse(second_value["id"].as_str().unwrap()).unwrap();
+        assert_ne!(first_cursor.conversation_id, second_cursor.conversation_id);
+        let paths = lotta_store::StorePaths::new(root.clone()).unwrap();
+        let fork: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                paths
+                    .conversation_dir(&second_cursor.agent_id, &second_cursor.conversation_id)
+                    .unwrap()
+                    .join("conversation.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fork["hidden"], true);
+
+        let stream = completed_gated_response(
+            handle.address(),
+            &provider,
+            serde_json::json!({"model":model,"input":"stream","stream":true}),
+            "",
+        )
+        .await;
+        let events = sse_values(&stream);
+        assert_eq!(events.first().unwrap()["type"], "response.created");
+        assert_eq!(events.last().unwrap()["type"], "response.completed");
+        assert!(
+            events
+                .iter()
+                .enumerate()
+                .all(|(index, event)| { event["sequence_number"] == serde_json::json!(index) })
+        );
+        assert!(!stream.contains("[DONE]"));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        handle.shutdown();
+        handle.wait().await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn production_responses_ignores_idempotency_and_failed_store_has_no_cursor() {
+        let provider = Arc::new(OpenAiGatedProvider::default());
+        let (root, service, controller, ..) = production_controller_fixture(
+            "local-chat-o7",
+            provider.clone() as Arc<dyn ProviderPort>,
+        )
+        .await;
+        let mut handle = start_production_listener(&root, Arc::clone(&service), controller).await;
+        let body = serde_json::json!({"model":"agent-local-chat-o7","input":"independent"});
+        let first = completed_gated_response(
+            handle.address(),
+            &provider,
+            body.clone(),
+            "Idempotency-Key: same\r\n",
+        )
+        .await;
+        let second = completed_gated_response(
+            handle.address(),
+            &provider,
+            body,
+            "Idempotency-Key: same\r\n",
+        )
+        .await;
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        assert!(second.starts_with("HTTP/1.1 200"), "{second}");
+        assert_ne!(response_json(&first)["id"], response_json(&second)["id"]);
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(service.state.active.lock().unwrap().is_empty());
+        assert!(service.state.inner.lock().await.registry.is_empty());
+        handle.shutdown();
+        handle.wait().await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
+
+        let (root, service, controller, ..) = production_controller_fixture(
+            "local-chat-o7",
+            Arc::new(OpenAiTerminalErrorProvider) as Arc<dyn ProviderPort>,
+        )
+        .await;
+        let mut handle = start_production_listener(&root, Arc::clone(&service), controller).await;
+        let failed = responses_request(
+            handle.address(),
+            serde_json::json!({
+                "model":"agent-local-chat-o7","input":"fail","store":true
+            }),
+            "",
+        )
+        .await;
+        assert!(failed.starts_with("HTTP/1.1 500"), "{failed}");
+        let failed = response_json(&failed);
+        assert_eq!(failed["status"], "failed");
+        assert!(!failed["id"].as_str().unwrap().starts_with("resp_letta_"));
+        assert!(service.state.inner.lock().await.registry.is_empty());
+        assert_eq!(
+            std::fs::read_dir(root.join("conversations"))
+                .unwrap()
+                .count(),
+            1
+        );
+        let failed_stream = responses_request(
+            handle.address(),
+            serde_json::json!({
+                "model":"agent-local-chat-o7","input":"fail stream",
+                "store":true,"stream":true
+            }),
+            "",
+        )
+        .await;
+        assert!(failed_stream.starts_with("HTTP/1.1 200"), "{failed_stream}");
+        let events = sse_values(&failed_stream);
+        assert_eq!(events.last().unwrap()["type"], "response.failed");
+        assert!(!failed_stream.contains("resp_letta_"));
+        assert!(!failed_stream.contains("[DONE]"));
+        handle.shutdown();
+        handle.wait().await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test(flavor = "multi_thread")]
