@@ -99,6 +99,12 @@ fn assistant_projections(message: &LocalMessage) -> Vec<(ReturnMessageType, Valu
                     pending_reasoning.push(text.to_owned());
                 }
             }
+            Some("redacted_thinking") => {
+                flush_text(&mut output, &mut pending_text);
+                if let Some(marker) = part.get("data").and_then(Value::as_str) {
+                    pending_reasoning.push(marker.to_owned());
+                }
+            }
             Some("toolCall") => {
                 flush_text(&mut output, &mut pending_text);
                 flush_reasoning(&mut output, &mut pending_reasoning);

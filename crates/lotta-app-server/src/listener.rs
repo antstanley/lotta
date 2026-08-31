@@ -650,6 +650,7 @@ async fn run_listener(
         }
     };
     state.shutdown.cancel();
+    state.openai_chat.shutdown().await;
     let turn_result = state.turns.shutdown().await;
     publish_shutdown_subscription_updates(&state).await;
     server_result.and(turn_result)
@@ -939,11 +940,11 @@ fn protected_http_router(state: &Arc<ListenerState>) -> Router<Arc<ListenerState
         router
             .route(
                 "/v1/models",
-                get(openai_models).fallback(method_not_allowed),
+                get(openai_models).fallback(openai_method_not_allowed),
             )
             .route(
                 "/v1/chat/completions",
-                post(openai_chat_completions).fallback(method_not_allowed),
+                post(openai_chat_completions).fallback(openai_method_not_allowed),
             )
     } else {
         router
@@ -961,6 +962,10 @@ async fn authorize_http(
 ) -> Response {
     match authorize_listener_headers(&state, request.headers()) {
         Ok(()) => next.run(request).await,
+        Err(error) if request.uri().path().starts_with("/v1/") => crate::openai::errors::response(
+            error.status(),
+            crate::openai::errors::authentication_error(),
+        ),
         Err(error) => error.into_response(),
     }
 }
@@ -984,6 +989,13 @@ async fn openai_chat_completions(
     body: crate::openai::chat::ChatJson,
 ) -> Response {
     crate::openai::chat::complete(Arc::clone(&state.openai_chat), headers, body).await
+}
+
+async fn openai_method_not_allowed() -> Response {
+    crate::openai::errors::response(
+        axum::http::StatusCode::METHOD_NOT_ALLOWED,
+        crate::openai::errors::invalid_request("method not allowed"),
+    )
 }
 
 fn authorize_listener_headers(

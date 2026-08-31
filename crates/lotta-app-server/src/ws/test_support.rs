@@ -122,12 +122,12 @@ impl EventIdGenerator for TestIds {
 }
 
 #[derive(Default)]
-pub(super) struct RecordingService {
-    pub(super) calls: AtomicUsize,
-    pub(super) writes: AtomicUsize,
-    pub(super) stages: Mutex<Vec<String>>,
-    pub(super) subscriptions: Mutex<Vec<(RuntimeScope, usize)>>,
-    pub(super) recoveries_surfaced: AtomicUsize,
+pub(crate) struct RecordingService {
+    pub(crate) calls: AtomicUsize,
+    pub(crate) writes: AtomicUsize,
+    pub(crate) stages: Mutex<Vec<String>>,
+    pub(crate) subscriptions: Mutex<Vec<(RuntimeScope, usize)>>,
+    pub(crate) recoveries_surfaced: AtomicUsize,
 }
 impl RecordingService {
     pub(super) fn stage(&self, value: &str) {

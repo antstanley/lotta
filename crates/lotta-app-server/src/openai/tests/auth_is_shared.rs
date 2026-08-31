@@ -14,6 +14,12 @@ async fn http_and_websocket_use_same_capability_policy() {
             401
         );
     }
+    let openai_unauthorized = get(&handle, "/v1/models", "").await;
+    let envelope: serde_json::Value = serde_json::from_str(&openai_unauthorized.body)
+        .unwrap_or_else(|error| panic!("OpenAI auth JSON: {error}"));
+    assert_eq!(envelope["error"]["type"], "authentication_error");
+    assert_eq!(envelope["error"]["param"], serde_json::Value::Null);
+    assert_eq!(envelope["error"]["code"], serde_json::Value::Null);
     let auth = "Authorization: Bearer correct-token\r\n";
     assert_eq!(get(&handle, "/v1/models", auth).await.status, 200);
     assert_eq!(get(&handle, "/app-server-info", auth).await.status, 200);

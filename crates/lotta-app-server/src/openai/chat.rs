@@ -2,6 +2,7 @@
 
 use std::{
     convert::Infallible,
+    panic::AssertUnwindSafe,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -14,11 +15,12 @@ use axum::{
     http::{HeaderMap, Request, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use futures_util::stream;
+use futures_util::{FutureExt as _, stream};
 use lotta_domain::{Agent, BoundedJsonValue, Clock, NonEmptyString, RuntimeScope};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use sha2::{Digest as _, Sha256};
+use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -33,10 +35,11 @@ use crate::{
 };
 
 use super::{
-    chat_keys::{ChatKeyCache, ChatKeyClaim, OPENAI_CHAT_KEY_BYTES_MAX},
+    chat_keys::{ChatKeyCache, ChatKeyClaim, ChatScopeKey, OPENAI_CHAT_KEY_BYTES_MAX},
     errors,
     idempotency::{
-        IDEMPOTENCY_KEY_BYTES_MAX, OutcomeCache, OutcomeCell, OutcomeClaim, TurnOutcome, Usage,
+        ChatIdentity, IDEMPOTENCY_KEY_BYTES_MAX, OutcomeCache, OutcomeCell, OutcomeClaim,
+        OutcomeKey, TurnOutcome, Usage,
     },
     resolve,
 };
@@ -75,6 +78,7 @@ pub struct ChatState {
     pub shutdown: CancellationToken,
     chat_keys: ChatKeyCache,
     outcomes: Arc<OutcomeCache>,
+    owners: tokio::sync::Mutex<JoinSet<()>>,
 }
 
 impl ChatState {
@@ -97,7 +101,15 @@ impl ChatState {
             shutdown,
             chat_keys: ChatKeyCache::new(),
             outcomes: Arc::new(OutcomeCache::new()),
+            owners: tokio::sync::Mutex::new(JoinSet::new()),
         }
+    }
+
+    /// Cancels and joins every listener-owned Chat execution.
+    pub async fn shutdown(&self) {
+        self.shutdown.cancel();
+        let mut owners = self.owners.lock().await;
+        while owners.join_next().await.is_some() {}
     }
 }
 
@@ -106,7 +118,7 @@ struct ChatRequest {
     model: Option<String>,
     messages: Option<Vec<ChatMessage>>,
     #[serde(default)]
-    stream: bool,
+    stream: Value,
 }
 
 #[derive(Deserialize)]
@@ -140,6 +152,7 @@ struct PreparedRequest {
     streaming: bool,
     chat_key: Option<String>,
     idempotency_key: Option<String>,
+    fingerprint: [u8; 32],
 }
 
 /// Route-local bounded JSON extractor with OpenAI-compatible rejections.
@@ -154,11 +167,18 @@ where
     async fn from_request(request: Request<Body>, _: &S) -> Result<Self, Self::Rejection> {
         let bytes = to_bytes(request.into_body(), HTTP_BODY_BYTES_MAX)
             .await
-            .map_err(|_| invalid("request body too large"))?;
-        let value = serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))?;
-        if json_depth(&value, 1) > OPENAI_CHAT_JSON_DEPTH_MAX {
-            return Err(invalid("request JSON exceeds maximum depth"));
-        }
+            .map_err(|_| {
+                errors::response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    errors::invalid_request("request body too large"),
+                )
+            })?;
+        let value = if bytes.is_empty() {
+            json!({})
+        } else {
+            serde_json::from_slice(&bytes).map_err(|_| invalid("invalid JSON body"))?
+        };
+        validate_json_shape(&value).map_err(ChatInputError::response)?;
         Ok(Self(value))
     }
 }
@@ -200,23 +220,27 @@ fn prepare(value: Value, headers: &HeaderMap) -> Result<PreparedRequest, ChatInp
     if messages.len() > OPENAI_CHAT_MESSAGES_MAX {
         return Err(ChatInputError::new("messages exceeds maximum length"));
     }
+    validate_all_content_arrays(&messages)?;
     let newest = newest_user(&messages).ok_or_else(|| {
         ChatInputError::new(
             "the messages array must include a user message with text or image content",
         )
     })?;
-    let chat_key = chat_key(headers, request.stream)?;
+    let streaming = request.stream == Value::Bool(true);
+    let chat_key = chat_key(headers, streaming)?;
     let selected = select_messages(&messages, newest, chat_key.is_some())?;
     let idempotency_key =
         normalized_header(headers, IDEMPOTENCY_HEADER, IDEMPOTENCY_KEY_BYTES_MAX)?.or(
             normalized_header(headers, X_IDEMPOTENCY_HEADER, IDEMPOTENCY_KEY_BYTES_MAX)?,
         );
+    let fingerprint = request_fingerprint(&model, &selected)?;
     Ok(PreparedRequest {
         model,
         messages: selected,
-        streaming: request.stream,
+        streaming,
         chat_key,
         idempotency_key,
+        fingerprint,
     })
 }
 
@@ -224,6 +248,29 @@ fn newest_user(messages: &[ChatMessage]) -> Option<usize> {
     messages.iter().rposition(|message| {
         message.role.as_deref() == Some("user") && !user_parts(message.content.as_ref()).is_empty()
     })
+}
+
+fn validate_all_content_arrays(messages: &[ChatMessage]) -> Result<(), ChatInputError> {
+    for message in messages {
+        if let Some(Value::Array(parts)) = message.content.as_ref()
+            && parts.len() > OPENAI_CHAT_CONTENT_PARTS_MAX
+        {
+            return Err(ChatInputError::new(
+                "message content parts exceeds maximum length",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn request_fingerprint(model: &str, messages: &[TurnMessage]) -> Result<[u8; 32], ChatInputError> {
+    let canonical = messages
+        .iter()
+        .map(|message| json!({"role":message.role, "content":message.content}))
+        .collect::<Vec<_>>();
+    let bytes = serde_json::to_vec(&json!({"model":model, "messages":canonical}))
+        .map_err(|_| ChatInputError::new("failed to canonicalize request"))?;
+    Ok(Sha256::digest(bytes).into())
 }
 
 fn select_messages(
@@ -385,38 +432,34 @@ fn normalized_header(
 }
 
 async fn dispatch(state: Arc<ChatState>, agent: Agent, request: PreparedRequest) -> Response {
-    let cache_key = request.idempotency_key.as_ref().map(|key| {
-        format!(
-            "{}:{}:{key}",
-            agent.id.as_str(),
-            request.chat_key.as_deref().unwrap_or("")
-        )
+    let cache_key = request.idempotency_key.as_ref().map(|key| OutcomeKey {
+        agent_id: agent.id.as_str().to_owned(),
+        chat: request
+            .chat_key
+            .as_ref()
+            .map_or(ChatIdentity::Ephemeral(request.fingerprint), |chat| {
+                ChatIdentity::Persistent(chat.clone())
+            }),
+        idempotency_key: key.clone(),
     });
     let (cell, owner) = match &cache_key {
         Some(key) => match state.outcomes.claim(key.clone()).await {
             OutcomeClaim::Owner(cell) => (cell, true),
             OutcomeClaim::Existing(cell) => (cell, false),
+            OutcomeClaim::Full => return capacity_failure("idempotency cache is at capacity"),
         },
         None => (Arc::new(OutcomeCell::new()), true),
     };
     if owner {
-        let conversation =
-            match resolve_conversation(&state, &agent, request.chat_key.as_deref()).await {
-                Ok(conversation) => conversation,
-                Err(response) => {
-                    settle_setup_failure(&state, cache_key.as_deref(), &cell).await;
-                    return response;
-                }
-            };
         spawn_owner(
             Arc::clone(&state),
-            agent.clone(),
-            conversation,
+            agent,
             request.messages.clone(),
-            request.chat_key.is_none(),
+            request.chat_key.clone(),
             cache_key,
             Arc::clone(&cell),
-        );
+        )
+        .await;
     }
     render(
         cell,
@@ -432,20 +475,21 @@ async fn resolve_conversation(
     state: &ChatState,
     agent: &Agent,
     chat_key: Option<&str>,
-) -> Result<lotta_domain::ConversationId, Response> {
+) -> Result<lotta_domain::ConversationId, ()> {
     let Some(chat_key) = chat_key else {
         return state
             .conversations
             .create_for_openai(&agent.id)
             .await
-            .map_err(|_| server_failure("failed to create a conversation for this chat"));
+            .map_err(|_| ());
     };
-    let key = format!("chat-key:{}:{chat_key}", agent.id.as_str());
+    let key = ChatScopeKey {
+        agent_id: agent.id.as_str().to_owned(),
+        chat_id: chat_key.to_owned(),
+    };
     match state.chat_keys.claim(key.clone()).await {
-        ChatKeyClaim::Existing(slot) => slot
-            .wait()
-            .await
-            .map_err(|()| server_failure("failed to create a conversation for this chat")),
+        ChatKeyClaim::Existing(slot) => slot.wait().await,
+        ChatKeyClaim::Full => Err(()),
         ChatKeyClaim::Owner(slot) => {
             let created = state
                 .conversations
@@ -456,43 +500,80 @@ async fn resolve_conversation(
             if created.is_err() {
                 state.chat_keys.remove_failed(&key, &slot).await;
             }
-            created.map_err(|()| server_failure("failed to create a conversation for this chat"))
+            created
         }
     }
 }
 
-async fn settle_setup_failure(state: &ChatState, key: Option<&str>, cell: &Arc<OutcomeCell>) {
-    cell.settle(TurnOutcome {
-        text: String::new(),
-        usage: Usage::default(),
-        error: Some("failed to create a conversation for this chat".to_owned()),
-    })
-    .await;
-    if let Some(key) = key {
-        state.outcomes.evict_failed(key, cell).await;
-    }
-}
-
-fn spawn_owner(
+async fn spawn_owner(
     state: Arc<ChatState>,
     agent: Agent,
-    conversation: lotta_domain::ConversationId,
     messages: Vec<TurnMessage>,
-    ephemeral: bool,
-    cache_key: Option<String>,
+    chat_key: Option<String>,
+    cache_key: Option<OutcomeKey>,
     cell: Arc<OutcomeCell>,
 ) {
-    tokio::spawn(async move {
-        let outcome =
-            execute_turn(&state, &agent, &conversation, messages, Arc::clone(&cell)).await;
+    let task_state = Arc::clone(&state);
+    let mut owners = state.owners.lock().await;
+    while owners.try_join_next().is_some() {}
+    if state.shutdown.is_cancelled() {
+        drop(owners);
+        cell.settle(failed_outcome()).await;
+        if let Some(key) = cache_key {
+            state.outcomes.evict_failed(&key, &cell).await;
+        }
+        return;
+    }
+    owners.spawn(async move {
+        let state = task_state;
+        let resolved = AssertUnwindSafe(resolve_conversation(&state, &agent, chat_key.as_deref()))
+            .catch_unwind()
+            .await;
+        let mut outcome = if let Ok(Ok(conversation)) = resolved {
+            let scope = RuntimeScope::new(agent.id.clone(), conversation.clone(), None);
+            let execution = AssertUnwindSafe(async {
+                tokio::select! {
+                    () = state.shutdown.cancelled() => failed_outcome(),
+                    outcome = execute_turn(
+                        &state,
+                        &agent,
+                        &conversation,
+                        messages,
+                        Arc::clone(&cell),
+                    ) => outcome,
+                }
+            })
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| failed_outcome());
+            let cleanup = AssertUnwindSafe(async {
+                let runtime = state
+                    .runtime_service
+                    .runtime_subscription_changed(scope, 0)
+                    .await;
+                let repository = if chat_key.is_none() {
+                    state
+                        .conversations
+                        .delete_for_openai(&agent.id, &conversation)
+                        .await
+                } else {
+                    Ok(())
+                };
+                runtime.is_ok() && repository.is_ok()
+            })
+            .catch_unwind()
+            .await
+            .unwrap_or(false);
+            if cleanup { execution } else { failed_outcome() }
+        } else {
+            failed_outcome()
+        };
+        // No provider/runtime detail is retained in cache or sent on the wire.
+        if outcome.error.is_some() {
+            outcome = failed_outcome();
+        }
         let failed = outcome.error.is_some();
         cell.settle(outcome).await;
-        if ephemeral {
-            let _ = state
-                .conversations
-                .delete_for_openai(&agent.id, &conversation)
-                .await;
-        }
         if failed && let Some(key) = cache_key {
             state.outcomes.evict_failed(&key, &cell).await;
         }
@@ -643,15 +724,10 @@ impl ChatTurnSink {
                 usage.total_tokens = number(value, "total_tokens");
                 usage.reasoning_tokens = value.get("reasoning_tokens").and_then(Value::as_u64);
             }
-        } else if matches!(message_type, Some("loop_error" | "error_message")) {
-            let message = value
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("agent turn failed")
-                .to_owned();
-            if let Ok(mut error) = self.error.lock() {
-                *error = Some(message);
-            }
+        } else if matches!(message_type, Some("loop_error" | "error_message"))
+            && let Ok(mut error) = self.error.lock()
+        {
+            *error = Some("failed to run agent turn".to_owned());
         }
     }
 }
@@ -675,9 +751,9 @@ impl RuntimeEventSink for ChatTurnSink {
                 let terminal = error.map_or_else(
                     || {
                         matches!(stop_reason.as_str(), "cancelled" | "user_cancellation")
-                            .then(|| "agent turn cancelled".to_owned())
+                            .then(|| "failed to run agent turn".to_owned())
                     },
-                    |error| Some(error.as_str().to_owned()),
+                    |_| Some("failed to run agent turn".to_owned()),
                 );
                 if terminal.is_some()
                     && let Ok(mut current) = self.error.lock()
@@ -723,7 +799,9 @@ async fn render(
     streaming: bool,
     created: i64,
 ) -> Response {
-    let completion_id = format!("chatcmpl-{}", fresh_uuid());
+    let (completion_id, created) = cell
+        .response_identity(|| (format!("chatcmpl-{}", fresh_uuid()), created))
+        .await;
     if streaming {
         return sse_response(cell, owner, completion_id, created, model.to_owned());
     }
@@ -779,7 +857,7 @@ fn sse_response(
 async fn write_sse(
     sender: mpsc::Sender<Bytes>,
     cell: Arc<OutcomeCell>,
-    owner: bool,
+    _owner: bool,
     id: String,
     created: i64,
     model: String,
@@ -794,36 +872,56 @@ async fn write_sse(
     if sender.send(Bytes::from(initial)).await.is_err() {
         return;
     }
+    let mut deltas = cell.subscribe();
+    let replay = cell.replay();
+    let mut last_sequence = 0_u64;
     let mut sent = String::new();
-    if owner {
-        let mut deltas = cell.subscribe();
-        loop {
-            tokio::select! {
-                outcome = cell.wait() => {
+    for (sequence, piece) in replay {
+        last_sequence = sequence;
+        sent.push_str(&piece);
+        if sender
+            .send(Bytes::from(chunk(
+                &id,
+                created,
+                &model,
+                &json!({"content":piece}),
+                &Value::Null,
+            )))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    loop {
+        tokio::select! {
+            outcome = cell.wait() => {
+                finish_sse(&sender, &id, created, &model, &sent, &outcome).await;
+                return;
+            }
+            delta = deltas.recv() => match delta {
+                Ok((sequence, piece)) if sequence > last_sequence => {
+                    last_sequence = sequence;
+                    sent.push_str(&piece);
+                    if sender.send(Bytes::from(chunk(
+                        &id,
+                        created,
+                        &model,
+                        &json!({"content":piece}),
+                        &Value::Null,
+                    ))).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    let outcome = cell.wait().await;
                     finish_sse(&sender, &id, created, &model, &sent, &outcome).await;
                     return;
-                }
-                delta = deltas.recv() => match delta {
-                    Ok(piece) => {
-                        sent.push_str(&piece);
-                        if sender.send(Bytes::from(chunk(
-                            &id,
-                            created,
-                            &model,
-                            &json!({"content":piece}),
-                            &Value::Null,
-                        ))).await.is_err() {
-                            return;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)
-                        | tokio::sync::broadcast::error::RecvError::Closed) => {}
                 }
             }
         }
     }
-    let outcome = cell.wait().await;
-    finish_sse(&sender, &id, created, &model, &sent, &outcome).await;
 }
 
 async fn finish_sse(
@@ -864,7 +962,7 @@ async fn finish_sse(
             return;
         }
     }
-    let _ = sender.send(Bytes::from_static(b"data: [DONE]\n\n")).await;
+    drop(sender.send(Bytes::from_static(b"data: [DONE]\n\n")).await);
 }
 
 fn chunk(id: &str, created: i64, model: &str, delta: &Value, finish_reason: &Value) -> String {
@@ -893,27 +991,44 @@ fn invalid(message: impl Into<String>) -> Response {
     errors::response(StatusCode::BAD_REQUEST, errors::invalid_request(message))
 }
 
-fn server_failure(message: impl Into<String>) -> Response {
+fn server_failure(_: impl Into<String>) -> Response {
     errors::response(
         StatusCode::INTERNAL_SERVER_ERROR,
+        errors::server_error("internal server error"),
+    )
+}
+
+fn capacity_failure(message: &'static str) -> Response {
+    errors::response(
+        StatusCode::SERVICE_UNAVAILABLE,
         errors::server_error(message),
     )
 }
 
-fn json_depth(value: &Value, depth: usize) -> usize {
-    match value {
-        Value::Array(values) => values
-            .iter()
-            .map(|value| json_depth(value, depth + 1))
-            .max()
-            .unwrap_or(depth),
-        Value::Object(values) => values
-            .values()
-            .map(|value| json_depth(value, depth + 1))
-            .max()
-            .unwrap_or(depth),
-        _ => depth,
+fn validate_json_shape(value: &Value) -> Result<(), ChatInputError> {
+    let mut stack = vec![(value, 1_usize)];
+    let mut work = 0_usize;
+    while let Some((current, depth)) = stack.pop() {
+        work = work
+            .checked_add(1)
+            .ok_or_else(|| ChatInputError::new("request JSON exceeds maximum work"))?;
+        if work > HTTP_BODY_BYTES_MAX {
+            return Err(ChatInputError::new("request JSON exceeds maximum work"));
+        }
+        if depth > OPENAI_CHAT_JSON_DEPTH_MAX {
+            return Err(ChatInputError::new("request JSON exceeds maximum depth"));
+        }
+        match current {
+            Value::Array(values) => {
+                stack.extend(values.iter().map(|child| (child, depth + 1)));
+            }
+            Value::Object(values) => {
+                stack.extend(values.values().map(|child| (child, depth + 1)));
+            }
+            _ => {}
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]

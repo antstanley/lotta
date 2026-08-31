@@ -1,8 +1,9 @@
-//! Bounded FIFO chat-key to conversation allocation cache.
-
 use std::{
     collections::{HashMap, VecDeque},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use lotta_domain::ConversationId;
@@ -13,10 +14,20 @@ use crate::bounds::OPENAI_CHAT_KEYS_MAX;
 /// Largest accepted normalized external chat identity.
 pub const OPENAI_CHAT_KEY_BYTES_MAX: usize = 1_024;
 
+/// Structural persistent-chat scope, immune to delimiter collisions.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ChatScopeKey {
+    /// Canonical agent identifier.
+    pub agent_id: String,
+    /// Caller-supplied persistent chat identifier.
+    pub chat_id: String,
+}
+
 /// One shared conversation allocation result.
 pub struct ConversationSlot {
     value: Mutex<Option<Result<ConversationId, ()>>>,
     settled: Notify,
+    active: AtomicBool,
 }
 
 impl ConversationSlot {
@@ -24,13 +35,14 @@ impl ConversationSlot {
         Self {
             value: Mutex::new(None),
             settled: Notify::new(),
+            active: AtomicBool::new(true),
         }
     }
 
     /// Waits for the allocation owner to settle.
     ///
     /// # Errors
-    /// Returns an opaque failure when the owning allocation failed.
+    /// Returns an opaque error when canonical conversation allocation failed.
     pub async fn wait(&self) -> Result<ConversationId, ()> {
         loop {
             let notified = self.settled.notified();
@@ -46,9 +58,14 @@ impl ConversationSlot {
         let mut current = self.value.lock().await;
         if current.is_none() {
             *current = Some(value);
+            self.active.store(false, Ordering::Release);
             drop(current);
             self.settled.notify_waiters();
         }
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
     }
 }
 
@@ -58,16 +75,18 @@ pub enum ChatKeyClaim {
     Owner(Arc<ConversationSlot>),
     /// Another request owns or completed creation.
     Existing(Arc<ConversationSlot>),
+    /// Every bounded entry is allocating, so no safe victim exists.
+    Full,
 }
 
-/// Per-listener bounded FIFO cache.
+/// Per-listener bounded cache that never evicts allocating ownership.
 pub struct ChatKeyCache {
     inner: Mutex<ChatKeyEntries>,
 }
 
 struct ChatKeyEntries {
-    values: HashMap<String, Arc<ConversationSlot>>,
-    order: VecDeque<String>,
+    values: HashMap<ChatScopeKey, Arc<ConversationSlot>>,
+    order: VecDeque<ChatScopeKey>,
 }
 
 impl ChatKeyCache {
@@ -83,20 +102,23 @@ impl ChatKeyCache {
     }
 
     /// Atomically returns an existing slot or inserts one owner slot.
-    pub async fn claim(&self, key: String) -> ChatKeyClaim {
+    pub async fn claim(&self, key: ChatScopeKey) -> ChatKeyClaim {
         let mut inner = self.inner.lock().await;
         if let Some(slot) = inner.values.get(&key) {
             return ChatKeyClaim::Existing(Arc::clone(slot));
         }
+        if inner.values.len() == OPENAI_CHAT_KEYS_MAX && !evict_one_settled(&mut inner) {
+            return ChatKeyClaim::Full;
+        }
         let slot = Arc::new(ConversationSlot::new());
         inner.values.insert(key.clone(), Arc::clone(&slot));
         inner.order.push_back(key);
-        evict_overflow(&mut inner);
+        debug_assert!(inner.values.len() <= OPENAI_CHAT_KEYS_MAX);
         ChatKeyClaim::Owner(slot)
     }
 
     /// Removes a failed slot only if it is still the current entry.
-    pub async fn remove_failed(&self, key: &str, slot: &Arc<ConversationSlot>) {
+    pub async fn remove_failed(&self, key: &ChatScopeKey, slot: &Arc<ConversationSlot>) {
         let mut inner = self.inner.lock().await;
         if inner
             .values
@@ -107,6 +129,17 @@ impl ChatKeyCache {
             inner.order.retain(|candidate| candidate != key);
         }
     }
+
+    #[cfg(test)]
+    pub(crate) async fn owner_count(&self) -> usize {
+        self.inner
+            .lock()
+            .await
+            .values
+            .values()
+            .filter(|slot| slot.is_active())
+            .count()
+    }
 }
 
 impl Default for ChatKeyCache {
@@ -115,12 +148,18 @@ impl Default for ChatKeyCache {
     }
 }
 
-fn evict_overflow(inner: &mut ChatKeyEntries) {
-    while inner.values.len() > OPENAI_CHAT_KEYS_MAX {
-        let Some(oldest) = inner.order.pop_front() else {
-            break;
-        };
-        inner.values.remove(&oldest);
+fn evict_one_settled(inner: &mut ChatKeyEntries) -> bool {
+    let Some(index) = inner
+        .order
+        .iter()
+        .position(|key| inner.values.get(key).is_some_and(|slot| !slot.is_active()))
+    else {
+        return false;
+    };
+    if let Some(key) = inner.order.remove(index) {
+        inner.values.remove(&key);
+        true
+    } else {
+        false
     }
-    assert!(inner.values.len() <= OPENAI_CHAT_KEYS_MAX);
 }

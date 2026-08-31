@@ -40,6 +40,19 @@ pub fn model_not_found(model: &str) -> ErrorEnvelope {
     }
 }
 
+/// Builds the pinned authentication-error envelope.
+#[must_use]
+pub fn authentication_error() -> ErrorEnvelope {
+    ErrorEnvelope {
+        error: ErrorBody {
+            message: "authentication failed".to_owned(),
+            error_type: "authentication_error",
+            param: None,
+            code: None,
+        },
+    }
+}
+
 /// Builds the pinned invalid-request envelope.
 #[must_use]
 pub fn invalid_request(message: impl Into<String>) -> ErrorEnvelope {

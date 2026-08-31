@@ -15,10 +15,7 @@ use lotta_runtime::ports::AgentStore;
 use lotta_store::{LocalStore, StorePaths};
 use sha2::{Digest, Sha256};
 
-use crate::{
-    config::ServerArgs,
-    listener::{ListenerHandle, start_listener},
-};
+use crate::{config::ServerArgs, listener::ListenerHandle};
 
 pub(super) struct TestClock;
 
@@ -86,6 +83,32 @@ pub(super) async fn seed(storage: &Path, agents: &[Agent]) {
 }
 
 pub(super) async fn launch(roots: &Roots, openai_api: bool, token: Option<&str>) -> ListenerHandle {
+    launch_with_runtime(
+        roots,
+        openai_api,
+        token,
+        Arc::new(crate::ws::UnsupportedRuntimeCommandService),
+    )
+    .await
+}
+
+pub(super) async fn launch_with_runtime(
+    roots: &Roots,
+    openai_api: bool,
+    token: Option<&str>,
+    runtime: Arc<dyn crate::ws::RuntimeCommandService>,
+) -> ListenerHandle {
+    let controller = Arc::new(crate::ws::ServiceBackedTurnController::new(runtime.clone()));
+    launch_with_runtime_and_controller(roots, openai_api, token, runtime, controller).await
+}
+
+pub(super) async fn launch_with_runtime_and_controller(
+    roots: &Roots,
+    openai_api: bool,
+    token: Option<&str>,
+    runtime: Arc<dyn crate::ws::RuntimeCommandService>,
+    controller: Arc<dyn crate::ws::TurnController>,
+) -> ListenerHandle {
     let mut args = ServerArgs {
         listen: Some("ws://127.0.0.1:0".to_owned()),
         listen_enabled: true,
@@ -101,9 +124,14 @@ pub(super) async fn launch(roots: &Roots, openai_api: bool, token: Option<&str>)
     let prepared = args
         .prepare()
         .unwrap_or_else(|error| panic!("prepare listener: {error}"));
-    start_listener(prepared, Arc::new(TestClock))
-        .await
-        .unwrap_or_else(|error| panic!("start listener: {error}"))
+    crate::listener::start_listener_with_runtime_service_and_controller(
+        prepared,
+        Arc::new(TestClock),
+        runtime,
+        controller,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("start listener: {error}"))
 }
 
 pub(super) struct HttpResponse {
@@ -127,7 +155,15 @@ pub(super) async fn post(
     headers: &str,
     body: &str,
 ) -> HttpResponse {
-    let address = handle.address();
+    post_at(handle.address(), target, headers, body).await
+}
+
+pub(super) async fn post_at(
+    address: std::net::SocketAddr,
+    target: &str,
+    headers: &str,
+    body: &str,
+) -> HttpResponse {
     let target = target.to_owned();
     let headers = headers.to_owned();
     let body = body.to_owned();

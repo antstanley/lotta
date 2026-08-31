@@ -802,9 +802,29 @@ impl ConversationsBridge {
         agent_id: &AgentId,
         conversation_id: &ConversationId,
     ) -> Result<(), AppServerError> {
+        self.delete_conversation_artifacts(agent_id, conversation_id)
+            .await
+            .map_err(|()| AppServerError::Unavailable)
+    }
+
+    async fn delete_conversation_artifacts(
+        &self,
+        agent_id: &AgentId,
+        conversation_id: &ConversationId,
+    ) -> Result<(), ()> {
+        let directory = self
+            .store
+            .paths()
+            .conversation_dir(agent_id, conversation_id)
+            .map_err(|_| ())?;
         ConversationStore::delete(&self.store, agent_id, conversation_id)
             .await
-            .map_err(|_| AppServerError::Unavailable)
+            .map_err(|_| ())?;
+        match tokio::fs::remove_dir_all(&directory).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(()),
+        }
     }
 
     /// Routes one decoded command in a detached task, like the baseline.
@@ -935,10 +955,19 @@ impl ConversationsBridge {
                 .await
                 .map_err(|error| create_store_failure(&error))?
         };
-        // The pinned backend persists the compiled prompt before returning, so
-        // a client that observed success would always find the cache record.
-        self.compile_prompt(&agent_id, &created.id, false, CREATE_FAILURE)
-            .await?;
+        // Creation is transactional at this boundary: prompt compilation must
+        // succeed before publication, and a failure is compensated by removing
+        // the record plus every conversation-owned transcript/cache artifact.
+        if self
+            .compile_prompt(&agent_id, &created.id, false, CREATE_FAILURE)
+            .await
+            .is_err()
+        {
+            self.delete_conversation_artifacts(&agent_id, &created.id)
+                .await
+                .map_err(|()| CREATE_FAILURE.to_owned())?;
+            return Err(CREATE_FAILURE.to_owned());
+        }
         Ok(created)
     }
 

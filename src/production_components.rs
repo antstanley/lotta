@@ -3840,9 +3840,20 @@ impl TurnEffectPort for ProductionEffects {
         let sequence = self
             .sequence
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let content = match projection.kind {
+            lotta_runtime::turn::ProjectionKind::Text => {
+                serde_json::json!([{"type":"text", "text":projection.text.as_str()}])
+            }
+            lotta_runtime::turn::ProjectionKind::Reasoning => {
+                serde_json::json!([{"type":"thinking", "thinking":projection.text.as_str()}])
+            }
+            lotta_runtime::turn::ProjectionKind::RedactedReasoning => {
+                serde_json::json!([{"type":"redacted_thinking", "data":projection.text.as_str()}])
+            }
+        };
         self.append_message(
             lotta_domain::LocalMessageRole::Assistant,
-            serde_json::json!(projection.text.as_str()),
+            content,
             format!("{}-assistant-{sequence}", self.turn_id.as_str()),
         )
     }
@@ -7008,6 +7019,60 @@ mod production_tests {
         assert_eq!(events[0].0, scope);
         assert_eq!(events[0].1.discriminant(), "turn_finished");
     }
+    #[tokio::test]
+    async fn production_effects_preserve_all_projection_variants_in_order() {
+        let service = service();
+        let scope = scope("projection-kinds");
+        let effects = ProductionEffects::new(
+            service.store.clone(),
+            scope.clone(),
+            Arc::new(Sink::default()),
+            Arc::clone(&service.state),
+            NonEmptyString::new("turn-kinds").unwrap(),
+            RunId::generate_sequence(2).unwrap(),
+            NonEmptyString::new("input-kinds").unwrap(),
+        );
+        for (kind, text) in [
+            (lotta_runtime::turn::ProjectionKind::Text, "visible"),
+            (lotta_runtime::turn::ProjectionKind::Reasoning, "thought"),
+            (
+                lotta_runtime::turn::ProjectionKind::RedactedReasoning,
+                "<redacted-reasoning>",
+            ),
+        ] {
+            effects
+                .persist_projection(TurnProjection {
+                    kind,
+                    text: ProviderEventText::new(text.to_owned()).unwrap(),
+                })
+                .unwrap();
+        }
+        let transcript_path = service
+            .store
+            .paths()
+            .conversation_dir(&scope.agent_id, &scope.conversation_id)
+            .unwrap()
+            .join("messages.jsonl");
+        let transcript = tokio::fs::read_to_string(transcript_path).await.unwrap();
+        let content = transcript
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|entry| entry.pointer("/message/content").cloned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            content[0],
+            serde_json::json!([{"type":"text","text":"visible"}])
+        );
+        assert_eq!(
+            content[1],
+            serde_json::json!([{"type":"thinking","thinking":"thought"}])
+        );
+        assert_eq!(
+            content[2],
+            serde_json::json!([{"type":"redacted_thinking","data":"<redacted-reasoning>"}])
+        );
+    }
+
     #[test]
     fn production_second_turn_includes_persisted_assistant_history() {
         let user = lotta_domain::LocalMessageRole::User;
