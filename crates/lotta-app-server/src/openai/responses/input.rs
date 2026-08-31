@@ -134,18 +134,31 @@ fn combined_instructions(request: &RequestWire) -> Option<String> {
     let mut values = request
         .instructions
         .iter()
-        .map(String::as_str)
-        .filter(|text| !text.trim().is_empty())
-        .map(str::to_owned)
+        .filter(|text| !text.is_empty())
+        .cloned()
         .collect::<Vec<_>>();
     if let Some(InputWire::Items(items)) = &request.input {
         values.extend(items.iter().filter_map(|item| {
             matches!(item.role.as_deref(), Some("system" | "developer"))
-                .then(|| text_parts(item.content.as_ref()))
-                .and_then(|parts| parts.first()?.get("text")?.as_str().map(str::to_owned))
+                .then(|| extract_text_content(item.content.as_ref()))
+                .filter(|text| !text.is_empty())
         }));
     }
     (!values.is_empty()).then(|| values.join("\n\n"))
+}
+
+fn extract_text_content(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+                Some("text" | "input_text" | "output_text") => part.get("text")?.as_str(),
+                _ => None,
+            })
+            .collect(),
+        _ => String::new(),
+    }
 }
 
 fn normalize_input(
@@ -279,16 +292,21 @@ fn turn_message(role: &'static str, content: Vec<Value>) -> TurnMessage {
 }
 
 fn apply_instructions(messages: &mut [TurnMessage], instructions: Option<&str>) {
-    let Some(text) = instructions.map(str::trim).filter(|text| !text.is_empty()) else {
+    let Some(text) = instructions.filter(|text| !text.is_empty()) else {
         return;
     };
     if let Some(message) = messages.iter_mut().rev().find(|item| item.role == "user") {
-        message.content.insert(
-            0,
-            json!({"type":"text","text":format!(
-                "<system-reminder>\n{text}\n</system-reminder>\n\n"
-            )}),
-        );
+        let reminder = format!("<system-reminder>\n{text}\n</system-reminder>\n\n");
+        if let Some(first) = message.content.first_mut()
+            && first.get("type").and_then(Value::as_str) == Some("text")
+            && let Some(existing) = first.get("text").and_then(Value::as_str)
+        {
+            *first = json!({"type":"text","text":format!("{reminder}{existing}")});
+        } else {
+            message
+                .content
+                .insert(0, json!({"type":"text","text":reminder}));
+        }
     }
 }
 

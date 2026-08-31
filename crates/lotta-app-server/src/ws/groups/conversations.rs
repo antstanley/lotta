@@ -721,6 +721,33 @@ pub trait ConversationAuthority: Send + Sync {
     >;
 }
 
+/// Backend capability queried by Responses before any allocation or fork work.
+pub trait ConversationCommandRepository: Send + Sync {
+    /// Returns whether hidden canonical conversation forks are supported atomically.
+    fn supports_hidden_fork(&self) -> bool;
+
+    /// Tests whether one agent owns the referenced stored conversation.
+    fn contains_for_openai<'a>(
+        &'a self,
+        agent_id: &'a AgentId,
+        conversation_id: &'a ConversationId,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, AppServerError>> + Send + 'a>>;
+
+    /// Creates one hidden canonical fork of a stored conversation.
+    fn fork_for_openai<'a>(
+        &'a self,
+        agent_id: &'a AgentId,
+        conversation_id: &'a ConversationId,
+    ) -> Pin<Box<dyn Future<Output = Result<ConversationId, AppServerError>> + Send + 'a>>;
+
+    /// Deletes one request-owned conversation and its artifacts.
+    fn delete_for_openai<'a>(
+        &'a self,
+        agent_id: &'a AgentId,
+        conversation_id: &'a ConversationId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AppServerError>> + Send + 'a>>;
+}
+
 /// Applies wire commands to the Task 23/24 store, Task 28 queries, the Task 30
 /// prompt compiler, and the Task 58 compaction service.
 pub struct ConversationsBridge {
@@ -740,6 +767,36 @@ pub(crate) fn panic_next_openai_create_for_agent(agent_id: &str) {
     *OPENAI_CREATE_PANIC_AGENT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(agent_id.to_owned());
+}
+
+impl ConversationCommandRepository for ConversationsBridge {
+    fn supports_hidden_fork(&self) -> bool {
+        true
+    }
+
+    fn contains_for_openai<'a>(
+        &'a self,
+        agent_id: &'a AgentId,
+        conversation_id: &'a ConversationId,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, AppServerError>> + Send + 'a>> {
+        Box::pin(async move { self.contains_for_openai(agent_id, conversation_id).await })
+    }
+
+    fn fork_for_openai<'a>(
+        &'a self,
+        agent_id: &'a AgentId,
+        conversation_id: &'a ConversationId,
+    ) -> Pin<Box<dyn Future<Output = Result<ConversationId, AppServerError>> + Send + 'a>> {
+        Box::pin(async move { self.fork_for_openai(agent_id, conversation_id).await })
+    }
+
+    fn delete_for_openai<'a>(
+        &'a self,
+        agent_id: &'a AgentId,
+        conversation_id: &'a ConversationId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AppServerError>> + Send + 'a>> {
+        Box::pin(async move { self.delete_for_openai(agent_id, conversation_id).await })
+    }
 }
 
 impl ConversationsBridge {

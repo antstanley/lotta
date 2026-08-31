@@ -1,5 +1,3 @@
-//! Pull-driven JSON and SSE Responses rendering.
-
 use std::{collections::VecDeque, convert::Infallible, sync::Arc};
 
 use axum::{
@@ -11,12 +9,12 @@ use axum::{
 use futures_util::stream;
 use serde_json::{Value, json};
 
-use super::super::{chat::fresh_uuid, cursor};
+use super::super::{cursor, idempotency::Usage};
 use super::{
     output::{
-        ResponseMeta, ResponseOutcome, response_value, response_value_for_output, signal_events,
+        OutputBuilder, ResponseMeta, ResponseOutcome, response_value, response_value_for_output,
     },
-    state::ResponseCell,
+    state::{ResponseCell, ResponseEvent},
 };
 
 /// Renders one request cell as exact JSON or a pull-driven SSE body.
@@ -44,7 +42,6 @@ fn settled_meta(mut meta: ResponseMeta, outcome: &ResponseOutcome) -> ResponseMe
         meta.id = id;
         return meta;
     }
-    meta.id = format!("resp_{}", fresh_uuid());
     meta.store = false;
     meta
 }
@@ -63,12 +60,15 @@ fn sse_response(cell: Arc<ResponseCell>, meta: ResponseMeta) -> Response {
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(body))
         .unwrap_or_else(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error":{"message":"internal server error",
-                    "type":"server_error","param":null,"code":null}})),
-            )
-                .into_response()
+            let error = json!({
+                "error": {
+                    "message": "internal server error",
+                    "type": "server_error",
+                    "param": null,
+                    "code": null
+                }
+            });
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response()
         })
 }
 
@@ -76,6 +76,8 @@ struct SseCursor {
     cell: Arc<ResponseCell>,
     meta: Option<ResponseMeta>,
     pending: VecDeque<Bytes>,
+    output: OutputBuilder,
+    event_index: usize,
     sequence: u64,
     finished: bool,
 }
@@ -86,48 +88,79 @@ impl SseCursor {
             cell,
             meta: Some(meta),
             pending: VecDeque::new(),
+            output: OutputBuilder::default(),
+            event_index: 0,
             sequence: 0,
             finished: false,
         }
     }
 
     async fn next(&mut self) -> Option<Bytes> {
-        if let Some(bytes) = self.pending.pop_front() {
-            return Some(bytes);
+        loop {
+            if let Some(bytes) = self.pending.pop_front() {
+                return Some(bytes);
+            }
+            if self.finished {
+                return None;
+            }
+            let Some(event) = self.cell.event(self.event_index).await else {
+                self.finished = true;
+                return None;
+            };
+            self.event_index = self.event_index.saturating_add(1);
+            self.apply(event);
         }
-        if self.finished {
-            return None;
-        }
-        let outcome = self.cell.wait().await;
-        let Some(meta) = self.meta.take() else {
-            self.finished = true;
-            return None;
-        };
-        self.enqueue(meta, &outcome);
-        self.finished = true;
-        self.pending.pop_front()
     }
 
-    fn enqueue(&mut self, meta: ResponseMeta, outcome: &ResponseOutcome) {
-        let meta = settled_meta(meta, outcome);
-        let (events, output) = signal_events(&outcome.signals);
-        let terminal = response_value_for_output(&meta, outcome, &output);
-        let mut progress = terminal.clone();
-        progress["status"] = json!("in_progress");
-        progress["output"] = json!([]);
-        progress["error"] = Value::Null;
-        progress["usage"] = Value::Null;
-        self.push(json!({"type":"response.created","response":progress}));
-        self.push(json!({"type":"response.in_progress","response":progress}));
-        for event in events {
-            self.push(event);
+    fn apply(&mut self, event: ResponseEvent) {
+        match event {
+            ResponseEvent::Started(conversation) => {
+                let Some(meta) = self.meta.take() else {
+                    return;
+                };
+                let progress_outcome = ResponseOutcome {
+                    signals: Vec::new(),
+                    usage: Usage::default(),
+                    error: None,
+                    conversation_id: conversation,
+                };
+                let mut progress = response_value_for_output(&meta, &progress_outcome, &[]);
+                progress["status"] = json!("in_progress");
+                progress["output"] = json!([]);
+                progress["error"] = Value::Null;
+                progress["usage"] = Value::Null;
+                self.push(json!({"type":"response.created","response":progress}));
+                self.push(json!({"type":"response.in_progress","response":progress}));
+                self.meta = Some(meta);
+            }
+            ResponseEvent::Signal(signal) => {
+                let mut events = Vec::new();
+                self.output.apply(&signal, Some(&mut events));
+                for event in events {
+                    self.push(event);
+                }
+            }
+            ResponseEvent::Settled(outcome) => {
+                let mut events = Vec::new();
+                self.output.finish(Some(&mut events));
+                for event in events {
+                    self.push(event);
+                }
+                let Some(meta) = self.meta.take() else {
+                    self.finished = true;
+                    return;
+                };
+                let meta = settled_meta(meta, &outcome);
+                let terminal = response_value_for_output(&meta, &outcome, &self.output.output);
+                let kind = if outcome.error.is_some() {
+                    "response.failed"
+                } else {
+                    "response.completed"
+                };
+                self.push(json!({"type":kind,"response":terminal}));
+                self.finished = true;
+            }
         }
-        let kind = if outcome.error.is_some() {
-            "response.failed"
-        } else {
-            "response.completed"
-        };
-        self.push(json!({"type":kind,"response":terminal}));
     }
 
     fn push(&mut self, event: Value) {

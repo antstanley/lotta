@@ -109,6 +109,41 @@ pub(super) async fn launch_with_runtime_and_controller(
     runtime: Arc<dyn crate::ws::RuntimeCommandService>,
     controller: Arc<dyn crate::ws::TurnController>,
 ) -> ListenerHandle {
+    let prepared = prepared(roots, openai_api, token);
+    crate::listener::start_listener_with_runtime_service_and_controller(
+        prepared,
+        Arc::new(TestClock),
+        runtime,
+        controller,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("start listener: {error}"))
+}
+
+pub(super) async fn launch_responses_custom(
+    roots: &Roots,
+    token: Option<&str>,
+    runtime: Arc<dyn crate::ws::RuntimeCommandService>,
+    controller: Arc<dyn crate::ws::TurnController>,
+    repository: Option<Arc<dyn crate::ws::conversations::ConversationCommandRepository>>,
+    owner_capacity: usize,
+) -> (
+    ListenerHandle,
+    Arc<crate::openai::responses::ResponsesState>,
+) {
+    crate::listener::start_listener_with_responses_for_test(
+        prepared(roots, true, token),
+        Arc::new(TestClock),
+        runtime,
+        controller,
+        repository,
+        owner_capacity,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("start listener: {error}"))
+}
+
+fn prepared(roots: &Roots, openai_api: bool, token: Option<&str>) -> crate::config::PreparedServer {
     let mut args = ServerArgs {
         listen: Some("ws://127.0.0.1:0".to_owned()),
         listen_enabled: true,
@@ -121,17 +156,8 @@ pub(super) async fn launch_with_runtime_and_controller(
         args.ws_auth = Some("capability-token".to_owned());
         args.ws_token_sha256 = Some(format!("{:x}", Sha256::digest(token.as_bytes())));
     }
-    let prepared = args
-        .prepare()
-        .unwrap_or_else(|error| panic!("prepare listener: {error}"));
-    crate::listener::start_listener_with_runtime_service_and_controller(
-        prepared,
-        Arc::new(TestClock),
-        runtime,
-        controller,
-    )
-    .await
-    .unwrap_or_else(|error| panic!("start listener: {error}"))
+    args.prepare()
+        .unwrap_or_else(|error| panic!("prepare listener: {error}"))
 }
 
 pub(super) struct HttpResponse {

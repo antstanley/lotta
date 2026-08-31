@@ -33,6 +33,8 @@ pub enum OutputSignal {
         call_id: String,
         /// Whether execution succeeded.
         success: bool,
+        /// Exact bounded normalized execution output.
+        output: String,
     },
 }
 
@@ -175,6 +177,7 @@ pub fn response_value_for_output(
 
 /// Projects ordered runtime signals into exact Responses SSE event payloads.
 #[must_use]
+#[cfg(test)]
 pub fn signal_events(signals: &[OutputSignal]) -> (Vec<Value>, Vec<Value>) {
     let mut builder = OutputBuilder::default();
     let mut events = Vec::new();
@@ -197,8 +200,8 @@ fn usage(value: &Usage) -> ResponseUsage {
 }
 
 #[derive(Default)]
-struct OutputBuilder {
-    output: Vec<Value>,
+pub(crate) struct OutputBuilder {
+    pub(crate) output: Vec<Value>,
     active: Option<ActiveItem>,
 }
 
@@ -216,7 +219,7 @@ enum ActiveKind {
 }
 
 impl OutputBuilder {
-    fn apply(&mut self, signal: &OutputSignal, events: Option<&mut Vec<Value>>) {
+    pub(crate) fn apply(&mut self, signal: &OutputSignal, events: Option<&mut Vec<Value>>) {
         match signal {
             OutputSignal::Text(text) => self.add_text(ActiveKind::Text, text, events),
             OutputSignal::Reasoning(text) | OutputSignal::RedactedReasoning(text) => {
@@ -227,8 +230,12 @@ impl OutputBuilder {
                 name,
                 arguments,
             } => self.add_tool(call_id, name, arguments, events),
-            OutputSignal::ToolEnd { call_id, success } => {
-                self.finish_tool(call_id, *success, events);
+            OutputSignal::ToolEnd {
+                call_id,
+                success,
+                output,
+            } => {
+                self.finish_tool(call_id, *success, output, events);
             }
         }
     }
@@ -297,7 +304,7 @@ impl OutputBuilder {
         });
     }
 
-    fn finish(&mut self, mut events: Option<&mut Vec<Value>>) {
+    pub(crate) fn finish(&mut self, mut events: Option<&mut Vec<Value>>) {
         let Some(active) = self.active.take() else {
             return;
         };
@@ -337,7 +344,13 @@ impl OutputBuilder {
         self.output.push(item);
     }
 
-    fn finish_tool(&mut self, call_id: &str, success: bool, mut events: Option<&mut Vec<Value>>) {
+    fn finish_tool(
+        &mut self,
+        call_id: &str,
+        success: bool,
+        output: &str,
+        mut events: Option<&mut Vec<Value>>,
+    ) {
         let Some(index) = self
             .output
             .iter()
@@ -359,7 +372,7 @@ impl OutputBuilder {
             "output_index":index,"item":item}),
         );
         let result = json!({"type":"function_call_output","id":format!("fco_{}",fresh_uuid()),
-            "call_id":call_id,"output":[{"type":"input_text","text":""}],
+            "call_id":call_id,"output":[{"type":"input_text","text":output}],
             "status":if success {"completed"} else {"incomplete"}});
         let result_index = self.output.len();
         self.output.push(result.clone());

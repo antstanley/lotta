@@ -318,6 +318,68 @@ async fn start_listener_for_test(
 }
 
 #[cfg(test)]
+pub(crate) async fn start_listener_with_responses_for_test(
+    prepared: PreparedServer,
+    clock: Arc<dyn Clock + Send + Sync>,
+    runtime_service: Arc<dyn RuntimeCommandService>,
+    turn_controller: Arc<dyn TurnController>,
+    repository: Option<Arc<dyn crate::ws::conversations::ConversationCommandRepository>>,
+    owner_capacity: usize,
+) -> Result<
+    (
+        ListenerHandle,
+        Arc<crate::openai::responses::ResponsesState>,
+    ),
+    AppServerError,
+> {
+    let listener = TcpListener::bind(format_bind_address(&prepared.host, prepared.port))
+        .await
+        .map_err(|_| AppServerError::Listener)?;
+    let address = listener
+        .local_addr()
+        .map_err(|_| AppServerError::Listener)?;
+    let (base_url, websocket_url, openai_url) = resolved_urls(&prepared, address);
+    let shutdown = CancellationToken::new();
+    let path = prepared.websocket_path.clone();
+    let endpoints = RuntimeEndpoints::from_parts(
+        runtime_service,
+        turn_controller,
+        Arc::new(crate::observer::InertRuntimeBroadcastObserver),
+    );
+    let mut state = compose_listener_state(
+        prepared,
+        &clock,
+        SocketLimits::default(),
+        endpoints,
+        None,
+        shutdown.clone(),
+    )?;
+    let repository = repository.unwrap_or_else(|| state.openai_chat.conversations.clone());
+    let responses = Arc::new(
+        crate::openai::responses::ResponsesState::with_repository_and_capacity(
+            Arc::clone(&state.openai_chat),
+            repository,
+            owner_capacity,
+        ),
+    );
+    Arc::get_mut(&mut state)
+        .ok_or(AppServerError::Internal)?
+        .openai_responses = Arc::clone(&responses);
+    register_device_runtime_ports(&state);
+    let router = build_router(&path, Arc::clone(&state));
+    let task = tokio::spawn(run_listener(listener, router, state));
+    let handle = ListenerHandle {
+        address,
+        base_url,
+        websocket_url,
+        openai_url,
+        shutdown,
+        task,
+    };
+    Ok((handle, responses))
+}
+
+#[cfg(test)]
 async fn start_listener_with_state_for_test(
     prepared: PreparedServer,
     clock: Arc<dyn Clock + Send + Sync>,

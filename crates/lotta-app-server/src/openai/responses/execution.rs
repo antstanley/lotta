@@ -1,10 +1,18 @@
-//! Responses conversation selection and supervised runtime ownership.
-
-use std::{collections::HashMap, panic::AssertUnwindSafe, sync::Arc};
+use std::{
+    collections::HashMap,
+    panic::AssertUnwindSafe,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use futures_util::FutureExt as _;
 use lotta_domain::{Agent, ConversationId, RuntimeScope};
-use tokio::task::JoinSet;
+use tokio::{
+    sync::{Mutex, OwnedMutexGuard, Semaphore},
+    task::JoinSet,
+};
 
 use crate::ws::{DeferredInput, InputAdmissionWork};
 
@@ -15,49 +23,113 @@ use super::{
     state::{ResponseCell, ResponseTurnSink},
 };
 
+/// Named maximum number of listener-owned Responses operations.
+pub const OPENAI_RESPONSES_OWNERS_MAX: usize = 128;
+
+struct SetupLock {
+    gate: Arc<Mutex<()>>,
+    refs: AtomicUsize,
+}
+
 /// Listener-owned Responses execution state sharing Task 75 runtime/repository adapters.
 pub struct ResponsesState {
     /// Shared canonical Chat infrastructure and persistent key cache.
     pub chat: Arc<chat::ChatState>,
-    owners: tokio::sync::Mutex<JoinSet<()>>,
-    agent_owners: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    owners: Mutex<JoinSet<()>>,
+    owner_capacity: Arc<Semaphore>,
+    setup_locks: Mutex<HashMap<String, Arc<SetupLock>>>,
+    conversations: Arc<dyn crate::ws::conversations::ConversationCommandRepository>,
     fork_supported: bool,
 }
 
 impl ResponsesState {
-    /// Composes production Responses state over the canonical Chat adapters.
+    /// Composes production Responses state over the canonical Chat adapters and backend capability.
     #[must_use]
     pub fn new(chat: Arc<chat::ChatState>) -> Self {
-        Self::with_fork_support(chat, true)
+        let repository = chat.conversations.clone();
+        Self::with_repository(chat, repository)
     }
 
-    /// Composes state with an explicit canonical fork capability flag.
+    /// Composes state from an explicit conversation command repository.
     #[must_use]
-    pub fn with_fork_support(chat: Arc<chat::ChatState>, fork_supported: bool) -> Self {
+    pub fn with_repository(
+        chat: Arc<chat::ChatState>,
+        repository: Arc<dyn crate::ws::conversations::ConversationCommandRepository>,
+    ) -> Self {
+        Self::with_repository_and_bound(chat, repository, OPENAI_RESPONSES_OWNERS_MAX)
+    }
+
+    fn with_repository_and_bound(
+        chat: Arc<chat::ChatState>,
+        repository: Arc<dyn crate::ws::conversations::ConversationCommandRepository>,
+        owner_capacity: usize,
+    ) -> Self {
+        let fork_supported = repository.supports_hidden_fork();
         Self {
             chat,
-            owners: tokio::sync::Mutex::new(JoinSet::new()),
-            agent_owners: tokio::sync::Mutex::new(HashMap::new()),
+            owners: Mutex::new(JoinSet::new()),
+            owner_capacity: Arc::new(Semaphore::new(owner_capacity)),
+            setup_locks: Mutex::new(HashMap::new()),
+            conversations: repository,
             fork_supported,
         }
     }
 
-    async fn agent_owner(&self, agent_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        let owner = {
-            let mut owners = self.agent_owners.lock().await;
-            Arc::clone(
-                owners
-                    .entry(agent_id.to_owned())
-                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-            )
+    #[cfg(test)]
+    pub(crate) fn with_repository_and_capacity(
+        chat: Arc<chat::ChatState>,
+        repository: Arc<dyn crate::ws::conversations::ConversationCommandRepository>,
+        owner_capacity: usize,
+    ) -> Self {
+        Self::with_repository_and_bound(chat, repository, owner_capacity)
+    }
+
+    async fn acquire_setup(&self, key: &str) -> (Arc<SetupLock>, OwnedMutexGuard<()>) {
+        let entry = {
+            let mut locks = self.setup_locks.lock().await;
+            let entry = Arc::clone(locks.entry(key.to_owned()).or_insert_with(|| {
+                Arc::new(SetupLock {
+                    gate: Arc::new(Mutex::new(())),
+                    refs: AtomicUsize::new(0),
+                })
+            }));
+            entry.refs.fetch_add(1, Ordering::AcqRel);
+            entry
         };
-        owner.lock_owned().await
+        let guard = Arc::clone(&entry.gate).lock_owned().await;
+        (entry, guard)
+    }
+
+    async fn release_setup(&self, key: &str, entry: &Arc<SetupLock>) {
+        if entry.refs.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        let mut locks = self.setup_locks.lock().await;
+        if locks
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+            && entry.refs.load(Ordering::Acquire) == 0
+        {
+            locks.remove(key);
+        }
     }
 
     /// Cancels through the shared listener token and joins every Responses owner.
     pub async fn shutdown(&self) {
         let mut owners = self.owners.lock().await;
         while owners.join_next().await.is_some() {}
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn owner_count(&self) -> usize {
+        let mut owners = self.owners.lock().await;
+        while owners.try_join_next().is_some() {}
+        owners.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn setup_lock_count(&self) -> usize {
+        self.setup_locks.lock().await.len()
     }
 }
 
@@ -71,20 +143,13 @@ pub struct PreviousState {
 /// Prior-response resolution failure.
 #[derive(Clone, Copy)]
 pub enum PreviousError {
-    /// Cursor or durable source is absent for this model.
     NotFound,
-    /// Cursor belongs to a different model.
     WrongModel,
-    /// Canonical fork support is unavailable.
     Unsupported,
-    /// Repository lookup failed.
     Failed,
 }
 
 /// Strictly resolves one optional previous-response cursor before allocation.
-///
-/// # Errors
-/// Distinguishes pinned not-found, unsupported-backend, and scrubbed server failures.
 pub async fn resolve_previous(
     state: &ResponsesState,
     agent: &Agent,
@@ -97,11 +162,11 @@ pub async fn resolve_previous(
     if parsed.agent_id != agent.id {
         return Err(PreviousError::WrongModel);
     }
+    // Capability is checked before existence lookup, allocation, or fork work.
     if !state.fork_supported {
         return Err(PreviousError::Unsupported);
     }
     let exists = state
-        .chat
         .conversations
         .contains_for_openai(&agent.id, &parsed.conversation_id)
         .await
@@ -114,29 +179,48 @@ pub async fn resolve_previous(
     }))
 }
 
-/// Spawns one independent supervised owner; no idempotency header is consulted.
+/// Owner registration failure returned before a response is exposed.
+pub enum SpawnError {
+    Backpressure,
+    Shutdown,
+}
+
+/// Registers one independent supervised owner within the named bound.
 pub async fn spawn_owner(
     state: Arc<ResponsesState>,
     agent: Agent,
     request: PreparedRequest,
     previous: Option<PreviousState>,
     cell: Arc<ResponseCell>,
-) {
+) -> Result<(), SpawnError> {
+    if state.chat.shutdown.is_cancelled() {
+        return Err(SpawnError::Shutdown);
+    }
+    let permit = Arc::clone(&state.owner_capacity)
+        .try_acquire_owned()
+        .map_err(|_| SpawnError::Backpressure)?;
     let task_state = Arc::clone(&state);
+    let task_cell = Arc::clone(&cell);
     let mut owners = state.owners.lock().await;
     while owners.try_join_next().is_some() {}
     if state.chat.shutdown.is_cancelled() {
-        drop(owners);
-        cell.settle(ResponseOutcome::failed()).await;
-        return;
+        return Err(SpawnError::Shutdown);
     }
     owners.spawn(async move {
-        let operation = AssertUnwindSafe(run_owner(&task_state, &agent, request, previous))
-            .catch_unwind()
-            .await
-            .unwrap_or_else(|_| ResponseOutcome::failed());
-        cell.settle(operation).await;
+        let _permit = permit;
+        let operation = AssertUnwindSafe(run_owner(
+            &task_state,
+            &agent,
+            request,
+            previous,
+            Arc::clone(&task_cell),
+        ))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| ResponseOutcome::failed());
+        task_cell.settle(operation);
     });
+    Ok(())
 }
 
 async fn run_owner(
@@ -144,15 +228,17 @@ async fn run_owner(
     agent: &Agent,
     request: PreparedRequest,
     previous: Option<PreviousState>,
+    cell: Arc<ResponseCell>,
 ) -> ResponseOutcome {
-    let _agent_owner = state.agent_owner(agent.id.as_str()).await;
-    let allocated = allocate(state, agent, &request, previous.as_ref()).await;
+    let allocated = allocate_serialized(state, agent, &request, previous.as_ref()).await;
     let Ok((conversation, owned, created_fork)) = allocated else {
+        cell.start(None);
         return ResponseOutcome::failed();
     };
+    cell.start(Some(conversation.clone()));
     let mut outcome = tokio::select! {
         () = state.chat.shutdown.cancelled() => ResponseOutcome::failed(),
-        outcome = execute_turn(state, agent, &conversation, &request) => outcome,
+        outcome = execute_turn(state, agent, &conversation, &request, Arc::clone(&cell)) => outcome,
     };
     let success = outcome.error.is_none();
     let retained = success && (request.store || request.chat_key.is_some());
@@ -183,6 +269,26 @@ async fn run_owner(
     outcome
 }
 
+fn setup_key(agent: &Agent) -> String {
+    // The local conversation repository's create/fork + prompt compilation setup is
+    // agent-scoped. Only that short setup is serialized; admission and the provider turn are not.
+    agent.id.as_str().to_owned()
+}
+
+async fn allocate_serialized(
+    state: &ResponsesState,
+    agent: &Agent,
+    request: &PreparedRequest,
+    previous: Option<&PreviousState>,
+) -> Result<(ConversationId, bool, bool), ()> {
+    let key = setup_key(agent);
+    let (entry, guard) = state.acquire_setup(&key).await;
+    let result = allocate(state, agent, request, previous).await;
+    drop(guard);
+    state.release_setup(&key, &entry).await;
+    result
+}
+
 async fn allocate(
     state: &ResponsesState,
     agent: &Agent,
@@ -191,7 +297,6 @@ async fn allocate(
 ) -> Result<(ConversationId, bool, bool), ()> {
     if let Some(previous) = previous {
         return state
-            .chat
             .conversations
             .fork_for_openai(&agent.id, &previous.conversation_id)
             .await
@@ -208,6 +313,7 @@ async fn execute_turn(
     agent: &Agent,
     conversation: &ConversationId,
     request: &PreparedRequest,
+    cell: Arc<ResponseCell>,
 ) -> ResponseOutcome {
     let scope = RuntimeScope::new(agent.id.clone(), conversation.clone(), None);
     if chat::start_runtime(&state.chat, &scope).await.is_err() {
@@ -227,7 +333,7 @@ async fn execute_turn(
     let InputAdmissionWork::NewStarted(continuation) = admission.work else {
         return ResponseOutcome::failed();
     };
-    submit_turn(state, command, scope, continuation).await
+    submit_turn(state, command, scope, continuation, cell).await
 }
 
 async fn submit_turn(
@@ -235,8 +341,9 @@ async fn submit_turn(
     command: crate::ws::command::InputCommand,
     scope: RuntimeScope,
     continuation: lotta_domain::BoundedJsonValue,
+    cell: Arc<ResponseCell>,
 ) -> ResponseOutcome {
-    let sink = Arc::new(ResponseTurnSink::new());
+    let sink = Arc::new(ResponseTurnSink::new(cell));
     let deferred = DeferredInput {
         scope,
         disposition: lotta_domain::InputDisposition::Started,
@@ -271,10 +378,16 @@ async fn cleanup(
         .teardown_ephemeral_runtime(scope)
         .await
         .map_err(|_| ())?;
-    state
-        .chat
+    // Local repository artifact deletion shares only the short setup critical section,
+    // preventing it from racing prompt compilation for another conversation.
+    let key = setup_key(agent);
+    let (entry, guard) = state.acquire_setup(&key).await;
+    let result = state
         .conversations
         .delete_for_openai(&agent.id, conversation)
         .await
-        .map_err(|_| ())
+        .map_err(|_| ());
+    drop(guard);
+    state.release_setup(&key, &entry).await;
+    result
 }

@@ -1,19 +1,38 @@
-//! Supervised Responses outcome state and runtime event capture.
-
 use std::sync::{Arc, Mutex};
 
-use lotta_domain::RuntimeScope;
-use tokio::sync::{Mutex as AsyncMutex, Notify};
+use lotta_domain::{ConversationId, RuntimeScope};
+use tokio::sync::Notify;
 
-use crate::ws::{RuntimeEvent, RuntimeEventSink, event::StreamDelta};
+use crate::ws::{RuntimeEvent, RuntimeEventSink, ToolExecutionResult, event::StreamDelta};
 
 use super::super::idempotency::Usage;
 use super::output::{OPENAI_RESPONSES_OUTPUT_SIGNALS_MAX, OutputSignal, ResponseOutcome};
 
-/// One request-owned outcome. Responses never indexes these cells by idempotency headers.
+/// Maximum request-owned replay records, including start and terminal records.
+pub const OPENAI_RESPONSES_EVENT_LOG_MAX: usize = OPENAI_RESPONSES_OUTPUT_SIGNALS_MAX + 2;
+
+/// One ordered internal record consumed by live and late-joining renderers.
+#[derive(Clone)]
+pub enum ResponseEvent {
+    /// Allocation completed and admission may now begin.
+    Started(Option<ConversationId>),
+    /// One canonical runtime projection.
+    Signal(OutputSignal),
+    /// Cleanup-complete terminal outcome.
+    Settled(Arc<ResponseOutcome>),
+}
+
+#[derive(Default)]
+struct CellState {
+    events: Vec<ResponseEvent>,
+    outcome: Option<Arc<ResponseOutcome>>,
+    started: bool,
+}
+
+/// One request-owned bounded ordered event log with gap-free replay and live notification.
 pub struct ResponseCell {
-    value: AsyncMutex<Option<Arc<ResponseOutcome>>>,
-    settled: Notify,
+    state: Mutex<CellState>,
+    changed: Notify,
 }
 
 impl ResponseCell {
@@ -21,30 +40,93 @@ impl ResponseCell {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            value: AsyncMutex::new(None),
-            settled: Notify::new(),
+            state: Mutex::new(CellState::default()),
+            changed: Notify::new(),
+        }
+    }
+
+    /// Publishes allocation completion exactly once, before admission.
+    pub fn start(&self, conversation: Option<ConversationId>) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.started || state.outcome.is_some() {
+            return;
+        }
+        state.started = true;
+        state.events.push(ResponseEvent::Started(conversation));
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    /// Appends one ordered bounded runtime signal for live delivery and replay.
+    pub fn publish(&self, signal: OutputSignal) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if !state.started
+            || state.outcome.is_some()
+            || state.events.len() >= OPENAI_RESPONSES_EVENT_LOG_MAX - 1
+        {
+            return;
+        }
+        state.events.push(ResponseEvent::Signal(signal));
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    /// Reads the next record without gaps; waits if the owner is still active.
+    pub async fn event(&self, index: usize) -> Option<ResponseEvent> {
+        loop {
+            let notified = self.changed.notified();
+            {
+                let Ok(state) = self.state.lock() else {
+                    return None;
+                };
+                if let Some(event) = state.events.get(index) {
+                    return Some(event.clone());
+                }
+                if state.outcome.is_some() {
+                    return None;
+                }
+            }
+            notified.await;
         }
     }
 
     /// Waits for cleanup-before-settlement owner completion.
     pub async fn wait(&self) -> Arc<ResponseOutcome> {
         loop {
-            let notified = self.settled.notified();
-            if let Some(value) = self.value.lock().await.clone() {
-                return value;
+            let notified = self.changed.notified();
+            if let Ok(state) = self.state.lock()
+                && let Some(value) = &state.outcome
+            {
+                return Arc::clone(value);
             }
             notified.await;
         }
     }
 
-    /// Settles exactly once.
-    pub async fn settle(&self, outcome: ResponseOutcome) {
-        let mut value = self.value.lock().await;
-        if value.is_none() {
-            *value = Some(Arc::new(outcome));
-            drop(value);
-            self.settled.notify_waiters();
+    /// Settles exactly once and publishes exactly one terminal replay record.
+    pub fn settle(&self, outcome: ResponseOutcome) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.outcome.is_some() {
+            return;
         }
+        if !state.started {
+            state.started = true;
+            state.events.push(ResponseEvent::Started(None));
+        }
+        let outcome = Arc::new(outcome);
+        state.outcome = Some(Arc::clone(&outcome));
+        if state.events.len() == OPENAI_RESPONSES_EVENT_LOG_MAX {
+            state.events.pop();
+        }
+        state.events.push(ResponseEvent::Settled(outcome));
+        drop(state);
+        self.changed.notify_waiters();
     }
 }
 
@@ -56,16 +138,18 @@ impl Default for ResponseCell {
 
 /// Runtime sink retaining canonical text, reasoning, redaction, tools, and usage.
 pub struct ResponseTurnSink {
+    cell: Arc<ResponseCell>,
     signals: Mutex<Vec<OutputSignal>>,
     usage: Mutex<Usage>,
     error: Mutex<Option<String>>,
 }
 
 impl ResponseTurnSink {
-    /// Creates an empty bounded projection sink.
+    /// Creates an empty bounded projection sink publishing into `cell`.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(cell: Arc<ResponseCell>) -> Self {
         Self {
+            cell,
             signals: Mutex::new(Vec::new()),
             usage: Mutex::new(Usage::default()),
             error: Mutex::new(None),
@@ -102,10 +186,10 @@ impl ResponseTurnSink {
             return;
         };
         if signals.len() < OPENAI_RESPONSES_OUTPUT_SIGNALS_MAX {
-            signals.push(signal);
-        } else if !merge_last(&mut signals, signal)
-            && let Ok(mut error) = self.error.lock()
-        {
+            signals.push(signal.clone());
+            drop(signals);
+            self.cell.publish(signal);
+        } else if let Ok(mut error) = self.error.lock() {
             *error = Some("failed to run agent turn".to_owned());
         }
     }
@@ -155,12 +239,6 @@ impl ResponseTurnSink {
     }
 }
 
-impl Default for ResponseTurnSink {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl RuntimeEventSink for ResponseTurnSink {
     fn emit(
         &self,
@@ -182,34 +260,36 @@ impl RuntimeEventSink for ResponseTurnSink {
                     .map_or_else(|| "tool".to_owned(), |name| name.as_str().to_owned()),
                 arguments: value.tool_args.unwrap_or_default(),
             }),
-            RuntimeEvent::StreamDelta {
-                delta: StreamDelta::ClientToolEnd(value),
-                subagent_id: None,
-            } => self.push(OutputSignal::ToolEnd {
-                call_id: value.tool_call_id.as_str().to_owned(),
-                success: matches!(value.status, crate::ws::event::ClientToolStatus::Success),
-            }),
             RuntimeEvent::TurnFinished {
                 stop_reason, error, ..
             } => self.terminal(stop_reason.as_str(), error.is_some()),
+            // A production tool result is delivered by `emit_tool_result`; accepting a bare
+            // public lifecycle end here would fabricate output, so unmatched events are omitted.
             _ => {}
         }
         Ok(())
     }
-}
 
-fn merge_last(signals: &mut [OutputSignal], incoming: OutputSignal) -> bool {
-    let Some(last) = signals.last_mut() else {
-        return false;
-    };
-    match (last, incoming) {
-        (OutputSignal::Text(current), OutputSignal::Text(next))
-        | (OutputSignal::Reasoning(current), OutputSignal::Reasoning(next))
-        | (OutputSignal::RedactedReasoning(current), OutputSignal::RedactedReasoning(next)) => {
-            current.push_str(&next);
-            true
+    fn emit_tool_result(
+        &self,
+        _: &RuntimeScope,
+        result: ToolExecutionResult,
+    ) -> Result<(), crate::error::AppServerError> {
+        if result.output.len() > lotta_runtime::bounds::TOOL_RESULT_BYTES_MAX.value
+            || result.output.chars().count()
+                > lotta_runtime::bounds::TOOL_RESULT_MODEL_CHARS_MAX.value
+        {
+            if let Ok(mut error) = self.error.lock() {
+                *error = Some("failed to run agent turn".to_owned());
+            }
+            return Ok(());
         }
-        _ => false,
+        self.push(OutputSignal::ToolEnd {
+            call_id: result.tool_call_id,
+            success: result.success,
+            output: result.output,
+        });
+        Ok(())
     }
 }
 

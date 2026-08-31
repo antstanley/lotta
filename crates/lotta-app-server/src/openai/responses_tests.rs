@@ -1,13 +1,13 @@
 use axum::http::HeaderValue;
 
-mod cursor {
+mod units_cursor {
     #[test]
     fn rejects_non_cursor_ids() {
         assert!(crate::openai::cursor::parse("resp_missing").is_err());
     }
 }
 
-mod non_stored {
+mod units_non_stored {
     use super::*;
 
     #[test]
@@ -36,7 +36,7 @@ mod non_stored {
     }
 }
 
-mod previous_response_id {
+mod units_previous_response_id {
     use super::*;
 
     #[test]
@@ -55,7 +55,7 @@ mod previous_response_id {
     }
 }
 
-mod no_idempotency {
+mod units_no_idempotency {
     use super::*;
 
     #[test]
@@ -69,7 +69,66 @@ mod no_idempotency {
     }
 }
 
-mod streaming {
+mod instructions {
+    use super::*;
+
+    #[test]
+    fn multipart_system_and_developer_text_is_concatenated_in_exact_order() {
+        let prepared = input::prepare(
+            json!({
+                "model":"memo",
+                "instructions":"root",
+                "input":[
+                    {"type":"message","role":"system","content":[
+                        {"type":"input_text","text":"sys-a"},
+                        {"type":"output_text","text":"sys-b"}
+                    ]},
+                    {"type":"message","role":"developer","content":[
+                        {"type":"text","text":"dev-a"},
+                        {"type":"input_image","image_url":"https://example.invalid/x"},
+                        {"type":"input_text","text":"dev-b"}
+                    ]},
+                    {"type":"message","role":"user","content":"hello"}
+                ]
+            }),
+            &HeaderMap::new(),
+        ).unwrap_or_else(|_| panic!("valid multipart instructions"));
+        assert_eq!(
+            prepared.messages[0].content[0]["text"],
+            "<system-reminder>\nroot\n\nsys-asys-b\n\ndev-adev-b\n</system-reminder>\n\nhello"
+        );
+    }
+}
+
+mod tool_results {
+    use super::output::{OutputSignal, signal_events};
+
+    #[test]
+    fn exact_real_success_and_error_outputs_are_projected_without_fabrication() {
+        for (success, output, status) in [
+            (true, "ponytail", "completed"),
+            (false, "permission denied", "incomplete"),
+        ] {
+            let (_, projected) = signal_events(&[
+                OutputSignal::ToolStart {
+                    call_id: "call-1".to_owned(),
+                    name: "shell".to_owned(),
+                    arguments: "{}".to_owned(),
+                },
+                OutputSignal::ToolEnd {
+                    call_id: "call-1".to_owned(),
+                    success,
+                    output: output.to_owned(),
+                },
+            ]);
+            assert_eq!(projected[1]["type"], "function_call_output");
+            assert_eq!(projected[1]["output"][0]["text"], output);
+            assert_eq!(projected[1]["status"], status);
+        }
+    }
+}
+
+mod units_streaming {
     use super::output::{OutputSignal, signal_events};
 
     #[test]

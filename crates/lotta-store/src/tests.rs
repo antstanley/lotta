@@ -707,10 +707,33 @@ mod errors {
         }
     }
 
+    const ISOLATED_LOG_CAPTURE: &str = "LOTTA_STORE_ISOLATED_LOG_CAPTURE";
+
     #[test]
     fn logs_exclude_contents() {
-        static SERIAL: Mutex<()> = Mutex::new(());
-        let _serial = SERIAL.lock().expect("serial trace capture");
+        if std::env::var_os(ISOLATED_LOG_CAPTURE).is_some() {
+            assert_log_capture();
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "tests::errors::logs_exclude_contents",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(ISOLATED_LOG_CAPTURE, "1")
+            .output()
+            .expect("isolated trace test");
+        assert!(
+            output.status.success(),
+            "isolated trace test failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn assert_log_capture() {
         let (_owned, paths) = root("errors-logs");
         let path = paths.providers().join("auth.json");
         let capture = Capture::default();
@@ -720,32 +743,7 @@ mod errors {
                 .without_time(),
         );
         let dispatch = tracing::Dispatch::new(subscriber);
-        tracing::dispatcher::with_default(&dispatch, || {
-            let error = atomic_write_observed(
-                &path,
-                MARKER.as_bytes(),
-                WriteMode::Standard,
-                &PermissionObserver,
-            )
-            .expect_err("permission failure");
-            assert_eq!(error.path(), path);
-            assert_eq!(error.kind(), StoreErrorKind::Permission);
-            for kind in [
-                StoreErrorKind::DiskFull,
-                StoreErrorKind::Permission,
-                StoreErrorKind::Parse,
-                StoreErrorKind::Checksum,
-                StoreErrorKind::StorageConflict,
-                StoreErrorKind::LottaLock,
-            ] {
-                let _logged = StoreError::new(kind, &path).log();
-            }
-            let lock = LottaStorageLock::try_acquire(paths.root()).expect("lock");
-            let contention = atomic_write(&path, MARKER.as_bytes(), WriteMode::Standard)
-                .expect_err("atomic lock contention");
-            assert_eq!(contention.kind(), StoreErrorKind::LottaLock);
-            drop(lock);
-        });
+        tracing::dispatcher::with_default(&dispatch, || emit_log_cases(&paths, &path));
         assert!(!path.exists());
         let output = String::from_utf8(capture.0.lock().expect("capture").clone()).expect("utf8");
         assert!(output.contains("auth.json"));
@@ -762,6 +760,33 @@ mod errors {
         assert!(!output.contains(MARKER));
         assert_eq!(output.matches("permission").count(), 2);
         assert_eq!(output.matches("lotta_lock").count(), 2);
+    }
+
+    fn emit_log_cases(paths: &StorePaths, path: &Path) {
+        let error = atomic_write_observed(
+            path,
+            MARKER.as_bytes(),
+            WriteMode::Standard,
+            &PermissionObserver,
+        )
+        .expect_err("permission failure");
+        assert_eq!(error.path(), path);
+        assert_eq!(error.kind(), StoreErrorKind::Permission);
+        for kind in [
+            StoreErrorKind::DiskFull,
+            StoreErrorKind::Permission,
+            StoreErrorKind::Parse,
+            StoreErrorKind::Checksum,
+            StoreErrorKind::StorageConflict,
+            StoreErrorKind::LottaLock,
+        ] {
+            let _logged = StoreError::new(kind, path).log();
+        }
+        let lock = LottaStorageLock::try_acquire(paths.root()).expect("lock");
+        let contention = atomic_write(path, MARKER.as_bytes(), WriteMode::Standard)
+            .expect_err("atomic lock contention");
+        assert_eq!(contention.kind(), StoreErrorKind::LottaLock);
+        drop(lock);
     }
 }
 

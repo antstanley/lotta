@@ -90,7 +90,15 @@ pub async fn respond(
     };
     let streaming = request.streaming;
     let cell = Arc::new(state::ResponseCell::new());
-    execution::spawn_owner(state, agent, request, previous, Arc::clone(&cell)).await;
+    if execution::spawn_owner(state, agent, request, previous, Arc::clone(&cell))
+        .await
+        .is_err()
+    {
+        return errors::response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            errors::server_error("Responses execution capacity unavailable"),
+        );
+    }
     render::render(cell, meta, streaming).await
 }
 
@@ -127,5 +135,4 @@ fn server_failure() -> Response {
 include!("responses_tests.rs");
 
 #[cfg(test)]
-#[path = "tests/responses_transport.rs"]
-mod transport;
+include!("tests/responses_transport.rs");

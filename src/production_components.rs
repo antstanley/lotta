@@ -3965,7 +3965,29 @@ impl TurnEffectPort for ProductionEffects {
                 .remove(&RuntimeKey::from(&self.scope));
         }
         let tool_end = match &event {
-            TurnEvent::ToolResult(result) => Some(result.call_id.as_str().to_owned()),
+            TurnEvent::ToolResult(result) => {
+                let (success, output) = match &result.outcome {
+                    ToolOutcome::Success { content } => (true, content.as_str()),
+                    ToolOutcome::UserDenied { message }
+                    | ToolOutcome::Interruption { message }
+                    | ToolOutcome::Timeout { message }
+                    | ToolOutcome::ValidationFailure { message }
+                    | ToolOutcome::SandboxDenied { message }
+                    | ToolOutcome::SpawnFailure { message }
+                    | ToolOutcome::ToolDefinedError { message, .. } => (false, message.as_str()),
+                };
+                self.sink
+                    .emit_tool_result(
+                        &self.scope,
+                        lotta_app_server::ws::ToolExecutionResult {
+                            tool_call_id: result.call_id.as_str().to_owned(),
+                            success,
+                            output: output.to_owned(),
+                        },
+                    )
+                    .map_err(|_| effect_error("internal tool result sink"))?;
+                Some(result.call_id.as_str().to_owned())
+            }
             _ => None,
         };
         let wire = self.wire_event(event)?;
@@ -6208,14 +6230,20 @@ mod production_tests {
     #[derive(Default)]
     struct OpenAiGatedProvider {
         calls: std::sync::atomic::AtomicU64,
+        requests: Mutex<Vec<ProviderRequest>>,
         first_delta: tokio::sync::Notify,
         release: tokio::sync::Notify,
     }
 
     impl ProviderPort for OpenAiGatedProvider {
-        fn stream(&self, _: ProviderRequest, events: ProviderEventSink) -> PortFuture<'_, ()> {
+        fn stream(
+            &self,
+            request: ProviderRequest,
+            events: ProviderEventSink,
+        ) -> PortFuture<'_, ()> {
             Box::pin(async move {
                 self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.requests.lock().unwrap().push(request);
                 events
                     .send(ProviderEvent::TextDelta {
                         text: lotta_runtime::boundary::ProviderEventText::new("one".into())?,
@@ -6359,6 +6387,26 @@ mod production_tests {
         String::from_utf8(bytes).unwrap()
     }
 
+    async fn responses_stream_request(
+        address: std::net::SocketAddr,
+        body: serde_json::Value,
+    ) -> tokio::net::TcpStream {
+        let body = body.to_string();
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            concat!(
+                "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\n",
+                "Connection: close\r\nContent-Type: application/json\r\n",
+                "Authorization: Bearer production-sync-token\r\n",
+                "Content-Length: {}\r\n\r\n{}"
+            ),
+            body.len(),
+            body
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream
+    }
+
     fn response_json(response: &str) -> serde_json::Value {
         let body = response.split_once("\r\n\r\n").unwrap().1;
         let start = body.find('{').unwrap();
@@ -6427,7 +6475,10 @@ mod production_tests {
         let first = completed_gated_response(
             handle.address(),
             &provider,
-            serde_json::json!({"model":model,"input":"remember green","store":true}),
+            serde_json::json!({
+                "model":model,"input":"remember green","store":true,
+                "instructions":"first instruction"
+            }),
             "",
         )
         .await;
@@ -6443,7 +6494,7 @@ mod production_tests {
             &provider,
             serde_json::json!({
                 "model":model,"input":"what color?","store":true,
-                "previous_response_id":first_id
+                "instructions":"second instruction","previous_response_id":first_id
             }),
             "",
         )
@@ -6452,6 +6503,62 @@ mod production_tests {
         let second_cursor =
             lotta_app_server::openai::cursor::parse(second_value["id"].as_str().unwrap()).unwrap();
         assert_ne!(first_cursor.conversation_id, second_cursor.conversation_id);
+        {
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let visible = |request: &ProviderRequest| {
+                request
+                    .messages
+                    .as_slice()
+                    .iter()
+                    .map(|message| {
+                        let text = message
+                            .content
+                            .as_slice()
+                            .iter()
+                            .filter_map(|part| match part {
+                                lotta_runtime::ports::ProviderContentPart::Text(value) => {
+                                    Some(value.as_str())
+                                }
+                                lotta_runtime::ports::ProviderContentPart::Image { .. } => None,
+                            })
+                            .collect::<String>();
+                        (message.role, text)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let first_messages = visible(&requests[0]);
+            assert!(first_messages.iter().any(|(role, text)| {
+                *role == lotta_runtime::ports::ProviderMessageRole::User
+                    && text.contains("first instruction")
+            }));
+            assert!(
+                first_messages.iter().any(|(role, text)| {
+                    *role == lotta_runtime::ports::ProviderMessageRole::User
+                        && text.contains("remember green")
+                }),
+                "{first_messages:?}"
+            );
+            let second_messages = visible(&requests[1]);
+            assert!(
+                second_messages
+                    .iter()
+                    .any(|(_, text)| text.contains("remember green"))
+            );
+            assert!(second_messages.iter().any(|(role, text)| {
+                *role == lotta_runtime::ports::ProviderMessageRole::Assistant
+                    && (text.contains("one") || text.contains("-two"))
+            }));
+            let current = second_messages
+                .iter()
+                .find(|(role, text)| {
+                    *role == lotta_runtime::ports::ProviderMessageRole::User
+                        && text.contains("what color?")
+                })
+                .unwrap();
+            assert!(current.1.contains("second instruction"));
+            assert!(!current.1.contains("first instruction"));
+        }
         let paths = lotta_store::StorePaths::new(root.clone()).unwrap();
         let fork: serde_json::Value = serde_json::from_slice(
             &std::fs::read(
@@ -6483,6 +6590,38 @@ mod production_tests {
         );
         assert!(!stream.contains("[DONE]"));
         assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        handle.shutdown();
+        handle.wait().await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn production_responses_streaming_is_live_before_gated_provider_release() {
+        let provider = Arc::new(OpenAiGatedProvider::default());
+        let (root, service, controller, ..) = production_controller_fixture(
+            "local-chat-o7-live-responses",
+            provider.clone() as Arc<dyn ProviderPort>,
+        )
+        .await;
+        let mut handle = start_production_listener(&root, Arc::clone(&service), controller).await;
+        let mut stream = responses_stream_request(
+            handle.address(),
+            serde_json::json!({
+                "model":"agent-local-chat-o7-live-responses",
+                "input":"stream now","stream":true
+            }),
+        )
+        .await;
+        let prefix = read_http_until(&mut stream, "response.output_text.delta").await;
+        assert!(prefix.contains("response.created"), "{prefix}");
+        assert!(prefix.contains("response.in_progress"), "{prefix}");
+        assert!(prefix.contains("\"delta\":\"one\""), "{prefix}");
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!prefix.contains("response.completed"));
+        provider.release.notify_one();
+        let complete = read_http_rest(stream, prefix).await;
+        assert!(complete.contains("response.completed"), "{complete}");
+        assert!(!complete.contains("[DONE]"));
         handle.shutdown();
         handle.wait().await.unwrap();
         let _ = std::fs::remove_dir_all(root);

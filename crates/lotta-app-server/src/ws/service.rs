@@ -82,6 +82,17 @@ pub struct DeviceStateOutcome {
     pub broadcasts: RuntimeEventBatch,
 }
 
+/// Internal canonical tool outcome projection. This never enters the public WebSocket protocol.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolExecutionResult {
+    /// Stable provider tool-call identifier.
+    pub tool_call_id: String,
+    /// Whether canonical execution succeeded.
+    pub success: bool,
+    /// Exact bounded, normalized, scrubbed model-facing result.
+    pub output: String,
+}
+
 /// Synchronous sink used by continuation work to stamp and fan out immediately.
 pub trait RuntimeEventSink: Send + Sync {
     /// Emits one event to current subscribers without awaiting router ownership.
@@ -93,6 +104,19 @@ pub trait RuntimeEventSink: Send + Sync {
         scope: &RuntimeScope,
         event: RuntimeEvent,
     ) -> Result<(), crate::error::AppServerError>;
+
+    /// Emits an internal tool result to interested projections without changing
+    /// WebSocket wire data.
+    ///
+    /// # Errors
+    /// Returns a projection-specific capacity or availability failure.
+    fn emit_tool_result(
+        &self,
+        _scope: &RuntimeScope,
+        _result: ToolExecutionResult,
+    ) -> Result<(), crate::error::AppServerError> {
+        Ok(())
+    }
 }
 
 /// Object-safe canonical turn submission port.
