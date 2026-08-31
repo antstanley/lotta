@@ -1,7 +1,7 @@
 //! `GET /v1/models` OpenAI list projection.
 
 use axum::Json;
-use lotta_domain::{Agent, Timestamp};
+use lotta_domain::Agent;
 use serde::Serialize;
 
 use crate::{errors::AppServerError, ws::agents::AgentsBridge};
@@ -73,8 +73,8 @@ fn created_at_seconds(agent: &Agent) -> i64 {
         .extras
         .get("created_at")
         .and_then(serde_json::Value::as_str)
-        .and_then(|value| Timestamp::parse_persisted_rfc3339(value).ok())
-        .map_or(0, |timestamp| timestamp.as_utc().timestamp())
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map_or(0, |timestamp| timestamp.timestamp())
 }
 
 #[cfg(test)]
@@ -137,6 +137,28 @@ mod tests {
             concat!(
                 r#"{"object":"list","data":[{"id":"created-model","object":"model","#,
                 r#""created":1786710896,"owned_by":"letta"}]}"#
+            )
+        );
+    }
+
+    #[test]
+    fn offset_created_at_has_exact_normalized_unix_seconds() {
+        assert_eq!(
+            encoded_created(Some(json!("2026-08-14T14:34:56+02:00"))),
+            concat!(
+                r#"{"object":"list","data":[{"id":"created-model","object":"model","#,
+                r#""created":1786710896,"owned_by":"letta"}]}"#
+            )
+        );
+    }
+
+    #[test]
+    fn fractional_pre_epoch_created_at_has_exact_negative_floor_seconds() {
+        assert_eq!(
+            encoded_created(Some(json!("1969-12-31T23:59:59.500Z"))),
+            concat!(
+                r#"{"object":"list","data":[{"id":"created-model","object":"model","#,
+                r#""created":-1,"owned_by":"letta"}]}"#
             )
         );
     }
