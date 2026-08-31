@@ -26,5 +26,7 @@ pub mod http_body;
 pub mod listener;
 /// Read-only Runtime broadcast dispatch observation.
 pub mod observer;
+/// OpenAI-compatible HTTP projection and model resolution.
+pub mod openai;
 /// Typed bounded Runtime WebSocket routing.
 pub mod ws;

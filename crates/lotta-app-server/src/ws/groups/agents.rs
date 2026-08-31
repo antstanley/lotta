@@ -59,8 +59,8 @@ use lotta_runtime::{
 use lotta_store::{
     AGENTS_MAX, LocalStore, SidePaths, StoreErrorKind, StorePaths,
     query::{
-        AgentFilters, ConversationFilters, Cursor, NameMatch, PageRequest, QUERY_PAGE_ITEMS_MAX,
-        TriState,
+        AgentFilters, ConversationFilters, Cursor, NameMatch, Page, PageRequest,
+        QUERY_PAGE_ITEMS_MAX, TriState,
     },
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -583,6 +583,21 @@ impl AgentsBridge {
             forward,
             clock,
         }
+    }
+
+    /// Reads one deterministic page of visible agents for HTTP projections.
+    pub(crate) async fn visible_page(
+        &self,
+        after: Option<Cursor>,
+    ) -> Result<Page<Agent>, AppServerError> {
+        let page = PageRequest {
+            limit: Some(QUERY_PAGE_ITEMS_MAX),
+            after,
+        };
+        self.store
+            .query_agents(AgentFilters::default(), page)
+            .await
+            .map_err(|_| AppServerError::Unavailable)
     }
 
     /// Routes one decoded command in a detached task, like the baseline.

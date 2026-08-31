@@ -145,6 +145,7 @@ fn router() -> axum::Router {
     let shutdown = tokio_util::sync::CancellationToken::new();
     let state = Arc::new(ListenerState {
         auth: AuthPolicy::None,
+        openai_api: false,
         listener_instance: "test-listener".to_owned(),
         clock: Arc::new(TestClock),
         shutdown: shutdown.clone(),

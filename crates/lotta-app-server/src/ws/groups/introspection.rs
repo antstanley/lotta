@@ -148,7 +148,7 @@ impl IntrospectionBridge {
         true
     }
 
-    fn response(&self, request_id: &str) -> AppServerInfoResponseMessage {
+    pub(crate) fn response(&self, request_id: &str) -> AppServerInfoResponseMessage {
         AppServerInfoResponseMessage {
             request_id: request_id.to_owned(),
             success: true,

@@ -291,6 +291,7 @@ fn typed_failure_state(
     let shutdown = tokio_util::sync::CancellationToken::new();
     super::ListenerState {
         auth: prepared.auth,
+        openai_api: false,
         listener_instance: "test-listener".to_owned(),
         clock: clock(),
         shutdown: shutdown.clone(),

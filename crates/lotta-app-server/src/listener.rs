@@ -8,13 +8,14 @@ use std::{
 };
 
 use axum::{
-    Router,
+    Json, Router,
     body::Body,
     extract::{
         State, WebSocketUpgrade,
         ws::{CloseFrame, Message, WebSocket, close_code, rejection::WebSocketUpgradeRejection},
     },
     http::{HeaderMap, Request},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -98,6 +99,7 @@ impl Default for SocketLimits {
 
 struct ListenerState {
     auth: crate::auth::AuthPolicy,
+    openai_api: bool,
     listener_instance: String,
     clock: Arc<dyn Clock + Send + Sync>,
     shutdown: CancellationToken,
@@ -667,6 +669,7 @@ fn compose_listener_state(
     shutdown: CancellationToken,
 ) -> Result<Arc<ListenerState>, AppServerError> {
     let shared = resolve_shared_bridges(shared, &prepared, clock)?;
+    let openai_api = prepared.openai_api;
     let conversations_authority = shared.conversations_authority();
     let mut device_ports = DevicePorts::from_shared(&shared);
     let SharedGroupBridges {
@@ -691,6 +694,7 @@ fn compose_listener_state(
     let turns = turn_supervisor::RuntimeTurnSupervisor::new(shutdown.clone());
     Ok(Arc::new(ListenerState {
         auth: prepared.auth,
+        openai_api,
         listener_instance: listener_instance(clock),
         clock: Arc::clone(clock),
         shutdown,
@@ -854,6 +858,7 @@ fn builtin_runner(
 }
 
 fn build_router(path: &str, state: Arc<ListenerState>) -> Router {
+    let protected = protected_http_router(&state);
     let router = Router::new()
         .route("/", get(upgrade).fallback(method_not_allowed))
         .route(
@@ -863,7 +868,8 @@ fn build_router(path: &str, state: Arc<ListenerState>) -> Router {
         .route(
             "/readyz",
             get(|| async { "ok\n" }).fallback(method_not_allowed),
-        );
+        )
+        .merge(protected);
     let router = if path == "/" {
         router
     } else {
@@ -880,17 +886,64 @@ fn build_router(path: &str, state: Arc<ListenerState>) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(HTTP_BODY_BYTES_MAX))
 }
 
+fn protected_http_router(state: &Arc<ListenerState>) -> Router<Arc<ListenerState>> {
+    let router = Router::new().route(
+        "/app-server-info",
+        get(app_server_info).fallback(method_not_allowed),
+    );
+    let router = if state.openai_api {
+        router.route(
+            "/v1/models",
+            get(openai_models).fallback(method_not_allowed),
+        )
+    } else {
+        router
+    };
+    router.layer(middleware::from_fn_with_state(
+        Arc::clone(state),
+        authorize_http,
+    ))
+}
+
+async fn authorize_http(
+    State(state): State<Arc<ListenerState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    match authorize_listener_headers(&state, request.headers()) {
+        Ok(()) => next.run(request).await,
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn app_server_info(
+    State(state): State<Arc<ListenerState>>,
+) -> Json<crate::ws::introspection::AppServerInfoResponseMessage> {
+    Json(state.introspection.response("http-info"))
+}
+
+async fn openai_models(State(state): State<Arc<ListenerState>>) -> Response {
+    match crate::openai::models::list(&state.agents).await {
+        Ok(response) => response.into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+fn authorize_listener_headers(
+    state: &ListenerState,
+    headers: &HeaderMap,
+) -> Result<(), AppServerError> {
+    state.auth.authorize(headers, state.clock.as_ref())?;
+    origin::enforce(headers, &state.auth)?;
+    Ok(())
+}
+
 async fn upgrade(
     State(state): State<Arc<ListenerState>>,
     headers: HeaderMap,
     websocket: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
-    if let Err(error) = state.auth.authorize(&headers, state.clock.as_ref()) {
-        tracing::warn!(code = error.code(), "websocket authentication denied");
-        return error.into_response();
-    }
-    if let Err(error) = origin::enforce(&headers, &state.auth) {
-        tracing::warn!(code = error.code(), "websocket origin denied");
+    if let Err(error) = authorize_listener_headers(&state, &headers) {
         return error.into_response();
     }
     let Ok(websocket) = websocket else {
