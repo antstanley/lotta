@@ -4,8 +4,14 @@
 //! cap is applied. This keeps advertised names collision-free even when the
 //! colliding agent sorts beyond the returned page.
 
+/// OpenAI Chat Completions route and runtime adapter.
+pub mod chat;
+/// Bounded header-keyed conversation cache.
+pub mod chat_keys;
 /// Stable OpenAI error envelopes.
 pub mod errors;
+/// Bounded in-flight and settled idempotency outcomes.
+pub mod idempotency;
 /// OpenAI model listing wire types and handler operation.
 pub mod models;
 /// Shared advertised-model resolver for OpenAI routes.
@@ -14,6 +20,9 @@ pub mod resolve;
 #[cfg(test)]
 #[path = "tests/auth_is_shared.rs"]
 mod auth_is_shared;
+#[cfg(test)]
+#[path = "tests/chat_transport.rs"]
+mod chat_transport;
 #[cfg(test)]
 #[path = "tests/listing_cap.rs"]
 mod listing_cap;

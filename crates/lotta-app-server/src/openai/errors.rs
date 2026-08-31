@@ -1,23 +1,28 @@
 //! Stable OpenAI-compatible error envelopes.
 
+use axum::{
+    Json,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use serde::Serialize;
 
 const INVALID_REQUEST_ERROR: &str = "invalid_request_error";
 const MODEL_NOT_FOUND: &str = "model_not_found";
 
 /// Stable `OpenAI` error envelope shared by model-taking handlers.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ErrorEnvelope {
     error: ErrorBody,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct ErrorBody {
     message: String,
     #[serde(rename = "type")]
     error_type: &'static str,
     param: Option<String>,
-    code: &'static str,
+    code: Option<&'static str>,
 }
 
 /// Builds the pinned pure missing-model contract without altering the model value.
@@ -30,9 +35,41 @@ pub fn model_not_found(model: &str) -> ErrorEnvelope {
             message,
             error_type: INVALID_REQUEST_ERROR,
             param: None,
-            code: MODEL_NOT_FOUND,
+            code: Some(MODEL_NOT_FOUND),
         },
     }
+}
+
+/// Builds the pinned invalid-request envelope.
+#[must_use]
+pub fn invalid_request(message: impl Into<String>) -> ErrorEnvelope {
+    ErrorEnvelope {
+        error: ErrorBody {
+            message: message.into(),
+            error_type: INVALID_REQUEST_ERROR,
+            param: None,
+            code: None,
+        },
+    }
+}
+
+/// Builds a scrubbed server-error envelope.
+#[must_use]
+pub fn server_error(message: impl Into<String>) -> ErrorEnvelope {
+    ErrorEnvelope {
+        error: ErrorBody {
+            message: message.into(),
+            error_type: "server_error",
+            param: None,
+            code: None,
+        },
+    }
+}
+
+/// Converts an `OpenAI` envelope to exact JSON content type and status.
+#[must_use]
+pub fn response(status: StatusCode, error: ErrorEnvelope) -> Response {
+    (status, Json(error)).into_response()
 }
 
 #[cfg(test)]

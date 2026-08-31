@@ -105,6 +105,12 @@ fn state(
         auth: AuthPolicy::None,
         openai_api: false,
         listener_instance: "test-listener".to_owned(),
+        openai_chat: super::test_openai_chat(
+            &group.agents,
+            &group.conversations,
+            Arc::clone(&clock),
+            shutdown.clone(),
+        ),
         clock,
         shutdown: shutdown.clone(),
         limits: SocketLimits::default(),

@@ -293,6 +293,12 @@ fn typed_failure_state(
         auth: prepared.auth,
         openai_api: false,
         listener_instance: "test-listener".to_owned(),
+        openai_chat: super::test_openai_chat(
+            &storage.agents,
+            &storage.conversations,
+            clock(),
+            shutdown.clone(),
+        ),
         clock: clock(),
         shutdown: shutdown.clone(),
         limits: super::SocketLimits::default(),

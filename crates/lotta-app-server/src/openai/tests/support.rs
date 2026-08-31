@@ -121,6 +121,47 @@ pub(super) async fn get(handle: &ListenerHandle, target: &str, headers: &str) ->
         .unwrap_or_else(|error| panic!("request task: {error}"))
 }
 
+pub(super) async fn post(
+    handle: &ListenerHandle,
+    target: &str,
+    headers: &str,
+    body: &str,
+) -> HttpResponse {
+    let address = handle.address();
+    let target = target.to_owned();
+    let headers = headers.to_owned();
+    let body = body.to_owned();
+    tokio::task::spawn_blocking(move || post_request(address, &target, &headers, &body))
+        .await
+        .unwrap_or_else(|error| panic!("request task: {error}"))
+}
+
+fn post_request(
+    address: std::net::SocketAddr,
+    target: &str,
+    headers: &str,
+    body: &str,
+) -> HttpResponse {
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
+        .unwrap_or_else(|error| panic!("connect: {error}"));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap_or_else(|error| panic!("read timeout: {error}"));
+    let request = format!(
+        "POST {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n{headers}\r\n{body}",
+        body.len(),
+    );
+    stream
+        .write_all(request.as_bytes())
+        .unwrap_or_else(|error| panic!("write request: {error}"));
+    let mut bytes = Vec::new();
+    stream
+        .read_to_end(&mut bytes)
+        .unwrap_or_else(|error| panic!("read response: {error}"));
+    parse_response(&bytes)
+}
+
 fn request(address: std::net::SocketAddr, target: &str, headers: &str) -> HttpResponse {
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
         .unwrap_or_else(|error| panic!("connect: {error}"));

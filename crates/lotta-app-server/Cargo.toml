@@ -11,6 +11,7 @@ base64.workspace = true
 chrono.workspace = true
 hmac.workspace = true
 getrandom = "0.3.4"
+futures-util.workspace = true
 lotta-domain = { version = "0.1.0", path = "../lotta-domain" }
 lotta-extensions = { version = "0.1.0", path = "../lotta-extensions" }
 lotta-memfs = { version = "0.1.0", path = "../lotta-memfs" }
@@ -35,7 +36,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true
-futures-util.workspace = true
 lotta-testkit = { version = "0.1.0", path = "../lotta-testkit" }
 tokio-tungstenite.workspace = true
 tower.workspace = true

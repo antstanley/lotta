@@ -147,6 +147,12 @@ fn router() -> axum::Router {
         auth: AuthPolicy::None,
         openai_api: false,
         listener_instance: "test-listener".to_owned(),
+        openai_chat: super::test_openai_chat(
+            &storage.agents,
+            &storage.conversations,
+            Arc::new(TestClock),
+            shutdown.clone(),
+        ),
         clock: Arc::new(TestClock),
         shutdown: shutdown.clone(),
         limits: SocketLimits::default(),

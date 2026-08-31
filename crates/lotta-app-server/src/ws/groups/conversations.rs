@@ -775,6 +775,38 @@ impl ConversationsBridge {
         }
     }
 
+    /// Creates one conversation through the canonical repository and prompt compiler.
+    ///
+    /// # Errors
+    /// Returns a scrubbed boundary failure if creation or compilation fails.
+    pub async fn create_for_openai(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<ConversationId, AppServerError> {
+        let body = ConversationCreateBody {
+            agent_id: Some(agent_id.as_str().to_owned()),
+            ..ConversationCreateBody::default()
+        };
+        self.create_core(&body)
+            .await
+            .map(|conversation| conversation.id)
+            .map_err(|_| AppServerError::Unavailable)
+    }
+
+    /// Deletes an ephemeral conversation through the canonical repository.
+    ///
+    /// # Errors
+    /// Returns a scrubbed boundary failure when the durable record cannot be removed.
+    pub async fn delete_for_openai(
+        &self,
+        agent_id: &AgentId,
+        conversation_id: &ConversationId,
+    ) -> Result<(), AppServerError> {
+        ConversationStore::delete(&self.store, agent_id, conversation_id)
+            .await
+            .map_err(|_| AppServerError::Unavailable)
+    }
+
     /// Routes one decoded command in a detached task, like the baseline.
     pub fn handle(self: &Arc<Self>, connection: ConnectionId, command: &ConversationsCommand) {
         let this = Arc::clone(self);
