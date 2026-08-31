@@ -129,16 +129,42 @@ mod idempotency {
     }
 
     #[tokio::test]
-    async fn evicts_failed_outcome_for_retry() {
-        let cache = OutcomeCache::new();
-        let OutcomeClaim::Owner(owner) = cache.claim(outcome_key("retry")).await else {
+    async fn failed_eviction_precedes_waiter_wakeup_and_retry_claim() {
+        let cache = Arc::new(OutcomeCache::new());
+        let key = outcome_key("retry");
+        let OutcomeClaim::Owner(owner) = cache.claim(key.clone()).await else {
             panic!("owner claim");
         };
-        cache.evict_failed(&outcome_key("retry"), &owner).await;
-        assert!(matches!(
-            cache.claim(outcome_key("retry")).await,
-            OutcomeClaim::Owner(_)
-        ));
+        let OutcomeClaim::Existing(waiter) = cache.claim(key.clone()).await else {
+            panic!("waiter claim");
+        };
+        let removed = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        cache.set_failed_eviction_barrier(Some((
+            Arc::clone(&removed),
+            Arc::clone(&release),
+        )));
+        let observed_removal = removed.notified();
+        let eviction_cache = Arc::clone(&cache);
+        let eviction_key = key.clone();
+        let eviction_owner = Arc::clone(&owner);
+        let eviction = tokio::spawn(async move {
+            eviction_cache
+                .evict_failed_and_settle(&eviction_key, &eviction_owner, failed_outcome())
+                .await;
+        });
+        observed_removal.await;
+
+        let OutcomeClaim::Owner(retry) = cache.claim(key).await else {
+            panic!("retry must become owner while old failure remains unpublished");
+        };
+        assert!(!Arc::ptr_eq(&owner, &retry));
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), waiter.wait())
+            .await
+            .is_err());
+        release.notify_one();
+        eviction.await.unwrap();
+        assert!(waiter.wait().await.error.is_some());
     }
 
     #[test]

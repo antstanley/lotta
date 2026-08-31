@@ -985,3 +985,52 @@ async fn production_strict_path_command_is_not_catalog_authorized() {
         .expect("permission decision");
     assert!(!actual.authorized);
 }
+
+fn transcript_message(content: serde_json::Value) -> LocalMessage {
+    LocalMessage {
+        id: MessageId::accept("history-message").expect("message id"),
+        role: LocalMessageRole::Assistant,
+        content: Some(BoundedJsonValue::new(content).expect("bounded content")),
+        timestamp: 0.0,
+        metadata: None,
+        extras: Default::default(),
+    }
+}
+
+#[test]
+fn production_history_maps_canonical_projection_content_and_skips_stop_records() {
+    for (content, expected) in [
+        (
+            serde_json::json!([{"type":"text","text":"visible"}]),
+            "visible",
+        ),
+        (
+            serde_json::json!([{"type":"thinking","thinking":"thought"}]),
+            "thought",
+        ),
+        (
+            serde_json::json!([{"type":"redacted_thinking","data":"<redacted-reasoning>"}]),
+            "<redacted-reasoning>",
+        ),
+    ] {
+        let mapped = local_provider_message(&transcript_message(content))
+            .expect("canonical projection")
+            .expect("provider-visible projection");
+        let [lotta_runtime::ports::ProviderContentPart::Text(text)] = mapped.content.as_slice()
+        else {
+            panic!("canonical projection must remain one text part");
+        };
+        assert_eq!(text.as_str(), expected);
+    }
+
+    let stop = transcript_message(serde_json::json!({
+        "type": "turn_stop",
+        "record": {"reason": "end_turn"}
+    }));
+    assert!(
+        local_provider_message(&stop)
+            .expect("stop metadata")
+            .is_none(),
+        "turn lifecycle metadata is not provider conversation history"
+    );
+}

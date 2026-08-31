@@ -732,6 +732,16 @@ pub struct ConversationsBridge {
     authority: Option<Arc<dyn ConversationAuthority>>,
 }
 
+#[cfg(test)]
+static OPENAI_CREATE_PANIC_AGENT: Mutex<Option<String>> = Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn panic_next_openai_create_for_agent(agent_id: &str) {
+    *OPENAI_CREATE_PANIC_AGENT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(agent_id.to_owned());
+}
+
 impl ConversationsBridge {
     /// Creates the production bridge over one canonical local storage root.
     ///
@@ -779,10 +789,28 @@ impl ConversationsBridge {
     ///
     /// # Errors
     /// Returns a scrubbed boundary failure if creation or compilation fails.
+    ///
+    /// # Panics
+    /// Test builds may inject a repository panic for allocation-owner recovery coverage.
     pub async fn create_for_openai(
         &self,
         agent_id: &AgentId,
     ) -> Result<ConversationId, AppServerError> {
+        #[cfg(test)]
+        {
+            let should_panic = OPENAI_CREATE_PANIC_AGENT
+                .lock()
+                .ok()
+                .and_then(|mut target| {
+                    (target.as_deref() == Some(agent_id.as_str())).then(|| target.take())
+                })
+                .flatten()
+                .is_some();
+            assert!(
+                !should_panic,
+                "injected canonical conversation repository panic"
+            );
+        }
         let body = ConversationCreateBody {
             agent_id: Some(agent_id.as_str().to_owned()),
             ..ConversationCreateBody::default()

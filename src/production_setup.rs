@@ -627,10 +627,13 @@ async fn build_provider_request(
     if let Some(input_id) = parts.input_id.as_deref() {
         history.retain(|message| message.id.as_str() != input_id);
     }
-    let mut messages = history
+    let mut messages: Vec<ProviderMessage> = history
         .iter()
         .map(local_provider_message)
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
     messages.push(provider_text_message(
         ProviderMessageRole::User,
         &parts.input,
@@ -1501,28 +1504,58 @@ fn provider_text_message(
     })
 }
 
-fn local_provider_message(message: &LocalMessage) -> Result<ProviderMessage, SetupError> {
+fn local_provider_message(message: &LocalMessage) -> Result<Option<ProviderMessage>, SetupError> {
     let role = match message.role {
         LocalMessageRole::User => ProviderMessageRole::User,
         LocalMessageRole::Assistant => ProviderMessageRole::Assistant,
         LocalMessageRole::ToolResult => ProviderMessageRole::Tool,
     };
-    let content = message
-        .content
-        .as_ref()
-        .map(BoundedJsonValue::as_value)
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .or_else(|| {
-            message
-                .content
-                .as_ref()
-                .map(BoundedJsonValue::as_value)
-                .and_then(|value| value.get("text"))
+    let Some(value) = message.content.as_ref().map(BoundedJsonValue::as_value) else {
+        return Err(SetupError::Adapter(
+            "unsupported transcript message content".into(),
+        ));
+    };
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("turn_stop") {
+        return Ok(None);
+    }
+    let content = if let Some(text) = value.as_str() {
+        text.to_owned()
+    } else if let Some(text) = value.get("text").and_then(serde_json::Value::as_str) {
+        text.to_owned()
+    } else if let Some(parts) = value.as_array() {
+        let mut content = String::new();
+        for part in parts {
+            let kind = part
+                .get("type")
                 .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
-        .ok_or_else(|| SetupError::Adapter("unsupported transcript message content".into()))?;
-    provider_text_message(role, &content)
+                .ok_or_else(|| {
+                    SetupError::Adapter("unsupported transcript message content".into())
+                })?;
+            let field = match kind {
+                "text" => "text",
+                "thinking" => "thinking",
+                "redacted_thinking" => "data",
+                _ => {
+                    return Err(SetupError::Adapter(
+                        "unsupported transcript message content".into(),
+                    ));
+                }
+            };
+            content.push_str(
+                part.get(field)
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        SetupError::Adapter("unsupported transcript message content".into())
+                    })?,
+            );
+        }
+        content
+    } else {
+        return Err(SetupError::Adapter(
+            "unsupported transcript message content".into(),
+        ));
+    };
+    provider_text_message(role, &content).map(Some)
 }
 
 fn provider_tool(

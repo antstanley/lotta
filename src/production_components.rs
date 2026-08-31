@@ -3,6 +3,8 @@
 use crate::production_setup::{
     ProductionSetupConfig, ProductionSetupPorts, ProductionTurnBrokers, ProductionTurnController,
 };
+#[cfg(test)]
+use futures_util::FutureExt as _;
 use lotta_app_server::config::PreparedServer;
 use lotta_app_server::error::AppServerError;
 use lotta_app_server::ws::command::{
@@ -3022,6 +3024,75 @@ impl RuntimeCommandService for ProductionRuntimeService {
         })
     }
 
+    fn teardown_ephemeral_runtime(&self, scope: RuntimeScope) -> ServiceFuture<'_, ()> {
+        Box::pin(async move {
+            let key = RuntimeKey::from(&scope);
+            if self
+                .state
+                .active
+                .lock()
+                .map_err(|_| AppServerError::Internal)?
+                .contains_key(&key)
+            {
+                return Err(AppServerError::Unavailable);
+            }
+            if self
+                .state
+                .executing_tools
+                .lock()
+                .map_err(|_| AppServerError::Internal)?
+                .get(&key)
+                .is_some_and(|tools| !tools.is_empty())
+            {
+                return Err(AppServerError::Unavailable);
+            }
+            if self
+                .approvals
+                .residency_count(&scope)
+                .map_err(runtime_service_error)?
+                != 0
+            {
+                return Err(AppServerError::Unavailable);
+            }
+
+            let auxiliary = self
+                .state
+                .residency_evidence
+                .lock()
+                .map_err(|_| AppServerError::Internal)?
+                .get(&key)
+                .copied()
+                .unwrap_or_default();
+            if auxiliary.interrupted_result_present || auxiliary.sandbox_subscriptions != 0 {
+                return Err(AppServerError::Unavailable);
+            }
+
+            // The canonical registry now proves the remaining lifecycle and
+            // queue terms are quiescent while removing this exact generation.
+            let mut state = self.state.inner.lock().await;
+            if state.pending.keys().any(|(candidate, _)| candidate == &key) {
+                return Err(AppServerError::Unavailable);
+            }
+            let Some(handle) = state.registry.lookup(&key) else {
+                return Ok(());
+            };
+            let update = state
+                .registry
+                .set_residency(&handle, lotta_runtime::RuntimeResidency::new(0, false, 0))
+                .map_err(runtime_service_error)?;
+            if update != lotta_runtime::ResidencyUpdate::Evicted || state.registry.contains(&key) {
+                return Err(AppServerError::Unavailable);
+            }
+            drop(state);
+            self.state
+                .residency_evidence
+                .lock()
+                .map_err(|_| AppServerError::Internal)?
+                .remove(&key);
+            Ok(())
+        })
+    }
+
     fn approval_recovery_surfaced(&self, scope: RuntimeScope) -> ServiceFuture<'_, ()> {
         Box::pin(async move {
             self.state.set_interrupted_result(&scope, false)?;
@@ -3207,7 +3278,17 @@ impl ProviderPort for ProductionProviderPort {
     fn stream(&self, request: ProviderRequest, events: ProviderEventSink) -> PortFuture<'_, ()> {
         #[cfg(test)]
         if let Some(port) = self.test_port.as_ref() {
-            return port.stream(request, events);
+            return Box::pin(async move {
+                std::panic::AssertUnwindSafe(port.stream(request, events))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(lotta_runtime::RuntimeError::AdapterFailure {
+                            code: "provider_port_panic",
+                            context: "production provider port panicked".into(),
+                        })
+                    })
+            });
         }
         Box::pin(async move {
             let connection_id = self
@@ -4055,6 +4136,7 @@ mod production_tests {
     };
     use lotta_app_server::ws::service::{RuntimeCommandService, RuntimeEventSink, TurnController};
     use lotta_domain::{ConversationId, DomainError, RunId, Timestamp};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     struct TestClock;
     impl Clock for TestClock {
@@ -4109,14 +4191,14 @@ mod production_tests {
                 _ => false,
             })
     }
-    fn unique_test_id() -> u128 {
+    fn unique_test_id() -> String {
         static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        (timestamp << 64) | u128::from(sequence)
+        format!("{}-{timestamp}-{sequence}", std::process::id())
     }
     fn assert_exact_toolsets(config: &crate::production_setup::ProductionSetupConfig) {
         for toolset in ToolsetId::ALL {
@@ -4358,6 +4440,7 @@ mod production_tests {
     struct HeldProvider {
         waiting: tokio::sync::Semaphore,
         release: tokio::sync::Notify,
+        released: std::sync::atomic::AtomicBool,
         calls: std::sync::atomic::AtomicU64,
     }
 
@@ -4366,6 +4449,7 @@ mod production_tests {
             Self {
                 waiting: tokio::sync::Semaphore::new(0),
                 release: tokio::sync::Notify::new(),
+                released: std::sync::atomic::AtomicBool::new(false),
                 calls: std::sync::atomic::AtomicU64::new(0),
             }
         }
@@ -4373,7 +4457,9 @@ mod production_tests {
 
     impl HeldProvider {
         fn release(&self) {
-            self.release.notify_waiters();
+            self.released
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.release.notify_one();
         }
     }
 
@@ -4400,13 +4486,15 @@ mod production_tests {
                         .await;
                 }
                 self.waiting.add_permits(1);
-                tokio::select! {
-                    () = request.cancellation.cancelled() => {
-                        return Err(lotta_runtime::RuntimeError::Cancelled {
-                            context: "production held provider".into(),
-                        });
-                    },
-                    () = self.release.notified() => {},
+                if !self.released.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::select! {
+                        () = request.cancellation.cancelled() => {
+                            return Err(lotta_runtime::RuntimeError::Cancelled {
+                                context: "production held provider".into(),
+                            });
+                        },
+                        () = self.release.notified() => {},
+                    }
                 }
                 events
                     .send(ProviderEvent::Stop {
@@ -4748,6 +4836,7 @@ mod production_tests {
         provider_port: Arc<dyn ProviderPort>,
     ) -> ProductionControllerFixture {
         let root = std::env::temp_dir().join(format!("lotta-cancel-{label}-{}", unique_test_id()));
+        std::fs::create_dir(&root).expect("create isolated controller root");
         ["workspace", "artifacts", ".letta/skills", "bundled-skills"]
             .iter()
             .for_each(|directory| std::fs::create_dir_all(root.join(directory)).unwrap());
@@ -5259,11 +5348,21 @@ mod production_tests {
         assert_eq!(cancelled, 1);
         assert_eq!(observer.releases.load(Ordering::SeqCst), 1);
         assert_eq!(observer.pumps.load(Ordering::SeqCst), 1);
-        assert_eq!(generic_finished, 0);
+        assert_eq!(
+            generic_finished, 1,
+            "the pumped successor completes normally"
+        );
         assert_eq!(idle, 1, "only the pumped successor may complete idle");
         assert_eq!(
             observer.order.lock().unwrap().as_slice(),
-            &["claim", "persist", "cancelled", "release", "pump"]
+            &[
+                "claim",
+                "persist",
+                "cancelled",
+                "release",
+                "pump",
+                "persist"
+            ]
         );
     }
 
@@ -5374,10 +5473,22 @@ mod production_tests {
             assert_eq!(queued.disposition, InputDisposition::Queued);
 
             race_abort_paths(&service, &scope, connection_cancellation).await;
-            let settled = tokio::time::timeout(std::time::Duration::from_secs(5), turn)
+            tokio::time::timeout(std::time::Duration::from_secs(5), held.waiting.acquire())
                 .await
-                .expect("turn settles")
-                .unwrap();
+                .expect("pumped successor reaches provider")
+                .expect("provider wait semaphore")
+                .forget();
+            assert_eq!(held.calls.load(Ordering::SeqCst), 2);
+            held.release();
+            let settled = match tokio::time::timeout(std::time::Duration::from_secs(5), turn).await
+            {
+                Ok(settled) => settled.unwrap(),
+                Err(error) => panic!(
+                    "turn settles: {error:?}; repetition={repetition}; calls={}; order={:?}",
+                    held.calls.load(Ordering::SeqCst),
+                    observer.order.lock().unwrap()
+                ),
+            };
             assert!(settled.is_ok() || matches!(settled, Err(AppServerError::Internal)));
 
             assert_abort_terminal(&service, &scope, &sink, &observer).await;
@@ -6035,6 +6146,7 @@ mod production_tests {
         std::fs::write(&token, "production-sync-token\n").unwrap();
         let prepared = lotta_app_server::config::ServerArgs {
             listen_enabled: true,
+            openai_api: true,
             ws_auth: Some("capability-token".into()),
             ws_token_file: Some(token),
             storage_dir: Some(root.to_path_buf()),
@@ -6055,6 +6167,312 @@ mod production_tests {
             prepared, Arc::new(TestClock), runtime, controller,
             Arc::new(lotta_app_server::observer::InertRuntimeBroadcastObserver), shared,
         ).await.unwrap()
+    }
+
+    struct OpenAiFailingProvider {
+        panic: bool,
+        calls: std::sync::atomic::AtomicU64,
+    }
+
+    impl ProviderPort for OpenAiFailingProvider {
+        fn stream(&self, _: ProviderRequest, _: ProviderEventSink) -> PortFuture<'_, ()> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert!(!self.panic, "injected production provider panic");
+                Err(lotta_runtime::RuntimeError::AdapterFailure {
+                    code: "injected_openai_provider_failure",
+                    context: "production OpenAI teardown test".into(),
+                })
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct OpenAiGatedProvider {
+        calls: std::sync::atomic::AtomicU64,
+        first_delta: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl ProviderPort for OpenAiGatedProvider {
+        fn stream(&self, _: ProviderRequest, events: ProviderEventSink) -> PortFuture<'_, ()> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                events
+                    .send(ProviderEvent::TextDelta {
+                        text: lotta_runtime::boundary::ProviderEventText::new("one".into())?,
+                    })
+                    .await?;
+                self.first_delta.notify_waiters();
+                self.release.notified().await;
+                events
+                    .send(ProviderEvent::TextDelta {
+                        text: lotta_runtime::boundary::ProviderEventText::new("-two".into())?,
+                    })
+                    .await?;
+                events
+                    .send(ProviderEvent::Usage {
+                        usage: lotta_runtime::ports::ProviderUsage {
+                            input_tokens: 7,
+                            output_tokens: 2,
+                            cached_input_tokens: 0,
+                            reasoning_tokens: 0,
+                        },
+                    })
+                    .await?;
+                events
+                    .send(ProviderEvent::Stop {
+                        reason: lotta_runtime::ports::StopReason::EndTurn,
+                    })
+                    .await
+            })
+        }
+    }
+
+    async fn openai_stream(
+        address: std::net::SocketAddr,
+        idempotency_header: &str,
+    ) -> tokio::net::TcpStream {
+        let body = serde_json::json!({
+            "model": "agent-local-chat-o7",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        })
+        .to_string();
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            concat!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n",
+                "Connection: close\r\nContent-Type: application/json\r\n",
+                "Authorization: Bearer production-sync-token\r\n",
+                "{}: production-o7-key\r\n",
+                "Content-Length: {}\r\n\r\n{}"
+            ),
+            idempotency_header,
+            body.len(),
+            body
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream
+    }
+
+    async fn read_http_until(stream: &mut tokio::net::TcpStream, needle: &str) -> String {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !String::from_utf8_lossy(&bytes).contains(needle) {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert_ne!(
+                    read,
+                    0,
+                    "HTTP stream ended before {needle}: {}",
+                    String::from_utf8_lossy(&bytes)
+                );
+                bytes.extend_from_slice(&buffer[..read]);
+            }
+        })
+        .await
+        .unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    async fn read_http_rest(mut stream: tokio::net::TcpStream, mut prefix: String) -> String {
+        let mut bytes = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read_to_end(&mut bytes),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        prefix.push_str(&String::from_utf8(bytes).unwrap());
+        prefix
+    }
+
+    async fn openai_json_request(
+        address: std::net::SocketAddr,
+        idempotency_header: &str,
+    ) -> String {
+        let body = serde_json::json!({
+            "model": "agent-local-chat-o7",
+            "messages": [{"role": "user", "content": "hi"}]
+        })
+        .to_string();
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            concat!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n",
+                "Connection: close\r\nContent-Type: application/json\r\n",
+                "Authorization: Bearer production-sync-token\r\n",
+                "{}: production-o7-key\r\n",
+                "Content-Length: {}\r\n\r\n{}"
+            ),
+            idempotency_header,
+            body.len(),
+            body
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await.unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    fn response_json(response: &str) -> serde_json::Value {
+        let body = response.split_once("\r\n\r\n").unwrap().1;
+        let start = body.find('{').unwrap();
+        let end = body.rfind('}').unwrap();
+        serde_json::from_str(&body[start..=end]).unwrap()
+    }
+
+    fn sse_values(response: &str) -> Vec<serde_json::Value> {
+        response
+            .lines()
+            .filter_map(|line| line.trim_end_matches('\r').strip_prefix("data: "))
+            .filter(|value| *value != "[DONE]")
+            .map(|value| serde_json::from_str(value).unwrap())
+            .collect()
+    }
+
+    fn assert_o7_sse(response: &str) -> (String, i64, serde_json::Value) {
+        assert!(response.contains("data: [DONE]"));
+        let values = sse_values(response);
+        let chunks = values
+            .iter()
+            .filter_map(|value| value["choices"][0]["delta"]["content"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(chunks, ["", "one", "-two"]);
+        let terminal = values.last().unwrap();
+        assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
+        (
+            terminal["id"].as_str().unwrap().to_owned(),
+            terminal["created"].as_i64().unwrap(),
+            terminal["usage"].clone(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn production_openai_o7_real_tcp_single_allocation_admission_turn_and_replay() {
+        let provider = Arc::new(OpenAiGatedProvider::default());
+        let (root, service, controller, ..) = production_controller_fixture(
+            "local-chat-o7",
+            provider.clone() as Arc<dyn ProviderPort>,
+        )
+        .await;
+        let mut handle = start_production_listener(&root, Arc::clone(&service), controller).await;
+        let address = handle.address();
+
+        let provider_delta = provider.first_delta.notified();
+        let mut live = openai_stream(address, "Idempotency-Key").await;
+        let live_prefix = read_http_until(&mut live, "\"content\":\"one\"").await;
+        provider_delta.await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let json = tokio::spawn(openai_json_request(address, "X-Idempotency-Key"));
+        let mut late = openai_stream(address, "Idempotency-Key").await;
+        let late_prefix = read_http_until(&mut late, "\"content\":\"one\"").await;
+
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let active_handle = {
+            let active = service.state.active.lock().unwrap();
+            assert_eq!(
+                active.len(),
+                1,
+                "one canonical provider turn must be active"
+            );
+            active.values().next().unwrap().handle.clone()
+        };
+        let state = service.state.inner.lock().await;
+        assert_eq!(state.registry.len(), 1);
+        assert_eq!(
+            state
+                .registry
+                .current_admission_history(&active_handle)
+                .unwrap()
+                .admission_count(),
+            1,
+            "one canonical input admission"
+        );
+        drop(state);
+        assert_eq!(
+            std::fs::read_dir(root.join("conversations"))
+                .unwrap()
+                .count(),
+            2,
+            "one seeded persistent plus exactly one allocated ephemeral conversation"
+        );
+
+        provider.release.notify_waiters();
+        let live_response = read_http_rest(live, live_prefix).await;
+        let late_response = read_http_rest(late, late_prefix).await;
+        let json_response = json.await.unwrap();
+        let json_value = response_json(&json_response);
+        assert_eq!(json_value["choices"][0]["message"]["content"], "one-two");
+        let live_identity = assert_o7_sse(&live_response);
+        let late_identity = assert_o7_sse(&late_response);
+        assert_eq!(live_identity, late_identity);
+        assert_eq!(json_value["id"], live_identity.0);
+        assert_eq!(json_value["created"], live_identity.1);
+        assert_eq!(json_value["usage"], live_identity.2);
+
+        let replay_json = openai_json_request(address, "Idempotency-Key").await;
+        let replay_json = response_json(&replay_json);
+        let replay_stream = openai_stream(address, "X-Idempotency-Key").await;
+        let replay_sse = read_http_rest(replay_stream, String::new()).await;
+        let replay_identity = assert_o7_sse(&replay_sse);
+        assert_eq!(replay_identity, live_identity);
+        assert_eq!(replay_json["id"], json_value["id"]);
+        assert_eq!(replay_json["created"], json_value["created"]);
+        assert_eq!(replay_json["usage"], json_value["usage"]);
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(service.state.active.lock().unwrap().is_empty());
+        assert!(service.state.inner.lock().await.registry.is_empty());
+        assert_eq!(
+            std::fs::read_dir(root.join("conversations"))
+                .unwrap()
+                .count(),
+            1,
+            "ephemeral artifacts must be absent after canonical teardown"
+        );
+
+        handle.shutdown();
+        handle.wait().await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn production_openai_ephemeral_teardown_after_provider_error_and_panic() {
+        for panic in [false, true] {
+            let provider = Arc::new(OpenAiFailingProvider {
+                panic,
+                calls: std::sync::atomic::AtomicU64::new(0),
+            });
+            let (root, service, controller, ..) = production_controller_fixture(
+                "local-chat-o7",
+                provider.clone() as Arc<dyn ProviderPort>,
+            )
+            .await;
+            let mut handle =
+                start_production_listener(&root, Arc::clone(&service), controller).await;
+            let response = openai_json_request(handle.address(), "Idempotency-Key").await;
+            assert!(
+                response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.1 500"),
+                "{response}"
+            );
+            assert!(provider.calls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+            assert!(service.state.active.lock().unwrap().is_empty());
+            assert!(service.state.inner.lock().await.registry.is_empty());
+            assert_eq!(
+                std::fs::read_dir(root.join("conversations"))
+                    .unwrap()
+                    .count(),
+                1,
+                "failed ephemeral turn artifacts must be absent"
+            );
+            handle.shutdown();
+            handle.wait().await.unwrap();
+            assert!(service.state.inner.lock().await.registry.is_empty());
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     struct ToolCallingProvider {
@@ -6385,6 +6803,23 @@ mod production_tests {
             .residency(&handle)
             .expect("residency snapshot");
         assert_eq!(residency.sandbox_subscription_count(), 1);
+        assert!(
+            service
+                .teardown_ephemeral_runtime(target.clone())
+                .await
+                .is_err(),
+            "ephemeral teardown must reject live subscription residency"
+        );
+        assert!(
+            service
+                .state
+                .inner
+                .lock()
+                .await
+                .registry
+                .contains(&RuntimeKey::from(&target)),
+            "failed teardown must retain the canonical runtime owner"
+        );
         service
             .runtime_subscription_changed(target.clone(), 0)
             .await

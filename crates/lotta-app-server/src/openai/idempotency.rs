@@ -163,6 +163,8 @@ pub enum OutcomeClaim {
 /// Per-listener cache with active ownership independent from settled FIFO eviction.
 pub struct OutcomeCache {
     inner: Mutex<OutcomeEntries>,
+    #[cfg(test)]
+    failed_eviction_barrier: StdMutex<Option<(Arc<Notify>, Arc<Notify>)>>,
 }
 
 struct OutcomeEntries {
@@ -179,6 +181,8 @@ impl OutcomeCache {
                 values: HashMap::new(),
                 order: VecDeque::new(),
             }),
+            #[cfg(test)]
+            failed_eviction_barrier: StdMutex::new(None),
         }
     }
 
@@ -198,16 +202,50 @@ impl OutcomeCache {
         OutcomeClaim::Owner(cell)
     }
 
-    /// Evicts a failed or cancelled owner only if its entry was not replaced.
-    pub async fn evict_failed(&self, key: &OutcomeKey, cell: &Arc<OutcomeCell>) {
-        let mut inner = self.inner.lock().await;
-        if inner
-            .values
-            .get(key)
-            .is_some_and(|found| Arc::ptr_eq(found, cell))
+    /// Removes an exact failed owner before publishing failure to its existing waiters.
+    ///
+    /// A retry consulting the cache after old waiters wake can therefore never
+    /// observe the failed cell. Waiters already holding the cell still receive
+    /// the failure passed here.
+    pub async fn evict_failed_and_settle(
+        &self,
+        key: &OutcomeKey,
+        cell: &Arc<OutcomeCell>,
+        failure: TurnOutcome,
+    ) {
         {
-            inner.values.remove(key);
-            inner.order.retain(|candidate| candidate != key);
+            let mut inner = self.inner.lock().await;
+            if inner
+                .values
+                .get(key)
+                .is_some_and(|found| Arc::ptr_eq(found, cell))
+            {
+                inner.values.remove(key);
+                inner.order.retain(|candidate| candidate != key);
+            }
+        }
+        #[cfg(test)]
+        self.wait_at_failed_eviction_barrier().await;
+        cell.settle(failure).await;
+    }
+
+    #[cfg(test)]
+    async fn wait_at_failed_eviction_barrier(&self) {
+        let barrier = self
+            .failed_eviction_barrier
+            .lock()
+            .ok()
+            .and_then(|barrier| barrier.clone());
+        if let Some((removed, release)) = barrier {
+            removed.notify_one();
+            release.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_failed_eviction_barrier(&self, barrier: Option<(Arc<Notify>, Arc<Notify>)>) {
+        if let Ok(mut current) = self.failed_eviction_barrier.lock() {
+            *current = barrier;
         }
     }
 

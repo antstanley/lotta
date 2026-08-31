@@ -163,6 +163,11 @@ pub trait RuntimeCommandService: Send + Sync {
     ) -> ServiceFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
+    /// Removes one ephemeral runtime only after canonical lifecycle, queue,
+    /// approval, interruption, and subscription state is proven quiescent.
+    fn teardown_ephemeral_runtime(&self, _scope: RuntimeScope) -> ServiceFuture<'_, ()> {
+        Box::pin(async { Err(crate::error::AppServerError::Unavailable) })
+    }
     /// Acknowledges that explicit approval-recovery evidence entered an outbound batch.
     fn approval_recovery_surfaced(&self, _scope: RuntimeScope) -> ServiceFuture<'_, ()> {
         Box::pin(async { Ok(()) })

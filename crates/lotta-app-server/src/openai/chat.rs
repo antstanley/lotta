@@ -1,6 +1,7 @@
 //! Authenticated OpenAI Chat Completions transport adapter.
 
 use std::{
+    collections::VecDeque,
     convert::Infallible,
     panic::AssertUnwindSafe,
     sync::{
@@ -20,7 +21,7 @@ use lotta_domain::{Agent, BoundedJsonValue, Clock, NonEmptyString, RuntimeScope}
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
-use tokio::{sync::mpsc, task::JoinSet};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -491,16 +492,27 @@ async fn resolve_conversation(
         ChatKeyClaim::Existing(slot) => slot.wait().await,
         ChatKeyClaim::Full => Err(()),
         ChatKeyClaim::Owner(slot) => {
-            let created = state
-                .conversations
-                .create_for_openai(&agent.id)
-                .await
-                .map_err(|_| ());
-            slot.settle(created.clone()).await;
-            if created.is_err() {
-                state.chat_keys.remove_failed(&key, &slot).await;
+            // The slot owner contains every abnormal exit from the repository
+            // await. Shutdown cancels the allocation future, panic is caught,
+            // and the exact slot is removed before existing waiters are woken.
+            let created = AssertUnwindSafe(async {
+                tokio::select! {
+                    () = state.shutdown.cancelled() => Err(()),
+                    result = state.conversations.create_for_openai(&agent.id) => {
+                        result.map_err(|_| ())
+                    }
+                }
+            })
+            .catch_unwind()
+            .await
+            .unwrap_or(Err(()));
+            if let Ok(conversation) = created {
+                slot.settle(Ok(conversation.clone())).await;
+                Ok(conversation)
+            } else {
+                state.chat_keys.remove_failed_and_settle(&key, &slot).await;
+                Err(())
             }
-            created
         }
     }
 }
@@ -518,9 +530,13 @@ async fn spawn_owner(
     while owners.try_join_next().is_some() {}
     if state.shutdown.is_cancelled() {
         drop(owners);
-        cell.settle(failed_outcome()).await;
         if let Some(key) = cache_key {
-            state.outcomes.evict_failed(&key, &cell).await;
+            state
+                .outcomes
+                .evict_failed_and_settle(&key, &cell, failed_outcome())
+                .await;
+        } else {
+            cell.settle(failed_outcome()).await;
         }
         return;
     }
@@ -546,24 +562,26 @@ async fn spawn_owner(
             .catch_unwind()
             .await
             .unwrap_or_else(|_| failed_outcome());
-            let cleanup = AssertUnwindSafe(async {
-                let runtime = state
-                    .runtime_service
-                    .runtime_subscription_changed(scope, 0)
-                    .await;
-                let repository = if chat_key.is_none() {
+            let cleanup = if chat_key.is_none() {
+                AssertUnwindSafe(async {
+                    // Durable artifacts are removed only after the canonical
+                    // runtime owner confirms lifecycle/queue/approval/subscription
+                    // quiescence and removes the registry entry.
+                    state
+                        .runtime_service
+                        .teardown_ephemeral_runtime(scope)
+                        .await?;
                     state
                         .conversations
                         .delete_for_openai(&agent.id, &conversation)
                         .await
-                } else {
-                    Ok(())
-                };
-                runtime.is_ok() && repository.is_ok()
-            })
-            .catch_unwind()
-            .await
-            .unwrap_or(false);
+                })
+                .catch_unwind()
+                .await
+                .is_ok_and(|result| result.is_ok())
+            } else {
+                true
+            };
             if cleanup { execution } else { failed_outcome() }
         } else {
             failed_outcome()
@@ -573,9 +591,13 @@ async fn spawn_owner(
             outcome = failed_outcome();
         }
         let failed = outcome.error.is_some();
-        cell.settle(outcome).await;
         if failed && let Some(key) = cache_key {
-            state.outcomes.evict_failed(&key, &cell).await;
+            state
+                .outcomes
+                .evict_failed_and_settle(&key, &cell, outcome)
+                .await;
+        } else {
+            cell.settle(outcome).await;
         }
     });
 }
@@ -832,19 +854,23 @@ fn json_completion(id: &str, created: i64, model: &str, outcome: &TurnOutcome) -
 
 fn sse_response(
     cell: Arc<OutcomeCell>,
-    owner: bool,
+    _owner: bool,
     id: String,
     created: i64,
     model: String,
 ) -> Response {
-    let (sender, receiver) = mpsc::channel::<Bytes>(OPENAI_CHAT_SSE_EVENTS_MAX);
-    tokio::spawn(write_sse(sender, cell, owner, id, created, model));
-    let body_stream = stream::unfold(receiver, |mut receiver| async move {
-        receiver
-            .recv()
-            .await
-            .map(|bytes| (Ok::<Bytes, Infallible>(bytes), receiver))
-    });
+    // The body itself owns the outcome cursor. No detached writer exists: if
+    // Hyper drops an unread body, the broadcast receiver and all polling stop
+    // immediately without a producer blocked on a bounded response queue.
+    let body_stream = stream::unfold(
+        SseCursor::new(cell, id, created, model),
+        |mut cursor| async move {
+            cursor
+                .next()
+                .await
+                .map(|bytes| (Ok::<Bytes, Infallible>(bytes), cursor))
+        },
+    );
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -854,115 +880,139 @@ fn sse_response(
         .unwrap_or_else(|_| server_failure("failed to create stream"))
 }
 
-async fn write_sse(
-    sender: mpsc::Sender<Bytes>,
+struct SseCursor {
     cell: Arc<OutcomeCell>,
-    _owner: bool,
+    deltas: tokio::sync::broadcast::Receiver<(u64, String)>,
+    pending: VecDeque<Bytes>,
     id: String,
     created: i64,
     model: String,
-) {
-    let initial = chunk(
-        &id,
-        created,
-        &model,
-        &json!({"role":"assistant", "content":""}),
-        &Value::Null,
-    );
-    if sender.send(Bytes::from(initial)).await.is_err() {
-        return;
-    }
-    let mut deltas = cell.subscribe();
-    let replay = cell.replay();
-    let mut last_sequence = 0_u64;
-    let mut sent = String::new();
-    for (sequence, piece) in replay {
-        last_sequence = sequence;
-        sent.push_str(&piece);
-        if sender
-            .send(Bytes::from(chunk(
+    last_sequence: u64,
+    sent: String,
+    finished: bool,
+}
+
+impl SseCursor {
+    fn new(cell: Arc<OutcomeCell>, id: String, created: i64, model: String) -> Self {
+        // Subscribe before snapshotting replay so publication cannot fall between
+        // those operations. Sequence filtering removes snapshot/live overlap.
+        let deltas = cell.subscribe();
+        let replay = cell.replay();
+        let mut cursor = Self {
+            cell,
+            deltas,
+            pending: VecDeque::from([Bytes::from(chunk(
                 &id,
                 created,
                 &model,
-                &json!({"content":piece}),
+                &json!({"role":"assistant", "content":""}),
                 &Value::Null,
-            )))
-            .await
-            .is_err()
-        {
-            return;
-        }
+            ))]),
+            id,
+            created,
+            model,
+            last_sequence: 0,
+            sent: String::new(),
+            finished: false,
+        };
+        cursor.enqueue_replay(replay);
+        cursor
     }
-    loop {
-        tokio::select! {
-            outcome = cell.wait() => {
-                finish_sse(&sender, &id, created, &model, &sent, &outcome).await;
-                return;
+
+    async fn next(&mut self) -> Option<Bytes> {
+        loop {
+            if let Some(bytes) = self.pending.pop_front() {
+                return Some(bytes);
             }
-            delta = deltas.recv() => match delta {
-                Ok((sequence, piece)) if sequence > last_sequence => {
-                    last_sequence = sequence;
-                    sent.push_str(&piece);
-                    if sender.send(Bytes::from(chunk(
-                        &id,
-                        created,
-                        &model,
-                        &json!({"content":piece}),
-                        &Value::Null,
-                    ))).await.is_err() {
-                        return;
+            if self.finished {
+                return None;
+            }
+            if !self.cell.is_active() {
+                let outcome = self.cell.wait().await;
+                self.enqueue_finish(&outcome);
+                continue;
+            }
+            tokio::select! {
+                outcome = self.cell.wait() => self.enqueue_finish(&outcome),
+                delta = self.deltas.recv() => match delta {
+                    Ok((sequence, piece)) => self.enqueue_delta(sequence, &piece),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        self.enqueue_replay(self.cell.replay());
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        let outcome = self.cell.wait().await;
+                        self.enqueue_finish(&outcome);
                     }
                 }
-                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    let outcome = cell.wait().await;
-                    finish_sse(&sender, &id, created, &model, &sent, &outcome).await;
-                    return;
-                }
             }
         }
+    }
+
+    fn enqueue_delta(&mut self, sequence: u64, piece: &str) {
+        if sequence <= self.last_sequence {
+            return;
+        }
+        self.last_sequence = sequence;
+        self.sent.push_str(piece);
+        self.pending.push_back(Bytes::from(chunk(
+            &self.id,
+            self.created,
+            &self.model,
+            &json!({"content":piece}),
+            &Value::Null,
+        )));
+    }
+
+    fn enqueue_replay(&mut self, replay: Vec<(u64, String)>) {
+        for (sequence, piece) in replay {
+            self.enqueue_delta(sequence, &piece);
+        }
+    }
+
+    fn enqueue_finish(&mut self, outcome: &TurnOutcome) {
+        if self.finished {
+            return;
+        }
+        // Reconcile the retained ordered log before terminal publication. This
+        // preserves exact chunks even if settlement wins the select race.
+        self.enqueue_replay(self.cell.replay());
+        if outcome.error.is_none() {
+            if let Some(remaining) = outcome.text.strip_prefix(&self.sent)
+                && !remaining.is_empty()
+            {
+                self.enqueue_delta(self.last_sequence.saturating_add(1), remaining);
+            }
+            self.pending.push_back(Bytes::from(terminal_chunk(
+                &self.id,
+                self.created,
+                &self.model,
+                &outcome.usage,
+            )));
+        } else if let Some(error) = &outcome.error {
+            self.pending.push_back(Bytes::from(format!(
+                "data: {}\n\n",
+                json!({"error":{"message":error, "type":"server_error"}})
+            )));
+        }
+        self.pending
+            .push_back(Bytes::from_static(b"data: [DONE]\n\n"));
+        self.finished = true;
     }
 }
 
-async fn finish_sse(
-    sender: &mpsc::Sender<Bytes>,
-    id: &str,
-    created: i64,
-    model: &str,
-    sent: &str,
-    outcome: &TurnOutcome,
-) {
-    if outcome.error.is_none() {
-        if let Some(remaining) = outcome.text.strip_prefix(sent)
-            && !remaining.is_empty()
-        {
-            let event = chunk(
-                id,
-                created,
-                model,
-                &json!({"content":remaining}),
-                &Value::Null,
-            );
-            if sender.send(Bytes::from(event)).await.is_err() {
-                return;
+fn terminal_chunk(id: &str, created: i64, model: &str, usage: &Usage) -> String {
+    format!(
+        "data: {}\n\n",
+        json!({
+            "id":id, "object":"chat.completion.chunk", "created":created, "model":model,
+            "choices":[{"index":0, "delta":{}, "finish_reason":"stop"}],
+            "usage":{
+                "prompt_tokens":usage.prompt_tokens,
+                "completion_tokens":usage.completion_tokens,
+                "total_tokens":usage.total_tokens
             }
-        }
-        let terminal = chunk(id, created, model, &json!({}), &json!("stop"));
-        if sender.send(Bytes::from(terminal)).await.is_err() {
-            return;
-        }
-    } else if let Some(error) = &outcome.error {
-        let event = format!(
-            "data: {}\n\n",
-            json!({
-                "error":{"message":error, "type":"server_error"}
-            })
-        );
-        if sender.send(Bytes::from(event)).await.is_err() {
-            return;
-        }
-    }
-    drop(sender.send(Bytes::from_static(b"data: [DONE]\n\n")).await);
+        })
+    )
 }
 
 fn chunk(id: &str, created: i64, model: &str, delta: &Value, finish_reason: &Value) -> String {

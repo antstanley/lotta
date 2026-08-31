@@ -2,6 +2,8 @@ use serde_json::Value;
 
 use std::{
     future::Future,
+    io::Write as _,
+    net::TcpStream,
     pin::Pin,
     sync::{
         Arc,
@@ -140,8 +142,8 @@ async fn real_listener_o7_claims_before_allocation_and_replays_json_and_sse() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    assert_eq!(subscriptions.len(), 1);
-    assert_eq!(subscriptions[0].1, 0);
+    assert!(subscriptions.is_empty());
+    assert_eq!(runtime.ephemeral_teardowns.load(Ordering::SeqCst), 1);
 
     let conversations = roots.storage.join("conversations");
     let remaining = std::fs::read_dir(conversations).map_or(0, std::iter::Iterator::count);
@@ -186,6 +188,34 @@ async fn real_listener_panicking_owner_settles_waiter_and_cleans_ephemeral_state
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn persistent_repository_panic_settles_concurrent_slot_waiter_and_retry_succeeds() {
+    let roots = roots("chat-persistent-repository-panic");
+    let agent_id = "agent-local-chat-repository-panic";
+    seed(&roots.storage, &[agent(agent_id, "memo", false)]).await;
+    let runtime = Arc::new(crate::ws::test_support::RecordingService::default());
+    let mut handle = launch_with_runtime(&roots, true, None, runtime.clone()).await;
+    crate::ws::conversations::panic_next_openai_create_for_agent(agent_id);
+    let headers = "X-Letta-Chat-Key: durable-chat\r\n";
+    let body = r#"{"model":"memo","messages":[{"role":"user","content":"hi"}]}"#;
+    let (first, waiter) = tokio::join!(
+        post(&handle, "/v1/chat/completions", headers, body),
+        post(&handle, "/v1/chat/completions", headers, body),
+    );
+    assert_eq!(first.status, 500);
+    assert_eq!(waiter.status, 500);
+    assert_eq!(runtime.calls.load(Ordering::SeqCst), 0);
+
+    let retry = post(&handle, "/v1/chat/completions", headers, body).await;
+    assert_eq!(retry.status, 200);
+    assert_eq!(runtime.calls.load(Ordering::SeqCst), 2);
+    let remaining = std::fs::read_dir(roots.storage.join("conversations"))
+        .map_or(0, std::iter::Iterator::count);
+    assert_eq!(remaining, 1, "persistent conversation must be retained");
+    handle.shutdown();
+    handle.wait().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn listener_shutdown_cancels_joins_owner_and_settles_http_waiter() {
     let roots = roots("chat-owner-shutdown");
     seed(
@@ -221,6 +251,46 @@ async fn listener_shutdown_cancels_joins_owner_and_settles_http_waiter() {
     assert_eq!(response.status, 500);
     handle.wait().await.unwrap();
     assert_eq!(controller.exited.load(Ordering::SeqCst), 1);
+    let remaining = std::fs::read_dir(roots.storage.join("conversations"))
+        .map_or(0, std::iter::Iterator::count);
+    assert_eq!(remaining, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn listener_shutdown_with_completely_unread_sse_body_leaves_no_writer_task() {
+    let roots = roots("chat-unread-sse-shutdown");
+    seed(
+        &roots.storage,
+        &[agent("agent-local-chat-unread", "memo", false)],
+    )
+    .await;
+    let runtime = Arc::new(crate::ws::test_support::RecordingService::default());
+    let controller = Arc::new(BlockingController::default());
+    let mut handle =
+        launch_with_runtime_and_controller(&roots, true, None, runtime, controller.clone()).await;
+    let address = handle.address();
+    let unread = tokio::task::spawn_blocking(move || {
+        let body = r#"{"model":"memo","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+        let mut socket = TcpStream::connect(address).unwrap();
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(request.as_bytes()).unwrap();
+        socket
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        controller.entered.notified(),
+    )
+    .await
+    .unwrap();
+    handle.shutdown();
+    handle.wait().await.unwrap();
+    assert_eq!(controller.exited.load(Ordering::SeqCst), 1);
+    drop(unread);
     let remaining = std::fs::read_dir(roots.storage.join("conversations"))
         .map_or(0, std::iter::Iterator::count);
     assert_eq!(remaining, 0);

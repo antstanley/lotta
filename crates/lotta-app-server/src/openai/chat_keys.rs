@@ -117,17 +117,20 @@ impl ChatKeyCache {
         ChatKeyClaim::Owner(slot)
     }
 
-    /// Removes a failed slot only if it is still the current entry.
-    pub async fn remove_failed(&self, key: &ChatScopeKey, slot: &Arc<ConversationSlot>) {
-        let mut inner = self.inner.lock().await;
-        if inner
-            .values
-            .get(key)
-            .is_some_and(|found| Arc::ptr_eq(found, slot))
+    /// Removes the exact failed allocation slot before waking its existing waiters.
+    pub async fn remove_failed_and_settle(&self, key: &ChatScopeKey, slot: &Arc<ConversationSlot>) {
         {
-            inner.values.remove(key);
-            inner.order.retain(|candidate| candidate != key);
+            let mut inner = self.inner.lock().await;
+            if inner
+                .values
+                .get(key)
+                .is_some_and(|found| Arc::ptr_eq(found, slot))
+            {
+                inner.values.remove(key);
+                inner.order.retain(|candidate| candidate != key);
+            }
         }
+        slot.settle(Err(())).await;
     }
 
     #[cfg(test)]

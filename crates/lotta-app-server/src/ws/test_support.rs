@@ -127,6 +127,7 @@ pub(crate) struct RecordingService {
     pub(crate) writes: AtomicUsize,
     pub(crate) stages: Mutex<Vec<String>>,
     pub(crate) subscriptions: Mutex<Vec<(RuntimeScope, usize)>>,
+    pub(crate) ephemeral_teardowns: AtomicUsize,
     pub(crate) recoveries_surfaced: AtomicUsize,
 }
 impl RecordingService {
@@ -215,6 +216,10 @@ impl RuntimeCommandService for RecordingService {
         if let Ok(mut subscriptions) = self.subscriptions.lock() {
             subscriptions.push((scope, count));
         }
+        Box::pin(async { Ok(()) })
+    }
+    fn teardown_ephemeral_runtime(&self, _: RuntimeScope) -> ServiceFuture<'_, ()> {
+        self.ephemeral_teardowns.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(()) })
     }
     fn approval_recovery_surfaced(&self, _: RuntimeScope) -> ServiceFuture<'_, ()> {

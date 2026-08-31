@@ -613,11 +613,11 @@ const TASK73_BASELINE_GAPS: &[(&str, &str)] = &[
     ),
     (
         "src/production_components.rs",
-        "LintSuppression { line: 3416 }",
+        "LintSuppression { line: 3497 }",
     ),
     (
         "src/production_components.rs",
-        "LintSuppression { line: 3482 }",
+        "LintSuppression { line: 3563 }",
     ),
     (
         "src/production_setup.rs",
