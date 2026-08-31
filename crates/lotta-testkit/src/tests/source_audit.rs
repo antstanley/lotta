@@ -624,7 +624,7 @@ const TASK73_BASELINE_GAPS: &[(&str, &str)] = &[
         "FunctionLines { name: \"run_production_turn\", lines: 72 }",
     ),
     ("src/production_setup.rs", "LintSuppression { line: 205 }"),
-    ("src/production_setup.rs", "LintSuppression { line: 2847 }"),
+    ("src/production_setup.rs", "LintSuppression { line: 2880 }"),
 ];
 
 fn checked_manifest_paths(workspace: &Path, paths: &[&str]) -> std::io::Result<Vec<PathBuf>> {
