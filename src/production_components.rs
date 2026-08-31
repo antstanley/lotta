@@ -7095,7 +7095,7 @@ mod production_tests {
         assert_eq!(live_identity, late_identity);
         assert_eq!(json_value["id"], live_identity.0);
         assert_eq!(json_value["created"], live_identity.1);
-        assert_eq!(json_value["usage"], live_identity.2);
+        assert!(live_identity.2.is_null());
 
         let replay_json = openai_json_request(address, "Idempotency-Key").await;
         let replay_json = response_json(&replay_json);

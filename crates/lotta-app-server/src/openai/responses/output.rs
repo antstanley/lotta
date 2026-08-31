@@ -2,7 +2,7 @@
 
 use lotta_domain::{AgentId, ConversationId};
 use serde::Serialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use super::super::{chat::fresh_uuid, idempotency::Usage};
 
@@ -75,10 +75,6 @@ pub struct ResponseMeta {
     pub created_at: i64,
     /// Advertised model.
     pub model: String,
-    /// Echoed explicit instructions.
-    pub instructions: Option<String>,
-    /// Echoed previous response ID.
-    pub previous_response_id: Option<String>,
     /// Whether this successful response is stored.
     pub store: bool,
 }
@@ -111,20 +107,8 @@ struct ResponseWire<'a> {
     output: &'a [Value],
     error: Option<ResponseError>,
     incomplete_details: Option<Value>,
-    instructions: Option<&'a str>,
     model: &'a str,
-    parallel_tool_calls: bool,
-    tools: [Value; 0],
-    tool_choice: &'static str,
-    truncation: &'static str,
     usage: Option<ResponseUsage>,
-    metadata: Map<String, Value>,
-    store: bool,
-    temperature: f64,
-    top_p: f64,
-    background: bool,
-    max_output_text: Option<u64>,
-    previous_response_id: Option<&'a str>,
 }
 
 /// Builds a pinned response object from settled output.
@@ -157,20 +141,8 @@ pub fn response_value_for_output(
             message: "failed to run agent turn",
         }),
         incomplete_details: None,
-        instructions: meta.instructions.as_deref(),
         model: &meta.model,
-        parallel_tool_calls: true,
-        tools: [],
-        tool_choice: "auto",
-        truncation: "disabled",
         usage: Some(usage(&outcome.usage)),
-        metadata: Map::new(),
-        store: meta.store && !failed,
-        temperature: 1.0,
-        top_p: 1.0,
-        background: false,
-        max_output_text: None,
-        previous_response_id: meta.previous_response_id.as_deref(),
     })
     .unwrap_or_else(|_| json!({"status":"failed"}))
 }

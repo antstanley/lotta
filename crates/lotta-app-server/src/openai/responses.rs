@@ -84,8 +84,6 @@ pub async fn respond(
         id: format!("resp_{}", fresh_uuid()),
         created_at: state.chat.clock.now().as_utc().timestamp(),
         model: request.model.clone(),
-        instructions: request.instructions.clone(),
-        previous_response_id: request.previous_response_id.clone(),
         store: request.store,
     };
     let streaming = request.streaming;

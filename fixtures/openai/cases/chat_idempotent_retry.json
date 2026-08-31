@@ -1,0 +1,145 @@
+{
+  "schema_version": 1,
+  "name": "chat_idempotent_retry",
+  "route": "chat",
+  "mode": "json",
+  "dependencies": [],
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "mode": "json",
+    "headers": {
+      "authorization": "<AUTHORIZATION>",
+      "idempotency-key": "<IDEMPOTENCY_KEY>"
+    },
+    "body": {
+      "model": "fixture-visible",
+      "messages": [
+        {
+          "role": "user",
+          "content": "<IDEMPOTENT_USER_TEXT>"
+        }
+      ]
+    }
+  },
+  "expected": {
+    "attempts": [
+      {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "id": "<CHAT_COMPLETION_ID>",
+          "object": "chat.completion",
+          "created": "<UNIX_TIMESTAMP>",
+          "model": "fixture-visible",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "<ASSISTANT_TEXT>"
+              },
+              "finish_reason": "stop"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+          }
+        }
+      },
+      {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "id": "<CHAT_COMPLETION_ID>",
+          "object": "chat.completion",
+          "created": "<UNIX_TIMESTAMP>",
+          "model": "fixture-visible",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "<ASSISTANT_TEXT>"
+              },
+              "finish_reason": "stop"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+          }
+        }
+      },
+      {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": {
+          "id": "<CHAT_COMPLETION_ID>",
+          "object": "chat.completion",
+          "created": "<UNIX_TIMESTAMP>",
+          "model": "fixture-visible",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "<ASSISTANT_TEXT>"
+              },
+              "finish_reason": "stop"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+          }
+        }
+      }
+    ]
+  },
+  "observable": {
+    "provider_calls_delta": 1,
+    "created_delta": 1,
+    "deleted_delta": 1,
+    "forked_delta": 0,
+    "conversations": [
+      {
+        "id": "<CONVERSATION_ID>",
+        "agent_id": "agent-local-visible",
+        "hidden": false,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<USER_TEXT_C>"
+              }
+            ],
+            "otid": "<UUID>"
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<NEWEST_USER_TEXT>"
+              }
+            ],
+            "otid": "<UUID>"
+          }
+        ]
+      }
+    ]
+  }
+}

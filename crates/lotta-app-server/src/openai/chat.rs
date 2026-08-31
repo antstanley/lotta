@@ -1077,7 +1077,6 @@ impl SseCursor {
                 &self.id,
                 self.created,
                 &self.model,
-                &outcome.usage,
             )));
         } else if let Some(error) = &outcome.error {
             self.pending.push_back(Bytes::from(format!(
@@ -1091,17 +1090,12 @@ impl SseCursor {
     }
 }
 
-fn terminal_chunk(id: &str, created: i64, model: &str, usage: &Usage) -> String {
+fn terminal_chunk(id: &str, created: i64, model: &str) -> String {
     format!(
         "data: {}\n\n",
         json!({
             "id":id, "object":"chat.completion.chunk", "created":created, "model":model,
-            "choices":[{"index":0, "delta":{}, "finish_reason":"stop"}],
-            "usage":{
-                "prompt_tokens":usage.prompt_tokens,
-                "completion_tokens":usage.completion_tokens,
-                "total_tokens":usage.total_tokens
-            }
+            "choices":[{"index":0, "delta":{}, "finish_reason":"stop"}]
         })
     )
 }

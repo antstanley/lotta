@@ -64,8 +64,6 @@ pub struct PreparedRequest {
     pub store: bool,
     /// Select SSE projection.
     pub streaming: bool,
-    /// Instructions echoed in the response subset.
-    pub instructions: Option<String>,
 }
 
 /// Stable request-validation failure message.
@@ -87,7 +85,6 @@ pub fn prepare(value: Value, headers: &HeaderMap) -> Result<PreparedRequest, Inp
     let stateful = chat_key.is_some() || request.previous_response_id.is_some();
     let combined = combined_instructions(&request);
     let previous_response_id = request.previous_response_id.clone();
-    let instructions = request.instructions.clone();
     let store = request.store == Value::Bool(true);
     let mut messages = normalize_input(request.input, stateful)?;
     apply_instructions(&mut messages, combined.as_deref());
@@ -98,7 +95,6 @@ pub fn prepare(value: Value, headers: &HeaderMap) -> Result<PreparedRequest, Inp
         previous_response_id,
         store,
         streaming,
-        instructions,
     })
 }
 

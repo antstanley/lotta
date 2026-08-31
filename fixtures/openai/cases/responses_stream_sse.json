@@ -1,0 +1,227 @@
+{
+  "schema_version": 1,
+  "name": "responses_stream_sse",
+  "route": "responses",
+  "mode": "sse",
+  "dependencies": [],
+  "request": {
+    "method": "POST",
+    "path": "/v1/responses",
+    "mode": "sse",
+    "headers": {
+      "authorization": "<AUTHORIZATION>"
+    },
+    "body": {
+      "model": "fixture-visible",
+      "input": "<RESPONSE_USER_TEXT_B>",
+      "stream": true
+    }
+  },
+  "expected": {
+    "status": 200,
+    "headers": {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache"
+    },
+    "events": [
+      {
+        "event": "response.created",
+        "data": {
+          "sequence_number": 0,
+          "type": "response.created",
+          "response": {
+            "id": "<RESPONSE_ID>",
+            "object": "response",
+            "created_at": "<UNIX_TIMESTAMP>",
+            "status": "in_progress",
+            "model": "fixture-visible",
+            "output": [],
+            "error": null,
+            "incomplete_details": null,
+            "usage": null
+          }
+        }
+      },
+      {
+        "event": "response.in_progress",
+        "data": {
+          "sequence_number": 1,
+          "type": "response.in_progress",
+          "response": {
+            "id": "<RESPONSE_ID>",
+            "object": "response",
+            "created_at": "<UNIX_TIMESTAMP>",
+            "status": "in_progress",
+            "model": "fixture-visible",
+            "output": [],
+            "error": null,
+            "incomplete_details": null,
+            "usage": null
+          }
+        }
+      },
+      {
+        "event": "response.output_item.added",
+        "data": {
+          "sequence_number": 2,
+          "type": "response.output_item.added",
+          "output_index": 0,
+          "item": {
+            "type": "message",
+            "id": "<MSG_ID>",
+            "status": "in_progress",
+            "role": "assistant",
+            "content": []
+          }
+        }
+      },
+      {
+        "event": "response.content_part.added",
+        "data": {
+          "sequence_number": 3,
+          "type": "response.content_part.added",
+          "output_index": 0,
+          "content_index": 0,
+          "item_id": "<MSG_ID>",
+          "part": {
+            "type": "output_text",
+            "text": "",
+            "annotations": []
+          }
+        }
+      },
+      {
+        "event": "response.output_text.delta",
+        "data": {
+          "sequence_number": 4,
+          "type": "response.output_text.delta",
+          "output_index": 0,
+          "content_index": 0,
+          "item_id": "<MSG_ID>",
+          "delta": "<ASSISTANT_TEXT>"
+        }
+      },
+      {
+        "event": "response.output_text.done",
+        "data": {
+          "sequence_number": 5,
+          "type": "response.output_text.done",
+          "output_index": 0,
+          "content_index": 0,
+          "item_id": "<MSG_ID>",
+          "text": "<ASSISTANT_TEXT>"
+        }
+      },
+      {
+        "event": "response.content_part.done",
+        "data": {
+          "sequence_number": 6,
+          "type": "response.content_part.done",
+          "output_index": 0,
+          "content_index": 0,
+          "item_id": "<MSG_ID>",
+          "part": {
+            "type": "output_text",
+            "text": "<ASSISTANT_TEXT>",
+            "annotations": []
+          }
+        }
+      },
+      {
+        "event": "response.output_item.done",
+        "data": {
+          "sequence_number": 7,
+          "type": "response.output_item.done",
+          "output_index": 0,
+          "item": {
+            "type": "message",
+            "id": "<MSG_ID>",
+            "status": "completed",
+            "role": "assistant",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "<ASSISTANT_TEXT>",
+                "annotations": []
+              }
+            ]
+          }
+        }
+      },
+      {
+        "event": "response.completed",
+        "data": {
+          "sequence_number": 8,
+          "type": "response.completed",
+          "response": {
+            "id": "<RESPONSE_ID>",
+            "object": "response",
+            "created_at": "<UNIX_TIMESTAMP>",
+            "status": "completed",
+            "model": "fixture-visible",
+            "output": [
+              {
+                "type": "message",
+                "id": "<MSG_ID>",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                  {
+                    "type": "output_text",
+                    "text": "<ASSISTANT_TEXT>",
+                    "annotations": []
+                  }
+                ]
+              }
+            ],
+            "error": null,
+            "incomplete_details": null,
+            "usage": {
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "total_tokens": 0,
+              "output_tokens_details": {
+                "reasoning_tokens": 0
+              }
+            }
+          }
+        }
+      }
+    ]
+  },
+  "observable": {
+    "provider_calls_delta": 1,
+    "created_delta": 1,
+    "deleted_delta": 1,
+    "forked_delta": 0,
+    "conversations": [
+      {
+        "id": "<CONVERSATION_ID>",
+        "agent_id": "agent-local-visible",
+        "hidden": false,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<USER_TEXT_C>"
+              }
+            ],
+            "otid": "<UUID>"
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<NEWEST_USER_TEXT>"
+              }
+            ],
+            "otid": "<UUID>"
+          }
+        ]
+      }
+    ]
+  }
+}

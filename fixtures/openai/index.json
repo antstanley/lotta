@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "baseline_commit": "300f923f16cc8eee50656d7da732902c1dea2b65",
+  "baseline_tree": "30d2e2cebc7761c153f5a6d136b242365092faa0",
+  "capture_command": "LOTTA_BUN=bun node tools/capture-openai-fixtures.mjs",
+  "bounds": {
+    "cases_max": 16,
+    "fixture_bytes_max": 1048576,
+    "events_per_case_max": 64,
+    "json_depth_max": 32
+  },
+  "cases": [
+    {
+      "name": "models_json",
+      "route": "models",
+      "mode": "json",
+      "dependencies": [],
+      "path": "cases/models_json.json",
+      "sha256": "babe7fa25f0e40d3047d97438f2d4a1a01776f9834b716f30931eccbab3d05ee"
+    },
+    {
+      "name": "chat_headerless_json",
+      "route": "chat",
+      "mode": "json",
+      "dependencies": [],
+      "path": "cases/chat_headerless_json.json",
+      "sha256": "bb0d21d21cc7d76d0c6085b0db202a1a1dcf940fe03248478b69b3910914f251"
+    },
+    {
+      "name": "chat_stream_sse",
+      "route": "chat",
+      "mode": "sse",
+      "dependencies": [],
+      "path": "cases/chat_stream_sse.json",
+      "sha256": "0b592636614ccda3f3c6d03310a41ec98c6b2131c513162363843c8a033e750e"
+    },
+    {
+      "name": "chat_stateful_first",
+      "route": "chat",
+      "mode": "json",
+      "dependencies": [],
+      "path": "cases/chat_stateful_first.json",
+      "sha256": "670fb1374e08d769b85b31a464babfea848d38c0b9e569438c1aa0d60c7cc9ec"
+    },
+    {
+      "name": "chat_stateful_newest",
+      "route": "chat",
+      "mode": "json",
+      "dependencies": [
+        "chat_stateful_first"
+      ],
+      "path": "cases/chat_stateful_newest.json",
+      "sha256": "d6b71f3f5ab59abd8fd7db989f0473b5215bf40100ef8b932c1ea7f954b09a17"
+    },
+    {
+      "name": "chat_idempotent_retry",
+      "route": "chat",
+      "mode": "json",
+      "dependencies": [],
+      "path": "cases/chat_idempotent_retry.json",
+      "sha256": "5560d93a4483a27c992659f7eab9fe0d84362e432fcfb3b1d09b9e58a3ffd19a"
+    },
+    {
+      "name": "responses_nonstored_json",
+      "route": "responses",
+      "mode": "json",
+      "dependencies": [],
+      "path": "cases/responses_nonstored_json.json",
+      "sha256": "20b5f0aa2486707658d89f96cd9c087abed86b11550fd1ffbe21f1e27efa1168"
+    },
+    {
+      "name": "responses_stream_sse",
+      "route": "responses",
+      "mode": "sse",
+      "dependencies": [],
+      "path": "cases/responses_stream_sse.json",
+      "sha256": "6b16f34804628af085ddeb07d75774206a682eb3d56a977132859ca46e20f02f"
+    },
+    {
+      "name": "responses_stored_json",
+      "route": "responses",
+      "mode": "json",
+      "dependencies": [],
+      "path": "cases/responses_stored_json.json",
+      "sha256": "1ac7006fda9a46545c643935f682784aac312cea755cc47c1b5468f9473d79b0"
+    },
+    {
+      "name": "responses_previous_json",
+      "route": "responses",
+      "mode": "json",
+      "dependencies": [
+        "responses_stored_json"
+      ],
+      "path": "cases/responses_previous_json.json",
+      "sha256": "e5e3587d0407384763b1686dba2ee2b002fb52e40ea99e421df23bfc9034924e"
+    },
+    {
+      "name": "responses_no_idempotency",
+      "route": "responses",
+      "mode": "json",
+      "dependencies": [],
+      "path": "cases/responses_no_idempotency.json",
+      "sha256": "cc3696a54d7bf636734a83dc63cb15ec63d72c9b2dbd6c6e6d76a5b4dab041ad"
+    }
+  ]
+}

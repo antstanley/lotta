@@ -24,6 +24,8 @@ tokio.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
+base64.workspace = true
 futures-util.workspace = true
 lotta-testkit = { version = "0.1.0", path = "crates/lotta-testkit" }
 reqwest.workspace = true
@@ -45,6 +47,10 @@ path = "tests/conformance/cross_runtime.rs"
 [[test]]
 name = "provider_equivalence"
 path = "tests/provider_equivalence.rs"
+
+[[test]]
+name = "openai_golden"
+path = "tests/openai_golden.rs"
 
 [workspace]
 resolver = "3"

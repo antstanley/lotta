@@ -1,0 +1,116 @@
+{
+  "schema_version": 1,
+  "name": "responses_stored_json",
+  "route": "responses",
+  "mode": "json",
+  "dependencies": [],
+  "request": {
+    "method": "POST",
+    "path": "/v1/responses",
+    "mode": "json",
+    "headers": {
+      "authorization": "<AUTHORIZATION>"
+    },
+    "body": {
+      "model": "fixture-visible",
+      "input": "<RESPONSE_USER_TEXT_C>",
+      "store": true
+    }
+  },
+  "expected": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "id": "<STORED_RESPONSE_ID>",
+      "object": "response",
+      "created_at": "<UNIX_TIMESTAMP>",
+      "status": "completed",
+      "model": "fixture-visible",
+      "output": [
+        {
+          "type": "message",
+          "id": "<MSG_ID>",
+          "status": "completed",
+          "role": "assistant",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "<ASSISTANT_TEXT>",
+              "annotations": []
+            }
+          ]
+        }
+      ],
+      "error": null,
+      "incomplete_details": null,
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      }
+    }
+  },
+  "observable": {
+    "provider_calls_delta": 1,
+    "created_delta": 1,
+    "deleted_delta": 0,
+    "forked_delta": 0,
+    "conversations": [
+      {
+        "id": "<CONVERSATION_ID>",
+        "agent_id": "agent-local-visible",
+        "hidden": false,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<USER_TEXT_C>"
+              }
+            ],
+            "otid": "<UUID>"
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<NEWEST_USER_TEXT>"
+              }
+            ],
+            "otid": "<UUID>"
+          }
+        ]
+      },
+      {
+        "id": "<CONVERSATION_ID>",
+        "agent_id": "agent-local-visible",
+        "hidden": false,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<RESPONSE_USER_TEXT_C>"
+              }
+            ],
+            "otid": "<UUID>"
+          }
+        ]
+      }
+    ]
+  },
+  "cursor": {
+    "version": 1,
+    "nonce": "<UUID>",
+    "agent_id": "agent-local-visible",
+    "conversation_id": "<CONVERSATION_ID>"
+  }
+}

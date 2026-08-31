@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "name": "models_json",
+  "route": "models",
+  "mode": "json",
+  "dependencies": [],
+  "request": {
+    "method": "GET",
+    "path": "/v1/models",
+    "mode": "json",
+    "headers": {
+      "authorization": "<AUTHORIZATION>"
+    },
+    "body": null
+  },
+  "expected": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "object": "list",
+      "data": [
+        {
+          "id": "agent-local-collision-a",
+          "object": "model",
+          "created": "<UNIX_TIMESTAMP>",
+          "owned_by": "letta"
+        },
+        {
+          "id": "agent-local-collision-b",
+          "object": "model",
+          "created": "<UNIX_TIMESTAMP>",
+          "owned_by": "letta"
+        },
+        {
+          "id": "fixture-visible",
+          "object": "model",
+          "created": "<UNIX_TIMESTAMP>",
+          "owned_by": "letta"
+        }
+      ]
+    }
+  },
+  "observable": {
+    "provider_calls_delta": 0,
+    "created_delta": 0,
+    "deleted_delta": 0,
+    "forked_delta": 0,
+    "conversations": []
+  }
+}

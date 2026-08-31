@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "name": "chat_stream_sse",
+  "route": "chat",
+  "mode": "sse",
+  "dependencies": [],
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "mode": "sse",
+    "headers": {
+      "authorization": "<AUTHORIZATION>"
+    },
+    "body": {
+      "model": "agent-local-visible",
+      "messages": [
+        {
+          "role": "user",
+          "content": "<USER_TEXT_B>"
+        }
+      ],
+      "stream": true
+    }
+  },
+  "expected": {
+    "status": 200,
+    "headers": {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache"
+    },
+    "events": [
+      {
+        "event": null,
+        "data": {
+          "id": "<CHAT_COMPLETION_ID>",
+          "object": "chat.completion.chunk",
+          "created": "<UNIX_TIMESTAMP>",
+          "model": "agent-local-visible",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "role": "assistant",
+                "content": ""
+              },
+              "finish_reason": null
+            }
+          ]
+        }
+      },
+      {
+        "event": null,
+        "data": {
+          "id": "<CHAT_COMPLETION_ID>",
+          "object": "chat.completion.chunk",
+          "created": "<UNIX_TIMESTAMP>",
+          "model": "agent-local-visible",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "<ASSISTANT_TEXT>"
+              },
+              "finish_reason": null
+            }
+          ]
+        }
+      },
+      {
+        "event": null,
+        "data": {
+          "id": "<CHAT_COMPLETION_ID>",
+          "object": "chat.completion.chunk",
+          "created": "<UNIX_TIMESTAMP>",
+          "model": "agent-local-visible",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {},
+              "finish_reason": "stop"
+            }
+          ]
+        }
+      },
+      {
+        "event": null,
+        "data": "[DONE]"
+      }
+    ]
+  },
+  "observable": {
+    "provider_calls_delta": 1,
+    "created_delta": 1,
+    "deleted_delta": 1,
+    "forked_delta": 0,
+    "conversations": []
+  }
+}
