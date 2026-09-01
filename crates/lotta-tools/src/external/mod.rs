@@ -1,11 +1,15 @@
 //! Runtime-scoped controller-owned external tools.
 
 mod call;
+mod channel;
 mod registry;
 
 pub use call::{
     ConnectionId, ControllerConnection, ControllerReceiver, ExternalCallRequest,
     ExternalCallResponse, ExternalRequestId, ResponseDisposition, RuntimeId, ScopeId, ToolCallId,
+};
+pub use channel::{
+    ChannelExternalToolManager, ChannelRuntimeKey, ChannelToolDescriptor, ChannelToolResponse,
 };
 pub use registry::{
     ExternalRegistrationError, ExternalToolGroup, ExternalToolManager, ExternalToolMember,

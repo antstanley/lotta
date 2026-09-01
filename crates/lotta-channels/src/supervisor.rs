@@ -1,15 +1,15 @@
-//! Bounded supervision of the real channel-host child process.
+//! Single-actor supervision of the sandboxed channel-host process.
 
 use crate::{
     control_plane::{
-        ChildFrame, ControlError, ControlPlane, ParentFrame, RuntimeKey, RuntimeTool, read_line,
-        write_line,
+        ChildFrame, ControlError, ControlPlane, ParentFrame, RuntimeKey, read_line, write_line,
     },
-    topology::{
-        CHANNEL_STARTUP_DEADLINE_MS, ChannelStore, ChildCapability, TopologyError,
-        sandboxed_child_command,
-    },
+    topology::{CHANNEL_STARTUP_DEADLINE_MS, ChannelStore, TopologyError, sandboxed_child_command},
 };
+use lotta_app_server::auth::channel_session::{
+    ChannelSessionAuthenticator, ChannelSessionCapability,
+};
+use lotta_tools::external::ChannelExternalToolManager;
 use std::{
     path::PathBuf,
     process::Stdio,
@@ -17,8 +17,8 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    process::{Child, ChildStdin},
+    io::{AsyncReadExt, BufReader},
+    process::{Child, ChildStdin, ChildStdout},
     sync::{oneshot, watch},
     task::JoinHandle,
 };
@@ -30,10 +30,14 @@ pub const CHANNEL_RESTART_ATTEMPTS_MAX: usize = 3;
 pub const CHANNEL_RESTART_BACKOFF_MS: u64 = 100;
 /// Maximum restart delay.
 pub const CHANNEL_RESTART_BACKOFF_MS_MAX: u64 = 2_000;
-/// Grace allowed after a shutdown management request.
+/// Grace allowed for the correlated shutdown acknowledgement.
 pub const CHANNEL_SHUTDOWN_GRACE_MS: u64 = 2_000;
-/// Maximum stderr line bytes drained without logging content.
+/// Maximum stderr bytes consumed from one child generation.
+pub const CHANNEL_STDERR_TOTAL_BYTES_MAX: usize = 256 * 1024;
+/// Maximum stderr bytes retained for one logical line.
 pub const CHANNEL_STDERR_LINE_BYTES_MAX: usize = 16 * 1024;
+/// Fixed allocation-free stderr drain chunk.
+pub const CHANNEL_STDERR_CHUNK_BYTES: usize = 4 * 1024;
 
 /// Stable supervised service failure.
 #[derive(Debug, thiserror::Error)]
@@ -44,7 +48,7 @@ pub enum SupervisorError {
     /// Management protocol failed.
     #[error("channel child management failed")]
     Control(#[from] ControlError),
-    /// Child spawn or pipe acquisition failed.
+    /// Child spawn, entropy, or pipe acquisition failed.
     #[error("channel child spawn failed")]
     Spawn,
     /// Startup handshake exceeded its deadline or was rejected.
@@ -58,39 +62,42 @@ pub enum SupervisorError {
     Task,
 }
 
-/// Immutable launch configuration containing no backend-store path.
+/// Immutable launch configuration containing no backend-store path or reusable credential.
 pub struct ChannelLaunchConfig {
     /// Absolute child executable.
     pub executable: PathBuf,
     /// Canonical shared channels store.
     pub store: ChannelStore,
-    /// Dedicated loopback App Server WebSocket URL.
+    /// Dedicated exact loopback App Server WebSocket URL.
     pub websocket_url: String,
-    /// Per-child capability, delivered only over stdin.
-    pub capability: ChildCapability,
+    /// Owner prefix; a generation suffix is added for every spawn.
+    pub owner_prefix: String,
+    /// Dynamic authority bound to the exact dedicated listener instance.
+    pub authenticator: ChannelSessionAuthenticator,
+    /// Canonical external-tool manager backed by production turn setup's registry.
+    pub tools: Arc<ChannelExternalToolManager>,
 }
 
 /// Running supervised channel service.
 pub struct ChannelSupervisor {
     cancellation: CancellationToken,
     pid: watch::Receiver<Option<u32>>,
-    plane: Arc<Mutex<ControlPlane>>,
+    plane: Arc<Mutex<Option<ControlPlane>>>,
     task: JoinHandle<Result<(), SupervisorError>>,
 }
 
 impl ChannelSupervisor {
-    /// Spawns the supervisor and waits for the first authenticated child handshake.
+    /// Spawns the one supervisor actor and waits for its first authenticated generation.
     ///
     /// # Errors
-    /// Returns a topology, spawn, startup, protocol, cleanup, or task failure.
+    /// Returns a topology, spawn, startup, protocol, cleanup, or actor failure.
     pub async fn start(config: ChannelLaunchConfig) -> Result<Self, SupervisorError> {
-        let owner = config.capability.owner().to_owned();
-        let plane = Arc::new(Mutex::new(ControlPlane::new(owner)?));
         let cancellation = CancellationToken::new();
+        let plane = Arc::new(Mutex::new(None));
         let (pid_sender, pid) = watch::channel(None);
         let (started_sender, started_receiver) = oneshot::channel();
-        let actor_plane = Arc::clone(&plane);
         let actor_cancel = cancellation.clone();
+        let actor_plane = Arc::clone(&plane);
         let task = tokio::spawn(async move {
             run_supervisor(
                 config,
@@ -106,18 +113,17 @@ impl ChannelSupervisor {
             started_receiver,
         )
         .await;
-        if let Ok(Ok(Ok(()))) = startup {
-            Ok(Self {
+        if matches!(startup, Ok(Ok(Ok(())))) {
+            return Ok(Self {
                 cancellation,
                 pid,
                 plane,
                 task,
-            })
-        } else {
-            cancellation.cancel();
-            let _ = task.await;
-            Err(SupervisorError::Startup)
+            });
         }
+        cancellation.cancel();
+        let _ = task.await;
+        Err(SupervisorError::Startup)
     }
 
     /// Returns the currently live child process identifier.
@@ -126,19 +132,21 @@ impl ChannelSupervisor {
         *self.pid.borrow()
     }
 
-    /// Returns one exact runtime tool snapshot from the parent registry.
+    /// Observes exact runtime ownership in the canonical production tool manager.
     #[must_use]
-    pub fn runtime_tools(&self, runtime: &RuntimeKey) -> Option<Vec<RuntimeTool>> {
+    pub fn runtime_tools(&self, runtime: &RuntimeKey) -> Option<()> {
         self.plane
             .lock()
-            .ok()
-            .and_then(|plane| plane.registry().snapshot(runtime))
+            .ok()?
+            .as_ref()?
+            .contains_runtime(runtime)
+            .then_some(())
     }
 
-    /// Requests graceful close, then bounded kill/reap, and waits for the supervisor.
+    /// Requests graceful close, then bounded kill/reap, and joins the actor.
     ///
     /// # Errors
-    /// Returns a protocol, cleanup, or supervisor-task failure.
+    /// Returns a protocol, cleanup, or actor failure.
     pub async fn shutdown(self) -> Result<(), SupervisorError> {
         self.cancellation.cancel();
         self.task.await.map_err(|_| SupervisorError::Task)?
@@ -146,52 +154,99 @@ impl ChannelSupervisor {
 }
 
 async fn run_supervisor(
-    mut config: ChannelLaunchConfig,
-    plane: Arc<Mutex<ControlPlane>>,
+    config: ChannelLaunchConfig,
+    plane: Arc<Mutex<Option<ControlPlane>>>,
     cancellation: CancellationToken,
     pid_sender: watch::Sender<Option<u32>>,
     started: oneshot::Sender<Result<(), SupervisorError>>,
 ) -> Result<(), SupervisorError> {
     let mut started = Some(started);
-    let mut delay = CHANNEL_RESTART_BACKOFF_MS;
-    for attempt in 0..=CHANNEL_RESTART_ATTEMPTS_MAX {
+    let mut backoff_ms = CHANNEL_RESTART_BACKOFF_MS;
+    let mut terminal = Ok(());
+    for generation in 1..=CHANNEL_RESTART_ATTEMPTS_MAX + 1 {
         if cancellation.is_cancelled() {
             break;
         }
-        let outcome = run_attempt(
-            &mut config,
+        let outcome = run_generation(
+            &config,
+            generation as u64,
             &plane,
             &cancellation,
             &pid_sender,
             &mut started,
         )
         .await;
-        if cancellation.is_cancelled() {
+        terminal = outcome;
+        if cancellation.is_cancelled() || generation > CHANNEL_RESTART_ATTEMPTS_MAX {
             break;
         }
-        if attempt == CHANNEL_RESTART_ATTEMPTS_MAX {
-            return outcome;
+        tokio::select! {
+            () = cancellation.cancelled() => break,
+            () = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
         }
-        release_stale(&plane);
-        tokio::time::sleep(Duration::from_millis(delay)).await;
-        delay = delay.saturating_mul(2).min(CHANNEL_RESTART_BACKOFF_MS_MAX);
+        backoff_ms = backoff_ms
+            .saturating_mul(2)
+            .min(CHANNEL_RESTART_BACKOFF_MS_MAX);
     }
-    release_stale(&plane);
-    config.capability.revoke();
-    let _ = pid_sender.send(None);
-    Ok(())
+    if let Some(sender) = started.take() {
+        let _ = sender.send(Err(copy_error(
+            terminal.as_ref().err().unwrap_or(&SupervisorError::Startup),
+        )));
+    }
+    terminal
 }
 
-async fn run_attempt(
-    config: &mut ChannelLaunchConfig,
-    plane: &Arc<Mutex<ControlPlane>>,
+struct Generation {
+    owner: String,
+    number: u64,
+    pid: u32,
+    bootstrap_id: String,
+    child: Child,
+    input: Option<ChildStdin>,
+    output: BufReader<ChildStdout>,
+    stderr: JoinHandle<()>,
+    capability: ChannelSessionCapability,
+}
+
+async fn run_generation(
+    config: &ChannelLaunchConfig,
+    generation: u64,
+    plane_slot: &Arc<Mutex<Option<ControlPlane>>>,
     cancellation: &CancellationToken,
     pid_sender: &watch::Sender<Option<u32>>,
     started: &mut Option<oneshot::Sender<Result<(), SupervisorError>>>,
 ) -> Result<(), SupervisorError> {
-    if !config.capability.is_valid() {
-        return Err(SupervisorError::Startup);
+    let mut session = spawn_generation(config, generation, pid_sender).await?;
+    let plane = ControlPlane::new(session.owner.clone(), generation, Arc::clone(&config.tools));
+    let install = plane.and_then(|plane| {
+        let mut slot = plane_slot.lock().map_err(|_| ControlError::Io)?;
+        *slot = Some(plane);
+        Ok(())
+    });
+    if let Err(error) = install {
+        let _ = cleanup_generation(config, &mut session, plane_slot, pid_sender).await;
+        return Err(error.into());
     }
+    let startup = start_generation(config, &mut session, plane_slot).await;
+    if startup.is_ok()
+        && let Some(sender) = started.take()
+    {
+        let _ = sender.send(Ok(()));
+    }
+    let outcome = match startup {
+        Ok(()) => supervise_generation(config, &mut session, plane_slot, cancellation).await,
+        Err(error) => Err(error),
+    };
+    let cleanup = cleanup_generation(config, &mut session, plane_slot, pid_sender).await;
+    outcome.and(cleanup)
+}
+
+async fn spawn_generation(
+    config: &ChannelLaunchConfig,
+    generation: u64,
+    pid_sender: &watch::Sender<Option<u32>>,
+) -> Result<Generation, SupervisorError> {
+    let bootstrap_id = random_id("bootstrap")?;
     let mut command = sandboxed_child_command(&config.executable, &config.store)?;
     command
         .stdin(Stdio::piped())
@@ -199,49 +254,58 @@ async fn run_attempt(
         .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|_| SupervisorError::Spawn)?;
     let pid = child.id().ok_or(SupervisorError::Spawn)?;
-    let mut input = child.stdin.take().ok_or(SupervisorError::Spawn)?;
-    let output = child.stdout.take().ok_or(SupervisorError::Spawn)?;
-    let stderr = child.stderr.take().ok_or(SupervisorError::Spawn)?;
+    let owner = format!("{}-{generation}", config.owner_prefix);
+    let sandbox_root = config.store.root().to_str().ok_or(SupervisorError::Spawn)?;
+    let Ok(capability) = config
+        .authenticator
+        .install(&owner, generation, pid, sandbox_root)
+    else {
+        reap_failed_spawn(&mut child).await;
+        return Err(SupervisorError::Spawn);
+    };
+    let input = child.stdin.take();
+    let output = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (Some(input), Some(output), Some(stderr)) = (input, output, stderr) else {
+        let _ = config.authenticator.revoke(&owner, generation, pid);
+        reap_failed_spawn(&mut child).await;
+        return Err(SupervisorError::Spawn);
+    };
     let _ = pid_sender.send(Some(pid));
-    let stderr_task = tokio::spawn(drain_stderr(stderr));
-    let bootstrap_id = format!("bootstrap-{pid}");
-    write_bootstrap(config, &mut input, &bootstrap_id).await?;
-    let mut reader = BufReader::new(output);
-    let startup = read_ready(&mut reader, plane, &bootstrap_id, pid).await;
-    if let Some(sender) = started.take() {
-        let startup_result = match &startup {
-            Ok(()) => Ok(()),
-            Err(error) => Err(copy_error(error)),
-        };
-        let _ = sender.send(startup_result);
-    }
-    startup?;
-    supervise_session(
+    Ok(Generation {
+        owner,
+        number: generation,
+        pid,
+        bootstrap_id,
         child,
-        input,
-        reader,
-        stderr_task,
-        plane,
-        cancellation,
-        config.store.clone(),
-    )
-    .await?;
-    let _ = pid_sender.send(None);
-    Ok(())
+        input: Some(input),
+        output: BufReader::new(output),
+        stderr: tokio::spawn(drain_stderr(stderr)),
+        capability,
+    })
 }
 
-async fn read_ready<R>(
-    reader: &mut BufReader<R>,
-    plane: &Arc<Mutex<ControlPlane>>,
-    bootstrap_id: &str,
-    pid: u32,
-) -> Result<(), SupervisorError>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
+async fn start_generation(
+    config: &ChannelLaunchConfig,
+    session: &mut Generation,
+    plane: &Arc<Mutex<Option<ControlPlane>>>,
+) -> Result<(), SupervisorError> {
+    let root = config.store.root().to_str().ok_or(SupervisorError::Spawn)?;
+    let frame = ParentFrame::Bootstrap {
+        request_id: session.bootstrap_id.clone(),
+        owner: session.owner.clone(),
+        websocket_url: config.websocket_url.clone(),
+        token: session.capability.expose_for_pipe().to_owned(),
+        channels_root: root.to_owned(),
+    };
+    write_line(
+        session.input.as_mut().ok_or(SupervisorError::Cleanup)?,
+        &frame,
+    )
+    .await?;
     let frame = tokio::time::timeout(
         Duration::from_millis(CHANNEL_STARTUP_DEADLINE_MS),
-        read_line::<_, ChildFrame>(reader),
+        read_line::<_, ChildFrame>(&mut session.output),
     )
     .await
     .map_err(|_| SupervisorError::Startup)??
@@ -249,130 +313,191 @@ where
     match &frame {
         ChildFrame::Ready {
             correlation_id,
-            pid: child_pid,
-            ..
-        } if correlation_id == bootstrap_id && *child_pid == pid => {}
+            pid,
+            owner,
+        } if correlation_id == &session.bootstrap_id
+            && *pid == session.pid
+            && owner == &session.owner => {}
         _ => return Err(SupervisorError::Startup),
     }
-    let channels = Vec::new();
-    let mut plane = plane.lock().map_err(|_| SupervisorError::Task)?;
-    plane.dispatch(frame, &channels)?;
-    plane.register_message_channel(RuntimeKey {
-        agent_id: "channel-host".into(),
-        conversation_id: "channel-host".into(),
-    })?;
+    dispatch(plane, frame, &[])?;
     Ok(())
 }
 
-async fn supervise_session<R>(
-    mut child: Child,
-    mut input: ChildStdin,
-    mut reader: BufReader<R>,
-    stderr_task: JoinHandle<()>,
-    plane: &Arc<Mutex<ControlPlane>>,
+async fn supervise_generation(
+    config: &ChannelLaunchConfig,
+    session: &mut Generation,
+    plane: &Arc<Mutex<Option<ControlPlane>>>,
     cancellation: &CancellationToken,
-    store: ChannelStore,
-) -> Result<(), SupervisorError>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let result = loop {
+) -> Result<(), SupervisorError> {
+    loop {
         tokio::select! {
             biased;
-            () = cancellation.cancelled() => {
-                let request_id = format!("shutdown-{}", child.id().map_or(0, |pid| pid));
-                let _ = write_line(&mut input, &ParentFrame::Shutdown { request_id }).await;
-                break stop_and_reap(&mut child).await;
+            () = cancellation.cancelled() => return Ok(()),
+            frame = read_line::<_, ChildFrame>(&mut session.output) => {
+                let Some(frame) = frame? else { return Err(SupervisorError::Cleanup); };
+                let channels = config.store.channel_state()?;
+                if let Some(response) = dispatch(plane, frame, &channels)? {
+                    let input = session.input.as_mut().ok_or(SupervisorError::Cleanup)?;
+                    write_line(input, &response).await?;
+                }
             }
-            frame = read_line::<_, ChildFrame>(&mut reader) => {
-                let Some(frame) = frame? else { break wait_once(&mut child).await; };
-                let channels = store.channel_state()?;
-                let response = plane.lock().map_err(|_| SupervisorError::Task)?
-                    .dispatch(frame, &channels)?;
-                if let Some(response) = response { write_line(&mut input, &response).await?; }
-            }
-            status = child.wait() => {
-                break status.map(|_| ()).map_err(|_| SupervisorError::Cleanup);
+            status = session.child.wait() => {
+                status.map_err(|_| SupervisorError::Cleanup)?;
+                return Err(SupervisorError::Cleanup);
             }
         }
-    };
-    drop(input);
+    }
+}
+
+fn dispatch(
+    plane: &Arc<Mutex<Option<ControlPlane>>>,
+    frame: ChildFrame,
+    channels: &[crate::control_plane::ChannelState],
+) -> Result<Option<ParentFrame>, SupervisorError> {
+    plane
+        .lock()
+        .map_err(|_| SupervisorError::Task)?
+        .as_mut()
+        .ok_or(SupervisorError::Task)?
+        .dispatch(frame, channels)
+        .map_err(Into::into)
+}
+
+async fn cleanup_generation(
+    config: &ChannelLaunchConfig,
+    session: &mut Generation,
+    plane: &Arc<Mutex<Option<ControlPlane>>>,
+    pid_sender: &watch::Sender<Option<u32>>,
+) -> Result<(), SupervisorError> {
+    let shutdown_id = random_id("shutdown")
+        .unwrap_or_else(|_| format!("shutdown-{}-{}", session.number, session.pid));
+    if let Some(input) = &mut session.input {
+        let _ = write_line(
+            input,
+            &ParentFrame::Shutdown {
+                request_id: shutdown_id.clone(),
+            },
+        )
+        .await;
+        let acknowledgement = tokio::time::timeout(
+            Duration::from_millis(CHANNEL_SHUTDOWN_GRACE_MS),
+            wait_shutdown_ack(&mut session.output, &session.owner, &shutdown_id),
+        )
+        .await;
+        let _ = acknowledgement;
+    }
+    session.input.take();
+    let _ = config
+        .authenticator
+        .revoke(&session.owner, session.number, session.pid);
+    if let Ok(mut slot) = plane.lock()
+        && let Some(current) = slot.take()
+    {
+        let _ = current.release_stale();
+    }
+    let _ = pid_sender.send(None);
+    let wait = tokio::time::timeout(
+        Duration::from_millis(CHANNEL_SHUTDOWN_GRACE_MS),
+        session.child.wait(),
+    )
+    .await;
+    match wait {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => return Err(SupervisorError::Cleanup),
+        Err(_) => {
+            session
+                .child
+                .kill()
+                .await
+                .map_err(|_| SupervisorError::Cleanup)?;
+            session
+                .child
+                .wait()
+                .await
+                .map_err(|_| SupervisorError::Cleanup)?;
+        }
+    }
     if tokio::time::timeout(
         Duration::from_millis(CHANNEL_SHUTDOWN_GRACE_MS),
-        stderr_task,
+        &mut session.stderr,
     )
     .await
     .is_err()
     {
-        return Err(SupervisorError::Cleanup);
+        session.stderr.abort();
+        let _ = (&mut session.stderr).await;
     }
-    result
+    Ok(())
 }
 
-async fn write_bootstrap(
-    config: &ChannelLaunchConfig,
-    input: &mut ChildStdin,
-    request_id: &str,
-) -> Result<(), SupervisorError> {
-    let root = config.store.root().to_str().ok_or(SupervisorError::Spawn)?;
-    let frame = ParentFrame::Bootstrap {
-        request_id: request_id.to_owned(),
-        owner: config.capability.owner().to_owned(),
-        websocket_url: config.websocket_url.clone(),
-        token: config.capability.expose_for_pipe().to_owned(),
-        channels_root: root.to_owned(),
-    };
-    write_line(input, &frame)
-        .await
-        .map_err(SupervisorError::from)
-}
-
-async fn stop_and_reap(child: &mut Child) -> Result<(), SupervisorError> {
-    match tokio::time::timeout(
-        Duration::from_millis(CHANNEL_SHUTDOWN_GRACE_MS),
-        child.wait(),
-    )
-    .await
-    {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(_)) => Err(SupervisorError::Cleanup),
-        Err(_) => {
-            child.kill().await.map_err(|_| SupervisorError::Cleanup)?;
-            wait_once(child).await
-        }
-    }
-}
-
-async fn wait_once(child: &mut Child) -> Result<(), SupervisorError> {
-    child
-        .wait()
-        .await
-        .map(|_| ())
-        .map_err(|_| SupervisorError::Cleanup)
-}
-
-async fn drain_stderr<R>(stderr: R)
+async fn wait_shutdown_ack<R>(
+    output: &mut BufReader<R>,
+    owner: &str,
+    correlation: &str,
+) -> Result<(), SupervisorError>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut reader = BufReader::new(stderr);
-    let mut bytes = Vec::new();
     loop {
-        bytes.clear();
-        match reader.read_until(b'\n', &mut bytes).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) if bytes.len() > CHANNEL_STDERR_LINE_BYTES_MAX => {
-                bytes.truncate(CHANNEL_STDERR_LINE_BYTES_MAX);
-            }
-            Ok(_) => {}
+        let frame = read_line::<_, ChildFrame>(output)
+            .await?
+            .ok_or(SupervisorError::Cleanup)?;
+        if matches!(frame, ChildFrame::ShutdownComplete {
+            correlation_id, owner: frame_owner,
+        } if correlation_id == correlation && frame_owner == owner)
+        {
+            return Ok(());
         }
     }
 }
 
-fn release_stale(plane: &Arc<Mutex<ControlPlane>>) {
-    if let Ok(mut plane) = plane.lock() {
-        let _ = plane.release_stale();
+async fn reap_failed_spawn(child: &mut Child) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+async fn drain_stderr<R>(mut stderr: R)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut chunk = [0_u8; CHANNEL_STDERR_CHUNK_BYTES];
+    let mut total = 0_usize;
+    let mut line = 0_usize;
+    loop {
+        let remaining = CHANNEL_STDERR_TOTAL_BYTES_MAX.saturating_sub(total);
+        if remaining == 0 {
+            break;
+        }
+        let limit = remaining.min(chunk.len());
+        let Ok(length) = stderr.read(&mut chunk[..limit]).await else {
+            break;
+        };
+        if length == 0 {
+            break;
+        }
+        total += length;
+        for byte in &chunk[..length] {
+            if *byte == b'\n' {
+                line = 0;
+            } else {
+                line = line.saturating_add(1).min(CHANNEL_STDERR_LINE_BYTES_MAX);
+            }
+        }
     }
+}
+
+fn random_id(prefix: &str) -> Result<String, SupervisorError> {
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random).map_err(|_| SupervisorError::Spawn)?;
+    let mut value = String::with_capacity(prefix.len() + 33);
+    value.push_str(prefix);
+    value.push('-');
+    for byte in random {
+        use std::fmt::Write as _;
+        write!(&mut value, "{byte:02x}").map_err(|_| SupervisorError::Spawn)?;
+    }
+    Ok(value)
 }
 
 fn copy_error(error: &SupervisorError) -> SupervisorError {

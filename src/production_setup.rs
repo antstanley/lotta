@@ -105,6 +105,8 @@ pub struct ProductionSetupConfig {
     pub output_tokens: u64,
     /// Shared Task 32 registry, already populated with built-ins by composition.
     pub registry: Arc<ToolRegistry>,
+    /// Channel external-tool manager over that exact registry.
+    pub channel_tools: Arc<lotta_tools::external::ChannelExternalToolManager>,
     /// Shared runtime-scoped Task 40 lifecycle authority.
     pub tasks: Arc<lotta_tools::builtin::task::TaskLifecyclePort>,
     /// Shared canonical mod registries over the same Task 32 registry.
@@ -178,6 +180,7 @@ pub struct ProductionSetupPorts {
     server_context_window: u64,
     output_tokens: u64,
     registry: Arc<ToolRegistry>,
+    channel_tools: Arc<lotta_tools::external::ChannelExternalToolManager>,
     tasks: Arc<lotta_tools::builtin::task::TaskLifecyclePort>,
     mod_registries: Arc<ModRegistries>,
     hook_registry: Arc<HookRegistry>,
@@ -403,6 +406,12 @@ impl ProductionSetupPorts {
         Arc::clone(&self.registry)
     }
 
+    /// Returns the canonical runtime-scoped channel external-tool manager.
+    #[must_use]
+    pub fn channel_tools(&self) -> Arc<lotta_tools::external::ChannelExternalToolManager> {
+        Arc::clone(&self.channel_tools)
+    }
+
     /// Discovers the current scoped production skill catalog.
     pub fn available_skills(
         &self,
@@ -439,6 +448,7 @@ impl ProductionSetupPorts {
         std::fs::create_dir_all(&root).map_err(adapter)?;
         let memfs = GitMemFs::new(root.clone()).map_err(SetupError::from)?;
         let registry = config.registry;
+        let channel_tools = config.channel_tools;
         let mod_registries = config.mod_registries;
         let hook_registry = config.hook_registry;
         let default = config.default_model.to_string();
@@ -459,6 +469,7 @@ impl ProductionSetupPorts {
             server_context_window: config.server_context_window,
             output_tokens: config.output_tokens,
             registry,
+            channel_tools,
             tasks: config.tasks,
             mod_registries,
             hook_registry,
@@ -1006,23 +1017,37 @@ impl SetupPorts for ProductionSetupPorts {
             let _ = Arc::strong_count(&snapshot.hooks);
             let _ = Arc::strong_count(&self.hook_runtime);
         }
-        self.registry
+        let mut registrations = self
+            .registry
             .snapshot()
             .map_err(adapter)?
             .complete_registrations()
-            .1
+            .1;
+        registrations.retain(|registration| {
+            registration.definition.execution_owner
+                != lotta_runtime::ports::ToolExecutionOwner::Controller
+        });
+        let channel_key = lotta_tools::external::ChannelRuntimeKey {
+            agent_id: scope.runtime.agent_id.as_str().to_owned(),
+            conversation_id: scope.runtime.conversation_id.as_str().to_owned(),
+        };
+        if let Some(channel) = self.channel_tools.runtime_registrations(&channel_key) {
+            registrations.extend(channel);
+        }
+        registrations
             .into_iter()
             .map(|registration| {
+                let source = match registration.definition.execution_owner {
+                    lotta_runtime::ports::ToolExecutionOwner::ModSidecar => SetupToolSource::Mod,
+                    lotta_runtime::ports::ToolExecutionOwner::Controller => {
+                        SetupToolSource::Channel
+                    }
+                    _ => SetupToolSource::BuiltIn,
+                };
                 authorize_candidate(
                     scope,
                     ToolCandidate {
-                        source: if registration.definition.execution_owner
-                            == lotta_runtime::ports::ToolExecutionOwner::ModSidecar
-                        {
-                            SetupToolSource::Mod
-                        } else {
-                            SetupToolSource::BuiltIn
-                        },
+                        source,
                         definition: (*registration.definition).clone(),
                         model_name: registration.definition.model_name.as_str().to_owned(),
                         authorized: true,
@@ -1034,6 +1059,7 @@ impl SetupPorts for ProductionSetupPorts {
 
     fn merge_tools(
         &self,
+        scope_handle: SetupScopeHandle,
         model: &ResolvedTurnModel,
         candidates: Vec<ToolCandidate>,
     ) -> Result<TurnToolCatalog, SetupError> {
@@ -1043,7 +1069,7 @@ impl SetupPorts for ProductionSetupPorts {
             .map(|candidate| candidate.definition.internal_name.as_str().to_owned())
             .collect();
         let toolset = ToolsetId::from_str(&model.toolset).map_err(adapter)?;
-        let external = self
+        let mut external = self
             .registry
             .snapshot()
             .map_err(adapter)?
@@ -1056,6 +1082,17 @@ impl SetupPorts for ProductionSetupPorts {
                     && names.contains(registration.definition.internal_name.as_str())
             })
             .collect::<Vec<ToolRegistration>>();
+        if let Ok(scope) = self.scope_snapshot(scope_handle) {
+            let channel_key = lotta_tools::external::ChannelRuntimeKey {
+                agent_id: scope.runtime.agent_id.as_str().to_owned(),
+                conversation_id: scope.runtime.conversation_id.as_str().to_owned(),
+            };
+            if let Some(registrations) = self.channel_tools.runtime_registrations(&channel_key) {
+                external.extend(registrations.into_iter().filter(|registration| {
+                    names.contains(registration.definition.internal_name.as_str())
+                }));
+            }
+        }
         let allowlist = model
             .allowlist
             .as_ref()
@@ -2875,6 +2912,12 @@ pub struct ProductionTurnController {
 }
 
 impl ProductionTurnController {
+    /// Returns the exact channel manager consumed by production setup.
+    #[must_use]
+    pub fn channel_tools(&self) -> Arc<lotta_tools::external::ChannelExternalToolManager> {
+        self.setup.channel_tools()
+    }
+
     /// Creates the controller with all real runtime/provider/tool/turn dependencies.
     #[must_use]
     #[allow(

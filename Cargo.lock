@@ -984,6 +984,8 @@ version = "0.1.0"
 dependencies = [
  "futures-util",
  "getrandom 0.3.4",
+ "lotta-app-server",
+ "lotta-domain",
  "lotta-extensions",
  "lotta-testkit",
  "lotta-tools",

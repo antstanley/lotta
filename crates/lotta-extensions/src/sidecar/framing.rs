@@ -1,6 +1,7 @@
 //! Authoritative Task 42 v1 length-prefixed JSON adapter codec.
 
 use serde::{Serialize, de::DeserializeOwned};
+use serde_json::Value;
 use std::io::ErrorKind;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -32,6 +33,55 @@ pub enum FramingError {
     /// Local-pipe I/O failed.
     #[error("sidecar pipe io failed")]
     Io,
+}
+
+/// Generic structural JSON limits shared by local sidecar transports.
+#[derive(Clone, Copy, Debug)]
+pub struct JsonStructureBounds {
+    /// Maximum nesting depth, with the root at depth zero.
+    pub depth_max: usize,
+    /// Maximum UTF-8 bytes in any key or string value.
+    pub string_bytes_max: usize,
+    /// Maximum items in any array.
+    pub array_items_max: usize,
+    /// Maximum entries in any object.
+    pub map_entries_max: usize,
+}
+
+/// Validates JSON structure using the authoritative Task 42 depth/collection ordering.
+///
+/// # Errors
+/// Returns [`FramingError::Length`] at the first structural bound violation.
+pub fn validate_json_structure(
+    value: &Value,
+    bounds: JsonStructureBounds,
+) -> Result<(), FramingError> {
+    validate_json_at_depth(value, bounds, 0)
+}
+
+fn validate_json_at_depth(
+    value: &Value,
+    bounds: JsonStructureBounds,
+    depth: usize,
+) -> Result<(), FramingError> {
+    if depth > bounds.depth_max {
+        return Err(FramingError::Length);
+    }
+    match value {
+        Value::String(text) if text.len() > bounds.string_bytes_max => Err(FramingError::Length),
+        Value::Array(values) if values.len() > bounds.array_items_max => Err(FramingError::Length),
+        Value::Object(values) if values.len() > bounds.map_entries_max => Err(FramingError::Length),
+        Value::Array(values) => values
+            .iter()
+            .try_for_each(|item| validate_json_at_depth(item, bounds, depth + 1)),
+        Value::Object(values) => values.iter().try_for_each(|(key, item)| {
+            if key.len() > bounds.string_bytes_max {
+                return Err(FramingError::Length);
+            }
+            validate_json_at_depth(item, bounds, depth + 1)
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// Fallible factory for a frame payload buffer.

@@ -102,6 +102,9 @@ impl Fixture {
             }],
             server_context_window: 16_384,
             output_tokens: 2_048,
+            channel_tools: Arc::new(lotta_tools::external::ChannelExternalToolManager::new(
+                Arc::clone(&registry),
+            )),
             registry,
             tasks: Arc::new(lotta_tools::builtin::task::TaskLifecyclePort::new()),
             mod_registries,
@@ -485,7 +488,13 @@ async fn production_toolset_preserves_model_names_and_allowlist() {
         "ApplyPatch".to_owned(),
         "UpdatePlan".to_owned(),
     ]);
-    let catalog = SetupPorts::merge_tools(&ports, &allowlisted, Vec::new()).expect("merge tools");
+    let catalog = SetupPorts::merge_tools(
+        &ports,
+        lotta_runtime::turn::SetupScopeHandle::new(0),
+        &allowlisted,
+        Vec::new(),
+    )
+    .expect("merge tools");
     let names: BTreeSet<_> = catalog
         .definitions()
         .map(|definition| definition.model_name.as_str().to_owned())

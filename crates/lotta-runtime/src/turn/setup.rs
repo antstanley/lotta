@@ -343,6 +343,7 @@ pub trait SetupPorts: Send + Sync {
     /// Composes the actual Task32 registry after permission and allowlist filtering.
     fn merge_tools(
         &self,
+        scope: SetupScopeHandle,
         model: &ResolvedTurnModel,
         candidates: Vec<ToolCandidate>,
     ) -> Result<TurnToolCatalog, SetupError>;

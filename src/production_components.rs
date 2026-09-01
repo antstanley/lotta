@@ -372,6 +372,7 @@ impl ProductionComponents {
         .map_err(|_| SetupError::Adapter("shared group bridge roots".into()))?;
         let tooling = production_tooling(&root, &workspace)?;
         let (store_paths, provider_runtime, setup, tools, approvals, shell, tasks) = tooling;
+        shared.register_channel_tools(Some(setup.channel_tools()));
         let provider = Arc::new(provider_runtime);
         let runtime_state = production_runtime_state(&observer, &approvals);
         let brokers = Arc::new(ProductionTurnBrokers::new());
@@ -475,6 +476,12 @@ impl ProductionComponents {
     #[must_use]
     pub fn turn_controller(&self) -> Arc<dyn TurnController> {
         self.turn_controller.clone()
+    }
+
+    /// Returns the channel external-tool manager used by production turn setup.
+    #[must_use]
+    pub fn channel_tools(&self) -> Arc<lotta_tools::external::ChannelExternalToolManager> {
+        self.turn_controller.channel_tools()
     }
 
     /// Returns a handle over the shared skills/settings bridge pair served by
@@ -637,6 +644,9 @@ fn setup_config(
         Arc::clone(&tasks),
     )?;
     let registry = Arc::new(lotta_tools::ToolRegistry::new(builtins).map_err(adapter)?);
+    let channel_tools = Arc::new(lotta_tools::external::ChannelExternalToolManager::new(
+        Arc::clone(&registry),
+    ));
     let mod_registries = Arc::new(ModRegistries::new(Arc::clone(&registry)));
     let hook_registry = Arc::new(HookRegistry::new());
     let hook_runtime =
@@ -650,6 +660,7 @@ fn setup_config(
         server_context_window: DEFAULT_CONTEXT_WINDOW_TOKENS,
         output_tokens: DEFAULT_OUTPUT_TOKENS,
         registry,
+        channel_tools,
         tasks,
         mod_registries,
         hook_registry,

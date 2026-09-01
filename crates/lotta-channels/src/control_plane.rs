@@ -3,8 +3,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeSet, VecDeque},
     io::ErrorKind,
+    sync::Arc,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
@@ -60,12 +61,18 @@ pub struct ChannelState {
     pub id: String,
     /// Whether persisted configuration enables the channel.
     pub enabled: bool,
-    /// Number of persisted accounts, when available.
+    /// Number of canonical persisted account records.
     pub accounts: usize,
+    /// Number of canonical persisted routes.
+    pub routes: usize,
+    /// Number of pending pairing records.
+    pub pending_pairings: usize,
+    /// Number of discovered/bound targets.
+    pub targets: usize,
 }
 
 /// Parent-to-child bootstrap, command, and response frame.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ParentFrame {
     /// Secret bootstrap delivered on the inherited management pipe.
@@ -177,127 +184,13 @@ pub enum ControlError {
     Io,
 }
 
-#[derive(Clone, Debug)]
-struct OwnedTools {
-    owner: String,
-    tools: Vec<RuntimeTool>,
-}
-
-/// Parent-owned canonical runtime external-tool registry.
-#[derive(Default)]
-pub struct RuntimeToolRegistry {
-    entries: BTreeMap<RuntimeKey, OwnedTools>,
-}
-
-impl RuntimeToolRegistry {
-    /// Atomically replaces tools for one runtime after owner and collision checks.
-    ///
-    /// # Errors
-    /// Returns an owner, identity, collision, reserved-name, or bound failure.
-    pub fn publish(
-        &mut self,
-        owner: &str,
-        runtime: RuntimeKey,
-        tools: Vec<RuntimeTool>,
-    ) -> Result<(), ControlError> {
-        validate_id(owner)?;
-        validate_runtime(&runtime)?;
-        validate_tools(&tools)?;
-        let retained = self
-            .entries
-            .iter()
-            .filter(|(key, _)| **key != runtime)
-            .map(|(_, value)| value.tools.len())
-            .sum::<usize>();
-        if retained.saturating_add(tools.len()) > RUNTIME_TOOLS_PER_OWNER_MAX {
-            return Err(ControlError::Registry);
-        }
-        if self
-            .entries
-            .get(&runtime)
-            .is_some_and(|entry| entry.owner != owner)
-        {
-            return Err(ControlError::Registry);
-        }
-        self.entries.insert(
-            runtime,
-            OwnedTools {
-                owner: owner.to_owned(),
-                tools,
-            },
-        );
-        Ok(())
-    }
-
-    /// Registers the supervisor-blessed `MessageChannel` capability for one routed runtime.
-    ///
-    /// # Errors
-    /// Returns an owner, identity, collision, or bound failure.
-    pub fn register_message_channel(
-        &mut self,
-        owner: &str,
-        runtime: RuntimeKey,
-    ) -> Result<(), ControlError> {
-        validate_id(owner)?;
-        validate_runtime(&runtime)?;
-        if self
-            .entries
-            .get(&runtime)
-            .is_some_and(|entry| entry.owner != owner)
-        {
-            return Err(ControlError::Registry);
-        }
-        let tool = RuntimeTool {
-            name: "MessageChannel".into(),
-            description: "Send a visible reply through the originating channel".into(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {"message": {"type": "string"}},
-                "required": ["message"]
-            }),
-        };
-        self.entries.insert(
-            runtime,
-            OwnedTools {
-                owner: owner.to_owned(),
-                tools: vec![tool],
-            },
-        );
-        Ok(())
-    }
-
-    /// Releases one exact runtime only when the owner matches.
-    ///
-    /// # Errors
-    /// Returns when a different child owns the runtime.
-    pub fn release(&mut self, owner: &str, runtime: &RuntimeKey) -> Result<bool, ControlError> {
-        match self.entries.get(runtime) {
-            Some(entry) if entry.owner == owner => Ok(self.entries.remove(runtime).is_some()),
-            Some(_) => Err(ControlError::Owner),
-            None => Ok(false),
-        }
-    }
-
-    /// Releases every runtime owned by one exact child and returns the count.
-    pub fn release_owner(&mut self, owner: &str) -> usize {
-        let before = self.entries.len();
-        self.entries.retain(|_, value| value.owner != owner);
-        before - self.entries.len()
-    }
-
-    /// Returns an owned snapshot for tests and composition observers.
-    #[must_use]
-    pub fn snapshot(&self, runtime: &RuntimeKey) -> Option<Vec<RuntimeTool>> {
-        self.entries.get(runtime).map(|entry| entry.tools.clone())
-    }
-}
-
 /// Stateful owner/correlation validator and command dispatcher.
 pub struct ControlPlane {
     owner: String,
+    generation: u64,
     replay_order: VecDeque<String>,
     replay: BTreeSet<String>,
-    registry: RuntimeToolRegistry,
+    tools: Arc<lotta_tools::external::ChannelExternalToolManager>,
 }
 
 impl ControlPlane {
@@ -305,13 +198,21 @@ impl ControlPlane {
     ///
     /// # Errors
     /// Returns when the owner identity is invalid.
-    pub fn new(owner: String) -> Result<Self, ControlError> {
+    pub fn new(
+        owner: String,
+        generation: u64,
+        tools: Arc<lotta_tools::external::ChannelExternalToolManager>,
+    ) -> Result<Self, ControlError> {
         validate_id(&owner)?;
+        if generation == 0 {
+            return Err(ControlError::Owner);
+        }
         Ok(Self {
             owner,
+            generation,
             replay_order: VecDeque::new(),
             replay: BTreeSet::new(),
-            registry: RuntimeToolRegistry::default(),
+            tools,
         })
     }
 
@@ -338,7 +239,16 @@ impl ControlPlane {
                 tools,
                 ..
             } => {
-                self.registry.publish(&self.owner, runtime, tools)?;
+                validate_runtime(&runtime)?;
+                validate_tools(&tools)?;
+                self.tools
+                    .publish(
+                        &self.owner,
+                        self.generation,
+                        canonical_runtime(runtime),
+                        tools.into_iter().map(canonical_tool).collect(),
+                    )
+                    .map_err(|_| ControlError::Registry)?;
                 Ok(Some(ParentFrame::RuntimeToolsPublished {
                     correlation_id: request_id,
                 }))
@@ -348,7 +258,10 @@ impl ControlPlane {
                 runtime,
                 ..
             } => {
-                self.registry.release(&self.owner, &runtime)?;
+                validate_runtime(&runtime)?;
+                self.tools
+                    .release(&self.owner, self.generation, &canonical_runtime(runtime))
+                    .map_err(|_| ControlError::Registry)?;
                 Ok(Some(ParentFrame::RuntimeToolsReleased {
                     correlation_id: request_id,
                 }))
@@ -366,23 +279,16 @@ impl ControlPlane {
         }
     }
 
-    /// Registers the built-in `MessageChannel` capability after authenticated startup.
-    ///
-    /// # Errors
-    /// Returns an identity, owner, collision, or bound failure.
-    pub fn register_message_channel(&mut self, runtime: RuntimeKey) -> Result<(), ControlError> {
-        self.registry.register_message_channel(&self.owner, runtime)
-    }
-
-    /// Returns the canonical registry owned by this plane.
+    /// Returns whether the canonical production manager currently owns this runtime.
     #[must_use]
-    pub const fn registry(&self) -> &RuntimeToolRegistry {
-        &self.registry
+    pub fn contains_runtime(&self, runtime: &RuntimeKey) -> bool {
+        self.tools.contains(&canonical_runtime(runtime.clone()))
     }
 
-    /// Releases all stale registrations exactly once for terminal cleanup.
-    pub fn release_stale(&mut self) -> usize {
-        self.registry.release_owner(&self.owner)
+    /// Releases all registrations for this exact terminated generation.
+    #[must_use]
+    pub fn release_stale(&self) -> usize {
+        self.tools.release_generation(&self.owner, self.generation)
     }
 
     fn admit_request(&mut self, request_id: &str) -> Result<(), ControlError> {
@@ -440,7 +346,7 @@ where
     let mut deserializer = serde_json::Deserializer::from_str(text);
     let value = Value::deserialize(&mut deserializer).map_err(|_| ControlError::Malformed)?;
     deserializer.end().map_err(|_| ControlError::Malformed)?;
-    validate_json(&value, 0)?;
+    validate_structure(&value)?;
     serde_json::from_value(value)
         .map_err(|_| ControlError::Malformed)
         .map(Some)
@@ -464,25 +370,15 @@ where
     writer.flush().await.map_err(map_io)
 }
 
-fn validate_json(value: &Value, depth: usize) -> Result<(), ControlError> {
-    if depth > CONTROL_JSON_DEPTH_MAX {
-        return Err(ControlError::Bound);
-    }
-    match value {
-        Value::String(text) if text.len() > CONTROL_STRING_BYTES_MAX => Err(ControlError::Bound),
-        Value::Array(values) if values.len() > CONTROL_ARRAY_ITEMS_MAX => Err(ControlError::Bound),
-        Value::Object(values) if values.len() > CONTROL_MAP_ENTRIES_MAX => Err(ControlError::Bound),
-        Value::Array(values) => values
-            .iter()
-            .try_for_each(|item| validate_json(item, depth + 1)),
-        Value::Object(values) => values.iter().try_for_each(|(key, item)| {
-            if key.len() > CONTROL_STRING_BYTES_MAX {
-                return Err(ControlError::Bound);
-            }
-            validate_json(item, depth + 1)
-        }),
-        _ => Ok(()),
-    }
+fn validate_structure(value: &Value) -> Result<(), ControlError> {
+    let bounds = lotta_extensions::sidecar::framing::JsonStructureBounds {
+        depth_max: CONTROL_JSON_DEPTH_MAX,
+        string_bytes_max: CONTROL_STRING_BYTES_MAX,
+        array_items_max: CONTROL_ARRAY_ITEMS_MAX,
+        map_entries_max: CONTROL_MAP_ENTRIES_MAX,
+    };
+    lotta_extensions::sidecar::framing::validate_json_structure(value, bounds)
+        .map_err(|_| ControlError::Bound)
 }
 
 fn validate_tools(tools: &[RuntimeTool]) -> Result<(), ControlError> {
@@ -499,9 +395,24 @@ fn validate_tools(tools: &[RuntimeTool]) -> Result<(), ControlError> {
         {
             return Err(ControlError::Registry);
         }
-        validate_json(&tool.parameters, 0)?;
+        validate_structure(&tool.parameters)?;
     }
     Ok(())
+}
+
+fn canonical_runtime(runtime: RuntimeKey) -> lotta_tools::external::ChannelRuntimeKey {
+    lotta_tools::external::ChannelRuntimeKey {
+        agent_id: runtime.agent_id,
+        conversation_id: runtime.conversation_id,
+    }
+}
+
+fn canonical_tool(tool: RuntimeTool) -> lotta_tools::external::ChannelToolDescriptor {
+    lotta_tools::external::ChannelToolDescriptor {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters,
+    }
 }
 
 fn validate_runtime(runtime: &RuntimeKey) -> Result<(), ControlError> {
@@ -525,9 +436,15 @@ fn validate_id(value: &str) -> Result<(), ControlError> {
 
 fn frame_identity(frame: &ChildFrame) -> (&str, Option<&str>) {
     match frame {
-        ChildFrame::Ready { owner, .. } | ChildFrame::ShutdownComplete { owner, .. } => {
-            (owner, None)
+        ChildFrame::Ready {
+            owner,
+            correlation_id,
+            ..
         }
+        | ChildFrame::ShutdownComplete {
+            owner,
+            correlation_id,
+        } => (owner, Some(correlation_id)),
         ChildFrame::PublishRuntimeTools {
             owner, request_id, ..
         }
@@ -551,6 +468,14 @@ fn map_io(error: std::io::Error) -> ControlError {
 mod tests {
     use super::*;
 
+    fn plane() -> ControlPlane {
+        let registry = Arc::new(lotta_tools::ToolRegistry::new([]).unwrap());
+        let tools = Arc::new(lotta_tools::external::ChannelExternalToolManager::new(
+            registry,
+        ));
+        ControlPlane::new("owner".into(), 1, tools).unwrap()
+    }
+
     fn runtime() -> RuntimeKey {
         RuntimeKey {
             agent_id: "agent".into(),
@@ -567,7 +492,7 @@ mod tests {
 
     #[test]
     fn publish_release_channels_registry_effects() {
-        let mut plane = ControlPlane::new("owner".into()).unwrap();
+        let mut plane = plane();
         let publish = ChildFrame::PublishRuntimeTools {
             request_id: "p1".into(),
             owner: "owner".into(),
@@ -578,11 +503,14 @@ mod tests {
             plane.dispatch(publish, &[]),
             Ok(Some(ParentFrame::RuntimeToolsPublished { .. }))
         ));
-        assert_eq!(plane.registry().snapshot(&runtime()).unwrap().len(), 1);
+        assert!(plane.contains_runtime(&runtime()));
         let channels = vec![ChannelState {
             id: "telegram".into(),
             enabled: true,
             accounts: 1,
+            routes: 1,
+            pending_pairings: 0,
+            targets: 1,
         }];
         let slash = ChildFrame::Channels {
             request_id: "c1".into(),
@@ -602,7 +530,7 @@ mod tests {
             plane.dispatch(release, &[]),
             Ok(Some(ParentFrame::RuntimeToolsReleased { .. }))
         ));
-        assert!(plane.registry().snapshot(&runtime()).is_none());
+        assert!(!plane.contains_runtime(&runtime()));
     }
 
     #[tokio::test]
@@ -616,7 +544,7 @@ mod tests {
             let mut reader = BufReader::new(bytes);
             assert!(read_line::<_, ChildFrame>(&mut reader).await.is_err());
         }
-        let mut plane = ControlPlane::new("owner".into()).unwrap();
+        let mut plane = plane();
         let frame = ChildFrame::Channels {
             request_id: "same".into(),
             owner: "owner".into(),

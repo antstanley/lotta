@@ -199,7 +199,7 @@ impl SetupOrchestrator<'_> {
             .collect();
         let tools = self
             .ports
-            .merge_tools(model, authorized)
+            .merge_tools(scope, model, authorized)
             .map_err(SetupFailure::pre)?;
         stages.push(SetupStage::MergeTools);
         Ok(tools)

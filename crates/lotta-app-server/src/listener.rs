@@ -101,7 +101,7 @@ struct ListenerState {
     auth: crate::auth::AuthPolicy,
     openai_api: bool,
     channel_host_protocol_only: bool,
-    channel_capability_deadline: Option<std::time::Instant>,
+    channel_session: Option<crate::auth::channel_session::ChannelSessionAuthenticator>,
     listener_instance: String,
     clock: Arc<dyn Clock + Send + Sync>,
     shutdown: CancellationToken,
@@ -114,6 +114,7 @@ struct ListenerState {
     agents: Arc<AgentsBridge>,
     conversations: Arc<ConversationsBridge>,
     external_tools: Arc<ExternalToolBridge>,
+    channel_tools: Option<Arc<lotta_tools::external::ChannelExternalToolManager>>,
     teleports: Arc<TeleportBridge>,
     terminals: Arc<TerminalBridge>,
     files: Arc<FilesBridge>,
@@ -449,6 +450,8 @@ pub struct SharedGroupBridges {
         Arc<std::sync::Mutex<Option<Arc<dyn crate::ws::device::BackgroundProcessSource>>>>,
     device_status_authority:
         Arc<std::sync::Mutex<Option<crate::ws::device::DeviceStatusAuthority>>>,
+    channel_tools:
+        Arc<std::sync::Mutex<Option<Arc<lotta_tools::external::ChannelExternalToolManager>>>>,
 }
 
 impl SharedGroupBridges {
@@ -482,6 +485,7 @@ impl SharedGroupBridges {
             mod_commands: Arc::new(std::sync::Mutex::new(None)),
             background_processes: Arc::new(std::sync::Mutex::new(None)),
             device_status_authority: Arc::new(std::sync::Mutex::new(None)),
+            channel_tools: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -598,6 +602,25 @@ impl SharedGroupBridges {
             .ok()
             .and_then(|current| current.clone())
     }
+
+    /// Registers the canonical channel manager consumed by production turn setup.
+    pub fn register_channel_tools(
+        &self,
+        manager: Option<Arc<lotta_tools::external::ChannelExternalToolManager>>,
+    ) {
+        if let Ok(mut current) = self.channel_tools.lock() {
+            *current = manager;
+        }
+    }
+
+    /// Returns the canonical channel manager when production composition installed it.
+    #[must_use]
+    pub fn channel_tools(&self) -> Option<Arc<lotta_tools::external::ChannelExternalToolManager>> {
+        self.channel_tools
+            .lock()
+            .ok()
+            .and_then(|current| current.clone())
+    }
 }
 
 /// Binds a listener over host-composed skills/settings bridges.
@@ -654,6 +677,7 @@ fn compose_shared_bridges(
         mod_commands: Arc::new(std::sync::Mutex::new(None)),
         background_processes: Arc::new(std::sync::Mutex::new(None)),
         device_status_authority: Arc::new(std::sync::Mutex::new(None)),
+        channel_tools: Arc::new(std::sync::Mutex::new(None)),
     })
 }
 
@@ -705,7 +729,6 @@ async fn start_listener_with_limits(
 }
 
 const SUBSCRIPTION_LEASE_SWEEP_SECONDS: u64 = 1;
-const CHANNEL_HOST_CAPABILITY_TTL_SECONDS: u64 = 300;
 
 async fn run_listener(
     listener: TcpListener,
@@ -770,6 +793,7 @@ fn compose_listener_state(
 ) -> Result<Arc<ListenerState>, AppServerError> {
     let shared = resolve_shared_bridges(shared, &prepared, clock)?;
     let conversations_authority = shared.conversations_authority();
+    let channel_tools = shared.channel_tools();
     let mut device_ports = DevicePorts::from_shared(&shared);
     let SharedGroupBridges {
         outbound,
@@ -792,15 +816,20 @@ fn compose_listener_state(
     let turns = turn_supervisor::RuntimeTurnSupervisor::new(shutdown.clone());
     let (openai_chat, openai_responses) =
         compose_openai_states(&storage, &endpoints, clock, &shutdown);
+    let listener_instance = listener_instance(clock);
+    if let Some(authenticator) = &prepared.channel_session {
+        authenticator.bind_listener(
+            &prepared.host,
+            &prepared.websocket_path,
+            &listener_instance,
+        )?;
+    }
     Ok(Arc::new(ListenerState {
         auth: prepared.auth,
         openai_api: prepared.openai_api,
         channel_host_protocol_only: prepared.channel_host_protocol_only,
-        channel_capability_deadline: prepared.channel_host_protocol_only.then(|| {
-            std::time::Instant::now()
-                + std::time::Duration::from_secs(CHANNEL_HOST_CAPABILITY_TTL_SECONDS)
-        }),
-        listener_instance: listener_instance(clock),
+        channel_session: prepared.channel_session,
+        listener_instance,
         clock: Arc::clone(clock),
         shutdown,
         limits,
@@ -810,6 +839,7 @@ fn compose_listener_state(
         turns,
         observer: endpoints.observer,
         external_tools: Arc::new(ExternalToolBridge::new(external_forwarder(&outbound))),
+        channel_tools,
         teleports: Arc::new(TeleportBridge::new(teleport_forwarder(&outbound))),
         terminals: Arc::new(TerminalBridge::new(
             terminal_forwarder(&outbound),
@@ -1112,11 +1142,9 @@ fn authorize_listener_headers(
     state: &ListenerState,
     headers: &HeaderMap,
 ) -> Result<(), AppServerError> {
-    if state
-        .channel_capability_deadline
-        .is_some_and(|deadline| std::time::Instant::now() > deadline)
-    {
-        return Err(AppServerError::Unauthorized);
+    if let Some(authenticator) = &state.channel_session {
+        authenticator.authenticate(headers)?;
+        return Ok(());
     }
     state.auth.authorize(headers, state.clock.as_ref())?;
     origin::enforce(headers, &state.auth)?;
@@ -1135,12 +1163,18 @@ async fn upgrade(
         return AppServerError::Malformed.into_response();
     };
     let reconnect_identity = authenticated_reconnect_identity(&state, &headers);
+    let channel_principal = state
+        .channel_session
+        .as_ref()
+        .and_then(|authenticator| authenticator.authenticate(&headers).ok());
     let connection = state.clone();
     websocket
         .max_frame_size(state.limits.frame_bytes)
         .max_message_size(state.limits.frame_bytes)
         .on_failed_upgrade(|_| {})
-        .on_upgrade(move |socket| serve_socket(socket, connection, reconnect_identity))
+        .on_upgrade(move |socket| {
+            serve_socket(socket, connection, reconnect_identity, channel_principal)
+        })
         .into_response()
 }
 
@@ -1181,6 +1215,7 @@ async fn serve_socket(
     mut socket: WebSocket,
     state: Arc<ListenerState>,
     reconnect_identity: Option<crate::ws::connection::ReconnectIdentity>,
+    channel_principal: Option<crate::auth::channel_session::ChannelPrincipal>,
 ) {
     let (sender, mut receiver) = mpsc::channel(WS_OUTBOUND_FRAMES_PER_CONNECTION_MAX);
     let Ok(connection_id) = open_connection(&state, sender, reconnect_identity.as_ref()) else {
@@ -1192,8 +1227,20 @@ async fn serve_socket(
         state.limits.ping_interval_ms,
     ));
     interval.tick().await;
+    let mut channel_revision = state
+        .channel_session
+        .as_ref()
+        .map(crate::auth::channel_session::ChannelSessionAuthenticator::subscribe);
     loop {
         tokio::select! {
+            () = channel_authority_changed(&mut channel_revision), if channel_revision.is_some() => {
+                let admitted = state.channel_session.as_ref().zip(channel_principal.as_ref())
+                    .is_some_and(|(auth, principal)| auth.admits(principal));
+                if !admitted {
+                    send_close(&mut socket, close_code::POLICY, "channel authority revoked").await;
+                    break;
+                }
+            }
             () = state.shutdown.cancelled() => {
                 send_close(&mut socket, close_code::AWAY, "server shutdown").await;
                 break;
@@ -1204,6 +1251,12 @@ async fn serve_socket(
                 }
             }
             _ = interval.tick() => {
+                if state.channel_session.as_ref().zip(channel_principal.as_ref())
+                    .is_some_and(|(auth, principal)| !auth.admits(principal))
+                {
+                    send_close(&mut socket, close_code::POLICY, "channel authority expired").await;
+                    break;
+                }
                 if heartbeat.is_expired(state.clock.as_ref()) {
                     send_close(&mut socket, close_code::AWAY, "heartbeat expired").await;
                     break;
@@ -1219,6 +1272,7 @@ async fn serve_socket(
                     &mut heartbeat,
                     &state,
                     connection_id,
+                    channel_principal.as_ref(),
                 ).await;
                 if !keep_open {
                     break;
@@ -1227,6 +1281,14 @@ async fn serve_socket(
         }
     }
     close_connection(&state, connection_id).await;
+}
+
+async fn channel_authority_changed(revision: &mut Option<tokio::sync::watch::Receiver<u64>>) {
+    if let Some(revision) = revision {
+        let _ = revision.changed().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
 }
 
 fn open_connection(
@@ -1369,6 +1431,7 @@ async fn handle_incoming(
     heartbeat: &mut Heartbeat,
     state: &Arc<ListenerState>,
     connection_id: crate::ws::ConnectionId,
+    channel_principal: Option<&crate::auth::channel_session::ChannelPrincipal>,
 ) -> bool {
     match incoming {
         Some(Ok(Message::Pong(_))) => {
@@ -1376,7 +1439,9 @@ async fn handle_incoming(
             true
         }
         Some(Ok(Message::Ping(payload))) => socket.send(Message::Pong(payload)).await.is_ok(),
-        Some(Ok(Message::Text(text))) => handle_text(&text, state, connection_id).await,
+        Some(Ok(Message::Text(text))) => {
+            handle_text(&text, state, connection_id, channel_principal).await
+        }
         Some(Ok(Message::Binary(_))) => {
             send_close(socket, close_code::UNSUPPORTED, "binary unsupported").await;
             false
@@ -1411,20 +1476,46 @@ async fn handle_text(
     text: &str,
     state: &Arc<ListenerState>,
     connection_id: crate::ws::ConnectionId,
+    channel_principal: Option<&crate::auth::channel_session::ChannelPrincipal>,
 ) -> bool {
+    if let Some(authenticator) = &state.channel_session
+        && !channel_principal.is_some_and(|principal| authenticator.admits(principal))
+    {
+        return false;
+    }
     let frame = match crate::framing::decode_text(text) {
         Ok(frame) => frame,
         Err(error) => return dispatch_value(state, connection_id, &error).is_ok(),
     };
+    if state.channel_host_protocol_only
+        && !frame
+            .value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(crate::auth::channel_session::ChannelSessionAuthenticator::command_allowed)
+    {
+        return dispatch_typed_failure(state, connection_id, &frame).is_ok();
+    }
     let command = match crate::ws::command::decode(&frame) {
         Ok(Some(command)) => command,
+        Ok(None)
+            if state.channel_host_protocol_only
+                && frame.value["type"] == "runtime_external_tool_call_response" =>
+        {
+            return handle_channel_tool_response(state, channel_principal, &frame);
+        }
         Ok(None) if state.channel_host_protocol_only => {
             return dispatch_typed_failure(state, connection_id, &frame).is_ok();
         }
         Ok(None) => return handle_external_frame(state, connection_id, &frame),
         Err(error) => return dispatch_value(state, connection_id, &error).is_ok(),
     };
-    if state.channel_host_protocol_only && channel_runtime_extension_forbidden(&command) {
+    if state.channel_host_protocol_only && !channel_runtime_command_allowed(state, &command) {
+        return dispatch_typed_failure(state, connection_id, &frame).is_ok();
+    }
+    if state.channel_host_protocol_only
+        && !publish_channel_runtime_tool(state, connection_id, &command, channel_principal)
+    {
         return dispatch_typed_failure(state, connection_id, &frame).is_ok();
     }
     let routed = route_command(
@@ -1477,12 +1568,158 @@ async fn handle_text(
     true
 }
 
-fn channel_runtime_extension_forbidden(command: &crate::ws::RuntimeCommand) -> bool {
-    match command {
-        crate::ws::RuntimeCommand::RuntimeStart(start) => {
-            start.external_tools.is_some() || start.workspace_sandbox.is_some()
+fn handle_channel_tool_response(
+    state: &ListenerState,
+    principal: Option<&crate::auth::channel_session::ChannelPrincipal>,
+    frame: &crate::framing::DecodedFrame,
+) -> bool {
+    let (Some(manager), Some(principal)) = (&state.channel_tools, principal) else {
+        return false;
+    };
+    let Some(runtime) = frame
+        .value
+        .get("runtime")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    let (Some(agent), Some(conversation), Some(request_id)) = (
+        runtime.get("agent_id").and_then(serde_json::Value::as_str),
+        runtime
+            .get("conversation_id")
+            .and_then(serde_json::Value::as_str),
+        frame
+            .value
+            .get("request_id")
+            .and_then(serde_json::Value::as_str),
+    ) else {
+        return false;
+    };
+    let key = lotta_tools::external::ChannelRuntimeKey {
+        agent_id: agent.to_owned(),
+        conversation_id: conversation.to_owned(),
+    };
+    manager.respond(
+        principal.owner(),
+        principal.generation(),
+        &key,
+        lotta_tools::external::ChannelToolResponse {
+            request_id: request_id.to_owned(),
+            tool_call_id: frame
+                .value
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            result: frame.value.get("result").cloned(),
+            error: frame
+                .value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+        },
+    ) == lotta_tools::external::ResponseDisposition::Resolved
+}
+
+fn publish_channel_runtime_tool(
+    state: &Arc<ListenerState>,
+    connection_id: crate::ws::ConnectionId,
+    command: &crate::ws::RuntimeCommand,
+    principal: Option<&crate::auth::channel_session::ChannelPrincipal>,
+) -> bool {
+    let crate::ws::RuntimeCommand::RuntimeStart(start) = command else {
+        return true;
+    };
+    let Some(manager) = &state.channel_tools else {
+        return false;
+    };
+    let Some(principal) = principal else {
+        return false;
+    };
+    let (Some(agent), Some(conversation)) = (&start.agent_id, &start.conversation_id) else {
+        return false;
+    };
+    let runtime = lotta_tools::external::ChannelRuntimeKey {
+        agent_id: agent.as_str().to_owned(),
+        conversation_id: conversation.as_str().to_owned(),
+    };
+    if manager
+        .publish(
+            principal.owner(),
+            principal.generation(),
+            runtime.clone(),
+            vec![lotta_tools::external::ChannelToolDescriptor {
+                name: "MessageChannel".into(),
+                description: "Send a visible reply through the originating channel".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"message": {"type": "string"}},
+                    "required": ["message"],
+                    "additionalProperties": false
+                }),
+            }],
+        )
+        .is_err()
+    {
+        return false;
+    }
+    if let Some(receiver) =
+        manager.take_receiver(principal.owner(), principal.generation(), &runtime)
+    {
+        spawn_channel_tool_pump(
+            Arc::clone(state),
+            connection_id,
+            Arc::clone(manager),
+            principal.owner().to_owned(),
+            principal.generation(),
+            runtime,
+            receiver,
+        );
+    }
+    true
+}
+
+fn spawn_channel_tool_pump(
+    state: Arc<ListenerState>,
+    connection_id: crate::ws::ConnectionId,
+    manager: Arc<lotta_tools::external::ChannelExternalToolManager>,
+    owner: String,
+    generation: u64,
+    runtime: lotta_tools::external::ChannelRuntimeKey,
+    mut receiver: lotta_tools::external::ControllerReceiver,
+) {
+    tokio::spawn(async move {
+        while let Some(request) = receiver.recv().await {
+            if !manager.record_call(&owner, generation, &runtime, request.clone()) {
+                break;
+            }
+            let frame = serde_json::json!({
+                "type": "runtime_external_tool_call_request",
+                "request_id": request.request_id.as_str(),
+                "runtime": {
+                    "agent_id": runtime.agent_id,
+                    "conversation_id": runtime.conversation_id
+                },
+                "tool_call_id": request.tool_call_id.as_str(),
+                "tool_name": request.model_name.as_str(),
+                "input": request.arguments.as_value()
+            });
+            if dispatch_value(&state, connection_id, &frame).is_err() {
+                break;
+            }
         }
-        _ => false,
+    });
+}
+
+fn channel_runtime_command_allowed(
+    state: &ListenerState,
+    command: &crate::ws::RuntimeCommand,
+) -> bool {
+    match command {
+        crate::ws::RuntimeCommand::RuntimeStart(start) => state
+            .channel_session
+            .as_ref()
+            .is_some_and(|authenticator| authenticator.runtime_start_allowed(start)),
+        _ => true,
     }
 }
 

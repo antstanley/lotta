@@ -359,6 +359,7 @@ mod setup {
         }
         fn merge_tools(
             &self,
+            _scope: SetupScopeHandle,
             model: &ResolvedTurnModel,
             candidates: Vec<ToolCandidate>,
         ) -> Result<TurnToolCatalog, SetupError> {

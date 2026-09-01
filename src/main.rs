@@ -76,8 +76,18 @@ async fn run_server(arguments: Vec<String>) -> Result<(), cli::CliError> {
     if let Some(url) = handle.openai_url() {
         println!("OpenAI URL: {url}");
     }
-    let channels = if lotta_channels::topology::channels_enabled() {
-        Some(start_channels(&components, Arc::clone(&clock), storage_dir, workspace_dir).await?)
+    let channel_store = lotta_channels::topology::ChannelStore::from_parent_environment()?;
+    let channels = if lotta_channels::topology::channels_enabled(&channel_store)? {
+        Some(
+            start_channels(
+                &components,
+                Arc::clone(&clock),
+                storage_dir,
+                workspace_dir,
+                channel_store,
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -102,6 +112,7 @@ async fn start_channels(
     clock: Arc<dyn Clock + Send + Sync>,
     storage_dir: std::path::PathBuf,
     workspace_dir: std::path::PathBuf,
+    store: lotta_channels::topology::ChannelStore,
 ) -> Result<
     (
         lotta_channels::supervisor::ChannelSupervisor,
@@ -109,18 +120,16 @@ async fn start_channels(
     ),
     cli::CliError,
 > {
-    let owner = format!("channel-host-{}", std::process::id());
-    let capability = lotta_channels::topology::ChildCapability::mint(&owner)?;
+    let owner_prefix = format!("channel-host-{}", std::process::id());
+    let authenticator = lotta_app_server::auth::channel_session::ChannelSessionAuthenticator::new();
     let args = ServerArgs {
-        listen: Some("ws://127.0.0.1:0".into()),
+        listen: Some("ws://127.0.0.1:0/channel-runtime".into()),
         listen_enabled: true,
-        ws_auth: Some("capability-token".into()),
-        ws_token_sha256: Some(capability.digest_hex().to_owned()),
         storage_dir: Some(storage_dir),
         workspace_dir: Some(workspace_dir),
         ..ServerArgs::default()
     };
-    let channel_prepared = args.prepare()?.for_channel_host()?;
+    let channel_prepared = args.prepare()?.for_channel_session(authenticator.clone())?;
     let listener = start_listener_with_runtime_service_controller_observer_and_bridges(
         channel_prepared,
         clock,
@@ -131,32 +140,20 @@ async fn start_channels(
     )
     .await?;
     let executable = channel_executable()?;
-    let store = lotta_channels::topology::ChannelStore::from_parent_environment()?;
+    let tools = components.channel_tools();
     let config = lotta_channels::supervisor::ChannelLaunchConfig {
         executable,
         store,
         websocket_url: listener.websocket_url().to_owned(),
-        capability,
+        owner_prefix,
+        authenticator,
+        tools,
     };
     match lotta_channels::supervisor::ChannelSupervisor::start(config).await {
         Ok(supervisor) => {
-            let message_runtime = lotta_channels::control_plane::RuntimeKey {
-                agent_id: "channel-host".into(),
-                conversation_id: "channel-host".into(),
-            };
-            let publish_runtime = lotta_channels::control_plane::RuntimeKey {
-                agent_id: "channel-host".into(),
-                conversation_id: "channel-tools".into(),
-            };
-            wait_for_channel_publication(&supervisor, &publish_runtime).await?;
-            let message_registered = supervisor.runtime_tools(&message_runtime).is_some();
             println!(
-                concat!(
-                    "Channel host PID: {}; MessageChannel registered: ",
-                    "{}; control publish: true"
-                ),
-                supervisor.pid().map_or(0, |pid| pid),
-                message_registered
+                "Channel host PID: {}",
+                supervisor.pid().map_or(0, |pid| pid)
             );
             Ok((supervisor, listener))
         }
@@ -167,25 +164,6 @@ async fn start_channels(
             Err(error.into())
         }
     }
-}
-
-const CHANNEL_PUBLICATION_WAIT_ATTEMPTS_MAX: usize = 50;
-const CHANNEL_PUBLICATION_WAIT_MS: u64 = 20;
-
-async fn wait_for_channel_publication(
-    supervisor: &lotta_channels::supervisor::ChannelSupervisor,
-    runtime: &lotta_channels::control_plane::RuntimeKey,
-) -> Result<(), cli::CliError> {
-    for _attempt in 0..CHANNEL_PUBLICATION_WAIT_ATTEMPTS_MAX {
-        if supervisor.runtime_tools(runtime).is_some() {
-            return Ok(());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(
-            CHANNEL_PUBLICATION_WAIT_MS,
-        ))
-        .await;
-    }
-    Err(lotta_channels::supervisor::SupervisorError::Startup.into())
 }
 
 fn channel_executable() -> Result<std::path::PathBuf, cli::CliError> {

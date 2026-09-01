@@ -8,6 +8,8 @@ publish.workspace = true
 [dependencies]
 futures-util.workspace = true
 getrandom.workspace = true
+lotta-app-server = { version = "0.1.0", path = "../lotta-app-server" }
+lotta-domain = { version = "0.1.0", path = "../lotta-domain" }
 lotta-extensions = { version = "0.1.0", path = "../lotta-extensions" }
 lotta-tools = { version = "0.1.0", path = "../lotta-tools" }
 serde.workspace = true

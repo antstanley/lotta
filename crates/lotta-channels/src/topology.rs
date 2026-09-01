@@ -1,21 +1,14 @@
 //! Channel process topology, persistent-root validation, and per-child capability material.
 
 use crate::control_plane::{CHANNEL_STATE_ROWS_MAX, ChannelState};
-#[cfg(target_os = "linux")]
-use lotta_tools::sandbox::bubblewrap_arguments;
 #[cfg(target_os = "macos")]
-use lotta_tools::sandbox::{SEATBELT_PROGRAM, seatbelt_arguments};
-use sha2::{Digest, Sha256};
+use lotta_tools::sandbox::SEATBELT_PROGRAM;
 use std::{
     ffi::OsStr,
-    fmt,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
 };
 use tokio::process::Command;
 
-/// Per-child capability lifetime.
-pub const CHANNEL_CAPABILITY_TTL_SECONDS: u64 = 300;
 /// Child startup handshake deadline.
 pub const CHANNEL_STARTUP_DEADLINE_MS: u64 = 10_000;
 /// Maximum child owner identity bytes.
@@ -24,8 +17,6 @@ pub const CHANNEL_OWNER_ID_BYTES_MAX: usize = 128;
 pub const CHANNELS_DIRECTORY_NAME: &str = "channels";
 /// Compatibility environment indicating persisted channels should be restored.
 pub const RESTORE_ENABLED_CHANNELS_ENV: &str = "LETTA_RESTORE_ENABLED_CHANNELS";
-/// Explicit service-composition channel enable switch.
-pub const CHANNELS_ENABLED_ENV: &str = "LETTA_CHANNELS_ENABLED";
 /// Explicit executable override for packaged compatibility hosts.
 pub const CHANNEL_HOST_EXECUTABLE_ENV: &str = "LOTTA_CHANNEL_HOST_EXECUTABLE";
 
@@ -38,83 +29,9 @@ pub enum TopologyError {
     /// Secure directory permissions could not be established.
     #[error("channel root permissions are unsafe")]
     Permissions,
-    /// Cryptographic capability generation failed.
-    #[error("channel capability generation failed")]
-    Entropy,
-    /// Owner identity was invalid.
-    #[error("channel child identity is invalid")]
-    Identity,
     /// No supported mandatory filesystem sandbox is available.
     #[error("channel filesystem sandbox is unavailable")]
     Sandbox,
-}
-
-/// Plaintext per-child token that never renders its contents through Debug or Display.
-pub struct ChildCapability {
-    secret: String,
-    digest_hex: String,
-    owner: String,
-    issued: Instant,
-    revoked: bool,
-}
-
-impl ChildCapability {
-    /// Mints a cryptographically random capability bound to one child owner.
-    ///
-    /// # Errors
-    /// Returns a scrubbed identity or entropy failure.
-    pub fn mint(owner: &str) -> Result<Self, TopologyError> {
-        validate_owner(owner)?;
-        let mut random = [0_u8; 32];
-        getrandom::fill(&mut random).map_err(|_| TopologyError::Entropy)?;
-        let secret = hex(&random);
-        let digest_hex = hex(Sha256::digest(secret.as_bytes()).as_slice());
-        Ok(Self {
-            secret,
-            digest_hex,
-            owner: owner.to_owned(),
-            issued: Instant::now(),
-            revoked: false,
-        })
-    }
-
-    /// Returns the protected secret solely for inherited-pipe bootstrap.
-    #[must_use]
-    pub fn expose_for_pipe(&self) -> &str {
-        &self.secret
-    }
-    /// Returns the SHA-256 hex digest used to configure the dedicated listener.
-    #[must_use]
-    pub fn digest_hex(&self) -> &str {
-        &self.digest_hex
-    }
-    /// Returns the exact bound child owner.
-    #[must_use]
-    pub fn owner(&self) -> &str {
-        &self.owner
-    }
-    /// Returns whether the capability remains within lifetime and has not been revoked.
-    #[must_use]
-    pub fn is_valid(&self) -> bool {
-        !self.revoked
-            && self.issued.elapsed() <= Duration::from_secs(CHANNEL_CAPABILITY_TTL_SECONDS)
-    }
-    /// Revokes this exact capability; repeated revocation is harmless.
-    pub fn revoke(&mut self) {
-        self.revoked = true;
-        self.secret.clear();
-    }
-}
-
-impl fmt::Debug for ChildCapability {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ChildCapability")
-            .field("owner", &self.owner)
-            .field("secret", &"[REDACTED]")
-            .field("revoked", &self.revoked)
-            .finish_non_exhaustive()
-    }
 }
 
 /// Canonical shared channel configuration store root.
@@ -138,6 +55,7 @@ impl ChannelStore {
         let root = isolation_root.join(CHANNELS_DIRECTORY_NAME);
         create_secure_directory(&root)?;
         let root = canonical_directory(&root)?;
+        create_secure_directory(&root.join(".host-tmp"))?;
         if root.parent() != Some(isolation_root.as_path()) {
             return Err(TopologyError::Path);
         }
@@ -191,11 +109,22 @@ impl ChannelStore {
                 .file_name()
                 .into_string()
                 .map_err(|_| TopologyError::Path)?;
+            if id.starts_with('.') {
+                continue;
+            }
             validate_channel_id(&id)?;
+            validate_channel_tree(&entry.path())?;
+            let (accounts, account_enabled) = account_state(&entry.path())?;
             rows.push(ChannelState {
                 id,
-                enabled: true,
-                accounts: account_count(&entry.path())?,
+                enabled: config_enabled(&entry.path())? || account_enabled,
+                accounts,
+                routes: yaml_sequence_count(&entry.path().join("routing.yaml"), "routes")?,
+                pending_pairings: yaml_sequence_count(
+                    &entry.path().join("pairing.yaml"),
+                    "pending",
+                )?,
+                targets: json_array_count(&entry.path().join("targets.json"), "targets")?,
             });
         }
         if rows.len() > CHANNEL_STATE_ROWS_MAX {
@@ -206,12 +135,15 @@ impl ChannelStore {
     }
 }
 
-/// Returns whether existing startup composition requests channel restoration.
-#[must_use]
-pub fn channels_enabled() -> bool {
-    [CHANNELS_ENABLED_ENV, RESTORE_ENABLED_CHANNELS_ENV]
-        .iter()
-        .any(|name| std::env::var_os(name).is_some_and(|value| value == "1"))
+/// Returns whether canonical persisted state requests established channel restoration.
+///
+/// # Errors
+/// Fails closed when canonical state cannot be validated.
+pub fn channels_enabled(store: &ChannelStore) -> Result<bool, TopologyError> {
+    if std::env::var_os(RESTORE_ENABLED_CHANNELS_ENV).is_none_or(|value| value != "1") {
+        return Ok(false);
+    }
+    Ok(store.channel_state()?.iter().any(|channel| channel.enabled))
 }
 
 /// Builds a child command with cleared ambient environment and mandatory OS write confinement.
@@ -232,6 +164,7 @@ pub fn sandboxed_child_command(
     command
         .args(arguments)
         .env_clear()
+        .env("TMPDIR", store.root().join(".host-tmp"))
         .current_dir(store.root());
     command.kill_on_drop(true);
     Ok(command)
@@ -249,7 +182,7 @@ fn sandbox_arguments(
         }
         Ok((
             OsStr::new(SEATBELT_PROGRAM),
-            seatbelt_arguments(
+            channel_seatbelt_arguments(
                 store.root(),
                 store.isolation_root(),
                 executable,
@@ -263,7 +196,7 @@ fn sandbox_arguments(
             if Path::new(candidate).is_file() {
                 return Ok((
                     OsStr::new(candidate),
-                    bubblewrap_arguments(
+                    channel_bubblewrap_arguments(
                         store.root(),
                         store.isolation_root(),
                         executable,
@@ -279,6 +212,76 @@ fn sandbox_arguments(
         let _ = (store, executable, child_arguments);
         Err(TopologyError::Sandbox)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn channel_seatbelt_arguments(
+    channels: &Path,
+    isolation: &Path,
+    executable: &str,
+    child_arguments: &[String],
+) -> Vec<String> {
+    const PROFILE: &str = concat!(
+        "(version 1)\n",
+        "(allow default)\n",
+        "(deny file-write*)\n",
+        "(deny file-read* (subpath (param \"ISOLATION_ROOT\")))\n",
+        "(allow file-read-metadata (literal (param \"ISOLATION_ROOT\")))\n",
+        "(allow file-read* file-write* (subpath (param \"CHANNELS_ROOT\")))\n",
+        "(deny file-write* (subpath \"/dev\"))\n",
+        "(allow file-read* (subpath \"/dev\"))\n",
+        "(allow file-read-metadata (literal \"/dev/null\"))\n",
+        "(allow file-read-data file-write-data (literal \"/dev/null\"))"
+    );
+    let mut arguments = vec![
+        "-p".into(),
+        PROFILE.into(),
+        format!("-DISOLATION_ROOT={}", isolation.display()),
+        format!("-DCHANNELS_ROOT={}", channels.display()),
+        "--".into(),
+        executable.into(),
+    ];
+    arguments.extend(child_arguments.iter().cloned());
+    arguments
+}
+
+#[cfg(target_os = "linux")]
+fn channel_bubblewrap_arguments(
+    channels: &Path,
+    isolation: &Path,
+    executable: &str,
+    child_arguments: &[String],
+) -> Vec<String> {
+    let channels = channels.to_string_lossy().into_owned();
+    let isolation = isolation.to_string_lossy().into_owned();
+    let mut arguments = vec![
+        "--ro-bind".into(),
+        "/".into(),
+        "/".into(),
+        "--tmpfs".into(),
+        isolation,
+        "--bind".into(),
+        channels.clone(),
+        channels,
+        "--dev".into(),
+        "/dev".into(),
+        "--tmpfs".into(),
+        "/tmp".into(),
+        "--unshare-user".into(),
+        "--unshare-pid".into(),
+        "--unshare-ipc".into(),
+        "--unshare-uts".into(),
+        "--unshare-cgroup".into(),
+        "--proc".into(),
+        "/proc".into(),
+        "--new-session".into(),
+        "--die-with-parent".into(),
+        "--close-fds".into(),
+        "--".into(),
+        executable.into(),
+    ];
+    arguments.extend(child_arguments.iter().cloned());
+    arguments
 }
 
 fn create_secure_directory(path: &Path) -> Result<(), TopologyError> {
@@ -307,22 +310,144 @@ fn canonical_directory(path: &Path) -> Result<PathBuf, TopologyError> {
     std::fs::canonicalize(path).map_err(|_| TopologyError::Path)
 }
 
-fn account_count(channel: &Path) -> Result<usize, TopologyError> {
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountsFile {
+    accounts: Vec<lotta_domain::ChannelAccount>,
+}
+
+fn account_state(channel: &Path) -> Result<(usize, bool), TopologyError> {
     let path = channel.join("accounts.json");
+    if !path.exists() {
+        return Ok((0, false));
+    }
+    let bytes = read_regular_bounded(&path)?;
+    let value: AccountsFile = serde_json::from_slice(&bytes).map_err(|_| TopologyError::Path)?;
+    if value.accounts.len() > CHANNEL_STATE_ROWS_MAX {
+        return Err(TopologyError::Path);
+    }
+    Ok((
+        value.accounts.len(),
+        value
+            .accounts
+            .iter()
+            .any(|account| account.enabled && account.configured),
+    ))
+}
+
+fn config_enabled(channel: &Path) -> Result<bool, TopologyError> {
+    let path = channel.join("config.yaml");
+    if !path.exists() {
+        return Ok(false);
+    }
+    let bytes = read_regular_bounded(&path)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| TopologyError::Path)?;
+    let mut enabled = None;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim() == "enabled" {
+            if enabled.is_some() {
+                return Err(TopologyError::Path);
+            }
+            enabled = Some(match value.trim() {
+                "true" => true,
+                "false" => false,
+                _ => return Err(TopologyError::Path),
+            });
+        }
+    }
+    enabled.ok_or(TopologyError::Path)
+}
+
+fn json_array_count(path: &Path, key: &str) -> Result<usize, TopologyError> {
     if !path.exists() {
         return Ok(0);
     }
-    let metadata = std::fs::symlink_metadata(&path).map_err(|_| TopologyError::Path)?;
+    let bytes = read_regular_bounded(path)?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| TopologyError::Path)?;
+    let object = value.as_object().ok_or(TopologyError::Path)?;
+    if object.len() != 1 {
+        return Err(TopologyError::Path);
+    }
+    let count = object
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .ok_or(TopologyError::Path)?
+        .len();
+    (count <= CHANNEL_STATE_ROWS_MAX)
+        .then_some(count)
+        .ok_or(TopologyError::Path)
+}
+
+fn yaml_sequence_count(path: &Path, key: &str) -> Result<usize, TopologyError> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let bytes = read_regular_bounded(path)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| TopologyError::Path)?;
+    let marker = format!("{key}:");
+    let mut active = false;
+    let mut count = 0_usize;
+    for line in text.lines() {
+        if !line.starts_with(char::is_whitespace) {
+            active = line.trim() == marker;
+            continue;
+        }
+        if active && line.trim_start().starts_with("- ") {
+            count = count.checked_add(1).ok_or(TopologyError::Path)?;
+        }
+    }
+    (count <= CHANNEL_STATE_ROWS_MAX)
+        .then_some(count)
+        .ok_or(TopologyError::Path)
+}
+
+fn read_regular_bounded(path: &Path) -> Result<Vec<u8>, TopologyError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| TopologyError::Path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(TopologyError::Path);
     }
-    let bytes = std::fs::read(&path).map_err(|_| TopologyError::Path)?;
-    if bytes.len() > crate::control_plane::CONTROL_FRAME_BYTES_MAX {
+    #[cfg(unix)]
+    if std::os::unix::fs::MetadataExt::nlink(&metadata) != 1 {
         return Err(TopologyError::Path);
     }
-    let value: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|_| TopologyError::Path)?;
-    Ok(value.as_object().map_or(0, serde_json::Map::len))
+    if metadata.len() > crate::control_plane::CONTROL_FRAME_BYTES_MAX as u64 {
+        return Err(TopologyError::Path);
+    }
+    let bytes = std::fs::read(path).map_err(|_| TopologyError::Path)?;
+    (bytes.len() <= crate::control_plane::CONTROL_FRAME_BYTES_MAX)
+        .then_some(bytes)
+        .ok_or(TopologyError::Path)
+}
+
+fn validate_channel_tree(root: &Path) -> Result<(), TopologyError> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut visited = 0_usize;
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).map_err(|_| TopologyError::Path)? {
+            visited = visited.checked_add(1).ok_or(TopologyError::Path)?;
+            if visited > 512 {
+                return Err(TopologyError::Path);
+            }
+            let entry = entry.map_err(|_| TopologyError::Path)?;
+            let metadata =
+                std::fs::symlink_metadata(entry.path()).map_err(|_| TopologyError::Path)?;
+            if metadata.file_type().is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
+                return Err(TopologyError::Path);
+            }
+            #[cfg(unix)]
+            if metadata.is_file() && std::os::unix::fs::MetadataExt::nlink(&metadata) != 1 {
+                return Err(TopologyError::Path);
+            }
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_channel_id(id: &str) -> Result<(), TopologyError> {
@@ -336,30 +461,6 @@ fn validate_channel_id(id: &str) -> Result<(), TopologyError> {
     } else {
         Ok(())
     }
-}
-
-fn validate_owner(owner: &str) -> Result<(), TopologyError> {
-    if owner.is_empty()
-        || owner.len() > CHANNEL_OWNER_ID_BYTES_MAX
-        || !owner.is_ascii()
-        || owner
-            .bytes()
-            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
-    {
-        Err(TopologyError::Identity)
-    } else {
-        Ok(())
-    }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 15) as usize] as char);
-    }
-    output
 }
 
 #[cfg(test)]
@@ -417,18 +518,45 @@ for line in sys.stdin:
 s.close()
 ";
 
+    async fn serve_test_websocket(
+        listener: tokio::net::TcpListener,
+        observed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use futures_util::StreamExt as _;
+        use std::sync::atomic::Ordering;
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 4_096];
+        let length = loop {
+            let length = stream.peek(&mut request).await.unwrap();
+            if request[..length]
+                .windows(4)
+                .any(|window| window == b"\r\n\r\n")
+            {
+                break length;
+            }
+            tokio::task::yield_now().await;
+        };
+        let headers = String::from_utf8_lossy(&request[..length]);
+        observed.store(headers.contains("Authorization: Bearer "), Ordering::SeqCst);
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        while socket.next().await.is_some() {}
+    }
+
     #[test]
     fn authenticates_over_loopback_and_reads_shared_channel_config() {
         let parent = temp_root("supervision");
         let store = ChannelStore::under_letta_home(&parent).unwrap();
         std::fs::create_dir(store.root().join("telegram")).unwrap();
+        std::fs::write(store.root().join("telegram/config.yaml"), "enabled: true\n").unwrap();
+        std::fs::write(
+            store.root().join("telegram/accounts.json"),
+            "{\"accounts\":[]}",
+        )
+        .unwrap();
         let rows = store.channel_state().unwrap();
         assert_eq!(rows[0].id, "telegram");
-        let mut capability = ChildCapability::mint("supervised-child").unwrap();
-        assert!(capability.is_valid());
-        assert_eq!(capability.owner(), "supervised-child");
-        capability.revoke();
-        assert!(!capability.is_valid());
+        assert!(rows[0].enabled);
+        assert_eq!(rows[0].accounts, 0);
         std::fs::remove_dir_all(parent).unwrap();
     }
 
@@ -439,13 +567,13 @@ s.close()
             control_plane::RuntimeKey,
             supervisor::{ChannelLaunchConfig, ChannelSupervisor},
         };
-        use futures_util::StreamExt as _;
         use std::{
             os::unix::fs::PermissionsExt,
             sync::{
                 Arc,
                 atomic::{AtomicBool, Ordering},
             },
+            time::Duration,
         };
         let parent = temp_root("real-supervision");
         let script = parent.parent().unwrap().join(format!(
@@ -455,38 +583,27 @@ s.close()
         ));
         std::fs::write(&script, HELPER).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let capability = ChildCapability::mint("real-child").unwrap();
-        let expected = format!("Bearer {}", capability.expose_for_pipe());
+        let authenticator =
+            lotta_app_server::auth::channel_session::ChannelSessionAuthenticator::new();
+        authenticator
+            .bind_listener("127.0.0.1", "/ws", "test-listener")
+            .unwrap();
+        let registry = Arc::new(lotta_tools::ToolRegistry::new([]).unwrap());
+        let tools = Arc::new(lotta_tools::external::ChannelExternalToolManager::new(
+            registry,
+        ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let authenticated = Arc::new(AtomicBool::new(false));
         let observed = Arc::clone(&authenticated);
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 4_096];
-            let length = loop {
-                let length = stream.peek(&mut request).await.unwrap();
-                if request[..length]
-                    .windows(4)
-                    .any(|window| window == b"\r\n\r\n")
-                {
-                    break length;
-                }
-                tokio::task::yield_now().await;
-            };
-            let headers = String::from_utf8_lossy(&request[..length]);
-            observed.store(
-                headers.contains(&format!("Authorization: {expected}")),
-                Ordering::SeqCst,
-            );
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            while socket.next().await.is_some() {}
-        });
+        let server = tokio::spawn(serve_test_websocket(listener, observed));
         let supervisor = ChannelSupervisor::start(ChannelLaunchConfig {
             executable: script.clone(),
             store: ChannelStore::under_letta_home(&parent).unwrap(),
             websocket_url: format!("ws://127.0.0.1:{}/ws", address.port()),
-            capability,
+            owner_prefix: "real-child".into(),
+            authenticator,
+            tools,
         })
         .await
         .unwrap();
@@ -551,13 +668,25 @@ mod store_isolation {
             store.root(),
             parent.canonicalize().unwrap().join("channels")
         );
-        let capability = ChildCapability::mint("owner").unwrap();
-        assert!(!format!("{capability:?}").contains(capability.expose_for_pipe()));
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&parent, store.root().join("escape")).unwrap();
             assert_eq!(store.channel_state(), Err(TopologyError::Path));
         }
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_hardlinked_channel_state() {
+        let parent = temp_root("hardlink");
+        let store = ChannelStore::under_letta_home(&parent).unwrap();
+        let channel = store.root().join("telegram");
+        std::fs::create_dir(&channel).unwrap();
+        let source = parent.join("outside.json");
+        std::fs::write(&source, "{\"accounts\":[]}").unwrap();
+        std::fs::hard_link(&source, channel.join("accounts.json")).unwrap();
+        assert_eq!(store.channel_state(), Err(TopologyError::Path));
         std::fs::remove_dir_all(parent).unwrap();
     }
 

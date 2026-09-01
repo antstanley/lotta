@@ -293,7 +293,7 @@ fn typed_failure_state(
         auth: prepared.auth,
         openai_api: false,
         channel_host_protocol_only: false,
-        channel_capability_deadline: None,
+        channel_session: None,
         listener_instance: "test-listener".to_owned(),
         openai_chat: super::test_openai_chat(
             &storage.agents,
@@ -318,6 +318,7 @@ fn typed_failure_state(
         external_tools: Arc::new(crate::ws::external_tools::ExternalToolBridge::new(
             crate::ws::external_tools::inert_forwarder(),
         )),
+        channel_tools: None,
         teleports: Arc::new(crate::ws::teleport::TeleportBridge::new(
             crate::ws::teleport::inert_forwarder(),
         )),

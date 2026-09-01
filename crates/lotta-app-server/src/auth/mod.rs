@@ -8,6 +8,8 @@ use crate::{config::ServerArgs, error::AppServerError};
 
 /// Constant-time capability-token verification.
 pub mod capability_token;
+/// Dynamic generation-bound authentication for the supervised channel host.
+pub mod channel_session;
 /// Origin-bearing upgrade policy.
 pub mod origin;
 /// Dependency-minimal signed-bearer verification.

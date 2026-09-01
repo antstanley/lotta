@@ -57,6 +57,8 @@ pub struct PreparedServer {
     pub workspace_dir: PathBuf,
     /// Restrict this dedicated listener to Runtime-group channel-host commands.
     pub(crate) channel_host_protocol_only: bool,
+    /// Dynamic authority for the exact supervised child generation.
+    pub(crate) channel_session: Option<crate::auth::channel_session::ChannelSessionAuthenticator>,
 }
 
 /// Parses the exact Task-14 command-line surface.
@@ -183,17 +185,21 @@ fn set_skew(
 }
 
 impl PreparedServer {
-    /// Restricts a dedicated authenticated loopback listener to the public Runtime command group.
+    /// Restricts a dedicated loopback listener to one dynamic channel-session authority.
     ///
     /// # Errors
-    /// Rejects non-loopback or unauthenticated listener composition.
-    pub fn for_channel_host(mut self) -> Result<Self, AppServerError> {
-        if !is_loopback_host(&self.host) || self.auth.is_none() {
+    /// Rejects non-loopback composition or a second generic authentication policy.
+    pub fn for_channel_session(
+        mut self,
+        authenticator: crate::auth::channel_session::ChannelSessionAuthenticator,
+    ) -> Result<Self, AppServerError> {
+        if !is_loopback_host(&self.host) || !self.auth.is_none() {
             return Err(AppServerError::Config(
-                "channel host listener requires loopback authentication",
+                "channel session listener requires exclusive loopback authentication",
             ));
         }
         self.channel_host_protocol_only = true;
+        self.channel_session = Some(authenticator);
         Ok(self)
     }
 }
@@ -240,6 +246,7 @@ impl ServerArgs {
             storage_dir,
             workspace_dir,
             channel_host_protocol_only: false,
+            channel_session: None,
         })
     }
 }
