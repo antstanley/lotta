@@ -65,14 +65,50 @@ pub async fn run() -> Result<(), HostError> {
 /// # Errors
 /// Returns the same bounded host failures as [`run`].
 pub async fn run_composed(context: crate::adapter::HostContext) -> Result<(), HostError> {
-    let mut management_input = BufReader::new(stdin());
+    run_composed_io(context, stdin(), stdout(), true).await
+}
+
+/// Runs the production host composition over caller-owned NDJSON management streams.
+///
+/// This embedding boundary exists so a composition root can supply adapter factories while
+/// retaining the real authenticated Runtime WebSocket and host session loop. Process-level cwd
+/// enforcement remains the responsibility of an out-of-process launcher; filesystem isolation
+/// probes and every protocol check still execute here.
+///
+/// # Errors
+/// Returns the same bounded host failures as [`run`].
+pub async fn run_composed_with_management<R, W>(
+    context: crate::adapter::HostContext,
+    management_input: R,
+    management_output: W,
+) -> Result<(), HostError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    run_composed_io(context, management_input, management_output, false).await
+}
+
+async fn run_composed_io<R, W>(
+    context: crate::adapter::HostContext,
+    management_input: R,
+    management_output: W,
+    verify_cwd: bool,
+) -> Result<(), HostError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut management_input = BufReader::new(management_input);
     let bootstrap = read_bootstrap(&mut management_input).await?;
-    verify_working_root(&bootstrap.channels_root)?;
+    if verify_cwd {
+        verify_working_root(&bootstrap.channels_root)?;
+    }
     let isolation = probe_isolation(&bootstrap.channels_root)?;
     let request = authenticated_request(&bootstrap)?;
     let (socket, _) = connect_with_backoff(request).await?;
     let (mut ws_writer, mut ws_reader) = socket.split();
-    let mut management_output = stdout();
+    let mut management_output = management_output;
     write_line(
         &mut management_output,
         &ChildFrame::Ready {
@@ -343,14 +379,19 @@ where
     validate_parent_frame(&frame, bootstrap)?;
     match frame {
         ParentFrame::Shutdown { request_id, .. } => {
+            let mut released = std::collections::BTreeSet::new();
             for route in routes {
+                let runtime = runtime_key(route);
+                if !released.insert(runtime.clone()) {
+                    continue;
+                }
                 write_line(
                     output,
                     &ChildFrame::ReleaseRuntimeTools {
                         metadata: crate::control_plane::FrameMetadata::new(bootstrap.generation),
                         request_id: random_request_id("release-tools")?,
                         owner: bootstrap.owner.clone(),
-                        runtime: runtime_key(route),
+                        runtime,
                     },
                 )
                 .await?;

@@ -407,6 +407,39 @@ impl AdapterHub {
         &mut self,
         value: &serde_json::Value,
     ) -> Result<bool, ChannelAdapterError> {
+        let correlated;
+        let value = if value.get("request_id").is_none() && runtime_event_kind(value) {
+            let runtime = value
+                .get("runtime")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|runtime| {
+                    Some((
+                        runtime.get("agent_id")?.as_str()?.to_owned(),
+                        runtime.get("conversation_id")?.as_str()?.to_owned(),
+                    ))
+                })
+                .ok_or(ChannelAdapterError::Bound)?;
+            let route = self
+                .active_routes
+                .get(&runtime)
+                .ok_or(ChannelAdapterError::Bound)?;
+            let request_id = self
+                .pending
+                .iter()
+                .find_map(|(request_id, pending)| {
+                    (&pending.route_key == route).then_some(request_id)
+                })
+                .ok_or(ChannelAdapterError::Bound)?;
+            let mut object = value
+                .as_object()
+                .cloned()
+                .ok_or(ChannelAdapterError::Bound)?;
+            object.insert("request_id".to_owned(), serde_json::json!(request_id));
+            correlated = serde_json::Value::Object(object);
+            &correlated
+        } else {
+            value
+        };
         let event = match parse_runtime_event(value) {
             Ok(Some(event)) => event,
             Ok(None) => return Ok(false),
@@ -538,6 +571,13 @@ fn next_phase(
     }
 }
 
+fn runtime_event_kind(value: &serde_json::Value) -> bool {
+    matches!(
+        value.get("type").and_then(serde_json::Value::as_str),
+        Some("stream_delta" | "update_loop_status" | "turn_finished")
+    )
+}
+
 fn parse_runtime_event(
     value: &serde_json::Value,
 ) -> Result<Option<AdapterRuntimeEvent>, ChannelAdapterError> {
@@ -608,11 +648,25 @@ fn delivery(
     )
 }
 
+fn payload_client_message_id(payload: &serde_json::Value) -> Option<&str> {
+    payload
+        .get("client_message_id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            payload
+                .get("messages")?
+                .as_array()?
+                .first()?
+                .get("client_message_id")?
+                .as_str()
+        })
+}
+
 fn validate_inbound(message: &InboundChannelMessage) -> Result<(), ChannelAdapterError> {
     if message.client_message_id.is_empty()
         || message.client_message_id.len() > crate::control_plane::CONTROL_ID_BYTES_MAX
         || !message.route.enabled
-        || message.payload["client_message_id"].as_str() != Some(message.client_message_id.as_str())
+        || payload_client_message_id(&message.payload) != Some(message.client_message_id.as_str())
         || serde_json::to_vec(&message.payload)
             .map_err(|_| ChannelAdapterError::Bound)?
             .len()
