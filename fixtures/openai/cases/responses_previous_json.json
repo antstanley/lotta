@@ -20,8 +20,8 @@
     "body": {
       "model": "fixture-visible",
       "input": "<RESPONSE_USER_TEXT_D>",
-      "previous_response_id": "<FROM:responses_stored_json>",
-      "store": true
+      "store": true,
+      "previous_response_id": "<FROM:responses_stored_json>"
     }
   },
   "expected": {
@@ -65,11 +65,11 @@
       "stored_response": [
         "<STORED_RESPONSE_ID_1>"
       ],
-      "timestamp": [
-        "<TIMESTAMP_ID_1>"
-      ],
       "msg": [
         "<MSG_ID_1>"
+      ],
+      "timestamp": [
+        "<TIMESTAMP_ID_1>"
       ]
     }
   },
@@ -137,15 +137,15 @@
     "stored_response": [
       "<STORED_RESPONSE_ID_1>"
     ],
-    "timestamp": [
-      "<TIMESTAMP_ID_1>"
-    ],
     "msg": [
       "<MSG_ID_1>"
     ],
     "conversation": [
       "<CONVERSATION_ID_1>",
       "<CONVERSATION_ID_2>"
+    ],
+    "timestamp": [
+      "<TIMESTAMP_ID_1>"
     ]
   },
   "cursor": null

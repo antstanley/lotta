@@ -62,11 +62,11 @@
       "stored_response": [
         "<STORED_RESPONSE_ID_1>"
       ],
-      "timestamp": [
-        "<TIMESTAMP_ID_1>"
-      ],
       "msg": [
         "<MSG_ID_1>"
+      ],
+      "timestamp": [
+        "<TIMESTAMP_ID_1>"
       ]
     }
   },
@@ -120,9 +120,6 @@
     "stored_response": [
       "<STORED_RESPONSE_ID_1>"
     ],
-    "timestamp": [
-      "<TIMESTAMP_ID_1>"
-    ],
     "msg": [
       "<MSG_ID_1>"
     ],
@@ -131,6 +128,9 @@
     ],
     "conversation": [
       "<CONVERSATION_ID_1>"
+    ],
+    "timestamp": [
+      "<TIMESTAMP_ID_1>"
     ]
   },
   "cursor": {

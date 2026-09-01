@@ -1,52 +1,53 @@
-import { createServer } from "node:http";
-import { lstat, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";import {
+  lstat, mkdir, readFile, readdir, writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { mock } from "bun:test";
-
+import {
+  Normalizer, type TimestampAttempt, assertFreshRawResponseIdentities, assertSameStore,
+  assertTimestampMutationCoverage,
+} from "./openai-capture-adapter";
+import {
+  assertHandlerDeleteContract, deletePersistedConversation, recordConversationAllocation,
+} from "./openai-capture-adapter";
+process.on("unhandledRejection", (error) => {
+  console.error(error);
+  process.exit(1);
+});
+process.on("uncaughtException", (error) => {
+  console.error(error);
+  process.exit(1);
+});
 const TOKEN = "fixture-transport-credential";
 const STORAGE = process.env.LETTA_LOCAL_BACKEND_DIR!;
 const AGENTS = [
-  {
-    id: "agent-local-visible",
-    name: "fixture-visible",
-    created_at: "2026-01-01T00:00:00Z",
-    hidden: false,
-  },
-  {
-    id: "agent-local-collision-a",
-    name: "fixture-collision",
-    created_at: "2026-01-02T00:00:00Z",
-    hidden: false,
-  },
-  {
-    id: "agent-local-collision-b",
-    name: "fixture-collision",
-    created_at: "2026-01-03T00:00:00Z",
-    hidden: false,
-  },
-  {
-    id: "agent-local-hidden",
-    name: "fixture-hidden",
-    created_at: "2026-01-04T00:00:00Z",
-    hidden: true,
-  },
+  { id: "agent-local-visible", name: "fixture-visible",
+    created_at: "2026-01-01T00:00:00Z", hidden: false },
+  { id: "agent-local-collision-a", name: "fixture-collision",
+    created_at: "2026-01-02T00:00:00Z", hidden: false },
+  { id: "agent-local-collision-b", name: "fixture-collision",
+    created_at: "2026-01-03T00:00:00Z", hidden: false },
+  { id: "agent-local-hidden", name: "fixture-hidden",
+    created_at: "2026-01-04T00:00:00Z", hidden: true },
 ];
 const providerCalls: unknown[] = [];
-const observedForkSources: Record<string, string> = {};
-const activeRecords = new Map<string, Record<string, unknown>>();
+const rawForkSources: Record<string, string> = {};
+type BackendOperation = {
+  kind: "create" | "fork"; returned: Record<string, unknown>;
+  agent?: unknown; hidden?: unknown; source?: string;
+};
+const backendOperations = new Map<string, BackendOperation>();
+const backendDeleteCalls = new Set<string>();
 let providerHeld = false;
 let providerRelease: (() => void) | null = null;
 let providerGate: Promise<void> | null = null;
 let providerArrived: (() => void) | null = null;
-
 function page<T>(items: T[]) {
   return { getPaginatedItems: () => items };
 }
-
 function writeProviderEvent(response: any, value: unknown) {
   response.write(`data: ${JSON.stringify(value)}\n\n`);
 }
-
 const provider = createServer(async (request, response) => {
   if (request.method === "GET") {
     response.writeHead(200, { "content-type": "application/json" });
@@ -62,8 +63,9 @@ const provider = createServer(async (request, response) => {
   for await (const chunk of request) chunks.push(Buffer.from(chunk));
   providerCalls.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
   providerArrived?.();
-  if (providerHeld && providerGate) await providerGate;
   response.writeHead(200, { "content-type": "text/event-stream" });
+  response.flushHeaders();
+  if (providerHeld && providerGate) await providerGate;
   writeProviderEvent(response, {
     id: "chatcmpl-11111111-1111-4111-8111-111111111111",
     object: "chat.completion.chunk",
@@ -89,7 +91,6 @@ const provider = createServer(async (request, response) => {
 });
 await new Promise<void>((resolve) => provider.listen(0, "127.0.0.1", resolve));
 const providerPort = (provider.address() as { port: number }).port;
-
 await mkdir(join(STORAGE, "providers"), { recursive: true });
 await writeFile(
   join(STORAGE, "providers/auth.json"),
@@ -113,14 +114,11 @@ await writeFile(
     2,
   ),
 );
-
 const { HeadlessBackend } = await import("@/backend/dev/fake-headless-backend");
-const { ProviderTurnExecutor } =
-  await import("@/backend/dev/provider-turn-executor");
+const { ProviderTurnExecutor } = await import("@/backend/dev/provider-turn-executor");
 const { PiStreamAdapter } = await import("@/backend/dev/pi-stream-adapter");
 const executor = new ProviderTurnExecutor(
-  new PiStreamAdapter({ localProviderAuthStorageDir: STORAGE }),
-);
+  new PiStreamAdapter({ localProviderAuthStorageDir: STORAGE }));
 const delegate = new HeadlessBackend(
   "agent-local-visible",
   executor,
@@ -153,22 +151,20 @@ function agentProperty(property: PropertyKey) {
     return agent;
   };
 }
-
 const backend = new Proxy(delegate as object, {
   get(target, property, receiver) {
     const agent = agentProperty(property);
     if (agent) return agent;
     if (property === "createConversation") {
       return async (body: Record<string, unknown>) => {
-        const value = (await Reflect.get(target, property, receiver).apply(
-          target,
-          [body],
-        )) as Record<string, unknown>;
-        activeRecords.set(String(value.id), {
-          ...value,
-          agent_id: value.agent_id ?? body.agent_id,
-          hidden: value.hidden ?? body.hidden ?? null,
-          source_id: null,
+        const value = (await Reflect.get(target, property, receiver)
+          .apply(target, [body])) as Record<string, unknown>;
+        await recordConversationAllocation(STORAGE, String(value.id));
+        backendOperations.set(String(value.id), {
+          kind: "create",
+          returned: structuredClone(value),
+          agent: body.agent_id,
+          hidden: body.hidden,
         });
         return value;
       };
@@ -178,7 +174,9 @@ const backend = new Proxy(delegate as object, {
         const method = Reflect.get(target, property, receiver);
         const value =
           typeof method === "function" ? await method.apply(target, [id]) : {};
-        activeRecords.delete(id);
+        await deletePersistedConversation(STORAGE, id);
+        backendOperations.delete(id);
+        backendDeleteCalls.add(id);
         return value;
       };
     }
@@ -188,15 +186,19 @@ const backend = new Proxy(delegate as object, {
           target,
           [id, options],
         )) as Record<string, unknown>;
-        const source = activeRecords.get(id);
         const targetId = String(value.id);
-        activeRecords.set(targetId, {
-          ...value,
-          agent_id: value.agent_id ?? source?.agent_id ?? options.agentId,
-          hidden: value.hidden ?? options.hidden ?? null,
-          source_id: id,
+        await recordConversationAllocation(STORAGE, targetId);
+        if (rawForkSources[targetId] !== undefined) {
+          throw new Error(`fork target observed twice: ${targetId}`);
+        }
+        rawForkSources[targetId] = id;
+        backendOperations.set(targetId, {
+          kind: "fork",
+          returned: structuredClone(value),
+          agent: options.agentId,
+          hidden: options.hidden,
+          source: id,
         });
-        observedForkSources[targetId] = id;
         return value;
       };
     }
@@ -211,11 +213,8 @@ const backend = new Proxy(delegate as object, {
           client_tools: [],
           client_skills: [],
         };
-        return Reflect.get(target, property, receiver).apply(target, [
-          conversationId,
-          bounded,
-          ...rest,
-        ]);
+        return Reflect.get(target, property, receiver)
+          .apply(target, [conversationId, bounded, ...rest]);
       };
     }
     return Reflect.get(target, property, receiver);
@@ -243,101 +242,39 @@ const authPolicy = parseAppServerWebsocketAuthSettings({
   wsTokenSha256:
     "1947de502481746d5dc98a64e8fa1d743d6c3da164f5b031cbf9ee9e0fb05ffb",
 });
+let baselineRequests = 0;
 const baseline = createServer((request, response) => {
+  baselineRequests += 1;
   void handleOpenAiCompatRequest(request, response, { authPolicy });
 });
 await new Promise<void>((resolve) => baseline.listen(0, "127.0.0.1", resolve));
 const origin = `http://127.0.0.1:${(baseline.address() as { port: number }).port}`;
-
-type DynamicKind =
-  | "CHAT_COMPLETION"
-  | "STORED_RESPONSE"
-  | "RESPONSE"
-  | "MSG"
-  | "FC"
-  | "FCO"
-  | "RS"
-  | "UUID"
-  | "CONVERSATION"
-  | "TIMESTAMP";
-class Normalizer {
-  maps = new Map<DynamicKind, Map<string, string>>();
-  reuseChatCompletion = false;
-  token(kind: DynamicKind, original: string): string {
-    let values = this.maps.get(kind);
-    if (!values) {
-      values = new Map();
-      this.maps.set(kind, values);
-    }
-    const present = values.get(original);
-    if (present) return present;
-    if (
-      kind === "CHAT_COMPLETION" &&
-      this.reuseChatCompletion &&
-      values.size > 0
-    ) {
-      const token = values.values().next().value as string;
-      values.set(original, token);
-      return token;
-    }
-    const token = `<${kind}_ID_${values.size + 1}>`;
-    values.set(original, token);
-    return token;
-  }
-  string(value: string): string {
-    const uuid =
-      "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
-    const patterns: Array<[DynamicKind, RegExp]> = [
-      ["CHAT_COMPLETION", new RegExp(`^chatcmpl-${uuid}$`)],
-      ["RESPONSE", new RegExp(`^resp_${uuid}$`)],
-      ["MSG", new RegExp(`^msg_${uuid}$`)],
-      ["FC", new RegExp(`^fc_${uuid}$`)],
-      ["FCO", new RegExp(`^fco_${uuid}$`)],
-      ["RS", new RegExp(`^rs_${uuid}$`)],
-      ["UUID", new RegExp(`^${uuid}$`)],
-      ["CONVERSATION", /^conv-fake-headless-[1-9][0-9]*$/],
-    ];
-    if (value.startsWith("resp_letta_"))
-      return this.token("STORED_RESPONSE", value);
-    for (const [kind, pattern] of patterns)
-      if (pattern.test(value)) return this.token(kind, value);
-    if (
-      /^(chatcmpl-|resp_|msg_|fc_|fco_|rs_|conv-fake-headless-)/.test(value)
-    ) {
-      throw new Error(`malformed dynamic identifier: ${value}`);
-    }
-    return value;
-  }
-  value(value: unknown, key = ""): unknown {
-    if (
-      typeof value === "number" &&
-      (key === "created" || key === "created_at" || key === "timestamp")
-    ) {
-      return this.token("TIMESTAMP", String(value));
-    }
-    if (typeof value === "string") return this.string(value);
-    if (Array.isArray(value))
-      return value.map((child) => this.value(child, key));
-    if (value && typeof value === "object") {
-      return Object.fromEntries(
-        Object.entries(value).map(([name, child]) => [
-          name,
-          this.value(child, name),
-        ]),
-      );
-    }
-    return value;
-  }
-  relationships(): Record<string, string[]> {
-    return Object.fromEntries(
-      [...this.maps].map(([kind, values]) => [
-        kind.toLowerCase(),
-        [...new Set(values.values())],
-      ]),
-    );
+function assertIdentityBijection(pairs: Array<{ raw: string; token: string }>) {
+  for (const [index, left] of pairs.entries()) for (const right of pairs.slice(index + 1)) {
+    if ((left.raw === right.raw) !== (left.token === right.token)) failMutation("raw/token");
   }
 }
-
+function rejects(action: () => void) {
+  try { action(); } catch { return true; }
+  return false;
+}
+function failMutation(name: string): never {
+  throw new Error(`${name} identity collapse or split`);
+}
+function assertIdentityMutationCoverage() {
+  const a = "chatcmpl-11111111-1111-4111-8111-111111111111";
+  const b = "chatcmpl-22222222-2222-4222-8222-222222222222";
+  const one = "<CHAT_COMPLETION_ID_1>";
+  const two = "<CHAT_COMPLETION_ID_2>";
+  if (!rejects(() => assertIdentityBijection([{ raw: a, token: one }, { raw: b, token: one }])))
+    failMutation("raw collapse");
+  if (!rejects(() => assertIdentityBijection([{ raw: a, token: one }, { raw: a, token: two }])))
+    failMutation("raw split");
+  if (!rejects(() => assertFreshRawResponseIdentities([a, a])))
+    failMutation("retry collapse");
+  if (!rejects(() => assertFreshRawResponseIdentities([`${a}${b}`])))
+    failMutation("response split");
+}
 function headers(source: Headers) {
   const result: Record<string, string> = {};
   for (const name of ["content-type", "cache-control"]) {
@@ -346,7 +283,7 @@ function headers(source: Headers) {
   }
   return result;
 }
-function parseSse(raw: string, normalizer: Normalizer) {
+function parseSse(raw: string, normalizer: Normalizer, attempt: TimestampAttempt) {
   return raw
     .split("\n\n")
     .filter(Boolean)
@@ -361,7 +298,7 @@ function parseSse(raw: string, normalizer: Normalizer) {
       if (data === null) throw new Error("SSE block missing data");
       return {
         event,
-        data: data === "[DONE]" ? data : normalizer.value(JSON.parse(data)),
+        data: data === "[DONE]" ? data : normalizer.response(JSON.parse(data), attempt),
       };
     });
 }
@@ -392,12 +329,13 @@ async function finish(
   normalizer: Normalizer,
 ) {
   const raw = await response.text();
+  const attempt = normalizer.responseAttempt();
   const result: Record<string, unknown> = {
     status: response.status,
     headers: headers(response.headers),
   };
-  if (mode === "sse") result.events = parseSse(raw, normalizer);
-  else result.body = normalizer.value(JSON.parse(raw));
+  if (mode === "sse") result.events = parseSse(raw, normalizer, attempt);
+  else result.body = normalizer.response(JSON.parse(raw), attempt);
   result.dynamic_map = normalizer.relationships();
   return { result, raw };
 }
@@ -425,31 +363,28 @@ type StoreSnapshot = {
   records: Record<string, Record<string, unknown>>;
   transcripts: unknown[];
   artifacts: string[];
-  forkSources: Record<string, string>;
   provider: number;
 };
-
 async function snapshot(): Promise<StoreSnapshot> {
   const files: Record<string, string> = {};
   await readTree(STORAGE, STORAGE, files);
   const values = Object.entries(files).flatMap(([path, text]) =>
     parseStored(path, text),
   );
-  const persisted: Record<string, Record<string, unknown>> = {};
-  for (const value of values) collectConversationRecords(value, persisted);
-  const records = Object.fromEntries(activeRecords);
+  const records: Record<string, Record<string, unknown>> = {};
+  for (const value of values) collectConversationRecords(value, records);
+  for (const value of values) enrichConversationRecords(value, records);
+  validateBackendOperations(records);
   const artifacts = Object.keys(records).sort(sequenceOrder);
   return {
-    sequence: durableSequence(values, Object.keys(persisted)),
+    sequence: durableSequence(values, artifacts),
     files,
     records,
     transcripts: values,
     artifacts,
-    forkSources: { ...observedForkSources },
     provider: providerCalls.length,
   };
 }
-
 async function readTree(
   root: string,
   directory: string,
@@ -466,7 +401,6 @@ async function readTree(
     }
   }
 }
-
 function parseStored(path: string, text: string): unknown[] {
   if (path.endsWith(".json")) {
     try {
@@ -483,7 +417,6 @@ function parseStored(path: string, text: string): unknown[] {
   }
   return [];
 }
-
 function collectConversationRecords(
   value: unknown,
   output: Record<string, Record<string, unknown>>,
@@ -506,7 +439,109 @@ function collectConversationRecords(
     collectConversationRecords(child, output);
   }
 }
-
+function enrichConversationRecords(
+  value: unknown,
+  records: Record<string, Record<string, unknown>>,
+) {
+  if (!value || typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    for (const child of value) enrichConversationRecords(child, records);
+    return;
+  }
+  const object = value as Record<string, unknown>;
+  const context = metadataField(object, ["conversation_id", "conversationId"]);
+  const candidates = [object.id, object.conversation_id, object.conversationId, context];
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string" || !records[candidate]) continue;
+    mergeCanonicalMetadata(records[candidate], object);
+    const source = JSON.stringify(object).match(
+      /Conversation ID[^:]+: (conv-fake-headless-[1-9][0-9]*)/,
+    )?.[1];
+    if (source && source !== candidate) records[candidate].source_id ??= source;
+  }
+  for (const child of Object.values(object)) {
+    enrichConversationRecords(child, records);
+  }
+}
+function mergeCanonicalMetadata(
+  record: Record<string, unknown>, source: Record<string, unknown>,
+) {
+  const fields: Array<[string, string[]]> = [
+    ["agent_id", ["agent_id", "agentId"]], ["hidden", ["hidden"]],
+    ["source_id", ["openai_fork_source_conversation_id", "source_conversation_id", "source_id"]],
+  ];
+  for (const [target, names] of fields) {
+    const value = metadataField(source, names);
+    if (value !== undefined) record[target] = value;
+  }
+}
+function metadataField(value: unknown, names: string[]): unknown {
+  if (!value || typeof value !== "object") return undefined;
+  if (Array.isArray(value)) {
+    for (const child of value) {
+      const found = metadataField(child, names);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  }
+  const object = value as Record<string, unknown>;
+  for (const name of names) {
+    if (object[name] !== undefined) return object[name];
+  }
+  for (const child of Object.values(object)) {
+    const found = metadataField(child, names);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+function validateBackendOperations(
+  records: Record<string, Record<string, unknown>>,
+) {
+  for (const [id, operation] of backendOperations) {
+    const record = records[id];
+    if (record) assertBackendOperation(record, id, operation);
+  }
+}
+function assertBackendOperation(
+  record: Record<string, unknown>,
+  id: string,
+  operation: BackendOperation,
+) {
+  if (String(operation.returned.id) !== id || String(record.id) !== id) {
+    throw new Error(`backend/persisted conversation id divergence: ${id}`);
+  }
+  const agent = metadataField(record, ["agent_id", "agentId"]);
+  const returnedAgent = operation.returned.agent_id ?? operation.returned.agentId;
+  if (returnedAgent !== undefined && returnedAgent !== agent) {
+    throw new Error(`backend/persisted agent divergence: ${id}`);
+  }
+  if (operation.agent !== undefined && operation.agent !== agent) {
+    throw new Error(`requested/persisted agent divergence: ${id}`);
+  }
+  const hidden = metadataField(record, ["hidden"]);
+  if (operation.hidden !== undefined && operation.hidden !== hidden) {
+    throw new Error(`requested/persisted hidden divergence: ${id}`);
+  }
+  const source = metadataField(record, ["source_id"]);
+  if (operation.kind === "fork" && operation.source !== source) {
+    throw new Error(`called/persisted fork source divergence: ${id}`);
+  }
+}
+function assertPersistenceMutationCoverage() {
+  const id = "conv-fake-headless-1";
+  const record = { id, agent_id: "agent-local-visible", hidden: true,
+    source_id: "conv-fake-headless-2" };
+  const base: BackendOperation = { kind: "fork", hidden: true,
+    returned: { id, agent_id: "agent-local-visible" }, source: record.source_id };
+  const mutations = [
+    { ...base, returned: { ...base.returned, id: "conv-fake-headless-9" } },
+    { ...base, source: "conv-fake-headless-3" },
+  ];
+  for (const mutation of mutations) {
+    if (!rejects(() => assertBackendOperation(record, id, mutation)))
+      throw new Error("persistence divergence mutation escaped");
+  }
+}
 function durableSequence(values: unknown[], artifacts: string[]): number {
   let sequence = artifacts.reduce(
     (max, id) => Math.max(max, idSequence(id)),
@@ -527,15 +562,12 @@ function durableSequence(values: unknown[], artifacts: string[]): number {
   for (const value of values) visit(value);
   return sequence;
 }
-
 function idSequence(id: string): number {
   return Number(id.slice(id.lastIndexOf("-") + 1));
 }
-
 function sequenceOrder(left: string, right: string): number {
   return idSequence(left) - idSequence(right);
 }
-
 function canonicalProviderCall(value: any) {
   const inputs: string[] = [];
   for (const message of value.messages ?? []) {
@@ -555,7 +587,6 @@ function canonicalProviderCall(value: any) {
     store: value.store === true,
   };
 }
-
 function observable(
   before: StoreSnapshot,
   after: StoreSnapshot,
@@ -563,9 +594,7 @@ function observable(
   phases: string[],
 ) {
   const ids = allocatedIds(before.sequence, after.sequence);
-  const created = ids.map((id) =>
-    conversationLink(id, after.records[id], after.forkSources[id]),
-  );
+  const created = ids.map((id) => conversationLink(id, after.records[id]));
   const retained = created.filter((item) => after.records[item.id]);
   const deleted = ids.filter((id) => !after.artifacts.includes(id));
   const calls = providerCalls.slice(before.provider).map(canonicalProviderCall);
@@ -597,7 +626,6 @@ function observable(
     },
   });
 }
-
 function allocatedIds(before: number, after: number): string[] {
   if (after < before) throw new Error("conversation sequence regressed");
   return Array.from(
@@ -605,12 +633,7 @@ function allocatedIds(before: number, after: number): string[] {
     (_, index) => `conv-fake-headless-${before + index + 1}`,
   );
 }
-
-function conversationLink(
-  id: string,
-  record?: Record<string, unknown>,
-  derivedSource?: string,
-) {
+function conversationLink(id: string, record?: Record<string, unknown>) {
   return {
     id,
     agent_id: record?.agent_id ?? record?.agentId ?? null,
@@ -619,18 +642,15 @@ function conversationLink(
       record?.openai_fork_source_conversation_id ??
       record?.source_conversation_id ??
       record?.source_id ??
-      derivedSource ??
       null,
   };
 }
-
 function roleDelta(before: StoreSnapshot, after: StoreSnapshot, role: string) {
   return Math.max(
     0,
     countRole(after.transcripts, role) - countRole(before.transcripts, role),
   );
 }
-
 function countRole(values: unknown[], role: string): number {
   let count = 0;
   const visit = (value: unknown) => {
@@ -646,7 +666,6 @@ function countRole(values: unknown[], role: string): number {
   for (const value of values) visit(value);
   return count;
 }
-
 type CaptureInput = {
   name: string;
   route: string;
@@ -655,23 +674,32 @@ type CaptureInput = {
   request: any;
   execution?: any;
 };
-
 type CaptureResult = {
   expected: unknown;
   cursor: unknown;
   phases: string[];
 };
-
 const cases: any[] = [];
 let storedId: string | undefined;
 let storedConversationId: string | undefined;
-
 async function capture(input: CaptureInput) {
   const normalizer = new Normalizer();
   const before = await snapshot();
   const execution = input.execution ?? { kind: "single" };
   const result = await executeCapture(input, execution, normalizer, before);
+  await Bun.sleep(25);
   const after = await snapshot();
+  const body = input.request.body ?? {};
+  const ephemeral =
+    (input.route === "chat" &&
+      input.request.headers?.["x-letta-chat-key"] === undefined) ||
+    (input.route === "responses" && body.store !== true);
+  assertHandlerDeleteContract(
+    ephemeral,
+    allocatedIds(before.sequence, after.sequence),
+    after,
+    backendDeleteCalls,
+  );
   const observed = observable(before, after, normalizer, result.phases);
   cases.push({
     schema_version: 2,
@@ -684,7 +712,6 @@ async function capture(input: CaptureInput) {
     cursor: result.cursor,
   });
 }
-
 async function executeCapture(
   input: CaptureInput,
   execution: any,
@@ -695,25 +722,23 @@ async function executeCapture(
     return executeLiveJoin(input, normalizer, before);
   }
   if (execution.kind === "repeat") {
-    const attempts = [];
+    const outputs = [];
     for (let index = 0; index < execution.count; index++) {
-      attempts.push((await send(input.request, normalizer)).result);
+      outputs.push(await send(input.request, normalizer));
     }
     return {
-      expected: { attempts },
+      expected: { attempts: outputs.map((output) => output.result) },
       cursor: null,
       phases: ["not_applicable"],
     };
   }
   return executeSingle(input, normalizer);
 }
-
 async function executeLiveJoin(
   input: CaptureInput,
   normalizer: Normalizer,
   before: StoreSnapshot,
 ): Promise<CaptureResult> {
-  normalizer.reuseChatCompletion = true;
   providerHeld = true;
   providerGate = new Promise<void>((resolve) => {
     providerRelease = resolve;
@@ -725,64 +750,56 @@ async function executeLiveJoin(
   const firstFinished = finish(firstResponse, input.mode, normalizer);
   await arrived;
   const owner = await snapshot();
-  const joinedResponse = await begin(input.request);
+  const received = baselineRequests + 1;
+  const joinedPending = begin(input.request);
+  await waitForBaselineRequest(received);
   const joined = await snapshot();
-  assertLiveJoin(joinedResponse, before, owner, joined);
-  const joinedFinished = finish(joinedResponse, input.mode, normalizer);
+  assertSameStore(owner, joined, "live join");
   releaseProvider();
+  const joinedResponse = await joinedPending;
+  assertLiveJoin(joinedResponse, before);
+  const joinedFinished = finish(joinedResponse, input.mode, normalizer);
   const first = await firstFinished;
   const second = await joinedFinished;
   const settledBefore = await snapshot();
   const replay = await send(input.request, normalizer);
   const settledAfter = await snapshot();
   assertSameStore(settledBefore, settledAfter, "settled replay");
+  assertFreshRawResponseIdentities([first.raw, second.raw, replay.raw]);
   return {
     expected: { attempts: [first.result, second.result, replay.result] },
     cursor: null,
     phases: ["owner_active", "live_join", "settled_replay"],
   };
 }
-
-function assertLiveJoin(
-  response: Response,
-  before: StoreSnapshot,
-  owner: StoreSnapshot,
-  joined: StoreSnapshot,
-) {
+async function waitForBaselineRequest(expected: number) {
+  for (let count = 0; count < 1_000; count++) {
+    if (baselineRequests >= expected) return;
+    await Bun.sleep(1);
+  }
+  throw new Error("joined HTTP request admission timeout");
+}
+function assertLiveJoin(response: Response, before: StoreSnapshot) {
   if (response.status !== 200 || providerCalls.length - before.provider !== 1) {
     throw new Error("second HTTP request was not an accepted live join");
   }
-  assertSameStore(owner, joined, "live join");
 }
-
-function assertSameStore(
-  left: StoreSnapshot,
-  right: StoreSnapshot,
-  phase: string,
-) {
-  if (JSON.stringify(left.files) !== JSON.stringify(right.files)) {
-    throw new Error(`${phase} changed canonical conversation/input storage`);
-  }
-  if (left.provider !== right.provider) {
-    throw new Error(`${phase} changed provider request count`);
-  }
-}
-
 function releaseProvider() {
   providerHeld = false;
   providerRelease?.();
   providerRelease = null;
   providerGate = null;
 }
-
 async function executeSingle(
   input: CaptureInput,
   normalizer: Normalizer,
 ): Promise<CaptureResult> {
-  const output = await send(input.request, normalizer, storedId);
-  const rawBody = input.mode === "json" ? JSON.parse(output.raw) : null;
+  const response = await begin(input.request, storedId);
+  const raw = await response.clone().text();
+  const rawBody = input.mode === "json" ? JSON.parse(raw) : null;
   const after = await snapshot();
   if (input.execution?.previous_cursor) recordPreviousFork(after);
+  const output = await finish(response, input.mode, normalizer);
   const cursor = input.execution?.capture_cursor
     ? captureCursor(rawBody.id, after, normalizer)
     : null;
@@ -792,7 +809,6 @@ async function executeSingle(
     phases: ["not_applicable"],
   };
 }
-
 function recordPreviousFork(after: StoreSnapshot) {
   const record = Object.values(after.records)
     .sort((left, right) => sequenceOrder(String(left.id), String(right.id)))
@@ -801,13 +817,15 @@ function recordPreviousFork(after: StoreSnapshot) {
     throw new Error("previous response canonical hidden fork missing");
   }
   const target = String(record.id);
-  after.forkSources[target] = storedConversationId;
-  observedForkSources[target] = storedConversationId;
-  if (after.forkSources[target] !== storedConversationId) {
-    throw new Error("previous response raw cursor source mismatch");
+  const persistedSource = metadataField(record, ["source_id"]);
+  const calledSource = rawForkSources[target];
+  if (
+    calledSource !== storedConversationId ||
+    persistedSource !== storedConversationId
+  ) {
+    throw new Error("previous response raw/persisted cursor source mismatch");
   }
 }
-
 function captureCursor(
   id: string,
   store: StoreSnapshot,
@@ -841,135 +859,61 @@ function captureCursor(
   const value = normalizer.value(decoded);
   return value;
 }
-
-await capture({
-  name: "models_json",
-  route: "models",
-  mode: "json",
-  request: request("GET", "/v1/models", "json"),
-});
-await capture({
-  name: "chat_headerless_json",
-  route: "chat",
-  mode: "json",
+assertIdentityMutationCoverage();
+assertTimestampMutationCoverage();
+assertPersistenceMutationCoverage();
+await capture({ name: "models_json", route: "models", mode: "json",
+  request: request("GET", "/v1/models", "json") });
+await capture({ name: "chat_headerless_json", route: "chat", mode: "json",
   request: request("POST", "/v1/chat/completions", "json", {
-    model: "fixture-visible",
-    messages: [{ role: "user", content: "<USER_TEXT_A>" }],
-  }),
-});
-await capture({
-  name: "chat_stream_sse",
-  route: "chat",
-  mode: "sse",
+    model: "fixture-visible", messages: [{ role: "user", content: "<USER_TEXT_A>" }],
+  }) });
+await capture({ name: "chat_stream_sse", route: "chat", mode: "sse",
   request: request("POST", "/v1/chat/completions", "sse", {
-    model: "agent-local-visible",
+    model: "agent-local-visible", stream: true,
     messages: [{ role: "user", content: "<USER_TEXT_B>" }],
-    stream: true,
-  }),
-});
-await capture({
-  name: "chat_stateful_first",
-  route: "chat",
-  mode: "json",
-  request: request(
-    "POST",
-    "/v1/chat/completions",
-    "json",
-    {
-      model: "fixture-visible",
-      messages: [{ role: "user", content: "<USER_TEXT_C>" }],
-    },
-    { "x-letta-chat-key": "<CHAT_KEY>" },
-  ),
-});
-await capture({
-  name: "chat_stateful_newest",
-  route: "chat",
-  mode: "json",
+  }) });
+await capture({ name: "chat_stateful_first", route: "chat", mode: "json",
+  request: request("POST", "/v1/chat/completions", "json", {
+    model: "fixture-visible", messages: [{ role: "user", content: "<USER_TEXT_C>" }],
+  }, { "x-letta-chat-key": "<CHAT_KEY>" }) });
+await capture({ name: "chat_stateful_newest", route: "chat", mode: "json",
   dependencies: ["chat_stateful_first"],
-  request: request(
-    "POST",
-    "/v1/chat/completions",
-    "json",
-    {
-      model: "fixture-visible",
-      messages: [
-        { role: "user", content: "<OLD_USER_TEXT>" },
-        { role: "assistant", content: "<OLD_ASSISTANT_TEXT>" },
-        { role: "user", content: "<NEWEST_USER_TEXT>" },
-      ],
-    },
-    { "x-letta-chat-key": "<CHAT_KEY>" },
-  ),
-});
-await capture({
-  name: "chat_idempotent_retry",
-  route: "chat",
-  mode: "sse",
+  request: request("POST", "/v1/chat/completions", "json", {
+    model: "fixture-visible", messages: [
+      { role: "user", content: "<OLD_USER_TEXT>" },
+      { role: "assistant", content: "<OLD_ASSISTANT_TEXT>" },
+      { role: "user", content: "<NEWEST_USER_TEXT>" },
+    ],
+  }, { "x-letta-chat-key": "<CHAT_KEY>" }) });
+await capture({ name: "chat_idempotent_retry", route: "chat", mode: "sse",
   execution: { kind: "idempotent_live_join" },
-  request: request(
-    "POST",
-    "/v1/chat/completions",
-    "sse",
-    {
-      model: "fixture-visible",
-      messages: [{ role: "user", content: "<IDEMPOTENT_USER_TEXT>" }],
-      stream: true,
-    },
-    {
-      "idempotency-key": "<IDEMPOTENCY_KEY>",
-      "x-letta-chat-key": "<IDEMPOTENCY_CHAT_KEY>",
-    },
-  ),
-});
-await capture({
-  name: "responses_nonstored_json",
-  route: "responses",
-  mode: "json",
+  request: request("POST", "/v1/chat/completions", "sse", {
+    model: "fixture-visible", stream: true,
+    messages: [{ role: "user", content: "<IDEMPOTENT_USER_TEXT>" }],
+  }, { "idempotency-key": "<IDEMPOTENCY_KEY>",
+    "x-letta-chat-key": "<IDEMPOTENCY_CHAT_KEY>" }) });
+await capture({ name: "responses_nonstored_json", route: "responses", mode: "json",
   request: request("POST", "/v1/responses", "json", {
-    model: "fixture-visible",
-    input: "<RESPONSE_USER_TEXT_A>",
-    store: false,
-  }),
-});
-await capture({
-  name: "responses_stream_sse",
-  route: "responses",
-  mode: "sse",
+    model: "fixture-visible", input: "<RESPONSE_USER_TEXT_A>", store: false,
+  }) });
+await capture({ name: "responses_stream_sse", route: "responses", mode: "sse",
   request: request("POST", "/v1/responses", "sse", {
-    model: "fixture-visible",
-    input: "<RESPONSE_USER_TEXT_B>",
-    stream: true,
-  }),
-});
-await capture({
-  name: "responses_stored_json",
-  route: "responses",
-  mode: "json",
+    model: "fixture-visible", input: "<RESPONSE_USER_TEXT_B>", stream: true,
+  }) });
+await capture({ name: "responses_stored_json", route: "responses", mode: "json",
   execution: { kind: "single", capture_cursor: true },
   request: request("POST", "/v1/responses", "json", {
-    model: "fixture-visible",
-    input: "<RESPONSE_USER_TEXT_C>",
-    store: true,
-  }),
-});
-await capture({
-  name: "responses_previous_json",
-  route: "responses",
-  mode: "json",
+    model: "fixture-visible", input: "<RESPONSE_USER_TEXT_C>", store: true,
+  }) });
+await capture({ name: "responses_previous_json", route: "responses", mode: "json",
   dependencies: ["responses_stored_json"],
   execution: { kind: "single", previous_cursor: "responses_stored_json" },
   request: request("POST", "/v1/responses", "json", {
-    model: "fixture-visible",
-    input: "<RESPONSE_USER_TEXT_D>",
+    model: "fixture-visible", input: "<RESPONSE_USER_TEXT_D>", store: true,
     previous_response_id: "<FROM:responses_stored_json>",
-    store: true,
-  }),
-});
-await capture({
-  name: "responses_no_idempotency",
-  route: "responses",
-  mode: "json",
+  }) });
+await capture({ name: "responses_no_idempotency", route: "responses", mode: "json",
   execution: { kind: "repeat", count: 2 },
   request: request(
     "POST",
@@ -979,7 +923,6 @@ await capture({
     { "idempotency-key": "<IDEMPOTENCY_KEY>" },
   ),
 });
-
 const { closeOpenAiBridgeRuntime } =
   await import("@/websocket/app-server-openai-turn");
 closeOpenAiBridgeRuntime();

@@ -23,9 +23,20 @@ pub struct ChatScopeKey {
     pub chat_id: String,
 }
 
+/// Failure while allocating or remembering a persistent chat-key mapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChatKeyCacheError {
+    /// Canonical conversation allocation failed.
+    AllocationFailed,
+    /// Every bounded entry is still actively allocating.
+    Capacity,
+    /// The requested key already has an active allocation owner.
+    ActiveAllocation,
+}
+
 /// One shared conversation allocation result.
 pub struct ConversationSlot {
-    value: Mutex<Option<Result<ConversationId, ()>>>,
+    value: Mutex<Option<Result<ConversationId, ChatKeyCacheError>>>,
     settled: Notify,
     active: AtomicBool,
 }
@@ -42,8 +53,9 @@ impl ConversationSlot {
     /// Waits for the allocation owner to settle.
     ///
     /// # Errors
-    /// Returns an opaque error when canonical conversation allocation failed.
-    pub async fn wait(&self) -> Result<ConversationId, ()> {
+    /// Returns [`ChatKeyCacheError::AllocationFailed`] when canonical
+    /// conversation allocation failed.
+    pub async fn wait(&self) -> Result<ConversationId, ChatKeyCacheError> {
         loop {
             let notified = self.settled.notified();
             if let Some(value) = self.value.lock().await.clone() {
@@ -54,7 +66,7 @@ impl ConversationSlot {
     }
 
     /// Settles the allocation exactly once.
-    pub async fn settle(&self, value: Result<ConversationId, ()>) {
+    pub async fn settle(&self, value: Result<ConversationId, ChatKeyCacheError>) {
         let mut current = self.value.lock().await;
         if current.is_none() {
             *current = Some(value);
@@ -120,23 +132,23 @@ impl ChatKeyCache {
     /// Replaces a settled key with a known persistent conversation.
     ///
     /// # Errors
-    /// Returns an opaque capacity or active-allocation conflict.
+    /// Returns a typed capacity or active-allocation conflict.
     pub async fn remember(
         &self,
         key: ChatScopeKey,
         conversation: ConversationId,
-    ) -> Result<(), ()> {
+    ) -> Result<(), ChatKeyCacheError> {
         let slot = Arc::new(ConversationSlot::new());
         slot.settle(Ok(conversation)).await;
         let mut inner = self.inner.lock().await;
         if inner.values.get(&key).is_some_and(|slot| slot.is_active()) {
-            return Err(());
+            return Err(ChatKeyCacheError::ActiveAllocation);
         }
         if !inner.values.contains_key(&key)
             && inner.values.len() == OPENAI_CHAT_KEYS_MAX
             && !evict_one_settled(&mut inner)
         {
-            return Err(());
+            return Err(ChatKeyCacheError::Capacity);
         }
         inner.values.insert(key.clone(), slot);
         inner.order.retain(|candidate| candidate != &key);
@@ -175,7 +187,7 @@ impl ChatKeyCache {
                 inner.order.retain(|candidate| candidate != key);
             }
         }
-        slot.settle(Err(())).await;
+        slot.settle(Err(ChatKeyCacheError::AllocationFailed)).await;
     }
 
     #[cfg(test)]

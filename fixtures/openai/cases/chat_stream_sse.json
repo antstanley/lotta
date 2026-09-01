@@ -12,13 +12,13 @@
     },
     "body": {
       "model": "agent-local-visible",
+      "stream": true,
       "messages": [
         {
           "role": "user",
           "content": "<USER_TEXT_B>"
         }
-      ],
-      "stream": true
+      ]
     }
   },
   "dependencies": [],
@@ -144,11 +144,11 @@
     "chat_completion": [
       "<CHAT_COMPLETION_ID_1>"
     ],
-    "timestamp": [
-      "<TIMESTAMP_ID_1>"
-    ],
     "conversation": [
       "<CONVERSATION_ID_1>"
+    ],
+    "timestamp": [
+      "<TIMESTAMP_ID_1>"
     ]
   },
   "cursor": null

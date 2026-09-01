@@ -17,7 +17,7 @@ const BASELINE_COMMIT = "300f923f16cc8eee50656d7da732902c1dea2b65";
 const BASELINE_TREE = "30d2e2cebc7761c153f5a6d136b242365092faa0";
 const CASES_MAX = 16;
 const FIXTURE_BYTES_MAX = 1_048_576;
-const COMMAND_TIMEOUT_MS = 60_000;
+const COMMAND_TIMEOUT_MS = 180_000;
 const REQUIRED_CASES = [
   "models_json",
   "chat_headerless_json",
@@ -56,6 +56,7 @@ const output = resolve(
   process.argv[2] ?? new URL("../fixtures/openai", import.meta.url).pathname,
 );
 const runnerSource = new URL("./openai-capture-runner.ts", import.meta.url);
+const adapterSource = new URL("./openai-capture-adapter.ts", import.meta.url);
 
 function run(command, args, options = {}) {
   return new Promise((resolvePromise, reject) => {
@@ -68,7 +69,7 @@ function run(command, args, options = {}) {
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       const err = Buffer.concat(stderr).toString("utf8");
-      reject(new Error(`command timed out: ${command}: ${err}`));
+      reject(new Error(`command timed out: ${command} ${args.join(" ")}: ${err}`));
     }, COMMAND_TIMEOUT_MS);
     child.stdout.on("data", (chunk) => stdout.push(chunk));
     child.stderr?.on("data", (chunk) => stderr.push(chunk));
@@ -208,7 +209,9 @@ async function main() {
       env: { ...process.env, HOME: join(temp, "home") },
     });
     await cp(runnerSource, join(tree, basename(runnerSource.pathname)));
+    await cp(adapterSource, join(tree, basename(adapterSource.pathname)));
     const runnerHash = sha256(await readFile(runnerSource));
+    const adapterHash = sha256(await readFile(adapterSource));
     const stdout = await run(bun, [basename(runnerSource.pathname)], {
       cwd: tree,
       env: {
@@ -228,6 +231,10 @@ async function main() {
     sources.capture_runner = {
       path: "tools/openai-capture-runner.ts",
       sha256: runnerHash,
+    };
+    sources.capture_adapter = {
+      path: "tools/openai-capture-adapter.ts",
+      sha256: adapterHash,
     };
     await writeCorpus(cases, {
       runtime: { name: "bun", version: runtime },

@@ -107,11 +107,11 @@
     "chat_completion": [
       "<CHAT_COMPLETION_ID_1>"
     ],
-    "timestamp": [
-      "<TIMESTAMP_ID_1>"
-    ],
     "conversation": [
       "<CONVERSATION_ID_1>"
+    ],
+    "timestamp": [
+      "<TIMESTAMP_ID_1>"
     ]
   },
   "cursor": null

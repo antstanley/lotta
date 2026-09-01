@@ -26,7 +26,11 @@
     },
     "capture_runner": {
       "path": "tools/openai-capture-runner.ts",
-      "sha256": "6869d6ed36dd1a67cc884c8d276abbf98f182f6c8573e51d9833984dcf21de3f"
+      "sha256": "a1595161531b53d1764136b91b3b5318b7a23b134520343a432f9177cfc2a41a"
+    },
+    "capture_adapter": {
+      "path": "tools/openai-capture-adapter.ts",
+      "sha256": "9de32e6fff81734dd6eec18021006d33fc62b26bce55c0518bc811896bb4c37c"
     }
   },
   "bounds": {
@@ -42,7 +46,7 @@
       "mode": "json",
       "dependencies": [],
       "path": "cases/models_json.json",
-      "sha256": "3d32dbd4e8b86d9c848aa08bae816c569600ed3fa0f8a09b3bc4bcf4bae35203"
+      "sha256": "e445683cd37b7da98a3ab4babd1f3dc484c345a0f150c433408e70e002db503a"
     },
     {
       "name": "chat_headerless_json",
@@ -50,7 +54,7 @@
       "mode": "json",
       "dependencies": [],
       "path": "cases/chat_headerless_json.json",
-      "sha256": "071c842b346103963b272099ca84cafc183afc42fc109a956023dbd74ee2cb91"
+      "sha256": "bf87612ac3211ae300833efdfda7cd26c6d269025e4615e13687d2da8f43b0a0"
     },
     {
       "name": "chat_stream_sse",
@@ -58,7 +62,7 @@
       "mode": "sse",
       "dependencies": [],
       "path": "cases/chat_stream_sse.json",
-      "sha256": "88e0df2b6fc14e8f085674ceb0c1d4a1303301d62ed5af6f04b6154ae0aa162d"
+      "sha256": "dd9e5eb078348e0051e10b96ed35cbd89eadc24553a92e1dfab5cf31bb9c58e2"
     },
     {
       "name": "chat_stateful_first",
@@ -66,7 +70,7 @@
       "mode": "json",
       "dependencies": [],
       "path": "cases/chat_stateful_first.json",
-      "sha256": "e853b025c628a67b8f6654320354b7581cb05383b49762715ad5ecfefd21cc31"
+      "sha256": "8e870bf3d20944881950503af21c9c85a2f8a167e2a8a1e1a4333c7bed1784bd"
     },
     {
       "name": "chat_stateful_newest",
@@ -84,7 +88,7 @@
       "mode": "sse",
       "dependencies": [],
       "path": "cases/chat_idempotent_retry.json",
-      "sha256": "f88d8dd9b9c1f1cd335c2a835904cb7910ef93da690f0926408356bcbb3b7f63"
+      "sha256": "1f197698c637df8e2b2d4d48e6ebc002691aaea31cb2893ee665f2dff1cf9832"
     },
     {
       "name": "responses_nonstored_json",
@@ -92,7 +96,7 @@
       "mode": "json",
       "dependencies": [],
       "path": "cases/responses_nonstored_json.json",
-      "sha256": "fe91f751c0f2ca94eb978b8241fbaf626425f5aa631b5c7df883d82b1b54e019"
+      "sha256": "8409e1bc073abfbcfad79cae86ef78c50c2d256eac5e4f5c7d2938fa9a6574e6"
     },
     {
       "name": "responses_stream_sse",
@@ -100,7 +104,7 @@
       "mode": "sse",
       "dependencies": [],
       "path": "cases/responses_stream_sse.json",
-      "sha256": "8ade3372e495c66d89c7a07ccac63245e3b6fb731ff3ab4e9957997bb6978476"
+      "sha256": "4a6d939b349d9877e0c557423c80b42338d8e8f49b0a04e2caf666e003c4eeeb"
     },
     {
       "name": "responses_stored_json",
@@ -108,7 +112,7 @@
       "mode": "json",
       "dependencies": [],
       "path": "cases/responses_stored_json.json",
-      "sha256": "152c1c8ca32e798e68eaf92a2daec487dcdce435f6e2fba81e8162bc87b5241d"
+      "sha256": "8aa89db0d834b30d9d50984acdacd21ef93fe917c667aa7bf933a06078577315"
     },
     {
       "name": "responses_previous_json",
@@ -118,7 +122,7 @@
         "responses_stored_json"
       ],
       "path": "cases/responses_previous_json.json",
-      "sha256": "d97adbafecac73b3e166b870588e04c3d07f2c28085c60a275c97af84a5c4858"
+      "sha256": "a4981815ef148ec9f68f73f5b4c6feb6101cec419476efb5fe17fd30326b983c"
     },
     {
       "name": "responses_no_idempotency",
@@ -126,7 +130,7 @@
       "mode": "json",
       "dependencies": [],
       "path": "cases/responses_no_idempotency.json",
-      "sha256": "966557e4d42b98c0c9db0317f16cb27b2956f5f4abefd98d10f7bacd6c26aee0"
+      "sha256": "559ea9d081892dfb680002282ae6d61b0b1f38c96ee37a66e6f839211d1d6804"
     }
   ]
 }

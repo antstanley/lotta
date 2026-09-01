@@ -65,11 +65,11 @@
           "response": [
             "<RESPONSE_ID_1>"
           ],
-          "timestamp": [
-            "<TIMESTAMP_ID_1>"
-          ],
           "msg": [
             "<MSG_ID_1>"
+          ],
+          "timestamp": [
+            "<TIMESTAMP_ID_1>"
           ]
         }
       },
@@ -81,7 +81,7 @@
         "body": {
           "id": "<RESPONSE_ID_2>",
           "object": "response",
-          "created_at": "<TIMESTAMP_ID_1>",
+          "created_at": "<TIMESTAMP_ID_2>",
           "status": "completed",
           "model": "fixture-visible",
           "output": [
@@ -115,12 +115,13 @@
             "<RESPONSE_ID_1>",
             "<RESPONSE_ID_2>"
           ],
-          "timestamp": [
-            "<TIMESTAMP_ID_1>"
-          ],
           "msg": [
             "<MSG_ID_1>",
             "<MSG_ID_2>"
+          ],
+          "timestamp": [
+            "<TIMESTAMP_ID_1>",
+            "<TIMESTAMP_ID_2>"
           ]
         }
       }
@@ -187,9 +188,6 @@
       "<RESPONSE_ID_1>",
       "<RESPONSE_ID_2>"
     ],
-    "timestamp": [
-      "<TIMESTAMP_ID_1>"
-    ],
     "msg": [
       "<MSG_ID_1>",
       "<MSG_ID_2>"
@@ -197,6 +195,10 @@
     "conversation": [
       "<CONVERSATION_ID_1>",
       "<CONVERSATION_ID_2>"
+    ],
+    "timestamp": [
+      "<TIMESTAMP_ID_1>",
+      "<TIMESTAMP_ID_2>"
     ]
   },
   "cursor": null

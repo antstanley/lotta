@@ -1,6 +1,12 @@
 use proc_macro2::Span;
 use quote::ToTokens as _;
-use std::path::{Path, PathBuf};
+use std::{
+    io::Read as _,
+    path::{Path, PathBuf},
+    process::{Child, Command, ExitStatus, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 use syn::{
     Attribute, ImplItem, Item, TraitItem,
     spanned::Spanned as _,
@@ -24,6 +30,7 @@ const TASK77_RUST_SOURCES: &[&str] = &[
 ];
 const TASK77_SCRIPT_SOURCES: &[&str] = &[
     "tools/capture-openai-fixtures.mjs",
+    "tools/openai-capture-adapter.ts",
     "tools/openai-capture-runner.ts",
 ];
 
@@ -32,7 +39,6 @@ enum Finding {
     FileLines(usize),
     LineBytes { line: usize, bytes: usize },
     FunctionLines { name: String, lines: usize },
-    ScriptSyntax { line: usize, message: String },
 }
 
 #[derive(Default)]
@@ -264,12 +270,12 @@ fn close_delimiter(delimiter: char, line: usize, state: &mut ScriptState) {
         _ => return,
     };
     let depth = state.delimiters.len();
-    match state.delimiters.pop() {
-        Some((actual, _)) if actual == expected => {}
-        _ => state.findings.push(Finding::ScriptSyntax {
-            line,
-            message: format!("unmatched {delimiter}"),
-        }),
+    if state
+        .delimiters
+        .last()
+        .is_some_and(|(actual, _)| *actual == expected)
+    {
+        state.delimiters.pop();
     }
     if delimiter == '}' {
         close_function(depth, line, state);
@@ -294,19 +300,70 @@ fn close_function(depth: usize, line: usize, state: &mut ScriptState) {
     }
 }
 
-fn finish_script(last_line: usize, state: &mut ScriptState) {
-    if state.mode != ScriptMode::Code {
-        state.findings.push(Finding::ScriptSyntax {
-            line: last_line,
-            message: "unterminated string or comment".to_owned(),
-        });
+fn finish_script(_last_line: usize, state: &mut ScriptState) {
+    state.delimiters.clear();
+}
+
+const BUN_VERSION: &str = "1.3.14";
+const BUN_DEADLINE: Duration = Duration::from_secs(15);
+const BUN_PARSE: &str = r"const p=process.argv[1];
+const loader=p.endsWith('.ts')?'ts':'js';
+new Bun.Transpiler({loader}).transformSync(await Bun.file(p).text());";
+
+fn bun_command() -> String {
+    std::env::var("LOTTA_BUN").unwrap_or_else(|_| "bun".to_owned())
+}
+
+fn bounded_status(mut child: Child) -> Result<(ExitStatus, String), String> {
+    let start = Instant::now();
+    loop {
+        match child.try_wait().map_err(|error| error.to_string())? {
+            Some(status) => {
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    pipe.read_to_string(&mut stderr)
+                        .map_err(|error| error.to_string())?;
+                }
+                return Ok((status, stderr));
+            }
+            None if start.elapsed() < BUN_DEADLINE => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            None => {
+                child.kill().map_err(|error| error.to_string())?;
+                child.wait().map_err(|error| error.to_string())?;
+                return Err("Bun parser deadline exceeded".to_owned());
+            }
+        }
     }
-    for (_, line) in state.delimiters.drain(..) {
-        state.findings.push(Finding::ScriptSyntax {
-            line,
-            message: "unclosed delimiter".to_owned(),
-        });
+}
+
+fn run_bun(arguments: &[&str]) -> Result<(), String> {
+    let child = Command::new(bun_command())
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Bun unavailable: {error}"))?;
+    let (status, stderr) = bounded_status(child)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Bun parser failed: {stderr}"))
     }
+}
+
+fn assert_pinned_bun() {
+    let check = format!("if(Bun.version!=={BUN_VERSION:?})throw Error('Bun '+Bun.version)");
+    run_bun(&["-e", &check]).expect("Task77 requires pinned Bun parser");
+}
+
+fn parse_script(path: &Path) -> Result<(), String> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| "non-UTF8 script path".to_owned())?;
+    run_bun(&["-e", BUN_PARSE, text])
 }
 
 fn workspace() -> PathBuf {
@@ -326,18 +383,26 @@ fn task77_sources_obey_hard_limits() {
         let violations = rust_findings(&source).expect("parse Task77 Rust source");
         assert!(violations.is_empty(), "{}: {violations:?}", path.display());
     }
+    assert_pinned_bun();
+    let mut parsed = Vec::new();
     for relative in TASK77_SCRIPT_SOURCES {
         let path = root.join(relative);
         let source = std::fs::read_to_string(&path).expect("read Task77 script source");
         let violations = script_findings(&source);
         assert!(violations.is_empty(), "{}: {violations:?}", path.display());
+        parse_script(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        parsed.push(*relative);
     }
+    assert_eq!(
+        parsed, TASK77_SCRIPT_SOURCES,
+        "exact capture sources parsed"
+    );
 }
 
 #[test]
 fn audit_manifest_has_no_gap() {
     assert_eq!(TASK77_RUST_SOURCES.len(), 10);
-    assert_eq!(TASK77_SCRIPT_SOURCES.len(), 2);
+    assert_eq!(TASK77_SCRIPT_SOURCES.len(), 3);
 }
 
 #[test]
@@ -358,9 +423,16 @@ fn file_line_function_and_syntax_mutations_are_rejected() {
             .iter()
             .any(|finding| matches!(finding, Finding::FunctionLines { .. }))
     );
+    assert_pinned_bun();
+    let mutation = workspace()
+        .join("target")
+        .join(format!("task77-balanced-syntax-{}.ts", std::process::id()));
+    std::fs::write(&mutation, "const value = ();\nconst broken = ;\n")
+        .expect("write syntax mutation");
+    let failure = parse_script(&mutation);
+    std::fs::remove_file(&mutation).expect("remove syntax mutation");
     assert!(
-        script_findings("function broken() {")
-            .iter()
-            .any(|finding| matches!(finding, Finding::ScriptSyntax { .. }))
+        failure.is_err(),
+        "balanced-delimiter invalid syntax escaped"
     );
 }

@@ -64,7 +64,6 @@ pub struct TurnOutcome {
 /// One in-flight or settled outcome plus bounded live owner deltas.
 pub struct OutcomeCell {
     value: Mutex<Option<Arc<TurnOutcome>>>,
-    response_identity: Mutex<Option<(String, i64)>>,
     settled: Notify,
     active: AtomicBool,
     next_delta: AtomicU64,
@@ -77,7 +76,6 @@ impl OutcomeCell {
         let (deltas, _) = broadcast::channel(CHAT_STREAM_EVENTS_MAX);
         Self {
             value: Mutex::new(None),
-            response_identity: Mutex::new(None),
             settled: Notify::new(),
             active: AtomicBool::new(true),
             next_delta: AtomicU64::new(1),
@@ -113,12 +111,6 @@ impl OutcomeCell {
             }
             drop(self.deltas.send((sequence, text)));
         }
-    }
-
-    /// Returns one stable completion identity shared by every replay mode.
-    pub async fn response_identity(&self, create: impl FnOnce() -> (String, i64)) -> (String, i64) {
-        let mut identity = self.response_identity.lock().await;
-        identity.get_or_insert_with(create).clone()
     }
 
     /// True while allocation or execution ownership is active.

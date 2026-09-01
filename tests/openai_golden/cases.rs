@@ -129,6 +129,7 @@ fn index_is_complete_strict_and_sanitized() {
         "common",
         "lockfile",
         "capture_runner",
+        "capture_adapter",
     ] {
         let pin = index
             .sources

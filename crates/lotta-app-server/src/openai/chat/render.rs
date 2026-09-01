@@ -16,9 +16,7 @@ pub(super) async fn render(
     streaming: bool,
     created: i64,
 ) -> Response {
-    let (completion_id, created) = cell
-        .response_identity(|| (format!("chatcmpl-{}", fresh_uuid()), created))
-        .await;
+    let completion_id = format!("chatcmpl-{}", fresh_uuid());
     if streaming {
         return sse_response(cell, owner, completion_id, created, model.to_owned());
     }

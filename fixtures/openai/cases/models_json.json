@@ -27,30 +27,24 @@
         {
           "id": "agent-local-collision-a",
           "object": "model",
-          "created": "<TIMESTAMP_ID_1>",
+          "created": 1767312000,
           "owned_by": "letta"
         },
         {
           "id": "agent-local-collision-b",
           "object": "model",
-          "created": "<TIMESTAMP_ID_2>",
+          "created": 1767398400,
           "owned_by": "letta"
         },
         {
           "id": "fixture-visible",
           "object": "model",
-          "created": "<TIMESTAMP_ID_3>",
+          "created": 1767225600,
           "owned_by": "letta"
         }
       ]
     },
-    "dynamic_map": {
-      "timestamp": [
-        "<TIMESTAMP_ID_1>",
-        "<TIMESTAMP_ID_2>",
-        "<TIMESTAMP_ID_3>"
-      ]
-    }
+    "dynamic_map": {}
   },
   "observable": {
     "provider_calls": [],
@@ -75,12 +69,6 @@
       ]
     }
   },
-  "relationships": {
-    "timestamp": [
-      "<TIMESTAMP_ID_1>",
-      "<TIMESTAMP_ID_2>",
-      "<TIMESTAMP_ID_3>"
-    ]
-  },
+  "relationships": {},
   "cursor": null
 }

@@ -122,7 +122,7 @@ const OPENAI_FORK_SOURCE_FIELD: &str = "openai_fork_source_conversation_id";
 const MESSAGES_FAILURE: &str = "Failed to list conversation messages";
 const COMPACT_FAILURE: &str = "Failed to compact conversation";
 
-// ── Wire commands ───────────────────────────────────────────────────────────
+// Wire commands.
 
 /// Query parameters accepted by the pinned `conversation_list`.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -396,7 +396,7 @@ pub enum ConversationsCommand {
     Compact(ConversationCompactCommand),
 }
 
-// ── Pinned stored-message wire models ───────────────────────────────────────
+// Pinned stored-message wire models.
 
 /// Return-message categories spelled exactly like the pinned protocol's
 /// `message_type` strings.
@@ -518,7 +518,7 @@ pub struct PinnedStoredMessage {
     pub kind: PinnedMessageKind,
 }
 
-// ── Wire responses ──────────────────────────────────────────────────────────
+// Wire responses.
 
 /// Pinned reference to the newly created fork.
 #[derive(Clone, Debug, PartialEq, Serialize)]

@@ -31,7 +31,12 @@ const APPROVED_SOURCES: &[(&str, &str, &str)] = &[
     (
         "capture_runner",
         "tools/openai-capture-runner.ts",
-        "6869d6ed36dd1a67cc884c8d276abbf98f182f6c8573e51d9833984dcf21de3f",
+        "a1595161531b53d1764136b91b3b5318b7a23b134520343a432f9177cfc2a41a",
+    ),
+    (
+        "capture_adapter",
+        "tools/openai-capture-adapter.ts",
+        "9de32e6fff81734dd6eec18021006d33fc62b26bce55c0518bc811896bb4c37c",
     ),
 ];
 

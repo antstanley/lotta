@@ -61,11 +61,11 @@
       "response": [
         "<RESPONSE_ID_1>"
       ],
-      "timestamp": [
-        "<TIMESTAMP_ID_1>"
-      ],
       "msg": [
         "<MSG_ID_1>"
+      ],
+      "timestamp": [
+        "<TIMESTAMP_ID_1>"
       ]
     }
   },
@@ -114,14 +114,14 @@
     "response": [
       "<RESPONSE_ID_1>"
     ],
-    "timestamp": [
-      "<TIMESTAMP_ID_1>"
-    ],
     "msg": [
       "<MSG_ID_1>"
     ],
     "conversation": [
       "<CONVERSATION_ID_1>"
+    ],
+    "timestamp": [
+      "<TIMESTAMP_ID_1>"
     ]
   },
   "cursor": null

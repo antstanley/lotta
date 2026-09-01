@@ -148,6 +148,8 @@ impl DynamicKind {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(transparent)]
+/// Dynamic response registry. Identifier kinds encode case-wide raw identity;
+/// timestamp entries encode only contiguous response-attempt ordinals.
 pub struct RelationshipMap(pub BTreeMap<DynamicKind, Vec<String>>);
 
 impl RelationshipMap {
@@ -157,7 +159,12 @@ impl RelationshipMap {
             for (index, token) in tokens.iter().enumerate() {
                 let expected = format!("<{}_ID_{}>", kind.token_name(), index + 1);
                 if token != &expected {
-                    return Err(format!("noncontiguous {kind:?} token {token}"));
+                    let meaning = if *kind == DynamicKind::Timestamp {
+                        "timestamp attempt"
+                    } else {
+                        "identity"
+                    };
+                    return Err(format!("noncontiguous {meaning} token {token}"));
                 }
                 if !all.insert(token) {
                     return Err(format!("duplicate relationship token {token}"));

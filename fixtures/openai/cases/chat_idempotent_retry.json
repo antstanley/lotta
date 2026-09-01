@@ -17,13 +17,13 @@
     },
     "body": {
       "model": "fixture-visible",
+      "stream": true,
       "messages": [
         {
           "role": "user",
           "content": "<IDEMPOTENT_USER_TEXT>"
         }
-      ],
-      "stream": true
+      ]
     }
   },
   "dependencies": [],
@@ -113,9 +113,9 @@
           {
             "event": null,
             "data": {
-              "id": "<CHAT_COMPLETION_ID_1>",
+              "id": "<CHAT_COMPLETION_ID_2>",
               "object": "chat.completion.chunk",
-              "created": "<TIMESTAMP_ID_1>",
+              "created": "<TIMESTAMP_ID_2>",
               "model": "fixture-visible",
               "choices": [
                 {
@@ -132,9 +132,9 @@
           {
             "event": null,
             "data": {
-              "id": "<CHAT_COMPLETION_ID_1>",
+              "id": "<CHAT_COMPLETION_ID_2>",
               "object": "chat.completion.chunk",
-              "created": "<TIMESTAMP_ID_1>",
+              "created": "<TIMESTAMP_ID_2>",
               "model": "fixture-visible",
               "choices": [
                 {
@@ -150,9 +150,9 @@
           {
             "event": null,
             "data": {
-              "id": "<CHAT_COMPLETION_ID_1>",
+              "id": "<CHAT_COMPLETION_ID_2>",
               "object": "chat.completion.chunk",
-              "created": "<TIMESTAMP_ID_1>",
+              "created": "<TIMESTAMP_ID_2>",
               "model": "fixture-visible",
               "choices": [
                 {
@@ -170,10 +170,12 @@
         ],
         "dynamic_map": {
           "chat_completion": [
-            "<CHAT_COMPLETION_ID_1>"
+            "<CHAT_COMPLETION_ID_1>",
+            "<CHAT_COMPLETION_ID_2>"
           ],
           "timestamp": [
-            "<TIMESTAMP_ID_1>"
+            "<TIMESTAMP_ID_1>",
+            "<TIMESTAMP_ID_2>"
           ]
         }
       },
@@ -187,9 +189,9 @@
           {
             "event": null,
             "data": {
-              "id": "<CHAT_COMPLETION_ID_1>",
+              "id": "<CHAT_COMPLETION_ID_3>",
               "object": "chat.completion.chunk",
-              "created": "<TIMESTAMP_ID_1>",
+              "created": "<TIMESTAMP_ID_3>",
               "model": "fixture-visible",
               "choices": [
                 {
@@ -206,9 +208,9 @@
           {
             "event": null,
             "data": {
-              "id": "<CHAT_COMPLETION_ID_1>",
+              "id": "<CHAT_COMPLETION_ID_3>",
               "object": "chat.completion.chunk",
-              "created": "<TIMESTAMP_ID_1>",
+              "created": "<TIMESTAMP_ID_3>",
               "model": "fixture-visible",
               "choices": [
                 {
@@ -224,9 +226,9 @@
           {
             "event": null,
             "data": {
-              "id": "<CHAT_COMPLETION_ID_1>",
+              "id": "<CHAT_COMPLETION_ID_3>",
               "object": "chat.completion.chunk",
-              "created": "<TIMESTAMP_ID_1>",
+              "created": "<TIMESTAMP_ID_3>",
               "model": "fixture-visible",
               "choices": [
                 {
@@ -244,10 +246,14 @@
         ],
         "dynamic_map": {
           "chat_completion": [
-            "<CHAT_COMPLETION_ID_1>"
+            "<CHAT_COMPLETION_ID_1>",
+            "<CHAT_COMPLETION_ID_2>",
+            "<CHAT_COMPLETION_ID_3>"
           ],
           "timestamp": [
-            "<TIMESTAMP_ID_1>"
+            "<TIMESTAMP_ID_1>",
+            "<TIMESTAMP_ID_2>",
+            "<TIMESTAMP_ID_3>"
           ]
         }
       }
@@ -303,13 +309,17 @@
   },
   "relationships": {
     "chat_completion": [
-      "<CHAT_COMPLETION_ID_1>"
-    ],
-    "timestamp": [
-      "<TIMESTAMP_ID_1>"
+      "<CHAT_COMPLETION_ID_1>",
+      "<CHAT_COMPLETION_ID_2>",
+      "<CHAT_COMPLETION_ID_3>"
     ],
     "conversation": [
       "<CONVERSATION_ID_1>"
+    ],
+    "timestamp": [
+      "<TIMESTAMP_ID_1>",
+      "<TIMESTAMP_ID_2>",
+      "<TIMESTAMP_ID_3>"
     ]
   },
   "cursor": null

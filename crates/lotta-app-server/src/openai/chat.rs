@@ -37,7 +37,9 @@ use crate::{
 };
 
 use super::{
-    chat_keys::{ChatKeyCache, ChatKeyClaim, ChatScopeKey, OPENAI_CHAT_KEY_BYTES_MAX},
+    chat_keys::{
+        ChatKeyCache, ChatKeyCacheError, ChatKeyClaim, ChatScopeKey, OPENAI_CHAT_KEY_BYTES_MAX,
+    },
     errors,
     idempotency::{
         ChatIdentity, IDEMPOTENCY_KEY_BYTES_MAX, OutcomeCache, OutcomeCell, OutcomeClaim,
@@ -113,7 +115,7 @@ impl ChatState {
         agent: &Agent,
         chat_id: &str,
         conversation: lotta_domain::ConversationId,
-    ) -> Result<(), ()> {
+    ) -> Result<(), ChatKeyCacheError> {
         self.chat_keys
             .remember(
                 ChatScopeKey {
@@ -542,10 +544,14 @@ pub(crate) async fn resolve_conversation_status(
         chat_id: chat_key.to_owned(),
     };
     match state.chat_keys.claim(key.clone()).await {
-        ChatKeyClaim::Existing(slot) => slot.wait().await.map(|id| ConversationResolution {
-            id,
-            newly_created: false,
-        }),
+        ChatKeyClaim::Existing(slot) => slot
+            .wait()
+            .await
+            .map(|id| ConversationResolution {
+                id,
+                newly_created: false,
+            })
+            .map_err(|_| ()),
         ChatKeyClaim::Full => Err(()),
         ChatKeyClaim::Owner(slot) => {
             // The slot owner contains every abnormal exit from the repository

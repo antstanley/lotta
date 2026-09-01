@@ -590,18 +590,6 @@ const TASK76_PRODUCTION_SOURCES: &[&str] = &[
 // scope visible and fails on any drift; Task73-touched code may not add to this debt.
 const TASK73_BASELINE_GAPS: &[(&str, &str)] = &[
     (
-        "crates/lotta-app-server/src/ws/groups/conversations.rs",
-        "LineWidth { line: 124, bytes: 201 }",
-    ),
-    (
-        "crates/lotta-app-server/src/ws/groups/conversations.rs",
-        "LineWidth { line: 398, bytes: 161 }",
-    ),
-    (
-        "crates/lotta-app-server/src/ws/groups/conversations.rs",
-        "LineWidth { line: 520, bytes: 199 }",
-    ),
-    (
         "crates/lotta-providers/src/host/client.rs",
         "LintSuppression { line: 3 }",
     ),

@@ -6,13 +6,23 @@ use reqwest::header::{CACHE_CONTROL, CONTENT_TYPE};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 
+const MAX_UNIX_TIMESTAMP_SECONDS: u64 = 253_402_300_799;
+
 #[derive(Default)]
 pub struct Normalizer {
     maps: BTreeMap<DynamicKind, BTreeMap<String, String>>,
+    timestamp_tokens: Vec<String>,
+}
+
+struct TimestampAttempt {
+    raw: Option<u64>,
+    token: String,
+    registered: bool,
 }
 
 impl Normalizer {
     fn token(&mut self, kind: DynamicKind, original: &str) -> String {
+        debug_assert_ne!(kind, DynamicKind::Timestamp);
         let values = self.maps.entry(kind).or_default();
         if let Some(token) = values.get(original) {
             return token.clone();
@@ -23,7 +33,7 @@ impl Normalizer {
     }
 
     pub fn relationships(&self) -> RelationshipMap {
-        let maps = self
+        let mut maps = self
             .maps
             .iter()
             .map(|(kind, values)| {
@@ -31,34 +41,82 @@ impl Normalizer {
                 tokens.sort_by_key(|token| token_number(token));
                 (*kind, tokens)
             })
-            .collect();
+            .collect::<BTreeMap<_, _>>();
+        if !self.timestamp_tokens.is_empty() {
+            maps.insert(DynamicKind::Timestamp, self.timestamp_tokens.clone());
+        }
         let relationships = RelationshipMap(maps);
         relationships.validate().expect("valid identity registry");
         relationships
     }
 
     pub fn value(&mut self, value: &mut Value) -> Result<(), String> {
-        self.at(value, "")
+        self.at(value, None)
     }
 
-    fn at(&mut self, value: &mut Value, key: &str) -> Result<(), String> {
+    fn response_value(
+        &mut self,
+        value: &mut Value,
+        attempt: &mut TimestampAttempt,
+    ) -> Result<(), String> {
+        self.at(value, Some(attempt))
+    }
+
+    fn response_attempt(&self) -> TimestampAttempt {
+        TimestampAttempt {
+            raw: None,
+            token: format!("<TIMESTAMP_ID_{}>", self.timestamp_tokens.len() + 1),
+            registered: false,
+        }
+    }
+
+    fn at(
+        &mut self,
+        value: &mut Value,
+        mut attempt: Option<&mut TimestampAttempt>,
+    ) -> Result<(), String> {
         match value {
-            Value::Number(number) if matches!(key, "created" | "created_at" | "timestamp") => {
-                *value = json!(self.token(DynamicKind::Timestamp, &number.to_string()));
-            }
             Value::String(text) => *text = self.string(text)?,
             Value::Array(values) => {
                 for child in values {
-                    self.at(child, key)?;
+                    self.at(child, attempt.as_deref_mut())?;
                 }
             }
             Value::Object(values) => {
+                let timestamp_key = response_timestamp_key(values);
                 for (child_key, child) in values {
-                    self.at(child, child_key)?;
+                    if timestamp_key == Some(child_key.as_str()) {
+                        self.timestamp(child, attempt.as_deref_mut())?;
+                    } else {
+                        self.at(child, attempt.as_deref_mut())?;
+                    }
                 }
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    fn timestamp(
+        &mut self,
+        value: &mut Value,
+        attempt: Option<&mut TimestampAttempt>,
+    ) -> Result<(), String> {
+        let attempt =
+            attempt.ok_or_else(|| "dynamic timestamp outside response attempt".to_owned())?;
+        let raw = value
+            .as_u64()
+            .filter(|raw| *raw <= MAX_UNIX_TIMESTAMP_SECONDS)
+            .ok_or_else(|| format!("invalid Unix created timestamp: {value}"))?;
+        if attempt.raw.is_some_and(|previous| previous != raw) {
+            return Err("created timestamp changed within response attempt".to_owned());
+        }
+        attempt.raw = Some(raw);
+        if !attempt.registered {
+            self.timestamp_tokens.push(attempt.token.clone());
+            attempt.registered = true;
+        }
+        *value = json!(attempt.token);
         Ok(())
     }
 
@@ -84,6 +142,14 @@ impl Normalizer {
             return Err(format!("malformed dynamic identifier: {text}"));
         }
         Ok(text.to_owned())
+    }
+}
+
+fn response_timestamp_key(values: &Map<String, Value>) -> Option<&'static str> {
+    match values.get("object").and_then(Value::as_str) {
+        Some(kind) if kind.starts_with("chat.completion") => Some("created"),
+        Some("response") => Some("created_at"),
+        _ => None,
     }
 }
 
@@ -145,8 +211,9 @@ pub async fn response(
 ) -> Result<NormalizedResponse, String> {
     let status = response.status().as_u16();
     let headers = selected_headers(response.headers());
+    let mut attempt = normalizer.response_attempt();
     if sse {
-        let events = parse_sse(response, normalizer).await?;
+        let events = parse_sse(response, normalizer, &mut attempt).await?;
         return Ok(NormalizedResponse {
             value: json!({
                 "status":status,
@@ -157,7 +224,7 @@ pub async fn response(
             stored_id: None,
         });
     }
-    json_response(response, status, headers, normalizer).await
+    json_response(response, status, headers, normalizer, &mut attempt).await
 }
 
 async fn json_response(
@@ -165,6 +232,7 @@ async fn json_response(
     status: u16,
     headers: Value,
     normalizer: &mut Normalizer,
+    attempt: &mut TimestampAttempt,
 ) -> Result<NormalizedResponse, String> {
     let mut body: Value = tokio::time::timeout(CHILD_TIMEOUT, response.json())
         .await
@@ -175,7 +243,7 @@ async fn json_response(
         .and_then(Value::as_str)
         .filter(|id| id.starts_with("resp_letta_"))
         .map(str::to_owned);
-    normalizer.value(&mut body)?;
+    normalizer.response_value(&mut body, attempt)?;
     Ok(NormalizedResponse {
         value: json!({
             "status":status,
@@ -203,6 +271,7 @@ fn selected_headers(headers: &reqwest::header::HeaderMap) -> Value {
 async fn parse_sse(
     response: reqwest::Response,
     normalizer: &mut Normalizer,
+    attempt: &mut TimestampAttempt,
 ) -> Result<Vec<Value>, String> {
     let mut stream = response.bytes_stream();
     let mut pending = Vec::new();
@@ -216,7 +285,7 @@ async fn parse_sse(
         if pending.len() > FIXTURE_BYTES_MAX {
             return Err("SSE pending byte bound".to_owned());
         }
-        drain_events(&mut pending, &mut events, normalizer)?;
+        drain_events(&mut pending, &mut events, normalizer, attempt)?;
     }
     if !pending.is_empty() {
         return Err("SSE framing has trailing bytes".to_owned());
@@ -228,10 +297,11 @@ fn drain_events(
     pending: &mut Vec<u8>,
     events: &mut Vec<Value>,
     normalizer: &mut Normalizer,
+    attempt: &mut TimestampAttempt,
 ) -> Result<(), String> {
     while let Some(end) = pending.windows(2).position(|part| part == b"\n\n") {
         let block = pending.drain(..end + 2).collect::<Vec<_>>();
-        events.push(parse_block(&block[..end], normalizer)?);
+        events.push(parse_block(&block[..end], normalizer, attempt)?);
         if events.len() > SSE_EVENTS_MAX {
             return Err("SSE event bound".to_owned());
         }
@@ -239,7 +309,11 @@ fn drain_events(
     Ok(())
 }
 
-fn parse_block(block: &[u8], normalizer: &mut Normalizer) -> Result<Value, String> {
+fn parse_block(
+    block: &[u8],
+    normalizer: &mut Normalizer,
+    attempt: &mut TimestampAttempt,
+) -> Result<Value, String> {
     let text = std::str::from_utf8(block).map_err(|error| error.to_string())?;
     let mut event = Value::Null;
     let mut data = None;
@@ -260,7 +334,7 @@ fn parse_block(block: &[u8], normalizer: &mut Normalizer) -> Result<Value, Strin
     } else {
         serde_json::from_str(data).map_err(|error| error.to_string())?
     };
-    normalizer.value(&mut value)?;
+    normalizer.response_value(&mut value, attempt)?;
     Ok(json!({"event":event,"data":value}))
 }
 
@@ -301,6 +375,63 @@ mod tests {
             )]));
             assert!(map.validate().is_err());
         }
+        timestamps_are_attempt_scoped_not_raw_identities();
+        timestamp_mutations_validate_attempt_consistency_and_range();
+        static_semantic_timestamps_and_sequences_are_unchanged();
+    }
+
+    fn timestamps_are_attempt_scoped_not_raw_identities() {
+        fn shape(raw: [u64; 2]) -> Value {
+            let mut normalizer = Normalizer::default();
+            let mut output = Vec::new();
+            for created in raw {
+                let mut value = json!({"object":"chat.completion","created":created});
+                let mut attempt = normalizer.response_attempt();
+                normalizer
+                    .response_value(&mut value, &mut attempt)
+                    .expect("normalize timestamp");
+                output.push(value);
+            }
+            json!({"responses":output,"dynamic_map":normalizer.relationships()})
+        }
+        assert_eq!(shape([1, 1]), shape([1, 2]));
+    }
+
+    fn timestamp_mutations_validate_attempt_consistency_and_range() {
+        let mut normalizer = Normalizer::default();
+        let mut attempt = normalizer.response_attempt();
+        let mut first = json!({"object":"chat.completion.chunk","created":1});
+        normalizer
+            .response_value(&mut first, &mut attempt)
+            .expect("first chunk");
+        let mut changed = json!({"object":"chat.completion.chunk","created":2});
+        assert!(
+            normalizer
+                .response_value(&mut changed, &mut attempt)
+                .is_err()
+        );
+        for malformed in [
+            json!("1"),
+            json!(1.5),
+            json!(-1),
+            json!(MAX_UNIX_TIMESTAMP_SECONDS + 1),
+        ] {
+            let mut normalizer = Normalizer::default();
+            let mut attempt = normalizer.response_attempt();
+            let mut value = json!({"object":"response","created_at":malformed});
+            assert!(normalizer.response_value(&mut value, &mut attempt).is_err());
+        }
+    }
+
+    fn static_semantic_timestamps_and_sequences_are_unchanged() {
+        let mut value = json!({"object":"model","created":1,"timestamp":2,"sequence":3});
+        Normalizer::default()
+            .value(&mut value)
+            .expect("normalize IDs only");
+        assert_eq!(
+            value,
+            json!({"object":"model","created":1,"timestamp":2,"sequence":3})
+        );
     }
 
     #[test]

@@ -335,7 +335,7 @@ mod responses {
     }
 
     #[tokio::test]
-    async fn settled_replay_reuses_exact_completion_identity() {
+    async fn each_http_attempt_gets_a_fresh_completion_identity() {
         let cell = Arc::new(OutcomeCell::new());
         cell.settle(TurnOutcome {
             text: "hello".to_owned(),
@@ -353,8 +353,9 @@ mod responses {
             &test_to_bytes(second.into_body(), 16_384).await.unwrap(),
         )
         .unwrap();
-        assert_eq!(first["id"], second["id"]);
-        assert_eq!(first["created"], second["created"]);
+        assert_ne!(first["id"], second["id"]);
+        assert_eq!(first["created"], 1);
+        assert_eq!(second["created"], 999);
     }
 
     #[tokio::test]
@@ -375,6 +376,15 @@ mod responses {
             String::from_utf8(body.to_vec()).unwrap_or_else(|error| panic!("SSE UTF-8: {error}"));
         assert!(text.ends_with("data: [DONE]\n\n"));
         assert!(text.contains("\"finish_reason\":\"stop\""));
+        let chunks = text
+            .split("\n\n")
+            .filter_map(|block| block.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str::<Value>(data).expect("SSE chunk JSON"))
+            .collect::<Vec<_>>();
+        let id = chunks.first().expect("initial chunk")["id"].clone();
+        assert!(chunks.iter().all(|chunk| chunk["id"] == id));
+        assert!(chunks.iter().all(|chunk| chunk["created"] == 1));
     }
 
     #[test]
