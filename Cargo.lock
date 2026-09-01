@@ -920,6 +920,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "lotta-app-server",
+ "lotta-channels",
  "lotta-domain",
  "lotta-extensions",
  "lotta-memfs",
@@ -980,6 +981,21 @@ dependencies = [
 [[package]]
 name = "lotta-channels"
 version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "getrandom 0.3.4",
+ "lotta-extensions",
+ "lotta-testkit",
+ "lotta-tools",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "url",
+]
 
 [[package]]
 name = "lotta-config"

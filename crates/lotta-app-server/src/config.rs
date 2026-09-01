@@ -55,6 +55,8 @@ pub struct PreparedServer {
     pub storage_dir: PathBuf,
     /// Canonical local production workspace root.
     pub workspace_dir: PathBuf,
+    /// Restrict this dedicated listener to Runtime-group channel-host commands.
+    pub(crate) channel_host_protocol_only: bool,
 }
 
 /// Parses the exact Task-14 command-line surface.
@@ -180,6 +182,22 @@ fn set_skew(
     Ok(index + 2)
 }
 
+impl PreparedServer {
+    /// Restricts a dedicated authenticated loopback listener to the public Runtime command group.
+    ///
+    /// # Errors
+    /// Rejects non-loopback or unauthenticated listener composition.
+    pub fn for_channel_host(mut self) -> Result<Self, AppServerError> {
+        if !is_loopback_host(&self.host) || self.auth.is_none() {
+            return Err(AppServerError::Config(
+                "channel host listener requires loopback authentication",
+            ));
+        }
+        self.channel_host_protocol_only = true;
+        Ok(self)
+    }
+}
+
 impl ServerArgs {
     /// Validates URL/auth configuration and reads secrets once, before bind.
     ///
@@ -221,6 +239,7 @@ impl ServerArgs {
             auth,
             storage_dir,
             workspace_dir,
+            channel_host_protocol_only: false,
         })
     }
 }

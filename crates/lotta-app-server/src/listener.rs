@@ -100,6 +100,8 @@ impl Default for SocketLimits {
 struct ListenerState {
     auth: crate::auth::AuthPolicy,
     openai_api: bool,
+    channel_host_protocol_only: bool,
+    channel_capability_deadline: Option<std::time::Instant>,
     listener_instance: String,
     clock: Arc<dyn Clock + Send + Sync>,
     shutdown: CancellationToken,
@@ -703,6 +705,7 @@ async fn start_listener_with_limits(
 }
 
 const SUBSCRIPTION_LEASE_SWEEP_SECONDS: u64 = 1;
+const CHANNEL_HOST_CAPABILITY_TTL_SECONDS: u64 = 300;
 
 async fn run_listener(
     listener: TcpListener,
@@ -792,6 +795,11 @@ fn compose_listener_state(
     Ok(Arc::new(ListenerState {
         auth: prepared.auth,
         openai_api: prepared.openai_api,
+        channel_host_protocol_only: prepared.channel_host_protocol_only,
+        channel_capability_deadline: prepared.channel_host_protocol_only.then(|| {
+            std::time::Instant::now()
+                + std::time::Duration::from_secs(CHANNEL_HOST_CAPABILITY_TTL_SECONDS)
+        }),
         listener_instance: listener_instance(clock),
         clock: Arc::clone(clock),
         shutdown,
@@ -986,6 +994,13 @@ fn builtin_runner(
 }
 
 fn build_router(path: &str, state: Arc<ListenerState>) -> Router {
+    if state.channel_host_protocol_only {
+        return Router::new()
+            .route(path, get(upgrade).fallback(method_not_allowed))
+            .with_state(state)
+            .fallback(not_found)
+            .layer(axum::extract::DefaultBodyLimit::max(HTTP_BODY_BYTES_MAX));
+    }
     let protected = protected_http_router(&state);
     let router = Router::new()
         .route("/", get(upgrade).fallback(method_not_allowed))
@@ -1097,6 +1112,12 @@ fn authorize_listener_headers(
     state: &ListenerState,
     headers: &HeaderMap,
 ) -> Result<(), AppServerError> {
+    if state
+        .channel_capability_deadline
+        .is_some_and(|deadline| std::time::Instant::now() > deadline)
+    {
+        return Err(AppServerError::Unauthorized);
+    }
     state.auth.authorize(headers, state.clock.as_ref())?;
     origin::enforce(headers, &state.auth)?;
     Ok(())
@@ -1397,9 +1418,15 @@ async fn handle_text(
     };
     let command = match crate::ws::command::decode(&frame) {
         Ok(Some(command)) => command,
+        Ok(None) if state.channel_host_protocol_only => {
+            return dispatch_typed_failure(state, connection_id, &frame).is_ok();
+        }
         Ok(None) => return handle_external_frame(state, connection_id, &frame),
         Err(error) => return dispatch_value(state, connection_id, &error).is_ok(),
     };
+    if state.channel_host_protocol_only && channel_runtime_extension_forbidden(&command) {
+        return dispatch_typed_failure(state, connection_id, &frame).is_ok();
+    }
     let routed = route_command(
         state.runtime_router.clone(),
         state.runtime_service.clone(),
@@ -1448,6 +1475,15 @@ async fn handle_text(
         }
     }
     true
+}
+
+fn channel_runtime_extension_forbidden(command: &crate::ws::RuntimeCommand) -> bool {
+    match command {
+        crate::ws::RuntimeCommand::RuntimeStart(start) => {
+            start.external_tools.is_some() || start.workspace_sandbox.is_some()
+        }
+        _ => false,
+    }
 }
 
 fn event_sink(state: &Arc<ListenerState>) -> Arc<dyn crate::ws::RuntimeEventSink> {

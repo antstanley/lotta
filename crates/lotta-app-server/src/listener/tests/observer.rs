@@ -104,6 +104,8 @@ fn state(
     let state = Arc::new(ListenerState {
         auth: AuthPolicy::None,
         openai_api: false,
+        channel_host_protocol_only: false,
+        channel_capability_deadline: None,
         listener_instance: "test-listener".to_owned(),
         openai_chat: super::test_openai_chat(
             &group.agents,

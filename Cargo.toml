@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 lotta-app-server = { version = "0.1.0", path = "crates/lotta-app-server" }
+lotta-channels = { version = "0.1.0", path = "crates/lotta-channels" }
 lotta-domain = { version = "0.1.0", path = "crates/lotta-domain" }
 lotta-store = { version = "0.1.0", path = "crates/lotta-store" }
 lotta-runtime = { version = "0.1.0", path = "crates/lotta-runtime" }
@@ -107,7 +108,7 @@ uuid = { version = "1.16.0", features = ["serde"] }
 [workspace.dependencies.tokio]
 version = "1.47.1"
 default-features = false
-features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"]
+features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"]
 
 [workspace.lints.rust]
 missing_docs = "deny"

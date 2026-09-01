@@ -169,6 +169,14 @@ pub(crate) enum CliError {
     Server(#[from] lotta_app_server::error::AppServerError),
     #[error(transparent)]
     Setup(#[from] lotta_runtime::turn::SetupError),
+    #[error(transparent)]
+    ChannelHost(#[from] lotta_channels::host::HostError),
+    #[error(transparent)]
+    ChannelSupervisor(#[from] lotta_channels::supervisor::SupervisorError),
+    #[error(transparent)]
+    ChannelTopology(#[from] lotta_channels::topology::TopologyError),
+    #[error("channel host executable is unavailable")]
+    ChannelExecutable,
 }
 
 impl CliError {
@@ -178,6 +186,10 @@ impl CliError {
             Self::Store(error) => error.kind().code(),
             Self::Server(error) => error.code(),
             Self::Setup(_) => "production_setup",
+            Self::ChannelHost(_) => "channel_host",
+            Self::ChannelSupervisor(_) => "channel_supervisor",
+            Self::ChannelTopology(_) => "channel_topology",
+            Self::ChannelExecutable => "channel_executable",
         }
     }
 }

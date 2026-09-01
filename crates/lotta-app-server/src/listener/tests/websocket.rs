@@ -292,6 +292,8 @@ fn typed_failure_state(
     super::ListenerState {
         auth: prepared.auth,
         openai_api: false,
+        channel_host_protocol_only: false,
+        channel_capability_deadline: None,
         listener_instance: "test-listener".to_owned(),
         openai_chat: super::test_openai_chat(
             &storage.agents,
