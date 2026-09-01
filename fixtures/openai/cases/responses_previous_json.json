@@ -1,11 +1,15 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "name": "responses_previous_json",
   "route": "responses",
   "mode": "json",
   "dependencies": [
     "responses_stored_json"
   ],
+  "execution": {
+    "kind": "single",
+    "previous_cursor": "responses_stored_json"
+  },
   "request": {
     "method": "POST",
     "path": "/v1/responses",
@@ -26,15 +30,15 @@
       "content-type": "application/json"
     },
     "body": {
-      "id": "<STORED_RESPONSE_ID>",
+      "id": "<STORED_RESPONSE_ID_1>",
       "object": "response",
-      "created_at": "<UNIX_TIMESTAMP>",
+      "created_at": "<TIMESTAMP_ID_1>",
       "status": "completed",
       "model": "fixture-visible",
       "output": [
         {
           "type": "message",
-          "id": "<MSG_ID>",
+          "id": "<MSG_ID_1>",
           "status": "completed",
           "role": "assistant",
           "content": [
@@ -56,85 +60,75 @@
           "reasoning_tokens": 0
         }
       }
+    },
+    "dynamic_map": {
+      "stored_response": [
+        "<STORED_RESPONSE_ID_1>"
+      ],
+      "timestamp": [
+        "<TIMESTAMP_ID_1>"
+      ],
+      "msg": [
+        "<MSG_ID_1>"
+      ]
     }
   },
   "observable": {
-    "provider_calls_delta": 1,
-    "created_delta": 1,
-    "deleted_delta": 0,
-    "forked_delta": 1,
-    "conversations": [
+    "provider_calls": [
       {
-        "id": "<CONVERSATION_ID>",
-        "agent_id": "agent-local-visible",
-        "hidden": false,
-        "messages": [
-          {
-            "role": "user",
-            "content": [
-              {
-                "type": "text",
-                "text": "<USER_TEXT_C>"
-              }
-            ],
-            "otid": "<UUID>"
-          },
-          {
-            "role": "user",
-            "content": [
-              {
-                "type": "text",
-                "text": "<NEWEST_USER_TEXT>"
-              }
-            ],
-            "otid": "<UUID>"
-          }
-        ]
-      },
-      {
-        "id": "<CONVERSATION_ID>",
-        "agent_id": "agent-local-visible",
-        "hidden": false,
-        "messages": [
-          {
-            "role": "user",
-            "content": [
-              {
-                "type": "text",
-                "text": "<RESPONSE_USER_TEXT_C>"
-              }
-            ],
-            "otid": "<UUID>"
-          }
-        ]
-      },
-      {
-        "id": "<CONVERSATION_ID>",
-        "agent_id": "agent-local-visible",
-        "hidden": true,
-        "messages": [
-          {
-            "role": "user",
-            "content": [
-              {
-                "type": "text",
-                "text": "<RESPONSE_USER_TEXT_C>"
-              }
-            ],
-            "otid": "<UUID>"
-          },
-          {
-            "role": "user",
-            "content": [
-              {
-                "type": "text",
-                "text": "<RESPONSE_USER_TEXT_D>"
-              }
-            ],
-            "otid": "<UUID>"
-          }
-        ]
+        "model": "default",
+        "inputs": [
+          "<RESPONSE_USER_TEXT_C>",
+          "<ASSISTANT_TEXT>",
+          "<RESPONSE_USER_TEXT_D>"
+        ],
+        "stream": true,
+        "store": false
       }
+    ],
+    "conversations": {
+      "created": [
+        {
+          "id": "<CONVERSATION_ID_1>",
+          "agent_id": "agent-local-visible",
+          "hidden": true,
+          "source_id": "<CONVERSATION_ID_2>"
+        }
+      ],
+      "deleted": [],
+      "hidden": [
+        {
+          "id": "<CONVERSATION_ID_1>",
+          "agent_id": "agent-local-visible",
+          "hidden": true,
+          "source_id": "<CONVERSATION_ID_2>"
+        }
+      ],
+      "forks": [
+        {
+          "source_id": "<CONVERSATION_ID_2>",
+          "target_id": "<CONVERSATION_ID_1>"
+        }
+      ]
+    },
+    "cleanup": {
+      "ephemeral_deleted": 0
+    },
+    "idempotency": {
+      "allocations": 1,
+      "admissions": 1,
+      "provider_calls": 1,
+      "live_joins": 0,
+      "phases": [
+        "not_applicable"
+      ]
+    }
+  },
+  "relationships": {
+    "conversation": [
+      "<CONVERSATION_ID_1>",
+      "<CONVERSATION_ID_2>"
     ]
-  }
+  },
+  "cursor": null
 }

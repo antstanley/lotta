@@ -1,9 +1,8 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "name": "responses_stream_sse",
   "route": "responses",
   "mode": "sse",
-  "dependencies": [],
   "request": {
     "method": "POST",
     "path": "/v1/responses",
@@ -16,6 +15,10 @@
       "input": "<RESPONSE_USER_TEXT_B>",
       "stream": true
     }
+  },
+  "dependencies": [],
+  "execution": {
+    "kind": "single"
   },
   "expected": {
     "status": 200,
@@ -30,9 +33,9 @@
           "sequence_number": 0,
           "type": "response.created",
           "response": {
-            "id": "<RESPONSE_ID>",
+            "id": "<RESPONSE_ID_1>",
             "object": "response",
-            "created_at": "<UNIX_TIMESTAMP>",
+            "created_at": "<TIMESTAMP_ID_1>",
             "status": "in_progress",
             "model": "fixture-visible",
             "output": [],
@@ -48,9 +51,9 @@
           "sequence_number": 1,
           "type": "response.in_progress",
           "response": {
-            "id": "<RESPONSE_ID>",
+            "id": "<RESPONSE_ID_1>",
             "object": "response",
-            "created_at": "<UNIX_TIMESTAMP>",
+            "created_at": "<TIMESTAMP_ID_1>",
             "status": "in_progress",
             "model": "fixture-visible",
             "output": [],
@@ -68,7 +71,7 @@
           "output_index": 0,
           "item": {
             "type": "message",
-            "id": "<MSG_ID>",
+            "id": "<MSG_ID_1>",
             "status": "in_progress",
             "role": "assistant",
             "content": []
@@ -82,7 +85,7 @@
           "type": "response.content_part.added",
           "output_index": 0,
           "content_index": 0,
-          "item_id": "<MSG_ID>",
+          "item_id": "<MSG_ID_1>",
           "part": {
             "type": "output_text",
             "text": "",
@@ -97,7 +100,7 @@
           "type": "response.output_text.delta",
           "output_index": 0,
           "content_index": 0,
-          "item_id": "<MSG_ID>",
+          "item_id": "<MSG_ID_1>",
           "delta": "<ASSISTANT_TEXT>"
         }
       },
@@ -108,7 +111,7 @@
           "type": "response.output_text.done",
           "output_index": 0,
           "content_index": 0,
-          "item_id": "<MSG_ID>",
+          "item_id": "<MSG_ID_1>",
           "text": "<ASSISTANT_TEXT>"
         }
       },
@@ -119,7 +122,7 @@
           "type": "response.content_part.done",
           "output_index": 0,
           "content_index": 0,
-          "item_id": "<MSG_ID>",
+          "item_id": "<MSG_ID_1>",
           "part": {
             "type": "output_text",
             "text": "<ASSISTANT_TEXT>",
@@ -135,7 +138,7 @@
           "output_index": 0,
           "item": {
             "type": "message",
-            "id": "<MSG_ID>",
+            "id": "<MSG_ID_1>",
             "status": "completed",
             "role": "assistant",
             "content": [
@@ -154,15 +157,15 @@
           "sequence_number": 8,
           "type": "response.completed",
           "response": {
-            "id": "<RESPONSE_ID>",
+            "id": "<RESPONSE_ID_1>",
             "object": "response",
-            "created_at": "<UNIX_TIMESTAMP>",
+            "created_at": "<TIMESTAMP_ID_1>",
             "status": "completed",
             "model": "fixture-visible",
             "output": [
               {
                 "type": "message",
-                "id": "<MSG_ID>",
+                "id": "<MSG_ID_1>",
                 "status": "completed",
                 "role": "assistant",
                 "content": [
@@ -187,41 +190,62 @@
           }
         }
       }
-    ]
+    ],
+    "dynamic_map": {
+      "response": [
+        "<RESPONSE_ID_1>"
+      ],
+      "timestamp": [
+        "<TIMESTAMP_ID_1>"
+      ],
+      "msg": [
+        "<MSG_ID_1>"
+      ]
+    }
   },
   "observable": {
-    "provider_calls_delta": 1,
-    "created_delta": 1,
-    "deleted_delta": 1,
-    "forked_delta": 0,
-    "conversations": [
+    "provider_calls": [
       {
-        "id": "<CONVERSATION_ID>",
-        "agent_id": "agent-local-visible",
-        "hidden": false,
-        "messages": [
-          {
-            "role": "user",
-            "content": [
-              {
-                "type": "text",
-                "text": "<USER_TEXT_C>"
-              }
-            ],
-            "otid": "<UUID>"
-          },
-          {
-            "role": "user",
-            "content": [
-              {
-                "type": "text",
-                "text": "<NEWEST_USER_TEXT>"
-              }
-            ],
-            "otid": "<UUID>"
-          }
-        ]
+        "model": "default",
+        "inputs": [
+          "<RESPONSE_USER_TEXT_B>"
+        ],
+        "stream": true,
+        "store": false
       }
+    ],
+    "conversations": {
+      "created": [
+        {
+          "id": "<CONVERSATION_ID_1>",
+          "agent_id": "agent-local-visible",
+          "hidden": false,
+          "source_id": null
+        }
+      ],
+      "deleted": [
+        "<CONVERSATION_ID_1>"
+      ],
+      "hidden": [],
+      "forks": []
+    },
+    "cleanup": {
+      "ephemeral_deleted": 1
+    },
+    "idempotency": {
+      "allocations": 1,
+      "admissions": 1,
+      "provider_calls": 1,
+      "live_joins": 0,
+      "phases": [
+        "not_applicable"
+      ]
+    }
+  },
+  "relationships": {
+    "conversation": [
+      "<CONVERSATION_ID_1>"
     ]
-  }
+  },
+  "cursor": null
 }

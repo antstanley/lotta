@@ -1,13 +1,15 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "name": "chat_idempotent_retry",
   "route": "chat",
-  "mode": "json",
-  "dependencies": [],
+  "mode": "sse",
+  "execution": {
+    "kind": "idempotent_live_join"
+  },
   "request": {
     "method": "POST",
     "path": "/v1/chat/completions",
-    "mode": "json",
+    "mode": "sse",
     "headers": {
       "authorization": "<AUTHORIZATION>",
       "idempotency-key": "<IDEMPOTENCY_KEY>"
@@ -19,127 +21,282 @@
           "role": "user",
           "content": "<IDEMPOTENT_USER_TEXT>"
         }
-      ]
+      ],
+      "stream": true
     }
   },
+  "dependencies": [],
   "expected": {
     "attempts": [
       {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache"
         },
-        "body": {
-          "id": "<CHAT_COMPLETION_ID>",
-          "object": "chat.completion",
-          "created": "<UNIX_TIMESTAMP>",
-          "model": "fixture-visible",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "<ASSISTANT_TEXT>"
-              },
-              "finish_reason": "stop"
+        "events": [
+          {
+            "event": null,
+            "data": {
+              "id": "<CHAT_COMPLETION_ID_1>",
+              "object": "chat.completion.chunk",
+              "created": "<TIMESTAMP_ID_1>",
+              "model": "fixture-visible",
+              "choices": [
+                {
+                  "index": 0,
+                  "delta": {
+                    "role": "assistant",
+                    "content": ""
+                  },
+                  "finish_reason": null
+                }
+              ]
             }
-          ],
-          "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0
+          },
+          {
+            "event": null,
+            "data": {
+              "id": "<CHAT_COMPLETION_ID_1>",
+              "object": "chat.completion.chunk",
+              "created": "<TIMESTAMP_ID_1>",
+              "model": "fixture-visible",
+              "choices": [
+                {
+                  "index": 0,
+                  "delta": {
+                    "content": "<ASSISTANT_TEXT>"
+                  },
+                  "finish_reason": null
+                }
+              ]
+            }
+          },
+          {
+            "event": null,
+            "data": {
+              "id": "<CHAT_COMPLETION_ID_1>",
+              "object": "chat.completion.chunk",
+              "created": "<TIMESTAMP_ID_1>",
+              "model": "fixture-visible",
+              "choices": [
+                {
+                  "index": 0,
+                  "delta": {},
+                  "finish_reason": "stop"
+                }
+              ]
+            }
+          },
+          {
+            "event": null,
+            "data": "[DONE]"
           }
+        ],
+        "dynamic_map": {
+          "chat_completion": [
+            "<CHAT_COMPLETION_ID_1>"
+          ],
+          "timestamp": [
+            "<TIMESTAMP_ID_1>"
+          ]
         }
       },
       {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache"
         },
-        "body": {
-          "id": "<CHAT_COMPLETION_ID>",
-          "object": "chat.completion",
-          "created": "<UNIX_TIMESTAMP>",
-          "model": "fixture-visible",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "<ASSISTANT_TEXT>"
-              },
-              "finish_reason": "stop"
+        "events": [
+          {
+            "event": null,
+            "data": {
+              "id": "<CHAT_COMPLETION_ID_1>",
+              "object": "chat.completion.chunk",
+              "created": "<TIMESTAMP_ID_1>",
+              "model": "fixture-visible",
+              "choices": [
+                {
+                  "index": 0,
+                  "delta": {
+                    "role": "assistant",
+                    "content": ""
+                  },
+                  "finish_reason": null
+                }
+              ]
             }
-          ],
-          "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0
+          },
+          {
+            "event": null,
+            "data": {
+              "id": "<CHAT_COMPLETION_ID_1>",
+              "object": "chat.completion.chunk",
+              "created": "<TIMESTAMP_ID_1>",
+              "model": "fixture-visible",
+              "choices": [
+                {
+                  "index": 0,
+                  "delta": {
+                    "content": "<ASSISTANT_TEXT>"
+                  },
+                  "finish_reason": null
+                }
+              ]
+            }
+          },
+          {
+            "event": null,
+            "data": {
+              "id": "<CHAT_COMPLETION_ID_1>",
+              "object": "chat.completion.chunk",
+              "created": "<TIMESTAMP_ID_1>",
+              "model": "fixture-visible",
+              "choices": [
+                {
+                  "index": 0,
+                  "delta": {},
+                  "finish_reason": "stop"
+                }
+              ]
+            }
+          },
+          {
+            "event": null,
+            "data": "[DONE]"
           }
+        ],
+        "dynamic_map": {
+          "chat_completion": [
+            "<CHAT_COMPLETION_ID_1>"
+          ],
+          "timestamp": [
+            "<TIMESTAMP_ID_1>"
+          ]
         }
       },
       {
         "status": 200,
         "headers": {
-          "content-type": "application/json"
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache"
         },
-        "body": {
-          "id": "<CHAT_COMPLETION_ID>",
-          "object": "chat.completion",
-          "created": "<UNIX_TIMESTAMP>",
-          "model": "fixture-visible",
-          "choices": [
-            {
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "<ASSISTANT_TEXT>"
-              },
-              "finish_reason": "stop"
+        "events": [
+          {
+            "event": null,
+            "data": {
+              "id": "<CHAT_COMPLETION_ID_1>",
+              "object": "chat.completion.chunk",
+              "created": "<TIMESTAMP_ID_1>",
+              "model": "fixture-visible",
+              "choices": [
+                {
+                  "index": 0,
+                  "delta": {
+                    "role": "assistant",
+                    "content": ""
+                  },
+                  "finish_reason": null
+                }
+              ]
             }
-          ],
-          "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0
+          },
+          {
+            "event": null,
+            "data": {
+              "id": "<CHAT_COMPLETION_ID_1>",
+              "object": "chat.completion.chunk",
+              "created": "<TIMESTAMP_ID_1>",
+              "model": "fixture-visible",
+              "choices": [
+                {
+                  "index": 0,
+                  "delta": {
+                    "content": "<ASSISTANT_TEXT>"
+                  },
+                  "finish_reason": null
+                }
+              ]
+            }
+          },
+          {
+            "event": null,
+            "data": {
+              "id": "<CHAT_COMPLETION_ID_1>",
+              "object": "chat.completion.chunk",
+              "created": "<TIMESTAMP_ID_1>",
+              "model": "fixture-visible",
+              "choices": [
+                {
+                  "index": 0,
+                  "delta": {},
+                  "finish_reason": "stop"
+                }
+              ]
+            }
+          },
+          {
+            "event": null,
+            "data": "[DONE]"
           }
+        ],
+        "dynamic_map": {
+          "chat_completion": [
+            "<CHAT_COMPLETION_ID_1>"
+          ],
+          "timestamp": [
+            "<TIMESTAMP_ID_1>"
+          ]
         }
       }
     ]
   },
   "observable": {
-    "provider_calls_delta": 1,
-    "created_delta": 1,
-    "deleted_delta": 1,
-    "forked_delta": 0,
-    "conversations": [
+    "provider_calls": [
       {
-        "id": "<CONVERSATION_ID>",
-        "agent_id": "agent-local-visible",
-        "hidden": false,
-        "messages": [
-          {
-            "role": "user",
-            "content": [
-              {
-                "type": "text",
-                "text": "<USER_TEXT_C>"
-              }
-            ],
-            "otid": "<UUID>"
-          },
-          {
-            "role": "user",
-            "content": [
-              {
-                "type": "text",
-                "text": "<NEWEST_USER_TEXT>"
-              }
-            ],
-            "otid": "<UUID>"
-          }
-        ]
+        "model": "default",
+        "inputs": [
+          "<IDEMPOTENT_USER_TEXT>"
+        ],
+        "stream": true,
+        "store": false
       }
+    ],
+    "conversations": {
+      "created": [
+        {
+          "id": "<CONVERSATION_ID_1>",
+          "agent_id": "agent-local-visible",
+          "hidden": false,
+          "source_id": null
+        }
+      ],
+      "deleted": [
+        "<CONVERSATION_ID_1>"
+      ],
+      "hidden": [],
+      "forks": []
+    },
+    "cleanup": {
+      "ephemeral_deleted": 1
+    },
+    "idempotency": {
+      "allocations": 1,
+      "admissions": 1,
+      "provider_calls": 1,
+      "live_joins": 1,
+      "phases": [
+        "owner_active",
+        "live_join",
+        "settled_replay"
+      ]
+    }
+  },
+  "relationships": {
+    "conversation": [
+      "<CONVERSATION_ID_1>"
     ]
-  }
+  },
+  "cursor": null
 }

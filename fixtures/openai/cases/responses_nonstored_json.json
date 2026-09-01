@@ -1,9 +1,8 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "name": "responses_nonstored_json",
   "route": "responses",
   "mode": "json",
-  "dependencies": [],
   "request": {
     "method": "POST",
     "path": "/v1/responses",
@@ -17,21 +16,25 @@
       "store": false
     }
   },
+  "dependencies": [],
+  "execution": {
+    "kind": "single"
+  },
   "expected": {
     "status": 200,
     "headers": {
       "content-type": "application/json"
     },
     "body": {
-      "id": "<RESPONSE_ID>",
+      "id": "<RESPONSE_ID_1>",
       "object": "response",
-      "created_at": "<UNIX_TIMESTAMP>",
+      "created_at": "<TIMESTAMP_ID_1>",
       "status": "completed",
       "model": "fixture-visible",
       "output": [
         {
           "type": "message",
-          "id": "<MSG_ID>",
+          "id": "<MSG_ID_1>",
           "status": "completed",
           "role": "assistant",
           "content": [
@@ -53,41 +56,62 @@
           "reasoning_tokens": 0
         }
       }
+    },
+    "dynamic_map": {
+      "response": [
+        "<RESPONSE_ID_1>"
+      ],
+      "timestamp": [
+        "<TIMESTAMP_ID_1>"
+      ],
+      "msg": [
+        "<MSG_ID_1>"
+      ]
     }
   },
   "observable": {
-    "provider_calls_delta": 1,
-    "created_delta": 1,
-    "deleted_delta": 1,
-    "forked_delta": 0,
-    "conversations": [
+    "provider_calls": [
       {
-        "id": "<CONVERSATION_ID>",
-        "agent_id": "agent-local-visible",
-        "hidden": false,
-        "messages": [
-          {
-            "role": "user",
-            "content": [
-              {
-                "type": "text",
-                "text": "<USER_TEXT_C>"
-              }
-            ],
-            "otid": "<UUID>"
-          },
-          {
-            "role": "user",
-            "content": [
-              {
-                "type": "text",
-                "text": "<NEWEST_USER_TEXT>"
-              }
-            ],
-            "otid": "<UUID>"
-          }
-        ]
+        "model": "default",
+        "inputs": [
+          "<RESPONSE_USER_TEXT_A>"
+        ],
+        "stream": true,
+        "store": false
       }
+    ],
+    "conversations": {
+      "created": [
+        {
+          "id": "<CONVERSATION_ID_1>",
+          "agent_id": "agent-local-visible",
+          "hidden": false,
+          "source_id": null
+        }
+      ],
+      "deleted": [
+        "<CONVERSATION_ID_1>"
+      ],
+      "hidden": [],
+      "forks": []
+    },
+    "cleanup": {
+      "ephemeral_deleted": 1
+    },
+    "idempotency": {
+      "allocations": 1,
+      "admissions": 1,
+      "provider_calls": 1,
+      "live_joins": 0,
+      "phases": [
+        "not_applicable"
+      ]
+    }
+  },
+  "relationships": {
+    "conversation": [
+      "<CONVERSATION_ID_1>"
     ]
-  }
+  },
+  "cursor": null
 }

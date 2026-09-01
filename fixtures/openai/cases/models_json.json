@@ -1,9 +1,8 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "name": "models_json",
   "route": "models",
   "mode": "json",
-  "dependencies": [],
   "request": {
     "method": "GET",
     "path": "/v1/models",
@@ -12,6 +11,10 @@
       "authorization": "<AUTHORIZATION>"
     },
     "body": null
+  },
+  "dependencies": [],
+  "execution": {
+    "kind": "single"
   },
   "expected": {
     "status": 200,
@@ -24,29 +27,52 @@
         {
           "id": "agent-local-collision-a",
           "object": "model",
-          "created": "<UNIX_TIMESTAMP>",
+          "created": "<TIMESTAMP_ID_1>",
           "owned_by": "letta"
         },
         {
           "id": "agent-local-collision-b",
           "object": "model",
-          "created": "<UNIX_TIMESTAMP>",
+          "created": "<TIMESTAMP_ID_2>",
           "owned_by": "letta"
         },
         {
           "id": "fixture-visible",
           "object": "model",
-          "created": "<UNIX_TIMESTAMP>",
+          "created": "<TIMESTAMP_ID_3>",
           "owned_by": "letta"
         }
+      ]
+    },
+    "dynamic_map": {
+      "timestamp": [
+        "<TIMESTAMP_ID_1>",
+        "<TIMESTAMP_ID_2>",
+        "<TIMESTAMP_ID_3>"
       ]
     }
   },
   "observable": {
-    "provider_calls_delta": 0,
-    "created_delta": 0,
-    "deleted_delta": 0,
-    "forked_delta": 0,
-    "conversations": []
-  }
+    "provider_calls": [],
+    "conversations": {
+      "created": [],
+      "deleted": [],
+      "hidden": [],
+      "forks": []
+    },
+    "cleanup": {
+      "ephemeral_deleted": 0
+    },
+    "idempotency": {
+      "allocations": 0,
+      "admissions": 0,
+      "provider_calls": 0,
+      "live_joins": 0,
+      "phases": [
+        "not_applicable"
+      ]
+    }
+  },
+  "relationships": {},
+  "cursor": null
 }

@@ -1,9 +1,8 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "name": "chat_stream_sse",
   "route": "chat",
   "mode": "sse",
-  "dependencies": [],
   "request": {
     "method": "POST",
     "path": "/v1/chat/completions",
@@ -22,6 +21,10 @@
       "stream": true
     }
   },
+  "dependencies": [],
+  "execution": {
+    "kind": "single"
+  },
   "expected": {
     "status": 200,
     "headers": {
@@ -32,9 +35,9 @@
       {
         "event": null,
         "data": {
-          "id": "<CHAT_COMPLETION_ID>",
+          "id": "<CHAT_COMPLETION_ID_1>",
           "object": "chat.completion.chunk",
-          "created": "<UNIX_TIMESTAMP>",
+          "created": "<TIMESTAMP_ID_1>",
           "model": "agent-local-visible",
           "choices": [
             {
@@ -51,9 +54,9 @@
       {
         "event": null,
         "data": {
-          "id": "<CHAT_COMPLETION_ID>",
+          "id": "<CHAT_COMPLETION_ID_1>",
           "object": "chat.completion.chunk",
-          "created": "<UNIX_TIMESTAMP>",
+          "created": "<TIMESTAMP_ID_1>",
           "model": "agent-local-visible",
           "choices": [
             {
@@ -69,9 +72,9 @@
       {
         "event": null,
         "data": {
-          "id": "<CHAT_COMPLETION_ID>",
+          "id": "<CHAT_COMPLETION_ID_1>",
           "object": "chat.completion.chunk",
-          "created": "<UNIX_TIMESTAMP>",
+          "created": "<TIMESTAMP_ID_1>",
           "model": "agent-local-visible",
           "choices": [
             {
@@ -86,13 +89,59 @@
         "event": null,
         "data": "[DONE]"
       }
-    ]
+    ],
+    "dynamic_map": {
+      "chat_completion": [
+        "<CHAT_COMPLETION_ID_1>"
+      ],
+      "timestamp": [
+        "<TIMESTAMP_ID_1>"
+      ]
+    }
   },
   "observable": {
-    "provider_calls_delta": 1,
-    "created_delta": 1,
-    "deleted_delta": 1,
-    "forked_delta": 0,
-    "conversations": []
-  }
+    "provider_calls": [
+      {
+        "model": "default",
+        "inputs": [
+          "<USER_TEXT_B>"
+        ],
+        "stream": true,
+        "store": false
+      }
+    ],
+    "conversations": {
+      "created": [
+        {
+          "id": "<CONVERSATION_ID_1>",
+          "agent_id": "agent-local-visible",
+          "hidden": false,
+          "source_id": null
+        }
+      ],
+      "deleted": [
+        "<CONVERSATION_ID_1>"
+      ],
+      "hidden": [],
+      "forks": []
+    },
+    "cleanup": {
+      "ephemeral_deleted": 1
+    },
+    "idempotency": {
+      "allocations": 1,
+      "admissions": 1,
+      "provider_calls": 1,
+      "live_joins": 0,
+      "phases": [
+        "not_applicable"
+      ]
+    }
+  },
+  "relationships": {
+    "conversation": [
+      "<CONVERSATION_ID_1>"
+    ]
+  },
+  "cursor": null
 }

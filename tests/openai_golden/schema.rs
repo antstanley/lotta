@@ -1,0 +1,161 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+
+pub const BASELINE_COMMIT: &str = "300f923f16cc8eee50656d7da732902c1dea2b65";
+pub const BASELINE_TREE: &str = "30d2e2cebc7761c153f5a6d136b242365092faa0";
+pub const FIXTURE_CASES_MAX: usize = 16;
+pub const FIXTURE_BYTES_MAX: usize = 1_048_576;
+pub const SSE_EVENTS_MAX: usize = 64;
+pub const JSON_DEPTH_MAX: usize = 32;
+pub const CHILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+pub const AUTHORIZATION: &str = "Bearer fixture-transport-credential";
+pub const TOKEN_SHA256: &str = "1947de502481746d5dc98a64e8fa1d743d6c3da164f5b031cbf9ee9e0fb05ffb";
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureIndex {
+    pub schema_version: u8,
+    pub baseline_commit: String,
+    pub baseline_tree: String,
+    pub capture_command: String,
+    pub runtime: RuntimeVersion,
+    pub sources: BTreeMap<String, SourcePin>,
+    pub bounds: FixtureBounds,
+    pub cases: Vec<IndexCase>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeVersion {
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourcePin {
+    pub path: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureBounds {
+    pub cases_max: usize,
+    pub fixture_bytes_max: usize,
+    pub events_per_case_max: usize,
+    pub json_depth_max: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexCase {
+    pub name: String,
+    pub route: String,
+    pub mode: String,
+    pub dependencies: Vec<String>,
+    pub path: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fixture {
+    pub schema_version: u8,
+    pub name: String,
+    pub route: String,
+    pub mode: String,
+    pub dependencies: Vec<String>,
+    pub execution: Execution,
+    pub request: FixtureRequest,
+    pub expected: Value,
+    pub observable: Observable,
+    pub relationships: BTreeMap<String, Vec<String>>,
+    pub cursor: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureRequest {
+    pub method: String,
+    pub path: String,
+    pub mode: String,
+    pub headers: BTreeMap<String, String>,
+    pub body: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Execution {
+    Single {
+        #[serde(default)]
+        capture_cursor: bool,
+        #[serde(default)]
+        previous_cursor: Option<String>,
+    },
+    Repeat {
+        count: usize,
+    },
+    IdempotentLiveJoin,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Observable {
+    pub provider_calls: Vec<ProviderCall>,
+    pub conversations: ConversationDelta,
+    pub cleanup: CleanupDelta,
+    pub idempotency: IdempotencyDelta,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCall {
+    pub model: String,
+    pub inputs: Vec<String>,
+    pub stream: bool,
+    pub store: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationDelta {
+    pub created: Vec<ConversationLink>,
+    pub deleted: Vec<String>,
+    pub hidden: Vec<ConversationLink>,
+    pub forks: Vec<ForkLink>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationLink {
+    pub id: String,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    pub hidden: bool,
+    pub source_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ForkLink {
+    pub source_id: String,
+    pub target_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CleanupDelta {
+    pub ephemeral_deleted: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct IdempotencyDelta {
+    pub allocations: usize,
+    pub admissions: usize,
+    pub provider_calls: usize,
+    pub live_joins: usize,
+    pub phases: Vec<String>,
+}
