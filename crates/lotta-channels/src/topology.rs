@@ -339,22 +339,20 @@ mod supervision {
         std::fs::write(
             channel.join("accounts.json"),
             concat!(
-                r#"{"accounts":[{"channel_id":"telegram","account_id":"main","#,
-                r#""enabled":true,"configured":true,"running":false,"#,
-                r#""dm_policy":"pairing","allowed_users":[],"config":{},"#,
-                r#""created_at":"2026-01-01T00:00:00Z","#,
-                r#""updated_at":"2026-01-01T00:00:00Z"}]}"#
+                r#"{"accounts":[{"channel":"telegram","accountId":"main","enabled":true,"#,
+                r#""dmPolicy":"pairing","allowedUsers":[],"binding":{"agentId":null,"#,
+                r#""conversationId":null},"createdAt":"2026-01-01T00:00:00Z","#,
+                r#""updatedAt":"2026-01-01T00:00:00Z"}]}"#,
             ),
         )
         .unwrap();
         std::fs::write(
             channel.join("routing.yaml"),
             concat!(
-                r#"{"routes":[{"channel_id":"telegram","account_id":"main","#,
-                r#""chat_id":"chat","agent_id":"agent-local-a","#,
-                r#""conversation_id":"conversation-a","enabled":true,"#,
-                r#""created_at":"2026-01-01T00:00:00Z","#,
-                r#""updated_at":"2026-01-01T00:00:00Z"}]}"#
+                r#"{"routes":[{"accountId":"main","chatId":"chat","#,
+                r#""agentId":"agent-local-a","conversationId":"conversation-a","#,
+                r#""enabled":true,"createdAt":"2026-01-01T00:00:00Z","#,
+                r#""updatedAt":"2026-01-01T00:00:00Z"}]}"#,
             ),
         )
         .unwrap();
@@ -379,6 +377,7 @@ mod plane_separation {
     #[test]
     fn records_both_planes_and_rejects_negative_crossover() {
         let management = ChildFrame::PublishRuntimeTools {
+            metadata: crate::control_plane::FrameMetadata::new(1),
             request_id: "publish".into(),
             owner: "owner".into(),
             runtime: RuntimeKey {

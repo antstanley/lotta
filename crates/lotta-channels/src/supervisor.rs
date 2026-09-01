@@ -62,6 +62,93 @@ pub enum SupervisorError {
     Task,
 }
 
+/// Non-secret structured evidence emitted at actual supervisor boundaries.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum ChannelSupervisorEvent {
+    /// The child authenticated its dedicated socket and returned its correlated ready frame.
+    ChildConnected {
+        /// Exact child owner.
+        owner: String,
+        /// Exact child generation.
+        generation: u64,
+        /// Operating-system child identifier.
+        pid: u32,
+    },
+    /// Active child filesystem probes completed at the arranged scopes.
+    StartupIsolation {
+        /// Exact child owner.
+        owner: String,
+        /// Exact child generation.
+        generation: u64,
+        /// A write below the channels root succeeded.
+        channels_write: bool,
+        /// A write at the parent backend sibling was denied.
+        backend_sibling_write_denied: bool,
+    },
+    /// The actual canonical `/channels` request was answered.
+    ChannelsResponse {
+        /// Exact child owner.
+        owner: String,
+        /// Exact child generation.
+        generation: u64,
+        /// Exact bounded canonical response rows.
+        channels: Vec<crate::control_plane::ChannelState>,
+    },
+    /// The canonical external manager installed and selected an exact runtime tool set.
+    RuntimeToolsPublished {
+        /// Exact child owner.
+        owner: String,
+        /// Exact child generation.
+        generation: u64,
+        /// Exact runtime receiving the registration.
+        runtime: RuntimeKey,
+        /// Names observed from the manager's selected registrations after publication.
+        manager_tools: Vec<String>,
+    },
+    /// The dedicated Runtime listener installed `MessageChannel` in the same canonical manager.
+    MessageChannelRegistered {
+        /// Exact child owner.
+        owner: String,
+        /// Exact child generation.
+        generation: u64,
+        /// Exact runtime receiving the registration.
+        runtime: RuntimeKey,
+        /// Names observed from the manager after the Runtime start frame was applied.
+        manager_tools: Vec<String>,
+    },
+    /// The canonical manager released one runtime's exact generation.
+    RuntimeToolsReleased {
+        /// Exact child owner.
+        owner: String,
+        /// Exact child generation.
+        generation: u64,
+        /// Number of runtime registrations removed.
+        released: usize,
+    },
+    /// The exact generation capability was revoked in the bound authenticator.
+    CapabilityRevoked {
+        /// Exact child owner.
+        owner: String,
+        /// Exact child generation.
+        generation: u64,
+        /// Operating-system child identifier.
+        pid: u32,
+    },
+    /// The exact child was waited and is no longer owned by the supervisor.
+    ChildReaped {
+        /// Exact child owner.
+        owner: String,
+        /// Exact child generation.
+        generation: u64,
+        /// Operating-system child identifier.
+        pid: u32,
+    },
+}
+
+/// Non-panicking observer for structured supervisor evidence.
+pub type ChannelSupervisorObserver = Arc<dyn Fn(ChannelSupervisorEvent) + Send + Sync>;
+
 /// Immutable launch configuration containing no backend-store path or reusable credential.
 pub struct ChannelLaunchConfig {
     /// Absolute child executable.
@@ -76,6 +163,8 @@ pub struct ChannelLaunchConfig {
     pub authenticator: ChannelSessionAuthenticator,
     /// Canonical external-tool manager backed by production turn setup's registry.
     pub tools: Arc<ChannelExternalToolManager>,
+    /// Optional structured non-secret evidence observer.
+    pub observer: Option<ChannelSupervisorObserver>,
 }
 
 /// Running supervised channel service.
@@ -309,6 +398,7 @@ async fn start_generation(
 ) -> Result<(), SupervisorError> {
     let root = config.store.root().to_str().ok_or(SupervisorError::Spawn)?;
     let frame = ParentFrame::Bootstrap {
+        metadata: crate::control_plane::FrameMetadata::new(session.number),
         request_id: session.bootstrap_id.clone(),
         owner: session.owner.clone(),
         websocket_url: config.websocket_url.clone(),
@@ -332,12 +422,34 @@ async fn start_generation(
             correlation_id,
             pid,
             owner,
+            channels_probe_success,
+            parent_sibling_probe_denied,
+            ..
         } if correlation_id == &session.bootstrap_id
             && *pid == session.pid
-            && owner == &session.owner => {}
+            && owner == &session.owner
+            && *channels_probe_success
+            && *parent_sibling_probe_denied => {}
         _ => return Err(SupervisorError::Startup),
     }
-    dispatch(plane, frame, &[])?;
+    dispatch(config, plane, frame, &[])?;
+    emit(
+        config,
+        ChannelSupervisorEvent::ChildConnected {
+            owner: session.owner.clone(),
+            generation: session.number,
+            pid: session.pid,
+        },
+    );
+    emit(
+        config,
+        ChannelSupervisorEvent::StartupIsolation {
+            owner: session.owner.clone(),
+            generation: session.number,
+            channels_write: true,
+            backend_sibling_write_denied: true,
+        },
+    );
     Ok(())
 }
 
@@ -347,6 +459,9 @@ async fn supervise_generation(
     plane: &Arc<Mutex<Option<ControlPlane>>>,
     cancellation: &CancellationToken,
 ) -> Result<(), SupervisorError> {
+    let mut observed_message_channels = std::collections::BTreeSet::new();
+    let mut observation_tick = tokio::time::interval(Duration::from_millis(10));
+    observation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             biased;
@@ -354,10 +469,13 @@ async fn supervise_generation(
             frame = read_line::<_, ChildFrame>(&mut session.output) => {
                 let Some(frame) = frame? else { return Err(SupervisorError::Cleanup); };
                 let channels = config.store.channel_state()?;
-                if let Some(response) = dispatch(plane, frame, &channels)? {
+                if let Some(response) = dispatch(config, plane, frame, &channels)? {
                     let input = session.input.as_mut().ok_or(SupervisorError::Cleanup)?;
                     write_line(input, &response).await?;
                 }
+            }
+            _ = observation_tick.tick() => {
+                observe_message_channels(config, session, &mut observed_message_channels)?;
             }
             status = session.child.wait() => {
                 status.map_err(|_| SupervisorError::Cleanup)?;
@@ -367,18 +485,132 @@ async fn supervise_generation(
     }
 }
 
+fn observe_message_channels(
+    config: &ChannelLaunchConfig,
+    session: &Generation,
+    observed: &mut std::collections::BTreeSet<RuntimeKey>,
+) -> Result<(), SupervisorError> {
+    for route in crate::state_store::ChannelStateStore::new(&config.store).restorable_routes()? {
+        let runtime = RuntimeKey {
+            agent_id: route.agent_id.as_str().to_owned(),
+            conversation_id: route.conversation_id.as_str().to_owned(),
+        };
+        if observed.contains(&runtime) {
+            continue;
+        }
+        let canonical = lotta_tools::external::ChannelRuntimeKey {
+            agent_id: runtime.agent_id.clone(),
+            conversation_id: runtime.conversation_id.clone(),
+        };
+        let Some(registrations) = config.tools.runtime_registrations(&canonical) else {
+            continue;
+        };
+        let manager_tools = registrations
+            .into_iter()
+            .map(|registration| registration.definition.model_name.as_str().to_owned())
+            .collect::<Vec<_>>();
+        if manager_tools != ["MessageChannel"] {
+            continue;
+        }
+        observed.insert(runtime.clone());
+        emit(
+            config,
+            ChannelSupervisorEvent::MessageChannelRegistered {
+                owner: session.owner.clone(),
+                generation: session.number,
+                runtime,
+                manager_tools,
+            },
+        );
+    }
+    Ok(())
+}
+
 fn dispatch(
+    config: &ChannelLaunchConfig,
     plane: &Arc<Mutex<Option<ControlPlane>>>,
     frame: ChildFrame,
     channels: &[crate::control_plane::ChannelState],
 ) -> Result<Option<ParentFrame>, SupervisorError> {
-    plane
+    let publication = match &frame {
+        ChildFrame::PublishRuntimeTools { runtime, .. } => Some(runtime.clone()),
+        _ => None,
+    };
+    let runtime_release = matches!(frame, ChildFrame::ReleaseRuntimeTools { .. });
+    let channels_request = matches!(frame, ChildFrame::Channels { .. });
+    let response = plane
         .lock()
         .map_err(|_| SupervisorError::Task)?
         .as_mut()
         .ok_or(SupervisorError::Task)?
-        .dispatch(frame, channels)
-        .map_err(Into::into)
+        .dispatch(frame, channels)?;
+    if channels_request {
+        emit(
+            config,
+            ChannelSupervisorEvent::ChannelsResponse {
+                owner: plane_owner(plane)?,
+                generation: plane_generation(plane)?,
+                channels: channels.to_vec(),
+            },
+        );
+    }
+    if runtime_release {
+        emit(
+            config,
+            ChannelSupervisorEvent::RuntimeToolsReleased {
+                owner: plane_owner(plane)?,
+                generation: plane_generation(plane)?,
+                released: 1,
+            },
+        );
+    }
+    if let Some(runtime) = publication {
+        let canonical = lotta_tools::external::ChannelRuntimeKey {
+            agent_id: runtime.agent_id.clone(),
+            conversation_id: runtime.conversation_id.clone(),
+        };
+        let manager_tools = config
+            .tools
+            .runtime_registrations(&canonical)
+            .ok_or(SupervisorError::Task)?
+            .into_iter()
+            .map(|registration| registration.definition.model_name.as_str().to_owned())
+            .collect();
+        emit(
+            config,
+            ChannelSupervisorEvent::RuntimeToolsPublished {
+                owner: plane_owner(plane)?,
+                generation: plane_generation(plane)?,
+                runtime,
+                manager_tools,
+            },
+        );
+    }
+    Ok(response)
+}
+
+fn plane_owner(plane: &Arc<Mutex<Option<ControlPlane>>>) -> Result<String, SupervisorError> {
+    plane
+        .lock()
+        .map_err(|_| SupervisorError::Task)?
+        .as_ref()
+        .map(ControlPlane::owner)
+        .ok_or(SupervisorError::Task)
+}
+
+fn plane_generation(plane: &Arc<Mutex<Option<ControlPlane>>>) -> Result<u64, SupervisorError> {
+    plane
+        .lock()
+        .map_err(|_| SupervisorError::Task)?
+        .as_ref()
+        .map(ControlPlane::generation)
+        .ok_or(SupervisorError::Task)
+}
+
+fn emit(config: &ChannelLaunchConfig, event: ChannelSupervisorEvent) {
+    if let Some(observer) = &config.observer {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer(event)));
+    }
 }
 
 async fn cleanup_generation(
@@ -387,50 +619,93 @@ async fn cleanup_generation(
     plane: &Arc<Mutex<Option<ControlPlane>>>,
     pid_sender: &watch::Sender<Option<u32>>,
 ) -> Result<(), SupervisorError> {
-    let shutdown_id = session.shutdown_id.clone();
-    let mut shutdown_failed = false;
-    let child_live = if let Ok(status) = session.child.try_wait() {
-        status.is_none()
-    } else {
-        shutdown_failed = true;
-        false
-    };
-    if child_live && let Some(input) = &mut session.input {
-        let wrote = write_line(
-            input,
-            &ParentFrame::Shutdown {
-                request_id: shutdown_id.clone(),
-            },
-        )
-        .await
-        .is_ok();
-        let acknowledged = wrote
-            && matches!(
-                tokio::time::timeout(
-                    Duration::from_millis(CHANNEL_SHUTDOWN_GRACE_MS),
-                    wait_shutdown_ack(&mut session.output, &session.owner, &shutdown_id, plane),
-                )
-                .await,
-                Ok(Ok(()))
-            );
-        shutdown_failed |= !acknowledged;
-    }
+    request_graceful_shutdown(config, session, plane).await?;
     session.input.take();
-    let _ = config
-        .authenticator
-        .revoke(&session.owner, session.number, session.pid);
-    if let Ok(mut slot) = plane.lock()
+    let released = if let Ok(mut slot) = plane.lock()
         && let Some(current) = slot.take()
     {
-        let _ = current.release_stale();
+        current.release_stale()
+    } else {
+        0
+    };
+    if released > 0 {
+        emit(
+            config,
+            ChannelSupervisorEvent::RuntimeToolsReleased {
+                owner: session.owner.clone(),
+                generation: session.number,
+                released,
+            },
+        );
+    }
+    if config
+        .authenticator
+        .revoke(&session.owner, session.number, session.pid)
+    {
+        emit(
+            config,
+            ChannelSupervisorEvent::CapabilityRevoked {
+                owner: session.owner.clone(),
+                generation: session.number,
+                pid: session.pid,
+            },
+        );
     }
     let _ = pid_sender.send(None);
-    let process = finish_generation_process(session).await;
-    if shutdown_failed {
-        Err(SupervisorError::Cleanup)
-    } else {
-        process
+    finish_generation_process(session).await?;
+    emit(
+        config,
+        ChannelSupervisorEvent::ChildReaped {
+            owner: session.owner.clone(),
+            generation: session.number,
+            pid: session.pid,
+        },
+    );
+    Ok(())
+}
+
+async fn request_graceful_shutdown(
+    config: &ChannelLaunchConfig,
+    session: &mut Generation,
+    plane: &Arc<Mutex<Option<ControlPlane>>>,
+) -> Result<(), SupervisorError> {
+    if session
+        .child
+        .try_wait()
+        .map_err(|_| SupervisorError::Cleanup)?
+        .is_some()
+    {
+        return Ok(());
     }
+    let Some(input) = &mut session.input else {
+        return Ok(());
+    };
+    let shutdown_id = session.shutdown_id.clone();
+    let wrote = write_line(
+        input,
+        &ParentFrame::Shutdown {
+            metadata: crate::control_plane::FrameMetadata::new(session.number),
+            owner: session.owner.clone(),
+            request_id: shutdown_id.clone(),
+        },
+    )
+    .await
+    .is_ok();
+    if wrote {
+        let acknowledgement = wait_shutdown_ack(
+            config,
+            &mut session.output,
+            &session.owner,
+            &shutdown_id,
+            plane,
+        );
+        let _ = tokio::time::timeout(
+            Duration::from_millis(CHANNEL_SHUTDOWN_GRACE_MS),
+            acknowledgement,
+        )
+        .await;
+    }
+    Ok(())
 }
 
 async fn finish_generation_process(session: &mut Generation) -> Result<(), SupervisorError> {
@@ -462,6 +737,7 @@ async fn finish_generation_process(session: &mut Generation) -> Result<(), Super
 }
 
 async fn wait_shutdown_ack<R>(
+    config: &ChannelLaunchConfig,
     output: &mut BufReader<R>,
     owner: &str,
     correlation: &str,
@@ -475,9 +751,9 @@ where
             .await?
             .ok_or(SupervisorError::Cleanup)?;
         let acknowledged = matches!(&frame, ChildFrame::ShutdownComplete {
-            correlation_id, owner: frame_owner,
+            correlation_id, owner: frame_owner, ..
         } if correlation_id == correlation && frame_owner == owner);
-        dispatch(plane, frame, &[])?;
+        dispatch(config, plane, frame, &[])?;
         if acknowledged {
             return Ok(());
         }
@@ -494,28 +770,12 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut chunk = [0_u8; CHANNEL_STDERR_CHUNK_BYTES];
-    let mut total = 0_usize;
-    let mut line = 0_usize;
-    loop {
-        let remaining = CHANNEL_STDERR_TOTAL_BYTES_MAX.saturating_sub(total);
-        if remaining == 0 {
-            break;
-        }
-        let limit = remaining.min(chunk.len());
-        let Ok(length) = stderr.read(&mut chunk[..limit]).await else {
-            break;
-        };
+    while let Ok(length) = stderr.read(&mut chunk).await {
         if length == 0 {
             break;
         }
-        total += length;
-        for byte in &chunk[..length] {
-            if *byte == b'\n' {
-                line = 0;
-            } else {
-                line = line.saturating_add(1).min(CHANNEL_STDERR_LINE_BYTES_MAX);
-            }
-        }
+        // Always drain to EOF so a noisy child cannot block on a full pipe. No child
+        // bytes are retained here; diagnostics remain bounded at the observing edge.
     }
 }
 

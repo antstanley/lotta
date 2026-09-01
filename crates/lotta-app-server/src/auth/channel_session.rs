@@ -339,6 +339,18 @@ impl ChannelSessionAuthenticator {
             && self.runtime_start_allowed(command)
     }
 
+    #[cfg(test)]
+    pub(crate) fn expire_current(&self) {
+        if let Ok(mut state) = self.state.lock()
+            && let Some(session) = &mut state.session
+        {
+            session.deadline = Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .expect("one millisecond precedes now");
+        }
+        self.bump();
+    }
+
     fn bump(&self) {
         let next = self.revision.borrow().wrapping_add(1);
         self.revision.send_replace(next);

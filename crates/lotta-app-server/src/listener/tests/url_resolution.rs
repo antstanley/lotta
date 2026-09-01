@@ -7,7 +7,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use futures_util::StreamExt as _;
 use lotta_domain::{Clock, DomainError, Timestamp};
+use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest as _};
 
 use super::{ListenerHandle, resolved_urls, start_listener};
 use crate::config::ServerArgs;
@@ -220,4 +222,90 @@ async fn origin_without_auth_policy_is_unauthorized() {
     let headers = format!("{UPGRADE}Origin: http://localhost\r\n");
     assert_eq!(status(&handle, "/ws", &headers).await, 401);
     stop(handle).await;
+}
+
+async fn channel_socket(
+    handle: &ListenerHandle,
+    token: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let mut request = handle.websocket_url().into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {token}").parse().unwrap());
+    tokio_tungstenite::connect_async(request).await.unwrap().0
+}
+
+async fn closes(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) {
+    let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("live channel socket close deadline");
+    assert!(matches!(
+        message,
+        None | Some(Err(_) | Ok(Message::Close(_)))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn channel_session_actual_socket_replacement_expiry_and_revoke_matrix() {
+    let root = unique_token_file().with_extension("channel-listener");
+    fs::create_dir(&root).unwrap();
+    let mut configured = args(Some("ws://127.0.0.1:0/channel-runtime"));
+    configured.storage_dir = Some(root.clone());
+    configured.workspace_dir = Some(root.join("workspace"));
+    let authenticator = crate::auth::channel_session::ChannelSessionAuthenticator::new();
+    let prepared = configured
+        .prepare()
+        .unwrap()
+        .for_channel_session(authenticator.clone())
+        .unwrap();
+    let handle = start_listener(prepared, Arc::new(TestClock)).await.unwrap();
+    let first = authenticator
+        .install_scoped(
+            "owner-1",
+            1,
+            101,
+            root.to_str().unwrap(),
+            &[("agent".into(), "conversation".into())],
+        )
+        .unwrap();
+    let first_token = first.expose_for_pipe().to_owned();
+    let wrong = format!("{UPGRADE}Authorization: Bearer wrong\r\n");
+    assert_eq!(status(&handle, "/channel-runtime", &wrong).await, 401);
+    assert_eq!(status(&handle, "/channel-runtime", UPGRADE).await, 401);
+    let mut first_socket = channel_socket(&handle, &first_token).await;
+
+    let second = authenticator
+        .install_scoped(
+            "owner-2",
+            2,
+            202,
+            root.to_str().unwrap(),
+            &[("agent".into(), "conversation".into())],
+        )
+        .unwrap();
+    closes(&mut first_socket).await;
+    let old = format!("{UPGRADE}Authorization: Bearer {first_token}\r\n");
+    assert_eq!(status(&handle, "/channel-runtime", &old).await, 401);
+    let second_token = second.expose_for_pipe().to_owned();
+    let mut second_socket = channel_socket(&handle, &second_token).await;
+    authenticator.expire_current();
+    closes(&mut second_socket).await;
+    let expired = format!("{UPGRADE}Authorization: Bearer {second_token}\r\n");
+    assert_eq!(status(&handle, "/channel-runtime", &expired).await, 401);
+
+    let third = authenticator
+        .install("owner-3", 3, 303, root.to_str().unwrap())
+        .unwrap();
+    let third_token = third.expose_for_pipe().to_owned();
+    let mut third_socket = channel_socket(&handle, &third_token).await;
+    assert!(authenticator.revoke("owner-3", 3, 303));
+    closes(&mut third_socket).await;
+    let revoked = format!("{UPGRADE}Authorization: Bearer {third_token}\r\n");
+    assert_eq!(status(&handle, "/channel-runtime", &revoked).await, 401);
+    stop(handle).await;
+    fs::remove_dir_all(root).unwrap();
 }

@@ -148,13 +148,15 @@ async fn start_channels(
         owner_prefix,
         authenticator,
         tools,
+        observer: Some(Arc::new(|event| {
+            if let Ok(encoded) = serde_json::to_string(&event) {
+                println!("Channel event: {encoded}");
+            }
+        })),
     };
     match lotta_channels::supervisor::ChannelSupervisor::start(config).await {
         Ok(supervisor) => {
-            println!(
-                "Channel host PID: {}",
-                supervisor.pid().map_or(0, |pid| pid)
-            );
+            println!("Channel host PID: {}", supervisor.pid().unwrap_or(0));
             Ok((supervisor, listener))
         }
         Err(error) => {

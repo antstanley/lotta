@@ -34,6 +34,46 @@ pub const RUNTIME_TOOLS_PER_OWNER_MAX: usize = 256;
 pub const CHANNEL_STATE_ROWS_MAX: usize = 256;
 /// Maximum stable identifier bytes.
 pub const CONTROL_ID_BYTES_MAX: usize = 256;
+/// Exact channel management protocol version repeated on every frame.
+pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
+/// Maximum child-declared management timeout.
+pub const CONTROL_TIMEOUT_MS_MAX: u64 = 10_000;
+
+/// The sole capability declared by the Task 78 management plane.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagementCapability {
+    /// Channel host lifecycle, state, and tool publication.
+    ChannelManagement,
+    /// Provider capability is representable but never admitted on this plane.
+    Provider,
+}
+
+/// Metadata repeated on every management frame.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FrameMetadata {
+    /// Exact protocol version.
+    pub version: u16,
+    /// Exact supervised child generation.
+    pub generation: u64,
+    /// Declared management capability.
+    pub capability: ManagementCapability,
+    /// Child-declared processing timeout.
+    pub timeout_ms: u64,
+}
+
+impl FrameMetadata {
+    /// Creates exact bounded metadata for one generation.
+    #[must_use]
+    pub const fn new(generation: u64) -> Self {
+        Self {
+            version: CONTROL_PROTOCOL_VERSION,
+            generation,
+            capability: ManagementCapability::ChannelManagement,
+            timeout_ms: CONTROL_TIMEOUT_MS_MAX,
+        }
+    }
+}
 
 const RESERVED_TOOL_NAMES: &[&str] = &["Bash", "Read", "Write", "Edit", "MessageChannel"];
 
@@ -80,6 +120,9 @@ pub struct ChannelState {
 pub enum ParentFrame {
     /// Secret bootstrap delivered on the inherited management pipe.
     Bootstrap {
+        /// Repeated protocol metadata.
+        #[serde(flatten)]
+        metadata: FrameMetadata,
         /// Correlation identifier.
         request_id: String,
         /// Exact child owner identity.
@@ -93,6 +136,11 @@ pub enum ParentFrame {
     },
     /// Canonical `/channels` response.
     ChannelsResult {
+        /// Repeated protocol metadata.
+        #[serde(flatten)]
+        metadata: FrameMetadata,
+        /// Exact child owner identity.
+        owner: String,
         /// Echoed request identifier.
         correlation_id: String,
         /// Bounded canonical state.
@@ -100,16 +148,31 @@ pub enum ParentFrame {
     },
     /// Publication acknowledgement.
     RuntimeToolsPublished {
+        /// Repeated protocol metadata.
+        #[serde(flatten)]
+        metadata: FrameMetadata,
+        /// Exact child owner identity.
+        owner: String,
         /// Echoed request identifier.
         correlation_id: String,
     },
     /// Release acknowledgement.
     RuntimeToolsReleased {
+        /// Repeated protocol metadata.
+        #[serde(flatten)]
+        metadata: FrameMetadata,
+        /// Exact child owner identity.
+        owner: String,
         /// Echoed request identifier.
         correlation_id: String,
     },
     /// Graceful child shutdown request.
     Shutdown {
+        /// Repeated protocol metadata.
+        #[serde(flatten)]
+        metadata: FrameMetadata,
+        /// Exact child owner identity.
+        owner: String,
         /// Correlation identifier.
         request_id: String,
     },
@@ -121,15 +184,25 @@ pub enum ParentFrame {
 pub enum ChildFrame {
     /// Startup handshake after the WebSocket has authenticated.
     Ready {
+        /// Repeated protocol metadata.
+        #[serde(flatten)]
+        metadata: FrameMetadata,
         /// Bootstrap correlation.
         correlation_id: String,
         /// Exact owner identity.
         owner: String,
         /// Child process identifier.
         pid: u32,
+        /// Actual write probe below the channels root succeeded.
+        channels_probe_success: bool,
+        /// Actual write probe at the parent/backend sibling scope was denied.
+        parent_sibling_probe_denied: bool,
     },
     /// Publish complete tools for one runtime under this child owner.
     PublishRuntimeTools {
+        /// Repeated protocol metadata.
+        #[serde(flatten)]
+        metadata: FrameMetadata,
         /// Unique request identifier.
         request_id: String,
         /// Exact child owner identity.
@@ -141,6 +214,9 @@ pub enum ChildFrame {
     },
     /// Release this child's tools for one exact runtime.
     ReleaseRuntimeTools {
+        /// Repeated protocol metadata.
+        #[serde(flatten)]
+        metadata: FrameMetadata,
         /// Unique request identifier.
         request_id: String,
         /// Exact child owner identity.
@@ -150,6 +226,9 @@ pub enum ChildFrame {
     },
     /// Execute `/channels` against the parent-owned canonical store view.
     Channels {
+        /// Repeated protocol metadata.
+        #[serde(flatten)]
+        metadata: FrameMetadata,
         /// Unique request identifier.
         request_id: String,
         /// Exact child owner identity.
@@ -157,6 +236,9 @@ pub enum ChildFrame {
     },
     /// Graceful shutdown acknowledgement.
     ShutdownComplete {
+        /// Repeated protocol metadata.
+        #[serde(flatten)]
+        metadata: FrameMetadata,
         /// Shutdown correlation.
         correlation_id: String,
         /// Exact child owner identity.
@@ -173,9 +255,18 @@ pub enum ControlError {
     /// Input was not exactly one UTF-8 JSON object.
     #[error("channel control frame is malformed")]
     Malformed,
-    /// Frame owner did not match the supervised child.
+    /// Protocol version did not match exactly.
+    #[error("channel control protocol version mismatch")]
+    Version,
+    /// Frame owner or generation did not match the supervised child.
     #[error("channel control owner mismatch")]
     Owner,
+    /// Frame did not declare channel-management capability.
+    #[error("channel control capability mismatch")]
+    Capability,
+    /// Frame timeout was zero or exceeded the host deadline.
+    #[error("channel control timeout rejected")]
+    Timeout,
     /// Request identifier was invalid, duplicated, or uncorrelated.
     #[error("channel control correlation rejected")]
     Correlation,
@@ -228,59 +319,99 @@ impl ControlPlane {
         frame: ChildFrame,
         channels: &[ChannelState],
     ) -> Result<Option<ParentFrame>, ControlError> {
-        let (owner, request_id) = frame_identity(&frame);
-        if owner != self.owner {
+        let (metadata, owner, request_id) = frame_identity(&frame);
+        if metadata.version != CONTROL_PROTOCOL_VERSION {
+            return Err(ControlError::Version);
+        }
+        if owner != self.owner || metadata.generation != self.generation {
             return Err(ControlError::Owner);
+        }
+        if metadata.capability != ManagementCapability::ChannelManagement {
+            return Err(ControlError::Capability);
+        }
+        if metadata.timeout_ms == 0 || metadata.timeout_ms > CONTROL_TIMEOUT_MS_MAX {
+            return Err(ControlError::Timeout);
         }
         validate_frame(&frame, channels)?;
         if let Some(id) = request_id {
             self.admit_request(id)?;
         }
+        self.apply(frame, channels)
+    }
+
+    fn apply(
+        &self,
+        frame: ChildFrame,
+        channels: &[ChannelState],
+    ) -> Result<Option<ParentFrame>, ControlError> {
         match frame {
             ChildFrame::PublishRuntimeTools {
                 request_id,
                 runtime,
                 tools,
                 ..
-            } => {
-                validate_runtime(&runtime)?;
-                validate_tools(&tools)?;
-                self.tools
-                    .publish(
-                        &self.owner,
-                        self.generation,
-                        canonical_runtime(runtime),
-                        tools.into_iter().map(canonical_tool).collect(),
-                    )
-                    .map_err(|_| ControlError::Registry)?;
-                Ok(Some(ParentFrame::RuntimeToolsPublished {
-                    correlation_id: request_id,
-                }))
-            }
+            } => self.publish(request_id, runtime, tools),
             ChildFrame::ReleaseRuntimeTools {
                 request_id,
                 runtime,
                 ..
-            } => {
-                validate_runtime(&runtime)?;
-                self.tools
-                    .release(&self.owner, self.generation, &canonical_runtime(runtime))
-                    .map_err(|_| ControlError::Registry)?;
-                Ok(Some(ParentFrame::RuntimeToolsReleased {
-                    correlation_id: request_id,
-                }))
-            }
-            ChildFrame::Channels { request_id, .. } => {
-                if channels.len() > CHANNEL_STATE_ROWS_MAX {
-                    return Err(ControlError::Bound);
-                }
-                Ok(Some(ParentFrame::ChannelsResult {
-                    correlation_id: request_id,
-                    channels: channels.to_vec(),
-                }))
-            }
+            } => self.release(request_id, runtime),
+            ChildFrame::Channels { request_id, .. } => Ok(Some(ParentFrame::ChannelsResult {
+                metadata: FrameMetadata::new(self.generation),
+                owner: self.owner.clone(),
+                correlation_id: request_id,
+                channels: channels.to_vec(),
+            })),
             ChildFrame::Ready { .. } | ChildFrame::ShutdownComplete { .. } => Ok(None),
         }
+    }
+
+    fn publish(
+        &self,
+        request_id: String,
+        runtime: RuntimeKey,
+        tools: Vec<RuntimeTool>,
+    ) -> Result<Option<ParentFrame>, ControlError> {
+        self.tools
+            .publish(
+                &self.owner,
+                self.generation,
+                canonical_runtime(runtime),
+                tools.into_iter().map(canonical_tool).collect(),
+            )
+            .map_err(|_| ControlError::Registry)?;
+        Ok(Some(ParentFrame::RuntimeToolsPublished {
+            metadata: FrameMetadata::new(self.generation),
+            owner: self.owner.clone(),
+            correlation_id: request_id,
+        }))
+    }
+
+    fn release(
+        &self,
+        request_id: String,
+        runtime: RuntimeKey,
+    ) -> Result<Option<ParentFrame>, ControlError> {
+        self.tools
+            .release(&self.owner, self.generation, &canonical_runtime(runtime))
+            .map_err(|_| ControlError::Registry)?;
+        Ok(Some(ParentFrame::RuntimeToolsReleased {
+            metadata: FrameMetadata::new(self.generation),
+            owner: self.owner.clone(),
+            correlation_id: request_id,
+        }))
+    }
+
+    /// Returns the exact owner bound to this management plane.
+    #[must_use]
+    pub(crate) fn owner(&self) -> String {
+        self.owner.clone()
+    }
+
+    /// Returns the exact generation bound to this management plane.
+    #[must_use]
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Returns whether the canonical production manager currently owns this runtime.
@@ -360,9 +491,18 @@ fn parse_bounded_json(text: &str) -> Result<Value, ControlError> {
     let mut deserializer = serde_json::Deserializer::from_str(text);
     let value = BoundedValueSeed { depth: 1 }
         .deserialize(&mut deserializer)
-        .map_err(|_| ControlError::Malformed)?;
+        .map_err(|error| map_json_decode(&error))?;
     deserializer.end().map_err(|_| ControlError::Malformed)?;
     Ok(value)
+}
+
+fn map_json_decode(error: &serde_json::Error) -> ControlError {
+    let text = error.to_string();
+    if text.contains("bound") {
+        ControlError::Bound
+    } else {
+        ControlError::Malformed
+    }
 }
 
 struct BoundedValueSeed {
@@ -566,24 +706,36 @@ fn validate_id(value: &str) -> Result<(), ControlError> {
     }
 }
 
-fn frame_identity(frame: &ChildFrame) -> (&str, Option<&str>) {
+fn frame_identity(frame: &ChildFrame) -> (FrameMetadata, &str, Option<&str>) {
     match frame {
         ChildFrame::Ready {
+            metadata,
             owner,
             correlation_id,
             ..
         }
         | ChildFrame::ShutdownComplete {
+            metadata,
             owner,
             correlation_id,
-        } => (owner, Some(correlation_id)),
+        } => (*metadata, owner, Some(correlation_id)),
         ChildFrame::PublishRuntimeTools {
-            owner, request_id, ..
+            metadata,
+            owner,
+            request_id,
+            ..
         }
         | ChildFrame::ReleaseRuntimeTools {
-            owner, request_id, ..
+            metadata,
+            owner,
+            request_id,
+            ..
         }
-        | ChildFrame::Channels { owner, request_id } => (owner, Some(request_id)),
+        | ChildFrame::Channels {
+            metadata,
+            owner,
+            request_id,
+        } => (*metadata, owner, Some(request_id)),
     }
 }
 
@@ -626,6 +778,7 @@ mod tests {
     fn publish_release_channels_registry_effects() {
         let mut plane = plane();
         let publish = ChildFrame::PublishRuntimeTools {
+            metadata: FrameMetadata::new(1),
             request_id: "p1".into(),
             owner: "owner".into(),
             runtime: runtime(),
@@ -645,6 +798,7 @@ mod tests {
             targets: 1,
         }];
         let slash = ChildFrame::Channels {
+            metadata: FrameMetadata::new(1),
             request_id: "c1".into(),
             owner: "owner".into(),
         };
@@ -654,6 +808,7 @@ mod tests {
             Ok(Some(ParentFrame::ChannelsResult { channels: rows, .. })) if rows == channels
         ));
         let release = ChildFrame::ReleaseRuntimeTools {
+            metadata: FrameMetadata::new(1),
             request_id: "r1".into(),
             owner: "owner".into(),
             runtime: runtime(),
@@ -665,10 +820,53 @@ mod tests {
         assert!(!plane.contains_runtime(&runtime()));
     }
 
+    #[test]
+    fn validates_version_owner_capability_timeout_before_dispatch() {
+        let make = |metadata, owner: &str| ChildFrame::Channels {
+            metadata,
+            request_id: "ordered".into(),
+            owner: owner.into(),
+        };
+        let mut metadata = FrameMetadata::new(1);
+        metadata.version += 1;
+        assert!(matches!(
+            plane().dispatch(make(metadata, "other"), &[]),
+            Err(ControlError::Version)
+        ));
+        let mut metadata = FrameMetadata::new(2);
+        metadata.capability = ManagementCapability::Provider;
+        metadata.timeout_ms = 0;
+        assert!(matches!(
+            plane().dispatch(make(metadata, "other"), &[]),
+            Err(ControlError::Owner)
+        ));
+        let mut metadata = FrameMetadata::new(1);
+        metadata.capability = ManagementCapability::Provider;
+        metadata.timeout_ms = 0;
+        assert!(matches!(
+            plane().dispatch(make(metadata, "owner"), &[]),
+            Err(ControlError::Capability)
+        ));
+        let mut metadata = FrameMetadata::new(1);
+        metadata.timeout_ms = 0;
+        assert!(matches!(
+            plane().dispatch(make(metadata, "owner"), &[]),
+            Err(ControlError::Timeout)
+        ));
+        let mut metadata = FrameMetadata::new(1);
+        metadata.timeout_ms = CONTROL_TIMEOUT_MS_MAX + 1;
+        assert!(matches!(
+            plane().dispatch(make(metadata, "owner"), &[]),
+            Err(ControlError::Timeout)
+        ));
+    }
+
     #[tokio::test]
     async fn bootstrap_ndjson_round_trip() {
         let bytes = concat!(
-            "{\"kind\":\"bootstrap\",\"request_id\":\"x\",\"owner\":\"o\",",
+            "{\"kind\":\"bootstrap\",\"version\":1,\"generation\":1,",
+            "\"capability\":\"channel_management\",\"timeout_ms\":10000,",
+            "\"request_id\":\"x\",\"owner\":\"o\",",
             "\"websocket_url\":\"ws://127.0.0.1:9/ws\",\"token\":\"t\",",
             "\"channels_root\":\"/tmp\"}\n"
         )
@@ -705,6 +903,7 @@ mod tests {
         }
         let mut plane = plane();
         let frame = ChildFrame::Channels {
+            metadata: FrameMetadata::new(1),
             request_id: "same".into(),
             owner: "owner".into(),
         };
@@ -713,5 +912,75 @@ mod tests {
             plane.dispatch(frame, &[]),
             Err(ControlError::Correlation)
         ));
+    }
+
+    #[tokio::test]
+    async fn exact_ndjson_structure_frame_and_order_boundaries() {
+        for length in [CONTROL_STRING_BYTES_MAX - 1, CONTROL_STRING_BYTES_MAX] {
+            let text = serde_json::to_string(&"x".repeat(length)).unwrap();
+            assert!(parse_bounded_json(&text).is_ok());
+        }
+        let text = serde_json::to_string(&"x".repeat(CONTROL_STRING_BYTES_MAX + 1)).unwrap();
+        assert_eq!(parse_bounded_json(&text), Err(ControlError::Bound));
+
+        for length in [CONTROL_ARRAY_ITEMS_MAX - 1, CONTROL_ARRAY_ITEMS_MAX] {
+            let text = serde_json::to_string(&vec![0; length]).unwrap();
+            assert!(parse_bounded_json(&text).is_ok());
+        }
+        let text = serde_json::to_string(&vec![0; CONTROL_ARRAY_ITEMS_MAX + 1]).unwrap();
+        assert_eq!(parse_bounded_json(&text), Err(ControlError::Bound));
+
+        for length in [CONTROL_MAP_ENTRIES_MAX - 1, CONTROL_MAP_ENTRIES_MAX] {
+            let map = (0..length)
+                .map(|index| (format!("k{index}"), 0))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert!(parse_bounded_json(&serde_json::to_string(&map).unwrap()).is_ok());
+        }
+        let map = (0..=CONTROL_MAP_ENTRIES_MAX)
+            .map(|index| (format!("k{index}"), 0))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            parse_bounded_json(&serde_json::to_string(&map).unwrap()),
+            Err(ControlError::Bound)
+        );
+
+        for length in [CONTROL_FRAME_BYTES_MAX - 1, CONTROL_FRAME_BYTES_MAX] {
+            let mut line = b"{}".to_vec();
+            line.resize(length, b' ');
+            line.push(b'\n');
+            let mut reader = BufReader::new(line.as_slice());
+            assert!(read_line::<_, Value>(&mut reader).await.is_ok());
+        }
+        let mut above = b"{}".to_vec();
+        above.resize(CONTROL_FRAME_BYTES_MAX + 1, b' ');
+        above.push(b'\n');
+        let mut reader = BufReader::new(above.as_slice());
+        assert_eq!(
+            read_line::<_, Value>(&mut reader).await,
+            Err(ControlError::Bound)
+        );
+
+        let first = serde_json::to_string(&ChildFrame::Channels {
+            metadata: FrameMetadata::new(1),
+            request_id: "first".into(),
+            owner: "owner".into(),
+        })
+        .unwrap();
+        let ordered = format!("{first}\n{}\n", first.replace("first", "second"));
+        let mut reader = BufReader::new(ordered.as_bytes());
+        for expected in ["first", "second"] {
+            let Some(ChildFrame::Channels { request_id, .. }) =
+                read_line::<_, ChildFrame>(&mut reader).await.unwrap()
+            else {
+                panic!("ordered channel frame");
+            };
+            assert_eq!(request_id, expected);
+        }
+        assert!(
+            read_line::<_, ChildFrame>(&mut reader)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

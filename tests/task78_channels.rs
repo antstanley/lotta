@@ -18,28 +18,19 @@ fn canonical_store() -> (std::path::PathBuf, ChannelStore) {
         std::process::id(),
         NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(root.join("backend")).unwrap();
     let store = ChannelStore::under_letta_home(&root).unwrap();
     let channel = store.root().join("telegram");
     std::fs::create_dir(&channel).unwrap();
     std::fs::write(channel.join("config.yaml"), "token: redacted\n").unwrap();
     std::fs::write(
         channel.join("accounts.json"),
-        concat!(
-            r#"{"accounts":[{"channel_id":"telegram","account_id":"main","#,
-            r#""enabled":true,"configured":true,"running":false,"dm_policy":"pairing","#,
-            r#""allowed_users":[],"config":{},"created_at":"2026-01-01T00:00:00Z","#,
-            r#""updated_at":"2026-01-01T00:00:00Z"}]}"#,
-        ),
+        r#"{"accounts":[{"channel":"telegram","accountId":"main","enabled":true,"dmPolicy":"pairing","allowedUsers":[],"binding":{"agentId":null,"conversationId":null},"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"}]}"#,
     )
     .unwrap();
     std::fs::write(
         channel.join("routing.yaml"),
-        concat!(
-            r#"{"routes":[{"channel_id":"telegram","account_id":"main","chat_id":"chat","#,
-            r#""agent_id":"agent-local-a","conversation_id":"conversation-a","enabled":true,"#,
-            r#""created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}]}"#,
-        ),
+        r#"{"routes":[{"accountId":"main","chatId":"chat","agentId":"agent-local-a","conversationId":"conversation-a","enabled":true,"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"}]}"#,
     )
     .unwrap();
     (root, store)
@@ -120,6 +111,7 @@ async fn built_lotta_channel_host_authenticates_starts_runtime_and_reaps() {
         owner_prefix: "task78-built".into(),
         authenticator,
         tools,
+        observer: None,
     })
     .await
     .unwrap();

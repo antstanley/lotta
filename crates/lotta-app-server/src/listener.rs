@@ -1162,11 +1162,12 @@ async fn upgrade(
     let Ok(websocket) = websocket else {
         return AppServerError::Malformed.into_response();
     };
-    let reconnect_identity = authenticated_reconnect_identity(&state, &headers);
     let channel_principal = state
         .channel_session
         .as_ref()
         .and_then(|authenticator| authenticator.authenticate(&headers).ok());
+    let reconnect_identity =
+        authenticated_reconnect_identity(&state, &headers, channel_principal.as_ref());
     let connection = state.clone();
     websocket
         .max_frame_size(state.limits.frame_bytes)
@@ -1187,10 +1188,23 @@ pub(crate) const RECONNECT_CLIENT_ID_BYTES_MAX: usize = 256;
 fn authenticated_reconnect_identity(
     state: &ListenerState,
     headers: &HeaderMap,
+    channel: Option<&crate::auth::channel_session::ChannelPrincipal>,
 ) -> Option<crate::ws::connection::ReconnectIdentity> {
-    if state.auth.is_none() {
-        return None;
+    if let Some(channel) = channel {
+        let principal = channel.reconnect_principal();
+        return Some(crate::ws::connection::ReconnectIdentity {
+            listener_instance: state.listener_instance.clone(),
+            client_id: principal.clone(),
+            principal,
+        });
     }
+    authenticated_client_reconnect_identity(state, headers)
+}
+
+fn authenticated_client_reconnect_identity(
+    state: &ListenerState,
+    headers: &HeaderMap,
+) -> Option<crate::ws::connection::ReconnectIdentity> {
     let client_id = headers
         .get(RECONNECT_CLIENT_ID_HEADER)?
         .to_str()
@@ -1229,6 +1243,22 @@ async fn initialize_socket_liveness(
     (heartbeat, interval, revision)
 }
 
+async fn reject_stale_channel_socket(
+    socket: &mut WebSocket,
+    state: &ListenerState,
+    principal: Option<&crate::auth::channel_session::ChannelPrincipal>,
+) -> bool {
+    let authority_invalid = state
+        .channel_session
+        .as_ref()
+        .zip(principal)
+        .is_some_and(|(auth, principal)| !auth.admits(principal));
+    if authority_invalid {
+        send_close(socket, close_code::POLICY, "channel authority revoked").await;
+    }
+    authority_invalid
+}
+
 async fn serve_socket(
     mut socket: WebSocket,
     state: Arc<ListenerState>,
@@ -1241,6 +1271,10 @@ async fn serve_socket(
     };
     let (mut heartbeat, mut interval, mut channel_revision) =
         initialize_socket_liveness(&state).await;
+    if reject_stale_channel_socket(&mut socket, &state, channel_principal.as_ref()).await {
+        close_connection(&state, connection_id).await;
+        return;
+    }
     loop {
         tokio::select! {
             () = channel_authority_changed(&mut channel_revision) => {

@@ -40,6 +40,7 @@ pub enum HostError {
 struct Bootstrap {
     correlation: String,
     owner: String,
+    generation: u64,
     websocket_url: String,
     token: String,
     channels_root: PathBuf,
@@ -52,23 +53,15 @@ type RoutedRuntime = lotta_domain::ChannelRoute;
 /// # Errors
 /// Returns a scrubbed protocol, bootstrap, runtime, or WebSocket failure.
 pub async fn run() -> Result<(), HostError> {
-    run_inner(None).await
+    let context = crate::adapter::HostContext::production();
+    run_composed(context).await
 }
 
-/// Runs the actual Runtime WebSocket client with a bounded in-memory adapter port.
-///
-/// # Errors
-/// Returns a scrubbed protocol, bootstrap, runtime, adapter, or WebSocket failure.
-pub async fn run_with_adapter_port(
-    adapter: crate::adapter::ChannelAdapterPort,
-) -> Result<(), HostError> {
-    run_inner(Some(adapter)).await
-}
-
-async fn run_inner(adapter: Option<crate::adapter::ChannelAdapterPort>) -> Result<(), HostError> {
+async fn run_composed(context: crate::adapter::HostContext) -> Result<(), HostError> {
     let mut management_input = BufReader::new(stdin());
     let bootstrap = read_bootstrap(&mut management_input).await?;
     verify_working_root(&bootstrap.channels_root)?;
+    let isolation = probe_isolation(&bootstrap.channels_root)?;
     let request = authenticated_request(&bootstrap)?;
     let (socket, _) = connect_with_backoff(request).await?;
     let (mut ws_writer, mut ws_reader) = socket.split();
@@ -76,9 +69,12 @@ async fn run_inner(adapter: Option<crate::adapter::ChannelAdapterPort>) -> Resul
     write_line(
         &mut management_output,
         &ChildFrame::Ready {
+            metadata: crate::control_plane::FrameMetadata::new(bootstrap.generation),
             correlation_id: bootstrap.correlation.clone(),
             owner: bootstrap.owner.clone(),
             pid: process::id(),
+            channels_probe_success: isolation.0,
+            parent_sibling_probe_denied: isolation.1,
         },
     )
     .await?;
@@ -86,23 +82,33 @@ async fn run_inner(adapter: Option<crate::adapter::ChannelAdapterPort>) -> Resul
     write_line(
         &mut management_output,
         &ChildFrame::Channels {
+            metadata: crate::control_plane::FrameMetadata::new(bootstrap.generation),
             request_id: channels_request.clone(),
             owner: bootstrap.owner.clone(),
         },
     )
     .await?;
-    let route = load_routed_runtime(&bootstrap.channels_root)?;
-    let publication_request =
-        publish_runtime_tools(&mut management_output, &bootstrap, route.as_ref()).await?;
-    if let Some(route) = &route {
+    let routes = load_routed_runtimes(&bootstrap.channels_root)?;
+    let publication_requests =
+        publish_runtime_tools(&mut management_output, &bootstrap, &routes).await?;
+    await_startup_management(
+        &mut management_input,
+        &bootstrap,
+        &channels_request,
+        &publication_requests,
+    )
+    .await?;
+    for route in &routes {
         send_runtime_start(&mut ws_writer, route, &bootstrap.channels_root).await?;
     }
+    let hub =
+        crate::adapter::AdapterHub::compose(&routes, &context).map_err(|_| HostError::Runtime)?;
     let session = HostSession {
         bootstrap: &bootstrap,
-        route,
+        routes,
         channels_request: &channels_request,
-        publication_request,
-        adapter,
+        publication_requests,
+        hub,
     };
     run_session(
         session,
@@ -114,12 +120,51 @@ async fn run_inner(adapter: Option<crate::adapter::ChannelAdapterPort>) -> Resul
     .await
 }
 
+async fn await_startup_management<R>(
+    input: &mut BufReader<R>,
+    bootstrap: &Bootstrap,
+    channels_request: &str,
+    publication_requests: &std::collections::BTreeSet<String>,
+) -> Result<(), HostError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut channels_pending = true;
+    let mut publications_pending = publication_requests.clone();
+    while channels_pending || !publications_pending.is_empty() {
+        let frame = tokio::time::timeout(
+            std::time::Duration::from_millis(crate::control_plane::CONTROL_TIMEOUT_MS_MAX),
+            read_line::<_, ParentFrame>(input),
+        )
+        .await
+        .map_err(|_| HostError::Bootstrap)??
+        .ok_or(HostError::Bootstrap)?;
+        validate_parent_frame(&frame, bootstrap)?;
+        match frame {
+            ParentFrame::ChannelsResult {
+                correlation_id,
+                channels,
+                ..
+            } if channels_pending
+                && correlation_id == channels_request
+                && channels.len() <= crate::control_plane::CHANNEL_STATE_ROWS_MAX =>
+            {
+                channels_pending = false;
+            }
+            ParentFrame::RuntimeToolsPublished { correlation_id, .. }
+                if publications_pending.remove(&correlation_id) => {}
+            _ => return Err(HostError::Bootstrap),
+        }
+    }
+    Ok(())
+}
+
 struct HostSession<'a> {
     bootstrap: &'a Bootstrap,
-    route: Option<RoutedRuntime>,
+    routes: Vec<RoutedRuntime>,
     channels_request: &'a str,
-    publication_request: Option<String>,
-    adapter: Option<crate::adapter::ChannelAdapterPort>,
+    publication_requests: std::collections::BTreeSet<String>,
+    hub: crate::adapter::AdapterHub,
 }
 
 async fn run_session<MI, MO, W, R>(
@@ -138,16 +183,12 @@ where
 {
     let HostSession {
         bootstrap,
-        route,
+        routes,
         channels_request,
-        publication_request,
-        adapter,
+        publication_requests,
+        mut hub,
     } = session;
-    let (mut adapter_input, adapter_output) = match adapter {
-        Some(port) => (Some(port.inbound), Some(port.outbound)),
-        None => (None, None),
-    };
-    let mut started = false;
+    let mut started = std::collections::BTreeSet::new();
     loop {
         tokio::select! {
             frame = read_line::<_, ParentFrame>(management_input) => {
@@ -158,15 +199,16 @@ where
                     ws_writer,
                     bootstrap,
                     channels_request,
-                    publication_request.as_deref(),
-                    route.as_ref(),
+                    &publication_requests,
+                    &routes,
                 ).await? {
                     return Ok(());
                 }
             }
-            inbound = receive_adapter_input(&mut adapter_input), if started => {
-                let Some(inbound) = inbound else { adapter_input = None; continue; };
-                send_adapter_input(ws_writer, inbound).await?;
+            inbound = hub.receive_inbound(), if !started.is_empty() => {
+                let Some(inbound) = inbound else { continue; };
+                let request_id = send_adapter_input(ws_writer, &inbound).await?;
+                hub.record_input(request_id, &inbound.route).map_err(|_| HostError::Runtime)?;
             }
             incoming = ws_reader.next() => {
                 let message = incoming.ok_or(HostError::WebSocket)?
@@ -174,11 +216,10 @@ where
                 handle_websocket_message(
                     ws_writer,
                     message,
-                    route.as_ref(),
-                    adapter_output.as_ref(),
+                    &routes,
+                    &mut hub,
                     &mut started,
-                )
-                .await?;
+                ).await?;
             }
         }
     }
@@ -187,9 +228,9 @@ where
 async fn handle_websocket_message<W>(
     writer: &mut W,
     message: Message,
-    route: Option<&RoutedRuntime>,
-    adapter: Option<&tokio::sync::mpsc::Sender<crate::adapter::MessageChannelDelivery>>,
-    started: &mut bool,
+    routes: &[RoutedRuntime],
+    hub: &mut crate::adapter::AdapterHub,
+    started: &mut std::collections::BTreeSet<(String, String)>,
 ) -> Result<(), HostError>
 where
     W: futures_util::Sink<Message> + Unpin,
@@ -203,12 +244,30 @@ where
         Message::Text(text) => {
             let value: serde_json::Value =
                 serde_json::from_str(&text).map_err(|_| HostError::WebSocket)?;
-            *started |= value["type"] == "runtime_start_response";
-            handle_message_channel_call(writer, &value, route, adapter).await
+            if value["type"] == "runtime_start_response" {
+                started.insert(runtime_value_key(&value)?);
+                return Ok(());
+            }
+            if hub
+                .accept_runtime_event(&value)
+                .map_err(|_| HostError::Runtime)?
+            {
+                return Ok(());
+            }
+            handle_message_channel_call(writer, &value, routes, hub).await
         }
         Message::Close(_) => Err(HostError::WebSocket),
         Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => Ok(()),
     }
+}
+
+fn runtime_value_key(value: &serde_json::Value) -> Result<(String, String), HostError> {
+    let runtime = &value["runtime"];
+    let agent = runtime["agent_id"].as_str().ok_or(HostError::Runtime)?;
+    let conversation = runtime["conversation_id"]
+        .as_str()
+        .ok_or(HostError::Runtime)?;
+    Ok((agent.to_owned(), conversation.to_owned()))
 }
 
 async fn handle_management<W, O>(
@@ -217,20 +276,22 @@ async fn handle_management<W, O>(
     ws_writer: &mut W,
     bootstrap: &Bootstrap,
     channels_request: &str,
-    publication_request: Option<&str>,
-    route: Option<&RoutedRuntime>,
+    publication_requests: &std::collections::BTreeSet<String>,
+    routes: &[RoutedRuntime],
 ) -> Result<bool, HostError>
 where
     O: tokio::io::AsyncWrite + Unpin,
     W: futures_util::Sink<Message> + Unpin,
     W::Error: std::fmt::Debug,
 {
+    validate_parent_frame(&frame, bootstrap)?;
     match frame {
-        ParentFrame::Shutdown { request_id } => {
-            if let Some(route) = route {
+        ParentFrame::Shutdown { request_id, .. } => {
+            for route in routes {
                 write_line(
                     output,
                     &ChildFrame::ReleaseRuntimeTools {
+                        metadata: crate::control_plane::FrameMetadata::new(bootstrap.generation),
                         request_id: random_request_id("release-tools")?,
                         owner: bootstrap.owner.clone(),
                         runtime: runtime_key(route),
@@ -245,6 +306,7 @@ where
             write_line(
                 output,
                 &ChildFrame::ShutdownComplete {
+                    metadata: crate::control_plane::FrameMetadata::new(bootstrap.generation),
                     correlation_id: request_id,
                     owner: bootstrap.owner.clone(),
                 },
@@ -256,9 +318,10 @@ where
         ParentFrame::ChannelsResult {
             correlation_id,
             channels,
+            ..
         } if correlation_id == channels_request && channels.len() <= 256 => Ok(false),
-        ParentFrame::RuntimeToolsPublished { correlation_id }
-            if publication_request == Some(correlation_id.as_str()) =>
+        ParentFrame::RuntimeToolsPublished { correlation_id, .. }
+            if publication_requests.contains(&correlation_id) =>
         {
             Ok(false)
         }
@@ -267,6 +330,38 @@ where
         | ParentFrame::Bootstrap { .. }
         | ParentFrame::ChannelsResult { .. } => Err(HostError::Bootstrap),
     }
+}
+
+fn validate_parent_frame(frame: &ParentFrame, bootstrap: &Bootstrap) -> Result<(), HostError> {
+    let (metadata, owner) = match frame {
+        ParentFrame::Bootstrap {
+            metadata, owner, ..
+        }
+        | ParentFrame::ChannelsResult {
+            metadata, owner, ..
+        }
+        | ParentFrame::RuntimeToolsPublished {
+            metadata, owner, ..
+        }
+        | ParentFrame::RuntimeToolsReleased {
+            metadata, owner, ..
+        }
+        | ParentFrame::Shutdown {
+            metadata, owner, ..
+        } => (*metadata, owner),
+    };
+    if owner != &bootstrap.owner || !valid_metadata(metadata, bootstrap.generation) {
+        return Err(HostError::Bootstrap);
+    }
+    Ok(())
+}
+
+fn valid_metadata(metadata: crate::control_plane::FrameMetadata, generation: u64) -> bool {
+    metadata.version == crate::control_plane::CONTROL_PROTOCOL_VERSION
+        && metadata.generation == generation
+        && metadata.capability == crate::control_plane::ManagementCapability::ChannelManagement
+        && metadata.timeout_ms > 0
+        && metadata.timeout_ms <= crate::control_plane::CONTROL_TIMEOUT_MS_MAX
 }
 
 fn authenticated_request(
@@ -282,12 +377,6 @@ fn authenticated_request(
         "Authorization",
         authorization.parse().map_err(|_| HostError::WebSocket)?,
     );
-    request.headers_mut().insert(
-        "x-lotta-reconnect-id",
-        format!("channel-{}", process::id())
-            .parse()
-            .map_err(|_| HostError::WebSocket)?,
-    );
     Ok(request)
 }
 
@@ -300,6 +389,7 @@ where
     };
     match frame {
         ParentFrame::Bootstrap {
+            metadata,
             request_id,
             owner,
             websocket_url,
@@ -307,7 +397,9 @@ where
             channels_root,
         } => {
             let root = PathBuf::from(channels_root);
-            if token.is_empty()
+            if !valid_metadata(metadata, metadata.generation)
+                || token.is_empty()
+                || owner.is_empty()
                 || !websocket_url.starts_with("ws://127.0.0.1:")
                 || !root.is_absolute()
             {
@@ -316,6 +408,7 @@ where
             Ok(Bootstrap {
                 correlation: request_id,
                 owner,
+                generation: metadata.generation,
                 websocket_url,
                 token,
                 channels_root: root,
@@ -328,34 +421,42 @@ where
 async fn publish_runtime_tools<W>(
     output: &mut W,
     bootstrap: &Bootstrap,
-    route: Option<&RoutedRuntime>,
-) -> Result<Option<String>, HostError>
+    routes: &[RoutedRuntime],
+) -> Result<std::collections::BTreeSet<String>, HostError>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let Some(route) = route else {
-        return Ok(None);
-    };
-    let request_id = random_request_id("publish-tools")?;
-    write_line(
-        output,
-        &ChildFrame::PublishRuntimeTools {
-            request_id: request_id.clone(),
-            owner: bootstrap.owner.clone(),
-            runtime: runtime_key(route),
-            tools: vec![crate::control_plane::RuntimeTool {
-                name: "ChannelHostAvailability".into(),
-                description: "Report bounded channel adapter availability".into(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false
-                }),
-            }],
-        },
-    )
-    .await?;
-    Ok(Some(request_id))
+    let mut requests = std::collections::BTreeSet::new();
+    let mut runtimes = std::collections::BTreeSet::new();
+    for route in routes {
+        let runtime = runtime_key(route);
+        if !runtimes.insert(runtime.clone()) {
+            continue;
+        }
+        if requests.len() >= crate::control_plane::CONTROL_CORRELATIONS_MAX {
+            return Err(HostError::Runtime);
+        }
+        let request_id = random_request_id("publish-tools")?;
+        write_line(
+            output,
+            &ChildFrame::PublishRuntimeTools {
+                metadata: crate::control_plane::FrameMetadata::new(bootstrap.generation),
+                request_id: request_id.clone(),
+                owner: bootstrap.owner.clone(),
+                runtime,
+                tools: vec![crate::control_plane::RuntimeTool {
+                    name: "ChannelHostAvailability".into(),
+                    description: "Report bounded channel adapter availability".into(),
+                    parameters: serde_json::json!({
+                        "type": "object", "properties": {}, "additionalProperties": false
+                    }),
+                }],
+            },
+        )
+        .await?;
+        requests.insert(request_id);
+    }
+    Ok(requests)
 }
 
 fn runtime_key(route: &RoutedRuntime) -> crate::control_plane::RuntimeKey {
@@ -392,19 +493,10 @@ where
     .await
 }
 
-async fn receive_adapter_input(
-    receiver: &mut Option<tokio::sync::mpsc::Receiver<crate::adapter::InboundChannelMessage>>,
-) -> Option<crate::adapter::InboundChannelMessage> {
-    match receiver {
-        Some(receiver) => receiver.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
 async fn send_adapter_input<W>(
     writer: &mut W,
-    message: crate::adapter::InboundChannelMessage,
-) -> Result<(), HostError>
+    message: &crate::adapter::InboundChannelMessage,
+) -> Result<String, HostError>
 where
     W: futures_util::Sink<Message> + Unpin,
     W::Error: std::fmt::Debug,
@@ -422,14 +514,15 @@ where
             "payload": message.payload
         }),
     )
-    .await
+    .await?;
+    Ok(request_id)
 }
 
 async fn handle_message_channel_call<W>(
     writer: &mut W,
     value: &serde_json::Value,
-    route: Option<&RoutedRuntime>,
-    adapter: Option<&tokio::sync::mpsc::Sender<crate::adapter::MessageChannelDelivery>>,
+    routes: &[RoutedRuntime],
+    hub: &crate::adapter::AdapterHub,
 ) -> Result<(), HostError>
 where
     W: futures_util::Sink<Message> + Unpin,
@@ -449,7 +542,14 @@ where
     let message = value["input"]["message"]
         .as_str()
         .ok_or(HostError::Runtime)?;
-    let outcome = deliver_outbound(route, adapter, request_id, tool_call_id, message).await;
+    let runtime = runtime_value_key(value)?;
+    let route = routes
+        .iter()
+        .find(|route| {
+            route.agent_id.as_str() == runtime.0 && route.conversation_id.as_str() == runtime.1
+        })
+        .ok_or(HostError::Runtime)?;
+    let outcome = hub.deliver(route, request_id, tool_call_id, message).await;
     let mut response = serde_json::json!({
         "type": "runtime_external_tool_call_response",
         "request_id": request_id,
@@ -496,40 +596,10 @@ where
     .await
 }
 
-async fn deliver_outbound(
-    route: Option<&RoutedRuntime>,
-    adapter: Option<&tokio::sync::mpsc::Sender<crate::adapter::MessageChannelDelivery>>,
-    request_id: &str,
-    tool_call_id: &str,
-    message: &str,
-) -> crate::adapter::MessageChannelResult {
-    let (Some(route), Some(adapter)) = (route, adapter) else {
-        return crate::adapter::MessageChannelResult::Unavailable;
-    };
-    let (delivery, completion) = crate::adapter::delivery(
-        route.clone(),
-        request_id.to_owned(),
-        tool_call_id.to_owned(),
-        message.to_owned(),
-    );
-    if adapter.try_send(delivery).is_err() {
-        return crate::adapter::MessageChannelResult::Unavailable;
-    }
-    tokio::time::timeout(
-        std::time::Duration::from_millis(CHANNEL_ADAPTER_DELIVERY_TIMEOUT_MS),
-        completion,
-    )
-    .await
-    .ok()
-    .and_then(Result::ok)
-    .unwrap_or(crate::adapter::MessageChannelResult::Unavailable)
-}
-
-fn load_routed_runtime(root: &Path) -> Result<Option<RoutedRuntime>, HostError> {
+fn load_routed_runtimes(root: &Path) -> Result<Vec<RoutedRuntime>, HostError> {
     crate::state_store::ChannelStateStore::from_root(root)
         .restorable_routes()
         .map_err(|_| HostError::Runtime)
-        .map(|routes| routes.into_iter().next())
 }
 
 fn message_channel_descriptor() -> serde_json::Value {
@@ -591,6 +661,26 @@ fn clone_request(
         .map_err(|_| HostError::WebSocket)?;
     *copy.headers_mut() = request.headers().clone();
     Ok(copy)
+}
+
+fn probe_isolation(root: &Path) -> Result<(bool, bool), HostError> {
+    let name = format!(".isolation-probe-{}", process::id());
+    let allowed = root.join(&name);
+    std::fs::write(&allowed, b"probe").map_err(|_| HostError::Bootstrap)?;
+    std::fs::remove_file(&allowed).map_err(|_| HostError::Bootstrap)?;
+    let parent = root.parent().ok_or(HostError::Bootstrap)?;
+    let denied = parent.join("backend").join(name);
+    let parent_sibling_probe_denied = match std::fs::write(&denied, b"probe") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(denied);
+            false
+        }
+        Err(_) => true,
+    };
+    if !parent_sibling_probe_denied {
+        return Err(HostError::Bootstrap);
+    }
+    Ok((true, true))
 }
 
 fn verify_working_root(expected: &Path) -> Result<(), HostError> {
