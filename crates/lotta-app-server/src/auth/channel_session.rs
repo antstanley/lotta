@@ -19,9 +19,6 @@ pub const CHANNEL_SESSION_TTL_SECONDS: u64 = 300;
 pub const CHANNEL_RUNTIME_COMMANDS: &[&str] = &[
     "runtime_start",
     "input",
-    "sync",
-    "abort_message",
-    "change_device_state",
     "runtime_external_tool_call_response",
 ];
 
@@ -40,6 +37,7 @@ struct Session {
     deadline: Instant,
     listener: ListenerIdentity,
     sandbox_root: String,
+    runtimes: Vec<(String, String)>,
     revoked: bool,
 }
 
@@ -119,11 +117,30 @@ impl ChannelSessionAuthenticator {
         pid: u32,
         sandbox_root: &str,
     ) -> Result<ChannelSessionCapability, AppServerError> {
+        self.install_scoped(owner, generation, pid, sandbox_root, &[])
+    }
+
+    /// Mints a capability bound to exact canonical routed Runtime scopes.
+    ///
+    /// # Errors
+    /// Fails closed for invalid scope, listener, identity, or entropy.
+    pub fn install_scoped(
+        &self,
+        owner: &str,
+        generation: u64,
+        pid: u32,
+        sandbox_root: &str,
+        runtimes: &[(String, String)],
+    ) -> Result<ChannelSessionCapability, AppServerError> {
         if owner.is_empty()
             || owner.len() > 128
             || generation == 0
             || pid == 0
             || !sandbox_root.starts_with('/')
+            || runtimes.len() > 256
+            || runtimes
+                .iter()
+                .any(|(agent, conversation)| agent.is_empty() || conversation.is_empty())
         {
             return Err(AppServerError::Config("invalid channel session identity"));
         }
@@ -150,6 +167,7 @@ impl ChannelSessionAuthenticator {
             deadline: Instant::now() + Duration::from_secs(CHANNEL_SESSION_TTL_SECONDS),
             listener,
             sandbox_root: sandbox_root.to_owned(),
+            runtimes: runtimes.to_vec(),
             revoked: false,
         });
         self.bump();
@@ -228,6 +246,19 @@ impl ChannelSessionAuthenticator {
         CHANNEL_RUNTIME_COMMANDS.contains(&kind)
     }
 
+    /// Checks one Runtime scope against the exact canonical routed scope set.
+    #[must_use]
+    pub fn runtime_scope_allowed(&self, runtime: &lotta_domain::RuntimeScope) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state.session.as_ref().is_some_and(|session| {
+                session.runtimes.iter().any(|(agent, conversation)| {
+                    agent == runtime.agent_id.as_str()
+                        && conversation == runtime.conversation_id.as_str()
+                })
+            })
+        })
+    }
+
     /// Validates the fixed sandbox, strict policy, and exact `MessageChannel` declaration.
     #[must_use]
     pub fn runtime_start_allowed(&self, command: &crate::ws::command::RuntimeStartCommand) -> bool {
@@ -240,9 +271,36 @@ impl ChannelSessionAuthenticator {
         let Some(sandbox) = &command.workspace_sandbox else {
             return false;
         };
+        let (Some(agent), Some(conversation)) = (&command.agent_id, &command.conversation_id)
+        else {
+            return false;
+        };
         if sandbox.root.as_str() != session.sandbox_root
             || sandbox.isolation_root.as_str() != session.sandbox_root
+            || command.cwd.as_deref() != Some(session.sandbox_root.as_str())
             || !matches!(command.mode, Some(crate::ws::command::RuntimeMode::Strict))
+            || command.create_agent.is_some()
+            || command.create_conversation.is_some()
+            || command.conversation_source_tags.is_some()
+            || command.skill_sources.is_some()
+            || command.preserve_skill_sources.is_some()
+            || command.force_device_status.is_some()
+            || command.wait_for_replay.is_some()
+            || !session
+                .runtimes
+                .iter()
+                .any(|(allowed_agent, allowed_conversation)| {
+                    allowed_agent == agent.as_str() && allowed_conversation == conversation.as_str()
+                })
+        {
+            return false;
+        }
+        let Some(client) = &command.client_info else {
+            return false;
+        };
+        if client.name.as_str() != "lotta-channel-host"
+            || client.title.is_some()
+            || client.version.is_some()
         {
             return false;
         }
@@ -253,6 +311,32 @@ impl ChannelSessionAuthenticator {
             return false;
         };
         tool.as_value() == &message_channel_descriptor()
+    }
+
+    /// Validates the complete dedicated-listener `runtime_start` object.
+    #[must_use]
+    pub fn runtime_start_frame_allowed(
+        &self,
+        command: &crate::ws::command::RuntimeStartCommand,
+        value: &serde_json::Value,
+    ) -> bool {
+        const FIELDS: &[&str] = &[
+            "type",
+            "request_id",
+            "agent_id",
+            "conversation_id",
+            "cwd",
+            "mode",
+            "workspace_sandbox",
+            "external_tools",
+            "client_info",
+        ];
+        let Some(object) = value.as_object() else {
+            return false;
+        };
+        object.len() == FIELDS.len()
+            && FIELDS.iter().all(|field| object.contains_key(*field))
+            && self.runtime_start_allowed(command)
     }
 
     fn bump(&self) {
@@ -378,18 +462,28 @@ mod tests {
         let auth = ChannelSessionAuthenticator::new();
         auth.bind_listener("127.0.0.1", "/channel-runtime", "listener-1")
             .unwrap();
-        let _capability = auth.install("owner", 1, 101, "/channels").unwrap();
+        let _capability = auth
+            .install_scoped(
+                "owner",
+                1,
+                101,
+                "/channels",
+                &[("agent".into(), "conversation".into())],
+            )
+            .unwrap();
         let command: crate::ws::command::RuntimeStartCommand =
             serde_json::from_value(serde_json::json!({
                 "request_id": "start",
                 "agent_id": "agent",
                 "conversation_id": "conversation",
+                "cwd": "/channels",
                 "mode": "strict",
                 "workspace_sandbox": {
                     "root": "/channels",
                     "isolation_root": "/channels"
                 },
-                "external_tools": [message_channel_descriptor()]
+                "external_tools": [message_channel_descriptor()],
+                "client_info": {"name": "lotta-channel-host"}
             }))
             .unwrap();
         assert!(auth.runtime_start_allowed(&command));

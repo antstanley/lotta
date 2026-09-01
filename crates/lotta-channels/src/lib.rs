@@ -6,8 +6,12 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+/// Bounded in-memory future-adapter boundary.
+pub mod adapter;
 /// Bounded newline-delimited management protocol and runtime-tool registry.
 pub mod control_plane;
+/// Typed canonical persisted channel state.
+pub mod state_store;
 /// Supervised child-process lifecycle.
 pub mod supervisor;
 /// Channel store, capability, sandbox, and process topology.

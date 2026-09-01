@@ -1,7 +1,10 @@
 //! Strict newline-delimited JSON management plane.
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::{
+    Deserialize, Serialize,
+    de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor},
+};
+use serde_json::{Map, Value};
 use std::{
     collections::{BTreeSet, VecDeque},
     io::ErrorKind,
@@ -229,6 +232,7 @@ impl ControlPlane {
         if owner != self.owner {
             return Err(ControlError::Owner);
         }
+        validate_frame(&frame, channels)?;
         if let Some(id) = request_id {
             self.admit_request(id)?;
         }
@@ -343,13 +347,126 @@ where
         bytes.pop();
     }
     let text = std::str::from_utf8(&bytes).map_err(|_| ControlError::Malformed)?;
-    let mut deserializer = serde_json::Deserializer::from_str(text);
-    let value = Value::deserialize(&mut deserializer).map_err(|_| ControlError::Malformed)?;
-    deserializer.end().map_err(|_| ControlError::Malformed)?;
-    validate_structure(&value)?;
+    let value = parse_bounded_json(text)?;
+    if !value.is_object() {
+        return Err(ControlError::Malformed);
+    }
     serde_json::from_value(value)
         .map_err(|_| ControlError::Malformed)
         .map(Some)
+}
+
+fn parse_bounded_json(text: &str) -> Result<Value, ControlError> {
+    let mut deserializer = serde_json::Deserializer::from_str(text);
+    let value = BoundedValueSeed { depth: 1 }
+        .deserialize(&mut deserializer)
+        .map_err(|_| ControlError::Malformed)?;
+    deserializer.end().map_err(|_| ControlError::Malformed)?;
+    Ok(value)
+}
+
+struct BoundedValueSeed {
+    depth: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for BoundedValueSeed {
+    type Value = Value;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if self.depth > CONTROL_JSON_DEPTH_MAX {
+            return Err(D::Error::custom("json depth bound"));
+        }
+        deserializer.deserialize_any(BoundedValueVisitor { depth: self.depth })
+    }
+}
+
+struct BoundedValueVisitor {
+    depth: usize,
+}
+
+impl<'de> Visitor<'de> for BoundedValueVisitor {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("bounded JSON value without duplicate keys")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Value, E> {
+        Ok(Value::Bool(value))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Value, E> {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .ok_or_else(|| E::custom("non-finite number"))
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Value, E> {
+        self.visit_string(value.to_owned())
+    }
+
+    fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Value, E> {
+        if value.len() > CONTROL_STRING_BYTES_MAX {
+            return Err(E::custom("json string bound"));
+        }
+        Ok(Value::String(value))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element_seed(BoundedValueSeed {
+            depth: self.depth + 1,
+        })? {
+            if values.len() >= CONTROL_ARRAY_ITEMS_MAX {
+                return Err(A::Error::custom("json array bound"));
+            }
+            values.push(value);
+        }
+        Ok(Value::Array(values))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = Map::new();
+        let mut keys = BTreeSet::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if key.len() > CONTROL_STRING_BYTES_MAX
+                || values.len() >= CONTROL_MAP_ENTRIES_MAX
+                || !keys.insert(key.clone())
+            {
+                return Err(A::Error::custom("json object bound or duplicate key"));
+            }
+            let value = object.next_value_seed(BoundedValueSeed {
+                depth: self.depth + 1,
+            })?;
+            values.insert(key, value);
+        }
+        Ok(Value::Object(values))
+    }
 }
 
 /// Writes exactly one bounded JSON object followed by one newline.
@@ -379,6 +496,21 @@ fn validate_structure(value: &Value) -> Result<(), ControlError> {
     };
     lotta_extensions::sidecar::framing::validate_json_structure(value, bounds)
         .map_err(|_| ControlError::Bound)
+}
+
+fn validate_frame(frame: &ChildFrame, channels: &[ChannelState]) -> Result<(), ControlError> {
+    match frame {
+        ChildFrame::PublishRuntimeTools { runtime, tools, .. } => {
+            validate_runtime(runtime)?;
+            validate_tools(tools)
+        }
+        ChildFrame::ReleaseRuntimeTools { runtime, .. } => validate_runtime(runtime),
+        ChildFrame::Channels { .. } => (channels.len() <= CHANNEL_STATE_ROWS_MAX)
+            .then_some(())
+            .ok_or(ControlError::Bound),
+        ChildFrame::Ready { pid, .. } => (*pid != 0).then_some(()).ok_or(ControlError::Correlation),
+        ChildFrame::ShutdownComplete { .. } => Ok(()),
+    }
 }
 
 fn validate_tools(tools: &[RuntimeTool]) -> Result<(), ControlError> {
@@ -534,12 +666,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_ndjson_round_trip() {
+        let bytes = concat!(
+            "{\"kind\":\"bootstrap\",\"request_id\":\"x\",\"owner\":\"o\",",
+            "\"websocket_url\":\"ws://127.0.0.1:9/ws\",\"token\":\"t\",",
+            "\"channels_root\":\"/tmp\"}\n"
+        )
+        .as_bytes();
+        let mut reader = BufReader::new(bytes);
+        assert!(matches!(
+            read_line::<_, ParentFrame>(&mut reader).await,
+            Ok(Some(ParentFrame::Bootstrap { .. }))
+        ));
+    }
+
+    #[tokio::test]
     async fn rejects_partial_multiple_oversize_malformed_unknown_and_replay() {
+        let duplicate_owner = concat!(
+            "{\"kind\":\"channels\",\"request_id\":\"a\",\"owner\":\"owner\",",
+            "\"owner\":\"owner\"}\n"
+        );
+        let nested_duplicate = concat!(
+            "{\"kind\":\"channels\",\"request_id\":\"a\",\"owner\":\"owner\",",
+            "\"nested\":{\"x\":1,\"x\":2}}\n"
+        );
         for bytes in [
             b"{}".as_slice(),
+            b"{} {}\n",
             b"{}\n{}\n",
             b"not-json\n",
             b"{\"kind\":\"unknown\"}\n",
+            duplicate_owner.as_bytes(),
+            nested_duplicate.as_bytes(),
+            b"{\"kind\":\"channels\",\"request_id\":\"a\",\"owner\":\"\xff\"}\n",
         ] {
             let mut reader = BufReader::new(bytes);
             assert!(read_line::<_, ChildFrame>(&mut reader).await.is_err());

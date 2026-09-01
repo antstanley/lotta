@@ -201,6 +201,7 @@ struct Generation {
     number: u64,
     pid: u32,
     bootstrap_id: String,
+    shutdown_id: String,
     child: Child,
     input: Option<ChildStdin>,
     output: BufReader<ChildStdout>,
@@ -238,7 +239,10 @@ async fn run_generation(
         Err(error) => Err(error),
     };
     let cleanup = cleanup_generation(config, &mut session, plane_slot, pid_sender).await;
-    outcome.and(cleanup)
+    match (outcome, cleanup) {
+        (_, Err(error)) | (Err(error), Ok(())) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 async fn spawn_generation(
@@ -247,6 +251,7 @@ async fn spawn_generation(
     pid_sender: &watch::Sender<Option<u32>>,
 ) -> Result<Generation, SupervisorError> {
     let bootstrap_id = random_id("bootstrap")?;
+    let shutdown_id = random_id("shutdown")?;
     let mut command = sandboxed_child_command(&config.executable, &config.store)?;
     command
         .stdin(Stdio::piped())
@@ -256,9 +261,20 @@ async fn spawn_generation(
     let pid = child.id().ok_or(SupervisorError::Spawn)?;
     let owner = format!("{}-{generation}", config.owner_prefix);
     let sandbox_root = config.store.root().to_str().ok_or(SupervisorError::Spawn)?;
-    let Ok(capability) = config
-        .authenticator
-        .install(&owner, generation, pid, sandbox_root)
+    let runtimes = crate::state_store::ChannelStateStore::new(&config.store)
+        .restorable_routes()?
+        .into_iter()
+        .map(|route| {
+            (
+                route.agent_id.as_str().to_owned(),
+                route.conversation_id.as_str().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let Ok(capability) =
+        config
+            .authenticator
+            .install_scoped(&owner, generation, pid, sandbox_root, &runtimes)
     else {
         reap_failed_spawn(&mut child).await;
         return Err(SupervisorError::Spawn);
@@ -277,6 +293,7 @@ async fn spawn_generation(
         number: generation,
         pid,
         bootstrap_id,
+        shutdown_id,
         child,
         input: Some(input),
         output: BufReader::new(output),
@@ -370,22 +387,33 @@ async fn cleanup_generation(
     plane: &Arc<Mutex<Option<ControlPlane>>>,
     pid_sender: &watch::Sender<Option<u32>>,
 ) -> Result<(), SupervisorError> {
-    let shutdown_id = random_id("shutdown")
-        .unwrap_or_else(|_| format!("shutdown-{}-{}", session.number, session.pid));
-    if let Some(input) = &mut session.input {
-        let _ = write_line(
+    let shutdown_id = session.shutdown_id.clone();
+    let mut shutdown_failed = false;
+    let child_live = if let Ok(status) = session.child.try_wait() {
+        status.is_none()
+    } else {
+        shutdown_failed = true;
+        false
+    };
+    if child_live && let Some(input) = &mut session.input {
+        let wrote = write_line(
             input,
             &ParentFrame::Shutdown {
                 request_id: shutdown_id.clone(),
             },
         )
-        .await;
-        let acknowledgement = tokio::time::timeout(
-            Duration::from_millis(CHANNEL_SHUTDOWN_GRACE_MS),
-            wait_shutdown_ack(&mut session.output, &session.owner, &shutdown_id),
-        )
-        .await;
-        let _ = acknowledgement;
+        .await
+        .is_ok();
+        let acknowledged = wrote
+            && matches!(
+                tokio::time::timeout(
+                    Duration::from_millis(CHANNEL_SHUTDOWN_GRACE_MS),
+                    wait_shutdown_ack(&mut session.output, &session.owner, &shutdown_id, plane),
+                )
+                .await,
+                Ok(Ok(()))
+            );
+        shutdown_failed |= !acknowledged;
     }
     session.input.take();
     let _ = config
@@ -397,26 +425,24 @@ async fn cleanup_generation(
         let _ = current.release_stale();
     }
     let _ = pid_sender.send(None);
+    let process = finish_generation_process(session).await;
+    if shutdown_failed {
+        Err(SupervisorError::Cleanup)
+    } else {
+        process
+    }
+}
+
+async fn finish_generation_process(session: &mut Generation) -> Result<(), SupervisorError> {
     let wait = tokio::time::timeout(
         Duration::from_millis(CHANNEL_SHUTDOWN_GRACE_MS),
         session.child.wait(),
     )
     .await;
-    match wait {
-        Ok(Ok(_)) => {}
-        Ok(Err(_)) => return Err(SupervisorError::Cleanup),
-        Err(_) => {
-            session
-                .child
-                .kill()
-                .await
-                .map_err(|_| SupervisorError::Cleanup)?;
-            session
-                .child
-                .wait()
-                .await
-                .map_err(|_| SupervisorError::Cleanup)?;
-        }
+    let mut failed = matches!(wait, Ok(Err(_)));
+    if wait.is_err() {
+        failed |= session.child.kill().await.is_err();
+        failed |= session.child.wait().await.is_err();
     }
     if tokio::time::timeout(
         Duration::from_millis(CHANNEL_SHUTDOWN_GRACE_MS),
@@ -426,15 +452,20 @@ async fn cleanup_generation(
     .is_err()
     {
         session.stderr.abort();
-        let _ = (&mut session.stderr).await;
+        failed |= (&mut session.stderr).await.is_err();
     }
-    Ok(())
+    if failed {
+        Err(SupervisorError::Cleanup)
+    } else {
+        Ok(())
+    }
 }
 
 async fn wait_shutdown_ack<R>(
     output: &mut BufReader<R>,
     owner: &str,
     correlation: &str,
+    plane: &Arc<Mutex<Option<ControlPlane>>>,
 ) -> Result<(), SupervisorError>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -443,10 +474,11 @@ where
         let frame = read_line::<_, ChildFrame>(output)
             .await?
             .ok_or(SupervisorError::Cleanup)?;
-        if matches!(frame, ChildFrame::ShutdownComplete {
+        let acknowledged = matches!(&frame, ChildFrame::ShutdownComplete {
             correlation_id, owner: frame_owner,
-        } if correlation_id == correlation && frame_owner == owner)
-        {
+        } if correlation_id == correlation && frame_owner == owner);
+        dispatch(plane, frame, &[])?;
+        if acknowledged {
             return Ok(());
         }
     }

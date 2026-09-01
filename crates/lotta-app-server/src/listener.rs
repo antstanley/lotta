@@ -1211,6 +1211,24 @@ fn authenticated_reconnect_identity(
     })
 }
 
+type ChannelRevision = Option<tokio::sync::watch::Receiver<u64>>;
+
+async fn initialize_socket_liveness(
+    state: &ListenerState,
+) -> (Heartbeat, tokio::time::Interval, ChannelRevision) {
+    publish_expired_subscription_updates(state).await;
+    let heartbeat = Heartbeat::new(state.clock.as_ref());
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(
+        state.limits.ping_interval_ms,
+    ));
+    interval.tick().await;
+    let revision = state
+        .channel_session
+        .as_ref()
+        .map(crate::auth::channel_session::ChannelSessionAuthenticator::subscribe);
+    (heartbeat, interval, revision)
+}
+
 async fn serve_socket(
     mut socket: WebSocket,
     state: Arc<ListenerState>,
@@ -1221,19 +1239,11 @@ async fn serve_socket(
     let Ok(connection_id) = open_connection(&state, sender, reconnect_identity.as_ref()) else {
         return;
     };
-    publish_expired_subscription_updates(&state).await;
-    let mut heartbeat = Heartbeat::new(state.clock.as_ref());
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(
-        state.limits.ping_interval_ms,
-    ));
-    interval.tick().await;
-    let mut channel_revision = state
-        .channel_session
-        .as_ref()
-        .map(crate::auth::channel_session::ChannelSessionAuthenticator::subscribe);
+    let (mut heartbeat, mut interval, mut channel_revision) =
+        initialize_socket_liveness(&state).await;
     loop {
         tokio::select! {
-            () = channel_authority_changed(&mut channel_revision), if channel_revision.is_some() => {
+            () = channel_authority_changed(&mut channel_revision) => {
                 let admitted = state.channel_session.as_ref().zip(channel_principal.as_ref())
                     .is_some_and(|(auth, principal)| auth.admits(principal));
                 if !admitted {
@@ -1472,15 +1482,23 @@ fn websocket_error_close(error: axum::Error) -> Option<(u16, &'static str)> {
     }
 }
 
+fn channel_principal_admitted(
+    state: &ListenerState,
+    principal: Option<&crate::auth::channel_session::ChannelPrincipal>,
+) -> bool {
+    state
+        .channel_session
+        .as_ref()
+        .is_none_or(|authenticator| principal.is_some_and(|value| authenticator.admits(value)))
+}
+
 async fn handle_text(
     text: &str,
     state: &Arc<ListenerState>,
     connection_id: crate::ws::ConnectionId,
     channel_principal: Option<&crate::auth::channel_session::ChannelPrincipal>,
 ) -> bool {
-    if let Some(authenticator) = &state.channel_session
-        && !channel_principal.is_some_and(|principal| authenticator.admits(principal))
-    {
+    if !channel_principal_admitted(state, channel_principal) {
         return false;
     }
     let frame = match crate::framing::decode_text(text) {
@@ -1510,7 +1528,9 @@ async fn handle_text(
         Ok(None) => return handle_external_frame(state, connection_id, &frame),
         Err(error) => return dispatch_value(state, connection_id, &error).is_ok(),
     };
-    if state.channel_host_protocol_only && !channel_runtime_command_allowed(state, &command) {
+    if state.channel_host_protocol_only
+        && !channel_runtime_command_allowed(state, &command, &frame.value)
+    {
         return dispatch_typed_failure(state, connection_id, &frame).is_ok();
     }
     if state.channel_host_protocol_only
@@ -1537,35 +1557,42 @@ async fn handle_text(
     {
         return false;
     }
-    if let Some(deferred) = deferred {
-        let sink = event_sink(state);
-        let Ok(command) = serde_json::from_value(frame.value.clone()) else {
-            return dispatch_typed_failure(state, connection_id, &frame).is_ok();
-        };
-        let controller = state.turn_controller.clone();
-        let task_state = state.clone();
-        let failure_frame = frame.clone();
-        let turn_cancellation = state.turns.cancellation();
-        let turn = Box::pin(async move {
-            let result = if controller.is_control_continuation(&deferred) {
-                task_state
-                    .runtime_service
-                    .continue_input(deferred.scope, deferred.continuation, sink)
-                    .await
-            } else {
-                controller
-                    .submit_turn(command, deferred, turn_cancellation, sink)
-                    .await
-            };
-            if result.is_err() {
-                let _ = dispatch_typed_failure(&task_state, connection_id, &failure_frame);
-            }
-        });
-        if state.turns.spawn(turn).await.is_err() {
-            return false;
-        }
+    match deferred {
+        Some(deferred) => spawn_deferred_turn(state, connection_id, &frame, deferred).await,
+        None => true,
     }
-    true
+}
+
+async fn spawn_deferred_turn(
+    state: &Arc<ListenerState>,
+    connection_id: crate::ws::ConnectionId,
+    frame: &crate::framing::DecodedFrame,
+    deferred: crate::ws::router::DeferredInput,
+) -> bool {
+    let sink = event_sink(state);
+    let Ok(command) = serde_json::from_value(frame.value.clone()) else {
+        return dispatch_typed_failure(state, connection_id, frame).is_ok();
+    };
+    let controller = state.turn_controller.clone();
+    let task_state = state.clone();
+    let failure_frame = frame.clone();
+    let turn_cancellation = state.turns.cancellation();
+    let turn = Box::pin(async move {
+        let result = if controller.is_control_continuation(&deferred) {
+            task_state
+                .runtime_service
+                .continue_input(deferred.scope, deferred.continuation, sink)
+                .await
+        } else {
+            controller
+                .submit_turn(command, deferred, turn_cancellation, sink)
+                .await
+        };
+        if result.is_err() {
+            let _ = dispatch_typed_failure(&task_state, connection_id, &failure_frame);
+        }
+    });
+    state.turns.spawn(turn).await.is_ok()
 }
 
 fn handle_channel_tool_response(
@@ -1642,21 +1669,18 @@ fn publish_channel_runtime_tool(
         agent_id: agent.as_str().to_owned(),
         conversation_id: conversation.as_str().to_owned(),
     };
+    let Some(tools) = &start.external_tools else {
+        return false;
+    };
+    let Some(descriptors) = channel_tool_descriptors(tools) else {
+        return false;
+    };
     if manager
         .publish(
             principal.owner(),
             principal.generation(),
             runtime.clone(),
-            vec![lotta_tools::external::ChannelToolDescriptor {
-                name: "MessageChannel".into(),
-                description: "Send a visible reply through the originating channel".into(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {"message": {"type": "string"}},
-                    "required": ["message"],
-                    "additionalProperties": false
-                }),
-            }],
+            descriptors,
         )
         .is_err()
     {
@@ -1676,6 +1700,24 @@ fn publish_channel_runtime_tool(
         );
     }
     true
+}
+
+fn channel_tool_descriptors(
+    tools: &crate::ws::command::RuntimeStartExternalTools,
+) -> Option<Vec<lotta_tools::external::ChannelToolDescriptor>> {
+    tools
+        .0
+        .as_slice()
+        .iter()
+        .map(|tool| {
+            let object = tool.as_value().as_object()?;
+            Some(lotta_tools::external::ChannelToolDescriptor {
+                name: object.get("name")?.as_str()?.to_owned(),
+                description: object.get("description")?.as_str()?.to_owned(),
+                parameters: object.get("parameters")?.clone(),
+            })
+        })
+        .collect()
 }
 
 fn spawn_channel_tool_pump(
@@ -1713,13 +1755,18 @@ fn spawn_channel_tool_pump(
 fn channel_runtime_command_allowed(
     state: &ListenerState,
     command: &crate::ws::RuntimeCommand,
+    value: &serde_json::Value,
 ) -> bool {
     match command {
         crate::ws::RuntimeCommand::RuntimeStart(start) => state
             .channel_session
             .as_ref()
-            .is_some_and(|authenticator| authenticator.runtime_start_allowed(start)),
-        _ => true,
+            .is_some_and(|authenticator| authenticator.runtime_start_frame_allowed(start, value)),
+        crate::ws::RuntimeCommand::Input(input) => state
+            .channel_session
+            .as_ref()
+            .is_some_and(|authenticator| authenticator.runtime_scope_allowed(&input.runtime)),
+        _ => false,
     }
 }
 

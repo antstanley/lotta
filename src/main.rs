@@ -167,12 +167,5 @@ async fn start_channels(
 }
 
 fn channel_executable() -> Result<std::path::PathBuf, cli::CliError> {
-    if let Some(path) = std::env::var_os(lotta_channels::topology::CHANNEL_HOST_EXECUTABLE_ENV) {
-        let path = std::path::PathBuf::from(path);
-        if path.is_absolute() {
-            return Ok(path);
-        }
-        return Err(cli::CliError::ChannelExecutable);
-    }
     std::env::current_exe().map_err(|_| cli::CliError::ChannelExecutable)
 }
