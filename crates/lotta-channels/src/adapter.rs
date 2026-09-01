@@ -399,6 +399,40 @@ impl AdapterHub {
         Ok(())
     }
 
+    fn correlate_missing_request_id(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>, ChannelAdapterError> {
+        if value.get("request_id").is_some() || !runtime_event_kind(value) {
+            return Ok(None);
+        }
+        let runtime = value
+            .get("runtime")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|runtime| {
+                Some((
+                    runtime.get("agent_id")?.as_str()?.to_owned(),
+                    runtime.get("conversation_id")?.as_str()?.to_owned(),
+                ))
+            })
+            .ok_or(ChannelAdapterError::Bound)?;
+        let route = self
+            .active_routes
+            .get(&runtime)
+            .ok_or(ChannelAdapterError::Bound)?;
+        let request_id = self
+            .pending
+            .iter()
+            .find_map(|(request_id, pending)| (&pending.route_key == route).then_some(request_id))
+            .ok_or(ChannelAdapterError::Bound)?;
+        let mut object = value
+            .as_object()
+            .cloned()
+            .ok_or(ChannelAdapterError::Bound)?;
+        object.insert("request_id".to_owned(), serde_json::json!(request_id));
+        Ok(Some(serde_json::Value::Object(object)))
+    }
+
     /// Parses, bounds, correlates, and orders one Runtime event before adapter delivery.
     ///
     /// # Errors
@@ -407,39 +441,8 @@ impl AdapterHub {
         &mut self,
         value: &serde_json::Value,
     ) -> Result<bool, ChannelAdapterError> {
-        let correlated;
-        let value = if value.get("request_id").is_none() && runtime_event_kind(value) {
-            let runtime = value
-                .get("runtime")
-                .and_then(serde_json::Value::as_object)
-                .and_then(|runtime| {
-                    Some((
-                        runtime.get("agent_id")?.as_str()?.to_owned(),
-                        runtime.get("conversation_id")?.as_str()?.to_owned(),
-                    ))
-                })
-                .ok_or(ChannelAdapterError::Bound)?;
-            let route = self
-                .active_routes
-                .get(&runtime)
-                .ok_or(ChannelAdapterError::Bound)?;
-            let request_id = self
-                .pending
-                .iter()
-                .find_map(|(request_id, pending)| {
-                    (&pending.route_key == route).then_some(request_id)
-                })
-                .ok_or(ChannelAdapterError::Bound)?;
-            let mut object = value
-                .as_object()
-                .cloned()
-                .ok_or(ChannelAdapterError::Bound)?;
-            object.insert("request_id".to_owned(), serde_json::json!(request_id));
-            correlated = serde_json::Value::Object(object);
-            &correlated
-        } else {
-            value
-        };
+        let correlated = self.correlate_missing_request_id(value)?;
+        let value = correlated.as_ref().unwrap_or(value);
         let event = match parse_runtime_event(value) {
             Ok(Some(event)) => event,
             Ok(None) => return Ok(false),
@@ -845,8 +848,12 @@ mod tests {
             delivery_task.await.unwrap();
 
             for event in [
-                serde_json::json!({"type":"input_accepted","request_id":request_id,"accepted":true}),
-                serde_json::json!({"type":"update_loop_status","request_id":request_id,"status":"idle"}),
+                serde_json::json!({
+                    "type":"input_accepted", "request_id":request_id, "accepted":true
+                }),
+                serde_json::json!({
+                    "type":"update_loop_status", "request_id":request_id, "status":"idle"
+                }),
                 serde_json::json!({"type":"turn_finished","request_id":request_id}),
             ] {
                 assert!(hub.accept_runtime_event(&event).unwrap());

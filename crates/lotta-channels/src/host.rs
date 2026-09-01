@@ -46,6 +46,13 @@ struct Bootstrap {
     channels_root: PathBuf,
 }
 
+struct StartupPreparation {
+    routes: Vec<RoutedRuntime>,
+    channels_request: String,
+    publication_requests: std::collections::BTreeSet<String>,
+    runtime_starts: std::collections::BTreeMap<String, crate::control_plane::RuntimeKey>,
+}
+
 type RoutedRuntime = lotta_domain::ChannelRoute;
 
 /// Runs the supervised child over management stdin/stdout and public Runtime WebSocket.
@@ -121,36 +128,19 @@ where
         },
     )
     .await?;
-    let channels_request = random_request_id("channels")?;
-    write_line(
-        &mut management_output,
-        &ChildFrame::Channels {
-            metadata: crate::control_plane::FrameMetadata::new(bootstrap.generation),
-            request_id: channels_request.clone(),
-            owner: bootstrap.owner.clone(),
-        },
-    )
-    .await?;
-    let routes = load_routed_runtimes(&bootstrap.channels_root)?;
-    let publication_requests =
-        publish_runtime_tools(&mut management_output, &bootstrap, &routes).await?;
-    await_startup_management(
+    let startup = prepare_startup(
         &mut management_input,
+        &mut management_output,
+        &mut ws_writer,
         &bootstrap,
-        &channels_request,
-        &publication_requests,
     )
     .await?;
-    let mut started_runtimes = std::collections::BTreeSet::new();
-    let mut runtime_starts = std::collections::BTreeMap::new();
-    for route in &routes {
-        let runtime = runtime_key(route);
-        if started_runtimes.insert(runtime.clone()) {
-            let request_id =
-                send_runtime_start(&mut ws_writer, route, &bootstrap.channels_root).await?;
-            runtime_starts.insert(request_id, runtime);
-        }
-    }
+    let StartupPreparation {
+        routes,
+        channels_request,
+        publication_requests,
+        runtime_starts,
+    } = startup;
     let hub =
         crate::adapter::AdapterHub::compose(&routes, &context).map_err(|_| HostError::Runtime)?;
     let session = HostSession {
@@ -169,6 +159,48 @@ where
         &mut ws_reader,
     )
     .await
+}
+
+async fn prepare_startup<R, O, W>(
+    input: &mut BufReader<R>,
+    output: &mut O,
+    writer: &mut W,
+    bootstrap: &Bootstrap,
+) -> Result<StartupPreparation, HostError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    O: tokio::io::AsyncWrite + Unpin,
+    W: futures_util::Sink<Message> + Unpin,
+    W::Error: std::fmt::Debug,
+{
+    let channels_request = random_request_id("channels")?;
+    write_line(
+        output,
+        &ChildFrame::Channels {
+            metadata: crate::control_plane::FrameMetadata::new(bootstrap.generation),
+            request_id: channels_request.clone(),
+            owner: bootstrap.owner.clone(),
+        },
+    )
+    .await?;
+    let routes = load_routed_runtimes(&bootstrap.channels_root)?;
+    let publication_requests = publish_runtime_tools(output, bootstrap, &routes).await?;
+    await_startup_management(input, bootstrap, &channels_request, &publication_requests).await?;
+    let mut started_runtimes = std::collections::BTreeSet::new();
+    let mut runtime_starts = std::collections::BTreeMap::new();
+    for route in &routes {
+        let runtime = runtime_key(route);
+        if started_runtimes.insert(runtime.clone()) {
+            let request_id = send_runtime_start(writer, route, &bootstrap.channels_root).await?;
+            runtime_starts.insert(request_id, runtime);
+        }
+    }
+    Ok(StartupPreparation {
+        routes,
+        channels_request,
+        publication_requests,
+        runtime_starts,
+    })
 }
 
 async fn await_startup_management<R>(
@@ -219,6 +251,47 @@ struct HostSession<'a> {
     hub: crate::adapter::AdapterHub,
 }
 
+fn take_deferred_input(
+    deferred: &mut std::collections::VecDeque<crate::adapter::InboundChannelMessage>,
+    started: &std::collections::BTreeSet<(String, String)>,
+    hub: &crate::adapter::AdapterHub,
+) -> Result<Option<crate::adapter::InboundChannelMessage>, HostError> {
+    let Some(index) = deferred.iter().position(|message| {
+        started.contains(&(
+            message.route.agent_id.as_str().to_owned(),
+            message.route.conversation_id.as_str().to_owned(),
+        )) && !hub.runtime_is_active(&message.route)
+    }) else {
+        return Ok(None);
+    };
+    deferred.remove(index).ok_or(HostError::Runtime).map(Some)
+}
+
+async fn handle_adapter_inbound<W>(
+    writer: &mut W,
+    hub: &mut crate::adapter::AdapterHub,
+    deferred: &mut std::collections::VecDeque<crate::adapter::InboundChannelMessage>,
+    started: &std::collections::BTreeSet<(String, String)>,
+    inbound: crate::adapter::InboundChannelMessage,
+) -> Result<(), HostError>
+where
+    W: futures_util::Sink<Message> + Unpin,
+    W::Error: std::fmt::Debug,
+{
+    let runtime = (
+        inbound.route.agent_id.as_str().to_owned(),
+        inbound.route.conversation_id.as_str().to_owned(),
+    );
+    if !started.contains(&runtime) || hub.runtime_is_active(&inbound.route) {
+        if deferred.len() >= crate::adapter::CHANNEL_ADAPTER_INPUT_CORRELATIONS_MAX {
+            return Err(HostError::Runtime);
+        }
+        deferred.push_back(inbound);
+        return Ok(());
+    }
+    dispatch_adapter_input(writer, hub, &inbound).await
+}
+
 async fn run_session<MI, MO, W, R>(
     session: HostSession<'_>,
     management_input: &mut BufReader<MI>,
@@ -244,17 +317,7 @@ where
     let mut started = std::collections::BTreeSet::new();
     let mut deferred = std::collections::VecDeque::new();
     loop {
-        if let Some(index) =
-            deferred
-                .iter()
-                .position(|message: &crate::adapter::InboundChannelMessage| {
-                    started.contains(&(
-                        message.route.agent_id.as_str().to_owned(),
-                        message.route.conversation_id.as_str().to_owned(),
-                    )) && !hub.runtime_is_active(&message.route)
-                })
-        {
-            let message = deferred.remove(index).ok_or(HostError::Runtime)?;
+        if let Some(message) = take_deferred_input(&mut deferred, &started, &hub)? {
             dispatch_adapter_input(ws_writer, &mut hub, &message).await?;
             continue;
         }
@@ -275,18 +338,9 @@ where
             }
             inbound = hub.receive_inbound() => {
                 let Some(inbound) = inbound else { continue; };
-                let runtime = (
-                    inbound.route.agent_id.as_str().to_owned(),
-                    inbound.route.conversation_id.as_str().to_owned(),
-                );
-                if !started.contains(&runtime) || hub.runtime_is_active(&inbound.route) {
-                    if deferred.len() >= crate::adapter::CHANNEL_ADAPTER_INPUT_CORRELATIONS_MAX {
-                        return Err(HostError::Runtime);
-                    }
-                    deferred.push_back(inbound);
-                    continue;
-                }
-                dispatch_adapter_input(ws_writer, &mut hub, &inbound).await?;
+                handle_adapter_inbound(
+                    ws_writer, &mut hub, &mut deferred, &started, inbound,
+                ).await?;
             }
             incoming = ws_reader.next() => {
                 let message = incoming.ok_or(HostError::WebSocket)?

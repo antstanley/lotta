@@ -392,6 +392,27 @@ async fn spawn_generation(
     })
 }
 
+fn validate_ready(frame: &ChildFrame, session: &Generation) -> Result<(), SupervisorError> {
+    match frame {
+        ChildFrame::Ready {
+            correlation_id,
+            pid,
+            owner,
+            channels_probe_success,
+            parent_sibling_probe_denied,
+            ..
+        } if correlation_id == &session.bootstrap_id
+            && *pid == session.pid
+            && owner == &session.owner
+            && *channels_probe_success
+            && *parent_sibling_probe_denied =>
+        {
+            Ok(())
+        }
+        _ => Err(SupervisorError::Startup),
+    }
+}
+
 async fn start_generation(
     config: &ChannelLaunchConfig,
     session: &mut Generation,
@@ -428,21 +449,7 @@ async fn start_generation(
     .await
     .map_err(|_| SupervisorError::Startup)??
     .ok_or(SupervisorError::Startup)?;
-    match &frame {
-        ChildFrame::Ready {
-            correlation_id,
-            pid,
-            owner,
-            channels_probe_success,
-            parent_sibling_probe_denied,
-            ..
-        } if correlation_id == &session.bootstrap_id
-            && *pid == session.pid
-            && owner == &session.owner
-            && *channels_probe_success
-            && *parent_sibling_probe_denied => {}
-        _ => return Err(SupervisorError::Startup),
-    }
+    validate_ready(&frame, session)?;
     dispatch(config, plane, frame, &[])?;
     emit(
         config,
