@@ -12,7 +12,8 @@
     "mode": "sse",
     "headers": {
       "authorization": "<AUTHORIZATION>",
-      "idempotency-key": "<IDEMPOTENCY_KEY>"
+      "idempotency-key": "<IDEMPOTENCY_KEY>",
+      "x-letta-chat-key": "<IDEMPOTENCY_CHAT_KEY>"
     },
     "body": {
       "model": "fixture-visible",
@@ -268,22 +269,29 @@
         {
           "id": "<CONVERSATION_ID_1>",
           "agent_id": "agent-local-visible",
-          "hidden": false,
+          "hidden": null,
           "source_id": null
         }
       ],
-      "deleted": [
-        "<CONVERSATION_ID_1>"
+      "deleted": [],
+      "retained": [
+        {
+          "id": "<CONVERSATION_ID_1>",
+          "agent_id": "agent-local-visible",
+          "hidden": null,
+          "source_id": null
+        }
       ],
       "hidden": [],
       "forks": []
     },
     "cleanup": {
-      "ephemeral_deleted": 1
+      "ephemeral_deleted": 0
     },
     "idempotency": {
       "allocations": 1,
       "admissions": 1,
+      "turns": 1,
       "provider_calls": 1,
       "live_joins": 1,
       "phases": [
@@ -294,6 +302,12 @@
     }
   },
   "relationships": {
+    "chat_completion": [
+      "<CHAT_COMPLETION_ID_1>"
+    ],
+    "timestamp": [
+      "<TIMESTAMP_ID_1>"
+    ],
     "conversation": [
       "<CONVERSATION_ID_1>"
     ]

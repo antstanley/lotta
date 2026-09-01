@@ -84,14 +84,15 @@
       "created": [
         {
           "id": "<CONVERSATION_ID_1>",
-          "agent_id": "agent-local-visible",
-          "hidden": false,
+          "agent_id": null,
+          "hidden": null,
           "source_id": null
         }
       ],
       "deleted": [
         "<CONVERSATION_ID_1>"
       ],
+      "retained": [],
       "hidden": [],
       "forks": []
     },
@@ -100,7 +101,8 @@
     },
     "idempotency": {
       "allocations": 1,
-      "admissions": 1,
+      "admissions": 0,
+      "turns": 0,
       "provider_calls": 1,
       "live_joins": 0,
       "phases": [
@@ -109,6 +111,15 @@
     }
   },
   "relationships": {
+    "response": [
+      "<RESPONSE_ID_1>"
+    ],
+    "timestamp": [
+      "<TIMESTAMP_ID_1>"
+    ],
+    "msg": [
+      "<MSG_ID_1>"
+    ],
     "conversation": [
       "<CONVERSATION_ID_1>"
     ]

@@ -14,6 +14,14 @@ async fn run_named_case(name: &str) {
     for entry in order {
         let fixture = sanitize::load_fixture(entry);
         let (actual, observable, relationships) = harness.execute(&fixture).await;
+        relationships
+            .validate()
+            .expect("actual relationship registry");
+        fixture
+            .relationships
+            .validate()
+            .expect("fixture relationship registry");
+        assert_identity_surfaces(&actual, &relationships);
         comparator::compare(&fixture.name, &fixture.mode, &fixture.expected, &actual);
         assert_eq!(
             observable, fixture.observable,
@@ -42,6 +50,58 @@ fn dependency_order<'a>(index: &'a FixtureIndex, selected: &'a IndexCase) -> Vec
     }
     order.push(selected);
     order
+}
+
+fn assert_identity_surfaces(actual: &Value, registry: &RelationshipMap) {
+    let allowed = registry
+        .0
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut maps = Vec::new();
+    collect_identity_surfaces(actual, "", &allowed, &mut maps);
+    assert!(!maps.is_empty(), "response identity surface missing");
+    for map in maps {
+        for token in map.0.values().flatten() {
+            assert!(
+                allowed.contains(token),
+                "response registry split token {token}"
+            );
+        }
+    }
+}
+
+fn collect_identity_surfaces(
+    value: &Value,
+    key: &str,
+    allowed: &BTreeSet<String>,
+    maps: &mut Vec<RelationshipMap>,
+) {
+    match value {
+        Value::String(text) if text.starts_with('<') && text.contains("_ID_") => {
+            assert!(allowed.contains(text), "unregistered dynamic token {text}");
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_identity_surfaces(child, key, allowed, maps);
+            }
+        }
+        Value::Object(values) => {
+            if let Some(dynamic) = values.get("dynamic_map") {
+                let map: RelationshipMap =
+                    serde_json::from_value(dynamic.clone()).expect("typed response registry");
+                map.validate().expect("response registry numbering");
+                maps.push(map);
+            }
+            for (child_key, child) in values {
+                collect_identity_surfaces(child, child_key, allowed, maps);
+            }
+        }
+        _ => {
+            let _ = key;
+        }
+    }
 }
 
 #[test]
@@ -156,3 +216,29 @@ golden_case!(fixture_responses_stream_sse, "responses_stream_sse");
 golden_case!(fixture_responses_stored_json, "responses_stored_json");
 golden_case!(fixture_responses_previous_json, "responses_previous_json");
 golden_case!(fixture_responses_no_idempotency, "responses_no_idempotency");
+
+#[cfg(test)]
+mod identity_mutations {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn cursor_provider_and_sse_json_identity_mismatches_fail() {
+        let registry = RelationshipMap(BTreeMap::from([(
+            DynamicKind::Msg,
+            vec!["<MSG_ID_1>".to_owned()],
+        )]));
+        let map = serde_json::to_value(&registry).expect("registry JSON");
+        for actual in [
+            json!({"body":{"id":"<MSG_ID_2>"},"dynamic_map":map.clone()}),
+            json!({"events":[{"data":{"id":"<MSG_ID_2>"}}],"dynamic_map":map.clone()}),
+            json!({"provider":{"id":"<MSG_ID_2>"},"dynamic_map":map.clone()}),
+            json!({"cursor":{"id":"<MSG_ID_2>"},"dynamic_map":map.clone()}),
+        ] {
+            let failure = std::panic::catch_unwind(|| {
+                assert_identity_surfaces(&actual, &registry);
+            });
+            assert!(failure.is_err(), "identity surface mismatch escaped");
+        }
+    }
+}

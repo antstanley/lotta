@@ -96,6 +96,14 @@
         }
       ],
       "deleted": [],
+      "retained": [
+        {
+          "id": "<CONVERSATION_ID_1>",
+          "agent_id": "agent-local-visible",
+          "hidden": true,
+          "source_id": "<CONVERSATION_ID_2>"
+        }
+      ],
       "hidden": [
         {
           "id": "<CONVERSATION_ID_1>",
@@ -116,7 +124,8 @@
     },
     "idempotency": {
       "allocations": 1,
-      "admissions": 1,
+      "admissions": 2,
+      "turns": 2,
       "provider_calls": 1,
       "live_joins": 0,
       "phases": [
@@ -125,6 +134,15 @@
     }
   },
   "relationships": {
+    "stored_response": [
+      "<STORED_RESPONSE_ID_1>"
+    ],
+    "timestamp": [
+      "<TIMESTAMP_ID_1>"
+    ],
+    "msg": [
+      "<MSG_ID_1>"
+    ],
     "conversation": [
       "<CONVERSATION_ID_1>",
       "<CONVERSATION_ID_2>"

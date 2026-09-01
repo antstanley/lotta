@@ -57,6 +57,7 @@
     "conversations": {
       "created": [],
       "deleted": [],
+      "retained": [],
       "hidden": [],
       "forks": []
     },
@@ -66,6 +67,7 @@
     "idempotency": {
       "allocations": 0,
       "admissions": 0,
+      "turns": 0,
       "provider_calls": 0,
       "live_joins": 0,
       "phases": [
@@ -73,6 +75,12 @@
       ]
     }
   },
-  "relationships": {},
+  "relationships": {
+    "timestamp": [
+      "<TIMESTAMP_ID_1>",
+      "<TIMESTAMP_ID_2>",
+      "<TIMESTAMP_ID_3>"
+    ]
+  },
   "cursor": null
 }

@@ -1,7 +1,8 @@
 use crate::normalize::{self, NormalizedResponse, Normalizer};
 use crate::schema::{
     AUTHORIZATION, CHILD_TIMEOUT, CleanupDelta, ConversationDelta, ConversationLink, Execution,
-    Fixture, FixtureRequest, ForkLink, IdempotencyDelta, Observable, ProviderCall, TOKEN_SHA256,
+    FORK_SOURCE_FIELD, Fixture, FixtureRequest, ForkLink, IdempotencyDelta, IdempotencyPhase,
+    Observable, ProviderCall, RelationshipMap, TOKEN_SHA256,
 };
 use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::post};
 use base64::Engine as _;
@@ -214,89 +215,117 @@ impl Harness {
         let _ = (&mut self.provider.task).await;
     }
 
-    pub async fn execute(
-        &mut self,
-        fixture: &Fixture,
-    ) -> (Value, Observable, BTreeMap<String, Vec<String>>) {
+    pub async fn execute(&mut self, fixture: &Fixture) -> (Value, Observable, RelationshipMap) {
         let provider_before = self.provider.count();
-        let records_before = conversation_records(&self.root.0);
+        let before = StoreSnapshot::capture(&self.root.0);
         let mut normalizer = Normalizer::default();
-        let actual = match &fixture.execution {
+        let execution = match &fixture.execution {
             Execution::Single { .. } => self.single(fixture, &mut normalizer).await,
             Execution::Repeat { count } => self.repeat(fixture, *count, &mut normalizer).await,
             Execution::IdempotentLiveJoin => self.live_join(fixture, &mut normalizer).await,
         };
-        let records_after = conversation_records(&self.root.0);
+        let after = StoreSnapshot::capture(&self.root.0);
         let observable = self.observable(
-            fixture,
             provider_before,
-            &records_before,
-            &records_after,
+            &before,
+            &after,
+            execution.phases,
             &mut normalizer,
         );
-        (actual, observable, normalizer.relationships())
+        (execution.value, observable, normalizer.relationships())
     }
 
-    async fn single(&mut self, fixture: &Fixture, normalizer: &mut Normalizer) -> Value {
+    async fn single(&mut self, fixture: &Fixture, normalizer: &mut Normalizer) -> ExecutionResult {
         let output = self.send(&fixture.request, normalizer).await;
         if let Some(id) = output.stored_id {
             let decoded = assert_cursor(&id, &self.root.0);
-            if matches!(
-                fixture.execution,
-                Execution::Single {
-                    capture_cursor: true,
-                    ..
-                }
-            ) {
-                self.stored_conversation_id =
-                    decoded["conversation_id"].as_str().map(str::to_owned);
-                self.stored_response_id = Some(id);
-            }
-            if let Some(expected) = &fixture.cursor {
-                let mut cursor = decoded;
-                normalizer.value(&mut cursor).expect("normalize cursor");
-                assert_eq!(&cursor, expected, "cursor fixture");
-            }
+            self.inspect_cursor(fixture, &id, &decoded, normalizer);
         }
-        output.value
+        if matches!(
+            fixture.execution,
+            Execution::Single {
+                previous_cursor: Some(_),
+                ..
+            }
+        ) {
+            assert_previous_fork(
+                &self.root.0,
+                self.stored_conversation_id
+                    .as_deref()
+                    .expect("cursor source"),
+            );
+        }
+        ExecutionResult::ordinary(output.value)
     }
 
-    async fn repeat(&self, fixture: &Fixture, count: usize, normalizer: &mut Normalizer) -> Value {
+    fn inspect_cursor(
+        &mut self,
+        fixture: &Fixture,
+        id: &str,
+        decoded: &Value,
+        normalizer: &mut Normalizer,
+    ) {
+        if matches!(
+            fixture.execution,
+            Execution::Single {
+                capture_cursor: true,
+                ..
+            }
+        ) {
+            self.stored_conversation_id = decoded["conversation_id"].as_str().map(str::to_owned);
+            self.stored_response_id = Some(id.to_owned());
+        }
+        if let Some(expected) = &fixture.cursor {
+            let mut cursor = decoded.clone();
+            normalizer.value(&mut cursor).expect("normalize cursor");
+            assert_eq!(&cursor, expected, "cursor fixture");
+        }
+    }
+
+    async fn repeat(
+        &self,
+        fixture: &Fixture,
+        count: usize,
+        normalizer: &mut Normalizer,
+    ) -> ExecutionResult {
         assert!((1..=3).contains(&count), "repeat bound");
         let mut attempts = Vec::with_capacity(count);
         for _ in 0..count {
             attempts.push(self.send(&fixture.request, normalizer).await.value);
         }
-        json!({"attempts":attempts})
+        ExecutionResult::ordinary(json!({"attempts":attempts}))
     }
 
-    async fn live_join(&self, fixture: &Fixture, normalizer: &mut Normalizer) -> Value {
+    async fn live_join(&self, fixture: &Fixture, normalizer: &mut Normalizer) -> ExecutionResult {
         self.provider.hold();
         let target = self.provider.count() + 1;
         let first = self.send_raw(&fixture.request).await;
         self.provider.wait_count(target).await;
+        let owner = StoreSnapshot::capture(&self.root.0);
         let joined = self.send_raw(&fixture.request).await;
-        assert_eq!(
-            self.provider.count(),
-            target,
-            "second request joined active claim"
-        );
+        let joined_snapshot = StoreSnapshot::capture(&self.root.0);
+        assert_eq!(joined.status(), StatusCode::OK, "live join accepted");
+        assert_eq!(self.provider.count(), target, "live join provider count");
+        assert_eq!(owner, joined_snapshot, "live join changed durable input");
         self.provider.release();
-        let first = normalize::response(first, true, normalizer)
-            .await
-            .expect("first SSE")
-            .value;
-        let joined = normalize::response(joined, true, normalizer)
-            .await
-            .expect("joined SSE")
-            .value;
+        let first = finish_sse(first, normalizer, "first SSE").await;
+        let joined = finish_sse(joined, normalizer, "joined SSE").await;
+        let settled_before = StoreSnapshot::capture(&self.root.0);
         let settled = self.send(&fixture.request, normalizer).await.value;
+        let settled_after = StoreSnapshot::capture(&self.root.0);
+        assert_eq!(self.provider.count(), target, "settled provider count");
         assert_eq!(
-            self.provider.count(),
-            target,
-            "settled replay provider count"
+            settled_before, settled_after,
+            "settled replay changed store"
         );
-        json!({"attempts":[first, joined, settled]})
+        ExecutionResult {
+            value: json!({"attempts":[first, joined, settled]}),
+            phases: vec![
+                IdempotencyPhase::OwnerActive,
+                IdempotencyPhase::LiveJoin,
+                IdempotencyPhase::SettledReplay,
+            ],
+        }
     }
 
     async fn send(
@@ -312,27 +341,17 @@ impl Harness {
 
     async fn send_raw(&self, request: &FixtureRequest) -> reqwest::Response {
         let method = reqwest::Method::from_bytes(request.method.as_bytes()).expect("method");
+        let url = format!("http://127.0.0.1:{}{}", self.server.port, request.path);
         let mut builder = self
             .client
-            .request(
-                method,
-                format!("http://127.0.0.1:{}{}", self.server.port, request.path),
-            )
+            .request(method, url)
             .header("authorization", AUTHORIZATION);
         for (name, value) in &request.headers {
             if name != "authorization" {
                 builder = builder.header(name, value);
             }
         }
-        if let Some(mut body) = request.body.clone() {
-            if body.get("previous_response_id").and_then(Value::as_str)
-                == Some("<FROM:responses_stored_json>")
-            {
-                body["previous_response_id"] =
-                    json!(self.stored_response_id.as_ref().expect("cursor dependency"));
-            }
-            builder = builder.json(&body);
-        }
+        builder = materialize_body(builder, request, self.stored_response_id.as_ref());
         tokio::time::timeout(CHILD_TIMEOUT, builder.send())
             .await
             .expect("HTTP timeout")
@@ -341,10 +360,10 @@ impl Harness {
 
     fn observable(
         &self,
-        fixture: &Fixture,
         provider_before: usize,
-        before: &BTreeMap<String, Value>,
-        after: &BTreeMap<String, Value>,
+        before: &StoreSnapshot,
+        after: &StoreSnapshot,
+        phases: Vec<IdempotencyPhase>,
         normalizer: &mut Normalizer,
     ) -> Observable {
         let calls = self
@@ -353,42 +372,90 @@ impl Harness {
             .iter()
             .map(canonical_provider_call)
             .collect::<Vec<_>>();
-        let conversations = conversation_delta(
-            fixture,
-            before,
-            after,
-            normalizer,
-            &self.stored_conversation_id,
-        );
-        let idempotency = match fixture.execution {
-            Execution::IdempotentLiveJoin => IdempotencyDelta {
-                allocations: 1,
-                admissions: 1,
-                provider_calls: calls.len(),
-                live_joins: 1,
-                phases: vec![
-                    "owner_active".into(),
-                    "live_join".into(),
-                    "settled_replay".into(),
-                ],
-            },
-            _ => IdempotencyDelta {
-                allocations: conversations.created.len(),
-                admissions: calls.len(),
-                provider_calls: calls.len(),
-                live_joins: 0,
-                phases: vec!["not_applicable".into()],
-            },
-        };
+        let conversations = conversation_delta(before, after, normalizer);
+        let allocations = allocated_ids(before.sequence, after.sequence).len();
+        let admissions = role_delta(before, after, "user");
+        let turns = role_delta(before, after, "assistant");
+        let live_joins = usize::from(phases.contains(&IdempotencyPhase::LiveJoin));
         Observable {
-            provider_calls: calls,
+            provider_calls: calls.clone(),
             cleanup: CleanupDelta {
                 ephemeral_deleted: conversations.deleted.len(),
             },
             conversations,
-            idempotency,
+            idempotency: IdempotencyDelta {
+                allocations,
+                admissions,
+                turns,
+                provider_calls: calls.len(),
+                live_joins,
+                phases,
+            },
         }
     }
+}
+
+struct ExecutionResult {
+    value: Value,
+    phases: Vec<IdempotencyPhase>,
+}
+
+impl ExecutionResult {
+    fn ordinary(value: Value) -> Self {
+        Self {
+            value,
+            phases: vec![IdempotencyPhase::NotApplicable],
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct StoreSnapshot {
+    sequence: u64,
+    records: BTreeMap<String, Value>,
+    transcripts: BTreeMap<String, Vec<Value>>,
+}
+
+impl StoreSnapshot {
+    fn capture(root: &Path) -> Self {
+        let records = conversation_records(root);
+        let transcripts = records
+            .keys()
+            .map(|id| (id.clone(), transcript_records(root, id)))
+            .collect();
+        Self {
+            sequence: allocation_sequence(root),
+            records,
+            transcripts,
+        }
+    }
+}
+
+async fn finish_sse(
+    response: reqwest::Response,
+    normalizer: &mut Normalizer,
+    context: &str,
+) -> Value {
+    normalize::response(response, true, normalizer)
+        .await
+        .unwrap_or_else(|error| panic!("{context}: {error}"))
+        .value
+}
+
+fn materialize_body(
+    mut builder: reqwest::RequestBuilder,
+    request: &FixtureRequest,
+    stored: Option<&String>,
+) -> reqwest::RequestBuilder {
+    if let Some(mut body) = request.body.clone() {
+        if body.get("previous_response_id").and_then(Value::as_str)
+            == Some("<FROM:responses_stored_json>")
+        {
+            body["previous_response_id"] = json!(stored.expect("cursor dependency"));
+        }
+        builder = builder.json(&body);
+    }
+    builder
 }
 
 fn canonical_provider_call(value: &Value) -> ProviderCall {
@@ -427,68 +494,77 @@ fn approved_placeholder(value: &str) -> bool {
 }
 
 fn conversation_delta(
-    fixture: &Fixture,
-    before: &BTreeMap<String, Value>,
-    after: &BTreeMap<String, Value>,
+    before: &StoreSnapshot,
+    after: &StoreSnapshot,
     normalizer: &mut Normalizer,
-    stored_source: &Option<String>,
 ) -> ConversationDelta {
-    let mut created_ids = after
-        .keys()
-        .filter(|id| !before.contains_key(*id))
+    let ids = allocated_ids(before.sequence, after.sequence);
+    let created = ids
+        .iter()
+        .map(|id| conversation_link(id, after.records.get(id)))
+        .collect::<Vec<_>>();
+    let retained = created
+        .iter()
+        .filter(|link| after.records.contains_key(&link.id))
         .cloned()
         .collect::<Vec<_>>();
-    let expected_created = fixture.observable.conversations.created.len();
-    while created_ids.len() < expected_created {
-        created_ids.push(format!("conversation-{}", created_ids.len() + 1));
-    }
-    let mut created = Vec::new();
-    for (index, id) in created_ids.into_iter().take(expected_created).enumerate() {
-        let record = after.get(&id);
-        let expected = &fixture.observable.conversations.created[index];
-        let source = if expected.source_id.is_some() {
-            stored_source.clone()
-        } else {
-            None
-        };
-        created.push(ConversationLink {
-            id,
-            agent_id: record
-                .and_then(|value| value["agent_id"].as_str().map(str::to_owned))
-                .or_else(|| expected.agent_id.clone()),
-            hidden: record
-                .and_then(|value| value["hidden"].as_bool())
-                .unwrap_or(expected.hidden),
-            source_id: source,
-        });
-    }
-    let deleted_count = fixture.observable.conversations.deleted.len();
-    let deleted = created
+    let deleted = ids
         .iter()
-        .take(deleted_count)
-        .map(|item| item.id.clone())
-        .collect::<Vec<_>>();
-    let hidden = created
-        .iter()
-        .filter(|item| item.hidden)
+        .filter(|id| !after.records.contains_key(*id))
         .cloned()
         .collect::<Vec<_>>();
-    let forks = created
+    let hidden = retained
         .iter()
-        .filter_map(|item| {
-            item.source_id.as_ref().map(|source| ForkLink {
+        .filter(|link| link.hidden == Some(true))
+        .cloned()
+        .collect::<Vec<_>>();
+    let forks = retained
+        .iter()
+        .filter_map(|link| {
+            link.source_id.as_ref().map(|source| ForkLink {
                 source_id: source.clone(),
-                target_id: item.id.clone(),
+                target_id: link.id.clone(),
             })
         })
         .collect::<Vec<_>>();
-    let mut value = serde_json::to_value(ConversationDelta {
-        created,
-        deleted,
-        hidden,
-        forks,
-    })
-    .expect("delta value");
+    normalize_delta(
+        ConversationDelta {
+            created,
+            deleted,
+            retained,
+            hidden,
+            forks,
+        },
+        normalizer,
+    )
+}
+
+fn allocated_ids(before: u64, after: u64) -> Vec<String> {
+    assert!(after >= before, "allocation sequence regressed");
+    ((before + 1)..=after)
+        .map(|sequence| format!("local-conv-{sequence}"))
+        .collect()
+}
+
+fn conversation_link(id: &str, record: Option<&Value>) -> ConversationLink {
+    ConversationLink {
+        id: id.to_owned(),
+        agent_id: record
+            .and_then(|value| value.get("agent_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        hidden: record
+            .and_then(|value| value.get("hidden"))
+            .and_then(Value::as_bool),
+        source_id: record
+            .and_then(|value| value.get(FORK_SOURCE_FIELD))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    }
+}
+
+fn normalize_delta(delta: ConversationDelta, normalizer: &mut Normalizer) -> ConversationDelta {
+    let mut value = serde_json::to_value(delta).expect("delta value");
     normalizer.value(&mut value).expect("normalize delta");
     serde_json::from_value(value).expect("normalized delta")
 }
@@ -512,6 +588,59 @@ fn conversation_records(root: &Path) -> BTreeMap<String, Value> {
     records
 }
 
+fn allocation_sequence(root: &Path) -> u64 {
+    let path = root.join("store/.conversation-sequence");
+    match fs::read_to_string(path) {
+        Ok(value) => value.trim().parse().expect("conversation sequence"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => panic!("conversation sequence: {error}"),
+    }
+}
+
+fn transcript_records(root: &Path, conversation: &str) -> Vec<Value> {
+    let key = format!("conversation:{conversation}");
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
+    let path = root
+        .join("store/conversations")
+        .join(encoded)
+        .join("messages.jsonl");
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(|line| serde_json::from_str(line).expect("canonical transcript row"))
+        .collect()
+}
+
+fn role_delta(before: &StoreSnapshot, after: &StoreSnapshot, role: &str) -> usize {
+    let old = before
+        .transcripts
+        .values()
+        .map(|rows| count_role(rows, role))
+        .sum::<usize>();
+    let new = after
+        .transcripts
+        .values()
+        .map(|rows| count_role(rows, role))
+        .sum::<usize>();
+    new.saturating_sub(old)
+}
+
+fn count_role(rows: &[Value], wanted: &str) -> usize {
+    rows.iter().filter(|row| contains_role(row, wanted)).count()
+}
+
+fn contains_role(value: &Value, wanted: &str) -> bool {
+    match value {
+        Value::Object(fields) => {
+            fields.get("role").and_then(Value::as_str) == Some(wanted)
+                || fields.values().any(|child| contains_role(child, wanted))
+        }
+        Value::Array(values) => values.iter().any(|child| contains_role(child, wanted)),
+        _ => false,
+    }
+}
+
 fn assert_cursor(id: &str, root: &Path) -> Value {
     let payload = id
         .strip_prefix("resp_letta_")
@@ -521,25 +650,35 @@ fn assert_cursor(id: &str, root: &Path) -> Value {
         .decode(payload)
         .expect("cursor base64");
     let value: Value = serde_json::from_slice(&bytes).expect("cursor JSON");
-    assert_eq!(value.as_object().expect("cursor object").len(), 4);
-    assert_eq!(value["version"], 1);
-    let nonce = value["nonce"].as_str().expect("cursor nonce");
-    assert_eq!(
-        uuid::Uuid::parse_str(nonce)
-            .expect("nonce UUID")
-            .get_version_num(),
-        4
-    );
-    assert_eq!(value["agent_id"], "agent-local-visible");
+    validate_cursor_shape(&value);
     let conversation = value["conversation_id"]
         .as_str()
         .expect("cursor conversation");
-    let records = conversation_records(root);
-    assert_eq!(
-        records.get(conversation).expect("canonical cursor record")["id"],
-        conversation
-    );
+    let record = conversation_records(root)
+        .remove(conversation)
+        .expect("canonical cursor record");
+    assert_eq!(record["id"], value["conversation_id"]);
+    assert_eq!(record["agent_id"], value["agent_id"]);
     value
+}
+
+fn validate_cursor_shape(value: &Value) {
+    assert_eq!(value.as_object().expect("cursor object").len(), 4);
+    assert_eq!(value["version"], 1);
+    let nonce = value["nonce"].as_str().expect("cursor nonce");
+    let parsed = uuid::Uuid::parse_str(nonce).expect("nonce UUID");
+    assert_eq!(parsed.get_version_num(), 4);
+    assert_eq!(parsed.hyphenated().to_string(), nonce);
+}
+
+fn assert_previous_fork(root: &Path, source: &str) {
+    let snapshot = StoreSnapshot::capture(root);
+    let (_, record) = snapshot.records.last_key_value().expect("fork record");
+    assert_eq!(record["hidden"], true, "previous response fork visibility");
+    assert_eq!(
+        record[FORK_SOURCE_FIELD], source,
+        "previous response raw cursor source"
+    );
 }
 
 async fn seed(root: &Path, provider_port: u16) {

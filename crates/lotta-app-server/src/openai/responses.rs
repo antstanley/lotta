@@ -82,7 +82,7 @@ pub async fn respond(
     let meta = output::ResponseMeta {
         agent_id: agent.id.clone(),
         id: format!("resp_{}", fresh_uuid()),
-        created_at: state.chat.clock.now().as_utc().timestamp(),
+        created_at: state.created_at,
         model: request.model.clone(),
         store: request.store,
     };

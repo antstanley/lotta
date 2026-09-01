@@ -79,7 +79,7 @@
           "content-type": "application/json"
         },
         "body": {
-          "id": "<RESPONSE_ID_1>",
+          "id": "<RESPONSE_ID_2>",
           "object": "response",
           "created_at": "<TIMESTAMP_ID_1>",
           "status": "completed",
@@ -87,7 +87,7 @@
           "output": [
             {
               "type": "message",
-              "id": "<MSG_ID_1>",
+              "id": "<MSG_ID_2>",
               "status": "completed",
               "role": "assistant",
               "content": [
@@ -112,13 +112,15 @@
         },
         "dynamic_map": {
           "response": [
-            "<RESPONSE_ID_1>"
+            "<RESPONSE_ID_1>",
+            "<RESPONSE_ID_2>"
           ],
           "timestamp": [
             "<TIMESTAMP_ID_1>"
           ],
           "msg": [
-            "<MSG_ID_1>"
+            "<MSG_ID_1>",
+            "<MSG_ID_2>"
           ]
         }
       }
@@ -147,14 +149,14 @@
       "created": [
         {
           "id": "<CONVERSATION_ID_1>",
-          "agent_id": "agent-local-visible",
-          "hidden": false,
+          "agent_id": null,
+          "hidden": null,
           "source_id": null
         },
         {
           "id": "<CONVERSATION_ID_2>",
-          "agent_id": "agent-local-visible",
-          "hidden": false,
+          "agent_id": null,
+          "hidden": null,
           "source_id": null
         }
       ],
@@ -162,6 +164,7 @@
         "<CONVERSATION_ID_1>",
         "<CONVERSATION_ID_2>"
       ],
+      "retained": [],
       "hidden": [],
       "forks": []
     },
@@ -170,7 +173,8 @@
     },
     "idempotency": {
       "allocations": 2,
-      "admissions": 2,
+      "admissions": 0,
+      "turns": 0,
       "provider_calls": 2,
       "live_joins": 0,
       "phases": [
@@ -179,6 +183,17 @@
     }
   },
   "relationships": {
+    "response": [
+      "<RESPONSE_ID_1>",
+      "<RESPONSE_ID_2>"
+    ],
+    "timestamp": [
+      "<TIMESTAMP_ID_1>"
+    ],
+    "msg": [
+      "<MSG_ID_1>",
+      "<MSG_ID_2>"
+    ],
     "conversation": [
       "<CONVERSATION_ID_1>",
       "<CONVERSATION_ID_2>"

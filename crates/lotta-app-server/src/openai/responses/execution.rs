@@ -71,6 +71,7 @@ pub struct ResponsesState {
     setup_locks: StdMutex<HashMap<String, Arc<SetupLock>>>,
     conversations: Arc<dyn crate::ws::conversations::ConversationCommandRepository>,
     fork_supported: bool,
+    pub(crate) created_at: i64,
 }
 
 impl ResponsesState {
@@ -96,6 +97,7 @@ impl ResponsesState {
         owner_capacity: usize,
     ) -> Self {
         let fork_supported = repository.supports_hidden_fork();
+        let created_at = chat.clock.now().as_utc().timestamp();
         Self {
             chat,
             owners: Mutex::new(JoinSet::new()),
@@ -103,6 +105,7 @@ impl ResponsesState {
             setup_locks: StdMutex::new(HashMap::new()),
             conversations: repository,
             fork_supported,
+            created_at,
         }
     }
 
@@ -408,8 +411,6 @@ async fn cleanup(
         .teardown_ephemeral_runtime(scope)
         .await
         .map_err(|_| ())?;
-    // Local repository artifact deletion shares only the short setup critical section,
-    // preventing it from racing prompt compilation for another conversation.
     let key = setup_key(agent);
     let _lease = state.acquire_setup(&key).await;
     state

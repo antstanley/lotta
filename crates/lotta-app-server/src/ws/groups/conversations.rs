@@ -118,6 +118,7 @@ const RETRIEVE_FAILURE: &str = "Failed to retrieve conversation";
 const UPDATE_FAILURE: &str = "Failed to update conversation";
 const RECOMPILE_FAILURE: &str = "Failed to recompile conversation";
 const FORK_FAILURE: &str = "Failed to fork conversation";
+const OPENAI_FORK_SOURCE_FIELD: &str = "openai_fork_source_conversation_id";
 const MESSAGES_FAILURE: &str = "Failed to list conversation messages";
 const COMPACT_FAILURE: &str = "Failed to compact conversation";
 
@@ -2494,8 +2495,16 @@ fn build_forked_record(
         context_window_limit: source.context_window_limit,
         hidden: hidden.or(source.hidden),
         tags: source.tags.clone(),
-        extras: EntityExtras::default(),
+        extras: fork_source_extras(source)?,
     })
+}
+
+fn fork_source_extras(source: &Conversation) -> Result<EntityExtras, ()> {
+    let values = BTreeMap::from([(
+        OPENAI_FORK_SOURCE_FIELD.to_owned(),
+        serde_json::Value::String(source.id.as_str().to_owned()),
+    )]);
+    EntityExtras::new(values, &[]).map_err(|_| ())
 }
 
 /// Converts one pinned sliding-window percentage (a fraction in `0..=1`) into
