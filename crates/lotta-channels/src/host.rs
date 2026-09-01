@@ -57,7 +57,14 @@ pub async fn run() -> Result<(), HostError> {
     run_composed(context).await
 }
 
-async fn run_composed(context: crate::adapter::HostContext) -> Result<(), HostError> {
+/// Runs the real child host with an explicitly composed adapter factory context.
+///
+/// This is the production integration boundary used by dedicated-listener tests and
+/// by future concrete adapter composition; it does not replace either transport.
+///
+/// # Errors
+/// Returns the same bounded host failures as [`run`].
+pub async fn run_composed(context: crate::adapter::HostContext) -> Result<(), HostError> {
     let mut management_input = BufReader::new(stdin());
     let bootstrap = read_bootstrap(&mut management_input).await?;
     verify_working_root(&bootstrap.channels_root)?;
@@ -98,8 +105,15 @@ async fn run_composed(context: crate::adapter::HostContext) -> Result<(), HostEr
         &publication_requests,
     )
     .await?;
+    let mut started_runtimes = std::collections::BTreeSet::new();
+    let mut runtime_starts = std::collections::BTreeMap::new();
     for route in &routes {
-        send_runtime_start(&mut ws_writer, route, &bootstrap.channels_root).await?;
+        let runtime = runtime_key(route);
+        if started_runtimes.insert(runtime.clone()) {
+            let request_id =
+                send_runtime_start(&mut ws_writer, route, &bootstrap.channels_root).await?;
+            runtime_starts.insert(request_id, runtime);
+        }
     }
     let hub =
         crate::adapter::AdapterHub::compose(&routes, &context).map_err(|_| HostError::Runtime)?;
@@ -108,6 +122,7 @@ async fn run_composed(context: crate::adapter::HostContext) -> Result<(), HostEr
         routes,
         channels_request: &channels_request,
         publication_requests,
+        runtime_starts,
         hub,
     };
     run_session(
@@ -164,6 +179,7 @@ struct HostSession<'a> {
     routes: Vec<RoutedRuntime>,
     channels_request: &'a str,
     publication_requests: std::collections::BTreeSet<String>,
+    runtime_starts: std::collections::BTreeMap<String, crate::control_plane::RuntimeKey>,
     hub: crate::adapter::AdapterHub,
 }
 
@@ -186,10 +202,26 @@ where
         routes,
         channels_request,
         publication_requests,
+        mut runtime_starts,
         mut hub,
     } = session;
     let mut started = std::collections::BTreeSet::new();
+    let mut deferred = std::collections::VecDeque::new();
     loop {
+        if let Some(index) =
+            deferred
+                .iter()
+                .position(|message: &crate::adapter::InboundChannelMessage| {
+                    started.contains(&(
+                        message.route.agent_id.as_str().to_owned(),
+                        message.route.conversation_id.as_str().to_owned(),
+                    )) && !hub.runtime_is_active(&message.route)
+                })
+        {
+            let message = deferred.remove(index).ok_or(HostError::Runtime)?;
+            dispatch_adapter_input(ws_writer, &mut hub, &message).await?;
+            continue;
+        }
         tokio::select! {
             frame = read_line::<_, ParentFrame>(management_input) => {
                 let Some(frame) = frame? else { return Ok(()); };
@@ -205,10 +237,20 @@ where
                     return Ok(());
                 }
             }
-            inbound = hub.receive_inbound(), if !started.is_empty() => {
+            inbound = hub.receive_inbound() => {
                 let Some(inbound) = inbound else { continue; };
-                let request_id = send_adapter_input(ws_writer, &inbound).await?;
-                hub.record_input(request_id, &inbound.route).map_err(|_| HostError::Runtime)?;
+                let runtime = (
+                    inbound.route.agent_id.as_str().to_owned(),
+                    inbound.route.conversation_id.as_str().to_owned(),
+                );
+                if !started.contains(&runtime) || hub.runtime_is_active(&inbound.route) {
+                    if deferred.len() >= crate::adapter::CHANNEL_ADAPTER_INPUT_CORRELATIONS_MAX {
+                        return Err(HostError::Runtime);
+                    }
+                    deferred.push_back(inbound);
+                    continue;
+                }
+                dispatch_adapter_input(ws_writer, &mut hub, &inbound).await?;
             }
             incoming = ws_reader.next() => {
                 let message = incoming.ok_or(HostError::WebSocket)?
@@ -219,6 +261,7 @@ where
                     &routes,
                     &mut hub,
                     &mut started,
+                    &mut runtime_starts,
                 ).await?;
             }
         }
@@ -231,6 +274,7 @@ async fn handle_websocket_message<W>(
     routes: &[RoutedRuntime],
     hub: &mut crate::adapter::AdapterHub,
     started: &mut std::collections::BTreeSet<(String, String)>,
+    runtime_starts: &mut std::collections::BTreeMap<String, crate::control_plane::RuntimeKey>,
 ) -> Result<(), HostError>
 where
     W: futures_util::Sink<Message> + Unpin,
@@ -245,7 +289,19 @@ where
             let value: serde_json::Value =
                 serde_json::from_str(&text).map_err(|_| HostError::WebSocket)?;
             if value["type"] == "runtime_start_response" {
-                started.insert(runtime_value_key(&value)?);
+                let request_id = value["request_id"].as_str().ok_or(HostError::Runtime)?;
+                let expected = runtime_starts
+                    .remove(request_id)
+                    .ok_or(HostError::Runtime)?;
+                let actual = runtime_value_key(&value)?;
+                if expected.agent_id != actual.0
+                    || expected.conversation_id != actual.1
+                    || value.get("success") == Some(&serde_json::Value::Bool(false))
+                    || value.get("error").is_some_and(|error| !error.is_null())
+                    || !started.insert(actual)
+                {
+                    return Err(HostError::Runtime);
+                }
                 return Ok(());
             }
             if hub
@@ -299,10 +355,8 @@ where
                 )
                 .await?;
             }
-            let close = ws_writer
-                .send(Message::Close(None))
-                .await
-                .map_err(|_| HostError::WebSocket);
+            // Acknowledge the management request before touching the independent
+            // Runtime transport. A dropped WebSocket must not erase a graceful ack.
             write_line(
                 output,
                 &ChildFrame::ShutdownComplete {
@@ -312,7 +366,10 @@ where
                 },
             )
             .await?;
-            close?;
+            ws_writer
+                .send(Message::Close(None))
+                .await
+                .map_err(|_| HostError::WebSocket)?;
             Ok(true)
         }
         ParentFrame::ChannelsResult {
@@ -470,17 +527,18 @@ async fn send_runtime_start<W>(
     writer: &mut W,
     runtime: &RoutedRuntime,
     root: &Path,
-) -> Result<(), HostError>
+) -> Result<String, HostError>
 where
     W: futures_util::Sink<Message> + Unpin,
     W::Error: std::fmt::Debug,
 {
     let root = root.to_str().ok_or(HostError::Runtime)?;
+    let request_id = random_request_id("runtime-start")?;
     send_json(
         writer,
         serde_json::json!({
             "type": "runtime_start",
-            "request_id": random_request_id("runtime-start")?,
+            "request_id": request_id.clone(),
             "agent_id": runtime.agent_id,
             "conversation_id": runtime.conversation_id,
             "cwd": root,
@@ -490,23 +548,27 @@ where
             "client_info": {"name": "lotta-channel-host"}
         }),
     )
-    .await
+    .await?;
+    Ok(request_id)
 }
 
-async fn send_adapter_input<W>(
+async fn dispatch_adapter_input<W>(
     writer: &mut W,
+    hub: &mut crate::adapter::AdapterHub,
     message: &crate::adapter::InboundChannelMessage,
-) -> Result<String, HostError>
+) -> Result<(), HostError>
 where
     W: futures_util::Sink<Message> + Unpin,
     W::Error: std::fmt::Debug,
 {
     let request_id = random_request_id("input")?;
-    send_json(
+    hub.record_input(request_id.clone(), &message.route)
+        .map_err(|_| HostError::Runtime)?;
+    let outcome = send_json(
         writer,
         serde_json::json!({
             "type": "input",
-            "request_id": request_id,
+            "request_id": request_id.clone(),
             "runtime": {
                 "agent_id": message.route.agent_id,
                 "conversation_id": message.route.conversation_id
@@ -514,8 +576,11 @@ where
             "payload": message.payload
         }),
     )
-    .await?;
-    Ok(request_id)
+    .await;
+    if outcome.is_err() {
+        let _ = hub.cancel_input(&request_id);
+    }
+    outcome
 }
 
 async fn handle_message_channel_call<W>(
@@ -543,11 +608,13 @@ where
         .as_str()
         .ok_or(HostError::Runtime)?;
     let runtime = runtime_value_key(value)?;
+    let active = hub
+        .active_route_key(&runtime.0, &runtime.1)
+        .ok_or(HostError::Runtime)?
+        .clone();
     let route = routes
         .iter()
-        .find(|route| {
-            route.agent_id.as_str() == runtime.0 && route.conversation_id.as_str() == runtime.1
-        })
+        .find(|route| crate::adapter::CanonicalRouteKey::from_route(route) == active)
         .ok_or(HostError::Runtime)?;
     let outcome = hub.deliver(route, request_id, tool_call_id, message).await;
     let mut response = serde_json::json!({

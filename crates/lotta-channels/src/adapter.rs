@@ -30,7 +30,7 @@ pub struct InboundChannelMessage {
 /// Typed Runtime events delivered back to the originating adapter.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum AdapterEvent {
+pub enum AdapterRuntimeEvent {
     /// Runtime accepted one correlated input.
     InputAccepted {
         /// Runtime request correlation.
@@ -63,14 +63,29 @@ pub enum AdapterEvent {
         #[serde(flatten)]
         fields: BTreeMap<String, serde_json::Value>,
     },
+    /// Exactly one typed terminal Runtime failure for a correlated input.
+    #[serde(alias = "error")]
+    RuntimeError {
+        /// Runtime request correlation.
+        request_id: String,
+        /// Stable bounded non-secret failure code or detail.
+        error: serde_json::Value,
+        /// Complete canonical frame retained for adapter UX.
+        #[serde(flatten)]
+        fields: BTreeMap<String, serde_json::Value>,
+    },
 }
 
-impl AdapterEvent {
+/// Backwards-compatible name for the typed adapter Runtime event boundary.
+pub type AdapterEvent = AdapterRuntimeEvent;
+
+impl AdapterRuntimeEvent {
     fn request_id(&self) -> Option<&str> {
         match self {
             Self::InputAccepted { request_id, .. }
             | Self::StreamDelta { request_id, .. }
-            | Self::TurnFinished { request_id, .. } => Some(request_id),
+            | Self::TurnFinished { request_id, .. }
+            | Self::RuntimeError { request_id, .. } => Some(request_id),
             Self::UpdateLoopStatus { request_id, .. } => request_id.as_deref(),
         }
     }
@@ -125,6 +140,7 @@ pub enum ChannelAdapterError {
 /// Cloneable production port handed to one adapter factory.
 #[derive(Clone)]
 pub struct ChannelRuntimeClient {
+    route_key: CanonicalRouteKey,
     inbound: mpsc::Sender<InboundChannelMessage>,
     outbound: Arc<Mutex<mpsc::Receiver<MessageChannelDelivery>>>,
     events: Arc<Mutex<mpsc::Receiver<AdapterEvent>>>,
@@ -140,6 +156,9 @@ impl ChannelRuntimeClient {
         message: InboundChannelMessage,
     ) -> Result<(), ChannelAdapterError> {
         validate_inbound(&message)?;
+        if CanonicalRouteKey::from_route(&message.route) != self.route_key {
+            return Err(ChannelAdapterError::Bound);
+        }
         self.inbound
             .try_send(message)
             .map_err(|error| map_try_send(&error))
@@ -219,12 +238,13 @@ struct AdapterPort {
     events: mpsc::Sender<AdapterEvent>,
 }
 
-fn channel_adapter_port() -> (ChannelRuntimeClient, AdapterPort) {
+fn channel_adapter_port(route_key: CanonicalRouteKey) -> (ChannelRuntimeClient, AdapterPort) {
     let (inbound_sender, inbound) = mpsc::channel(CHANNEL_ADAPTER_DELIVERIES_MAX);
     let (outbound, outbound_receiver) = mpsc::channel(CHANNEL_ADAPTER_DELIVERIES_MAX);
     let (events, event_receiver) = mpsc::channel(CHANNEL_ADAPTER_DELIVERIES_MAX);
     (
         ChannelRuntimeClient {
+            route_key,
             inbound: inbound_sender,
             outbound: Arc::new(Mutex::new(outbound_receiver)),
             events: Arc::new(Mutex::new(event_receiver)),
@@ -237,6 +257,46 @@ fn channel_adapter_port() -> (ChannelRuntimeClient, AdapterPort) {
     )
 }
 
+/// Full canonical adapter route identity, including its Runtime scope.
+///
+/// Mutable route flags and timestamps are deliberately excluded: they are route
+/// metadata, not delivery identity. Explicitly absent and explicitly-null thread
+/// identifiers remain distinct, matching the canonical domain representation.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CanonicalRouteKey {
+    /// Channel plugin identifier.
+    pub channel_id: String,
+    /// Channel account identifier.
+    pub account_id: String,
+    /// Canonical chat/target identifier.
+    pub chat_id: String,
+    /// Canonical optional thread identity with explicit-null preservation.
+    pub thread_id: Option<Option<String>>,
+    /// Runtime agent scope.
+    pub agent_id: String,
+    /// Runtime conversation scope.
+    pub conversation_id: String,
+}
+
+impl CanonicalRouteKey {
+    /// Constructs the full immutable delivery identity from a canonical route.
+    #[must_use]
+    pub fn from_route(route: &ChannelRoute) -> Self {
+        Self {
+            channel_id: route.channel_id.as_str().to_owned(),
+            account_id: route.account_id.as_str().to_owned(),
+            chat_id: route.chat_id.as_str().to_owned(),
+            thread_id: route.thread_id.clone(),
+            agent_id: route.agent_id.as_str().to_owned(),
+            conversation_id: route.conversation_id.as_str().to_owned(),
+        }
+    }
+
+    fn runtime_key(&self) -> RuntimeKey {
+        (self.agent_id.clone(), self.conversation_id.clone())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InputPhase {
     Submitted,
@@ -247,7 +307,7 @@ enum InputPhase {
 }
 
 struct PendingInput {
-    route_key: RuntimeKey,
+    route_key: CanonicalRouteKey,
     phase: InputPhase,
 }
 
@@ -256,9 +316,10 @@ type RuntimeKey = (String, String);
 /// Real bounded adapter hub owned by the child Runtime WebSocket loop.
 pub struct AdapterHub {
     inbound: mpsc::Receiver<InboundChannelMessage>,
-    outbound: BTreeMap<RuntimeKey, mpsc::Sender<MessageChannelDelivery>>,
-    events: BTreeMap<RuntimeKey, mpsc::Sender<AdapterEvent>>,
+    outbound: BTreeMap<CanonicalRouteKey, mpsc::Sender<MessageChannelDelivery>>,
+    events: BTreeMap<CanonicalRouteKey, mpsc::Sender<AdapterRuntimeEvent>>,
     pending: BTreeMap<String, PendingInput>,
+    active_routes: BTreeMap<RuntimeKey, CanonicalRouteKey>,
     forwarders: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -277,18 +338,19 @@ impl AdapterHub {
             outbound: BTreeMap::new(),
             events: BTreeMap::new(),
             pending: BTreeMap::new(),
+            active_routes: BTreeMap::new(),
             forwarders: Vec::new(),
         };
         let mut attached = BTreeSet::new();
         for route in routes {
-            let key = runtime_key(route);
+            let key = CanonicalRouteKey::from_route(route);
             if !attached.insert(key.clone()) {
                 continue;
             }
             let Some(factory) = context.factories.get(route.channel_id.as_str()) else {
                 continue;
             };
-            let (client, port) = channel_adapter_port();
+            let (client, port) = channel_adapter_port(key.clone());
             factory.start(
                 AdapterFactoryContext {
                     route: route.clone(),
@@ -317,15 +379,20 @@ impl AdapterHub {
         request_id: String,
         route: &ChannelRoute,
     ) -> Result<(), ChannelAdapterError> {
+        let route_key = CanonicalRouteKey::from_route(route);
+        let runtime = route_key.runtime_key();
         if self.pending.len() >= CHANNEL_ADAPTER_INPUT_CORRELATIONS_MAX
             || self.pending.contains_key(&request_id)
+            || self.active_routes.contains_key(&runtime)
+            || !self.events.contains_key(&route_key)
         {
             return Err(ChannelAdapterError::Busy);
         }
+        self.active_routes.insert(runtime, route_key.clone());
         self.pending.insert(
             request_id,
             PendingInput {
-                route_key: runtime_key(route),
+                route_key,
                 phase: InputPhase::Submitted,
             },
         );
@@ -340,9 +407,10 @@ impl AdapterHub {
         &mut self,
         value: &serde_json::Value,
     ) -> Result<bool, ChannelAdapterError> {
-        let event: AdapterEvent = match serde_json::from_value(value.clone()) {
-            Ok(event) => event,
-            Err(_) => return Ok(false),
+        let event = match parse_runtime_event(value) {
+            Ok(Some(event)) => event,
+            Ok(None) => return Ok(false),
+            Err(error) => return Err(error),
         };
         validate_event_bound(&event)?;
         let request_id = event
@@ -355,20 +423,53 @@ impl AdapterHub {
             .ok_or(ChannelAdapterError::Bound)?;
         pending.phase = next_phase(pending.phase, &event)?;
         let terminal = pending.phase == InputPhase::Terminal;
+        let route_key = pending.route_key.clone();
         let sender = self
             .events
-            .get(&pending.route_key)
+            .get(&route_key)
             .ok_or(ChannelAdapterError::Unavailable)?;
         sender
             .try_send(event)
             .map_err(|error| map_try_send(&error))?;
         if terminal {
             self.pending.remove(&request_id);
+            self.active_routes.remove(&route_key.runtime_key());
         }
         Ok(true)
     }
 
-    /// Delivers a correlated `MessageChannel` call through the route's attached adapter.
+    /// Clears the exact active input on cancellation or a terminal transport error.
+    ///
+    /// # Errors
+    /// Rejects unknown and already-terminal correlations.
+    pub fn cancel_input(&mut self, request_id: &str) -> Result<(), ChannelAdapterError> {
+        let pending = self
+            .pending
+            .remove(request_id)
+            .ok_or(ChannelAdapterError::Bound)?;
+        self.active_routes.remove(&pending.route_key.runtime_key());
+        Ok(())
+    }
+
+    /// Returns whether this route's serialized Runtime currently has an active input.
+    #[must_use]
+    pub fn runtime_is_active(&self, route: &ChannelRoute) -> bool {
+        self.active_routes
+            .contains_key(&CanonicalRouteKey::from_route(route).runtime_key())
+    }
+
+    /// Returns the full route identity currently owning a serialized Runtime turn.
+    #[must_use]
+    pub fn active_route_key(
+        &self,
+        agent_id: &str,
+        conversation_id: &str,
+    ) -> Option<&CanonicalRouteKey> {
+        self.active_routes
+            .get(&(agent_id.to_owned(), conversation_id.to_owned()))
+    }
+
+    /// Delivers a correlated `MessageChannel` call through the exact route's adapter.
     pub async fn deliver(
         &self,
         route: &ChannelRoute,
@@ -376,7 +477,8 @@ impl AdapterHub {
         tool_call_id: &str,
         message: &str,
     ) -> MessageChannelResult {
-        let Some(adapter) = self.outbound.get(&runtime_key(route)) else {
+        let route_key = CanonicalRouteKey::from_route(route);
+        let Some(adapter) = self.outbound.get(&route_key) else {
             return MessageChannelResult::Unavailable;
         };
         let (delivery, completion) = delivery(
@@ -424,19 +526,56 @@ fn next_phase(
         (InputPhase::Accepted | InputPhase::Streaming, AdapterEvent::UpdateLoopStatus { .. }) => {
             Ok(InputPhase::State)
         }
-        (InputPhase::State, AdapterEvent::TurnFinished { .. }) => Ok(InputPhase::Terminal),
+        (InputPhase::State, AdapterRuntimeEvent::TurnFinished { .. })
+        | (
+            InputPhase::Submitted
+            | InputPhase::Accepted
+            | InputPhase::Streaming
+            | InputPhase::State,
+            AdapterRuntimeEvent::RuntimeError { .. },
+        ) => Ok(InputPhase::Terminal),
         _ => Err(ChannelAdapterError::Bound),
     }
 }
 
-fn runtime_key(route: &ChannelRoute) -> RuntimeKey {
-    (
-        route.agent_id.as_str().to_owned(),
-        route.conversation_id.as_str().to_owned(),
-    )
+fn parse_runtime_event(
+    value: &serde_json::Value,
+) -> Result<Option<AdapterRuntimeEvent>, ChannelAdapterError> {
+    let Some(kind) = value.get("type").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    if kind == "input_accepted" && value.get("accepted") == Some(&serde_json::Value::Bool(false)) {
+        let request_id = value
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or(ChannelAdapterError::Bound)?
+            .to_owned();
+        let error = value
+            .get("error")
+            .filter(|error| error.is_string() || error.is_object())
+            .cloned()
+            .ok_or(ChannelAdapterError::Bound)?;
+        let mut fields = value
+            .as_object()
+            .cloned()
+            .ok_or(ChannelAdapterError::Bound)?;
+        for key in ["type", "request_id", "error"] {
+            fields.remove(key);
+        }
+        return Ok(Some(AdapterRuntimeEvent::RuntimeError {
+            request_id,
+            error,
+            fields: fields.into_iter().collect(),
+        }));
+    }
+    match serde_json::from_value(value.clone()) {
+        Ok(event) => Ok(Some(event)),
+        Err(_) => Ok(None),
+    }
 }
 
-fn validate_event_bound(event: &AdapterEvent) -> Result<(), ChannelAdapterError> {
+fn validate_event_bound(event: &AdapterRuntimeEvent) -> Result<(), ChannelAdapterError> {
     if serde_json::to_vec(event)
         .map_err(|_| ChannelAdapterError::Bound)?
         .len()
@@ -566,5 +705,135 @@ mod tests {
             MessageChannelResult::Delivered
         );
         delivery.await.unwrap();
+    }
+
+    #[derive(Default)]
+    struct MultiFactory(StdMutex<Vec<(CanonicalRouteKey, ChannelRuntimeClient)>>);
+    impl ChannelAdapterFactory for MultiFactory {
+        fn start(
+            &self,
+            context: AdapterFactoryContext,
+            runtime: ChannelRuntimeClient,
+        ) -> Result<(), ChannelAdapterError> {
+            self.0
+                .lock()
+                .map_err(|_| ChannelAdapterError::Unavailable)?
+                .push((CanonicalRouteKey::from_route(&context.route), runtime));
+            Ok(())
+        }
+    }
+
+    fn second_route() -> ChannelRoute {
+        serde_json::from_value(serde_json::json!({
+            "channel_id":"telegram", "account_id":"secondary", "chat_id":"other-chat",
+            "thread_id":"thread-2", "agent_id":"agent-local-a", "conversation_id":"default",
+            "enabled":true, "outbound_enabled":true,
+            "created_at":"2026-01-01T00:00:00Z", "updated_at":"2026-01-01T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn same_runtime_routes_keep_exact_inbound_event_and_outbound_identity() {
+        let factory = Arc::new(MultiFactory::default());
+        let mut context = HostContext::production();
+        context
+            .register_factory("telegram", factory.clone())
+            .unwrap();
+        let routes = [route(), second_route()];
+        let mut hub = AdapterHub::compose(&routes, &context).unwrap();
+        let clients = factory.0.lock().unwrap().clone();
+        assert_eq!(clients.len(), 2, "one attachment per full route key");
+        assert_eq!(
+            clients[0].1.submit_inbound(InboundChannelMessage {
+                route: routes[1].clone(),
+                client_message_id: "spoof".into(),
+                payload: serde_json::json!({"client_message_id":"spoof"}),
+            }),
+            Err(ChannelAdapterError::Bound),
+            "an attachment cannot spoof another full route"
+        );
+
+        for (index, route) in routes.iter().enumerate() {
+            let key = CanonicalRouteKey::from_route(route);
+            let client = clients
+                .iter()
+                .find(|(candidate, _)| candidate == &key)
+                .unwrap()
+                .1
+                .clone();
+            let client_id = format!("client-{index}");
+            client
+                .submit_inbound(InboundChannelMessage {
+                    route: route.clone(),
+                    client_message_id: client_id.clone(),
+                    payload: serde_json::json!({"client_message_id":client_id,"content":"hello"}),
+                })
+                .unwrap();
+            let inbound = hub.receive_inbound().await.unwrap();
+            assert_eq!(CanonicalRouteKey::from_route(&inbound.route), key);
+            let request_id = format!("input-{index}");
+            hub.record_input(request_id.clone(), route).unwrap();
+
+            let delivery_task = tokio::spawn({
+                let client = client.clone();
+                let key = key.clone();
+                async move {
+                    let delivery = client.receive_outbound().await.unwrap();
+                    assert_eq!(CanonicalRouteKey::from_route(&delivery.route), key);
+                    delivery.complete(MessageChannelResult::Delivered);
+                }
+            });
+            assert_eq!(
+                hub.deliver(route, "call", "tool", "exact").await,
+                MessageChannelResult::Delivered
+            );
+            delivery_task.await.unwrap();
+
+            for event in [
+                serde_json::json!({"type":"input_accepted","request_id":request_id,"accepted":true}),
+                serde_json::json!({"type":"update_loop_status","request_id":request_id,"status":"idle"}),
+                serde_json::json!({"type":"turn_finished","request_id":request_id}),
+            ] {
+                assert!(hub.accept_runtime_event(&event).unwrap());
+            }
+            assert!(matches!(
+                client.receive_event().await,
+                Some(AdapterRuntimeEvent::InputAccepted { .. })
+            ));
+            assert!(hub.active_route_key("agent-local-a", "default").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn correlated_runtime_error_is_terminal_and_rejects_malformed_unmatched_duplicate() {
+        let factory = Arc::new(FakeFactory::default());
+        let mut context = HostContext::production();
+        context
+            .register_factory("telegram", factory.clone())
+            .unwrap();
+        let route = route();
+        let mut hub = AdapterHub::compose(std::slice::from_ref(&route), &context).unwrap();
+        let client = factory.0.lock().unwrap().clone().unwrap();
+        hub.record_input("failed".into(), &route).unwrap();
+        assert!(
+            hub.accept_runtime_event(&serde_json::json!({
+                "type":"input_accepted", "request_id":"failed", "accepted":false,
+                "error":"runtime service unavailable"
+            }))
+            .unwrap()
+        );
+        assert!(matches!(
+            client.receive_event().await,
+            Some(AdapterRuntimeEvent::RuntimeError { request_id, .. }) if request_id == "failed"
+        ));
+        assert!(hub.active_route_key("agent-local-a", "default").is_none());
+        for invalid in [
+            serde_json::json!({"type":"input_accepted","request_id":"failed","accepted":false}),
+            serde_json::json!({"type":"runtime_error","request_id":"unknown","error":"x"}),
+            serde_json::json!({"type":"runtime_error","request_id":"failed","error":"x"}),
+        ] {
+            assert!(hub.accept_runtime_event(&invalid).is_err());
+        }
     }
 }

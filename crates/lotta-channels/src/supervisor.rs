@@ -329,7 +329,8 @@ async fn run_generation(
     };
     let cleanup = cleanup_generation(config, &mut session, plane_slot, pid_sender).await;
     match (outcome, cleanup) {
-        (_, Err(error)) | (Err(error), Ok(())) => Err(error),
+        (Err(first), _) => Err(first),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
         (Ok(()), Ok(())) => Ok(()),
     }
 }
@@ -405,6 +406,16 @@ async fn start_generation(
         token: session.capability.expose_for_pipe().to_owned(),
         channels_root: root.to_owned(),
     };
+    plane
+        .lock()
+        .map_err(|_| SupervisorError::Task)?
+        .as_mut()
+        .ok_or(SupervisorError::Task)?
+        .register_parent_request(
+            &session.bootstrap_id,
+            crate::control_plane::CONTROL_TIMEOUT_MS_MAX,
+            now_millis()?,
+        )?;
     write_line(
         session.input.as_mut().ok_or(SupervisorError::Cleanup)?,
         &frame,
@@ -472,6 +483,12 @@ async fn supervise_generation(
                 if let Some(response) = dispatch(config, plane, frame, &channels)? {
                     let input = session.input.as_mut().ok_or(SupervisorError::Cleanup)?;
                     write_line(input, &response).await?;
+                    plane
+                        .lock()
+                        .map_err(|_| SupervisorError::Task)?
+                        .as_mut()
+                        .ok_or(SupervisorError::Task)?
+                        .complete_parent_response_at(&response, now_millis()?)?;
                 }
             }
             _ = observation_tick.tick() => {
@@ -619,13 +636,18 @@ async fn cleanup_generation(
     plane: &Arc<Mutex<Option<ControlPlane>>>,
     pid_sender: &watch::Sender<Option<u32>>,
 ) -> Result<(), SupervisorError> {
-    request_graceful_shutdown(config, session, plane).await?;
-    session.input.take();
-    let released = if let Ok(mut slot) = plane.lock()
-        && let Some(current) = slot.take()
-    {
-        current.release_stale()
+    let mut first_error = request_graceful_shutdown(config, session, plane)
+        .await
+        .err();
+
+    // Closing the inherited management writer is unconditional: the child must
+    // observe EOF even when graceful acknowledgement was missing or malformed.
+    drop(session.input.take());
+
+    let released = if let Ok(mut slot) = plane.lock() {
+        slot.take().map_or(0, |current| current.release_stale())
     } else {
+        first_error.get_or_insert(SupervisorError::Task);
         0
     };
     if released > 0 {
@@ -638,6 +660,7 @@ async fn cleanup_generation(
             },
         );
     }
+
     if config
         .authenticator
         .revoke(&session.owner, session.number, session.pid)
@@ -652,7 +675,10 @@ async fn cleanup_generation(
         );
     }
     let _ = pid_sender.send(None);
-    finish_generation_process(session).await?;
+
+    if let Err(error) = finish_generation_process(session).await {
+        first_error.get_or_insert(error);
+    }
     emit(
         config,
         ChannelSupervisorEvent::ChildReaped {
@@ -661,7 +687,8 @@ async fn cleanup_generation(
             pid: session.pid,
         },
     );
-    Ok(())
+
+    first_error.map_or(Ok(()), Err)
 }
 
 async fn request_graceful_shutdown(
@@ -681,7 +708,17 @@ async fn request_graceful_shutdown(
         return Ok(());
     };
     let shutdown_id = session.shutdown_id.clone();
-    let wrote = write_line(
+    plane
+        .lock()
+        .map_err(|_| SupervisorError::Task)?
+        .as_mut()
+        .ok_or(SupervisorError::Task)?
+        .register_parent_request(
+            &shutdown_id,
+            CHANNEL_SHUTDOWN_GRACE_MS.min(crate::control_plane::CONTROL_TIMEOUT_MS_MAX),
+            now_millis()?,
+        )?;
+    write_line(
         input,
         &ParentFrame::Shutdown {
             metadata: crate::control_plane::FrameMetadata::new(session.number),
@@ -689,23 +726,23 @@ async fn request_graceful_shutdown(
             request_id: shutdown_id.clone(),
         },
     )
+    .await?;
+    let acknowledgement = wait_shutdown_ack(
+        config,
+        &mut session.output,
+        &session.owner,
+        &shutdown_id,
+        plane,
+    );
+    match tokio::time::timeout(
+        Duration::from_millis(CHANNEL_SHUTDOWN_GRACE_MS),
+        acknowledgement,
+    )
     .await
-    .is_ok();
-    if wrote {
-        let acknowledgement = wait_shutdown_ack(
-            config,
-            &mut session.output,
-            &session.owner,
-            &shutdown_id,
-            plane,
-        );
-        let _ = tokio::time::timeout(
-            Duration::from_millis(CHANNEL_SHUTDOWN_GRACE_MS),
-            acknowledgement,
-        )
-        .await;
+    {
+        Ok(result) => result,
+        Err(_) => Err(SupervisorError::Cleanup),
     }
-    Ok(())
 }
 
 async fn finish_generation_process(session: &mut Generation) -> Result<(), SupervisorError> {
@@ -714,8 +751,8 @@ async fn finish_generation_process(session: &mut Generation) -> Result<(), Super
         session.child.wait(),
     )
     .await;
-    let mut failed = matches!(wait, Ok(Err(_)));
-    if wait.is_err() {
+    let mut failed = false;
+    if !matches!(wait, Ok(Ok(_))) {
         failed |= session.child.kill().await.is_err();
         failed |= session.child.wait().await.is_err();
     }
@@ -770,13 +807,35 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut chunk = [0_u8; CHANNEL_STDERR_CHUNK_BYTES];
+    let mut retained_total = 0_usize;
+    let mut retained_line = 0_usize;
     while let Ok(length) = stderr.read(&mut chunk).await {
         if length == 0 {
             break;
         }
-        // Always drain to EOF so a noisy child cannot block on a full pipe. No child
-        // bytes are retained here; diagnostics remain bounded at the observing edge.
+        // Walk all bytes so both named ceilings are enforced independently, while
+        // continuing to drain to EOF after either ceiling. No child bytes are logged.
+        for byte in &chunk[..length] {
+            if *byte == b'\n' {
+                retained_line = 0;
+                continue;
+            }
+            if retained_total < CHANNEL_STDERR_TOTAL_BYTES_MAX
+                && retained_line < CHANNEL_STDERR_LINE_BYTES_MAX
+            {
+                retained_total += 1;
+                retained_line += 1;
+            }
+        }
     }
+}
+
+fn now_millis() -> Result<u64, SupervisorError> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| SupervisorError::Task)?
+        .as_millis();
+    u64::try_from(millis).map_err(|_| SupervisorError::Task)
 }
 
 fn random_id(prefix: &str) -> Result<String, SupervisorError> {

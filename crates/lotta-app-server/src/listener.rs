@@ -1484,6 +1484,17 @@ async fn handle_incoming(
         }
         Some(Ok(Message::Ping(payload))) => socket.send(Message::Pong(payload)).await.is_ok(),
         Some(Ok(Message::Text(text))) => {
+            if state.channel_host_protocol_only
+                && crate::framing::decode_text(&text).is_ok_and(|frame| {
+                    let kind = frame.value.get("type").and_then(serde_json::Value::as_str);
+                    !kind.is_some_and(
+                        crate::auth::channel_session::ChannelSessionAuthenticator::command_allowed,
+                    ) && kind != Some("runtime_external_tool_call_response")
+                })
+            {
+                send_close(socket, close_code::POLICY, "runtime plane only").await;
+                return false;
+            }
             handle_text(&text, state, connection_id, channel_principal).await
         }
         Some(Ok(Message::Binary(_))) => {

@@ -374,8 +374,10 @@ mod supervision {
 mod plane_separation {
     use crate::control_plane::{ChildFrame, RuntimeKey, RuntimeTool};
 
-    #[test]
-    fn records_both_planes_and_rejects_negative_crossover() {
+    #[tokio::test]
+    async fn records_both_planes_and_rejects_negative_crossover() {
+        use tokio::io::{AsyncWriteExt as _, BufReader};
+
         let management = ChildFrame::PublishRuntimeTools {
             metadata: crate::control_plane::FrameMetadata::new(1),
             request_id: "publish".into(),
@@ -397,8 +399,46 @@ mod plane_separation {
         });
         assert_eq!(control["kind"], "publish_runtime_tools");
         assert_eq!(runtime["type"], "runtime_start");
-        assert!(serde_json::from_value::<ChildFrame>(runtime).is_err());
         assert!(control.get("type").is_none());
+
+        // Exercise the real child/parent NDJSON decoder over an actual pipe. A
+        // Runtime frame is terminally rejected and never reaches dispatch.
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        writer
+            .write_all(format!("{runtime}\n").as_bytes())
+            .await
+            .unwrap();
+        drop(writer);
+        let mut reader = BufReader::new(reader);
+        assert!(
+            crate::control_plane::read_line::<_, ChildFrame>(&mut reader)
+                .await
+                .is_err()
+        );
+
+        // A fresh physical pipe records only a validated management frame.
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        writer
+            .write_all(format!("{control}\n").as_bytes())
+            .await
+            .unwrap();
+        drop(writer);
+        let mut reader = BufReader::new(reader);
+        let accepted = crate::control_plane::read_line::<_, ChildFrame>(&mut reader)
+            .await
+            .unwrap()
+            .unwrap();
+        let recorded_ndjson = [serde_json::to_value(accepted).unwrap()];
+        assert!(
+            recorded_ndjson
+                .iter()
+                .all(|frame| frame.get("kind").is_some())
+        );
+        assert!(
+            recorded_ndjson
+                .iter()
+                .all(|frame| frame.get("type").is_none())
+        );
     }
 }
 

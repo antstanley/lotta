@@ -6,9 +6,10 @@ use serde::{
 };
 use serde_json::{Map, Value};
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io::ErrorKind,
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
@@ -278,12 +279,30 @@ pub enum ControlError {
     Io,
 }
 
+/// Direction and ownership of one live management correlation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlCorrelationDirection {
+    /// Child request awaiting a parent response.
+    ChildRequest,
+    /// Parent request awaiting a child terminal response.
+    ParentRequest,
+}
+
+#[derive(Clone, Debug)]
+struct InFlightCorrelation {
+    direction: ControlCorrelationDirection,
+    owner: String,
+    generation: u64,
+    deadline_ms: u64,
+}
+
 /// Stateful owner/correlation validator and command dispatcher.
 pub struct ControlPlane {
     owner: String,
     generation: u64,
     replay_order: VecDeque<String>,
     replay: BTreeSet<String>,
+    in_flight: BTreeMap<String, InFlightCorrelation>,
     tools: Arc<lotta_tools::external::ChannelExternalToolManager>,
 }
 
@@ -306,6 +325,7 @@ impl ControlPlane {
             generation,
             replay_order: VecDeque::new(),
             replay: BTreeSet::new(),
+            in_flight: BTreeMap::new(),
             tools,
         })
     }
@@ -318,6 +338,23 @@ impl ControlPlane {
         &mut self,
         frame: ChildFrame,
         channels: &[ChannelState],
+    ) -> Result<Option<ParentFrame>, ControlError> {
+        self.dispatch_at(frame, channels, current_millis()?)
+    }
+
+    /// Validates and applies one frame at an explicit monotonic test deadline instant.
+    ///
+    /// Admission happens only after complete structural, owner, capability, and
+    /// operation validation. Parent terminals must match a live parent-owned
+    /// correlation; child requests remain live until their exact response is written.
+    ///
+    /// # Errors
+    /// Returns a structural, ownership, deadline, correlation, registry, or bound failure.
+    pub fn dispatch_at(
+        &mut self,
+        frame: ChildFrame,
+        channels: &[ChannelState],
+        now_ms: u64,
     ) -> Result<Option<ParentFrame>, ControlError> {
         let (metadata, owner, request_id) = frame_identity(&frame);
         if metadata.version != CONTROL_PROTOCOL_VERSION {
@@ -333,10 +370,31 @@ impl ControlPlane {
             return Err(ControlError::Timeout);
         }
         validate_frame(&frame, channels)?;
-        if let Some(id) = request_id {
-            self.admit_request(id)?;
+        let id = request_id.ok_or(ControlError::Correlation)?.to_owned();
+        if matches!(
+            frame,
+            ChildFrame::Ready { .. } | ChildFrame::ShutdownComplete { .. }
+        ) {
+            self.complete_correlation(
+                &id,
+                ControlCorrelationDirection::ParentRequest,
+                owner,
+                metadata.generation,
+                now_ms,
+            )?;
+            return self.apply(frame, channels);
         }
-        self.apply(frame, channels)
+        self.admit_request(
+            &id,
+            ControlCorrelationDirection::ChildRequest,
+            metadata.timeout_ms,
+            now_ms,
+        )?;
+        let outcome = self.apply(frame, channels);
+        if outcome.is_err() {
+            self.in_flight.remove(&id);
+        }
+        outcome
     }
 
     fn apply(
@@ -426,11 +484,114 @@ impl ControlPlane {
         self.tools.release_generation(&self.owner, self.generation)
     }
 
-    fn admit_request(&mut self, request_id: &str) -> Result<(), ControlError> {
+    /// Registers one exact parent request before it is written to the child.
+    ///
+    /// # Errors
+    /// Rejects invalid, replayed, over-capacity, or invalid-timeout requests.
+    pub fn register_parent_request(
+        &mut self,
+        request_id: &str,
+        timeout_ms: u64,
+        now_ms: u64,
+    ) -> Result<(), ControlError> {
+        if timeout_ms == 0 || timeout_ms > CONTROL_TIMEOUT_MS_MAX {
+            return Err(ControlError::Timeout);
+        }
+        self.admit_request(
+            request_id,
+            ControlCorrelationDirection::ParentRequest,
+            timeout_ms,
+            now_ms,
+        )
+    }
+
+    /// Completes the exact child request after its parent response is successfully written.
+    ///
+    /// # Errors
+    /// Unknown, late, duplicated, wrong-owner, wrong-generation, and wrong-direction
+    /// responses are terminal correlation failures.
+    pub fn complete_parent_response_at(
+        &mut self,
+        frame: &ParentFrame,
+        now_ms: u64,
+    ) -> Result<(), ControlError> {
+        let (metadata, owner, correlation) = parent_response_identity(frame)?;
+        if metadata.version != CONTROL_PROTOCOL_VERSION {
+            return Err(ControlError::Version);
+        }
+        if metadata.capability != ManagementCapability::ChannelManagement {
+            return Err(ControlError::Capability);
+        }
+        if metadata.timeout_ms == 0 || metadata.timeout_ms > CONTROL_TIMEOUT_MS_MAX {
+            return Err(ControlError::Timeout);
+        }
+        self.complete_correlation(
+            correlation,
+            ControlCorrelationDirection::ChildRequest,
+            owner,
+            metadata.generation,
+            now_ms,
+        )
+    }
+
+    /// Returns the current bounded live-correlation count.
+    #[must_use]
+    pub fn in_flight_len(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    fn admit_request(
+        &mut self,
+        request_id: &str,
+        direction: ControlCorrelationDirection,
+        timeout_ms: u64,
+        now_ms: u64,
+    ) -> Result<(), ControlError> {
         validate_id(request_id)?;
-        if self.replay.contains(request_id) {
+        if self.replay.contains(request_id) || self.in_flight.len() >= CONTROL_CORRELATIONS_MAX {
             return Err(ControlError::Correlation);
         }
+        self.retain_replay(request_id);
+        self.in_flight.insert(
+            request_id.to_owned(),
+            InFlightCorrelation {
+                direction,
+                owner: self.owner.clone(),
+                generation: self.generation,
+                deadline_ms: now_ms.saturating_add(timeout_ms),
+            },
+        );
+        Ok(())
+    }
+
+    fn complete_correlation(
+        &mut self,
+        request_id: &str,
+        direction: ControlCorrelationDirection,
+        owner: &str,
+        generation: u64,
+        now_ms: u64,
+    ) -> Result<(), ControlError> {
+        validate_id(request_id)?;
+        let pending = self
+            .in_flight
+            .remove(request_id)
+            .ok_or(ControlError::Correlation)?;
+        if pending.direction != direction
+            || pending.owner != owner
+            || pending.generation != generation
+            || now_ms > pending.deadline_ms
+        {
+            return Err(if now_ms > pending.deadline_ms {
+                ControlError::Timeout
+            } else {
+                ControlError::Correlation
+            });
+        }
+        Ok(())
+    }
+
+    fn retain_replay(&mut self, request_id: &str) {
         if self.replay.len() >= CONTROL_REPLAY_IDS_MAX
             && let Some(oldest) = self.replay_order.pop_front()
         {
@@ -438,7 +599,6 @@ impl ControlPlane {
         }
         self.replay.insert(request_id.to_owned());
         self.replay_order.push_back(request_id.to_owned());
-        Ok(())
     }
 }
 
@@ -706,6 +866,40 @@ fn validate_id(value: &str) -> Result<(), ControlError> {
     }
 }
 
+fn current_millis() -> Result<u64, ControlError> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ControlError::Timeout)?
+        .as_millis();
+    u64::try_from(millis).map_err(|_| ControlError::Timeout)
+}
+
+fn parent_response_identity(
+    frame: &ParentFrame,
+) -> Result<(FrameMetadata, &str, &str), ControlError> {
+    match frame {
+        ParentFrame::ChannelsResult {
+            metadata,
+            owner,
+            correlation_id,
+            ..
+        }
+        | ParentFrame::RuntimeToolsPublished {
+            metadata,
+            owner,
+            correlation_id,
+        }
+        | ParentFrame::RuntimeToolsReleased {
+            metadata,
+            owner,
+            correlation_id,
+        } => Ok((*metadata, owner, correlation_id)),
+        ParentFrame::Bootstrap { .. } | ParentFrame::Shutdown { .. } => {
+            Err(ControlError::Correlation)
+        }
+    }
+}
+
 fn frame_identity(frame: &ChildFrame) -> (FrameMetadata, &str, Option<&str>) {
     match frame {
         ChildFrame::Ready {
@@ -912,6 +1106,84 @@ mod tests {
             plane.dispatch(frame, &[]),
             Err(ControlError::Correlation)
         ));
+    }
+
+    #[test]
+    fn live_correlations_enforce_capacity_direction_deadline_and_replay_independently() {
+        let mut plane = plane();
+        for index in 0..CONTROL_CORRELATIONS_MAX {
+            plane
+                .register_parent_request(&format!("parent-{index}"), 10, 100)
+                .unwrap();
+        }
+        assert_eq!(plane.in_flight_len(), CONTROL_CORRELATIONS_MAX);
+        assert_eq!(
+            plane.register_parent_request("above", 10, 100),
+            Err(ControlError::Correlation)
+        );
+
+        let terminal = |id: &str, owner: &str| ChildFrame::Ready {
+            metadata: FrameMetadata::new(1),
+            correlation_id: id.into(),
+            owner: owner.into(),
+            pid: 7,
+            channels_probe_success: true,
+            parent_sibling_probe_denied: true,
+        };
+        assert!(
+            plane
+                .dispatch_at(terminal("parent-0", "owner"), &[], 110)
+                .is_ok()
+        );
+        assert_eq!(plane.in_flight_len(), CONTROL_CORRELATIONS_MAX - 1);
+        assert!(matches!(
+            plane.dispatch_at(terminal("parent-1", "owner"), &[], 111),
+            Err(ControlError::Timeout)
+        ));
+        assert!(matches!(
+            plane.dispatch_at(terminal("parent-0", "owner"), &[], 109),
+            Err(ControlError::Correlation)
+        ));
+        assert_eq!(
+            plane.register_parent_request("parent-0", 10, 100),
+            Err(ControlError::Correlation),
+            "replay retention is independent from live completion"
+        );
+    }
+
+    #[test]
+    fn child_request_completes_only_with_exact_parent_response() {
+        let mut plane = plane();
+        let request = ChildFrame::Channels {
+            metadata: FrameMetadata {
+                timeout_ms: 5,
+                ..FrameMetadata::new(1)
+            },
+            request_id: "child-live".into(),
+            owner: "owner".into(),
+        };
+        let response = plane.dispatch_at(request, &[], 50).unwrap().unwrap();
+        assert_eq!(plane.in_flight_len(), 1);
+        assert_eq!(plane.complete_parent_response_at(&response, 55), Ok(()));
+        assert_eq!(plane.in_flight_len(), 0);
+        assert_eq!(
+            plane.complete_parent_response_at(&response, 55),
+            Err(ControlError::Correlation)
+        );
+
+        let late = ChildFrame::Channels {
+            metadata: FrameMetadata {
+                timeout_ms: 5,
+                ..FrameMetadata::new(1)
+            },
+            request_id: "child-late".into(),
+            owner: "owner".into(),
+        };
+        let response = plane.dispatch_at(late, &[], 50).unwrap().unwrap();
+        assert_eq!(
+            plane.complete_parent_response_at(&response, 56),
+            Err(ControlError::Timeout)
+        );
     }
 
     #[tokio::test]

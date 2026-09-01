@@ -8,7 +8,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Message, client::IntoClientRequest},
+};
 
 use super::start_listener_for_test;
 use crate::config::ServerArgs;
@@ -61,6 +64,52 @@ impl Clock for TestClock {
     fn parse_timestamp(&self, value: &str) -> Result<Timestamp, lotta_domain::DomainError> {
         Timestamp::parse_persisted_rfc3339(value)
     }
+}
+
+#[tokio::test]
+async fn dedicated_runtime_listener_closes_valid_management_plane_frame() {
+    let authenticator = crate::auth::channel_session::ChannelSessionAuthenticator::new();
+    let args = ServerArgs {
+        listen_enabled: true,
+        ..ServerArgs::default()
+    };
+    let prepared = args
+        .prepare()
+        .unwrap()
+        .for_channel_session(authenticator.clone())
+        .unwrap();
+    let handle = start_listener_for_test(prepared, clock(), 4096, LONG_PING_MS)
+        .await
+        .unwrap();
+    let capability = authenticator
+        .install("owner", 1, std::process::id(), "/tmp")
+        .unwrap();
+    let mut request = handle.websocket_url().into_client_request().unwrap();
+    request.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {}", capability.expose_for_pipe())
+            .parse()
+            .unwrap(),
+    );
+    let (mut socket, _) = connect_async(request).await.unwrap();
+    socket
+        .send(Message::Text(
+            serde_json::json!({
+                "kind":"channels", "version":1, "generation":1,
+                "capability":"channel_management", "timeout_ms":10000,
+                "request_id":"management-on-ws", "owner":"owner"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let Message::Close(Some(frame)) = next_message(&mut socket).await else {
+        panic!("dedicated listener must close management crossover");
+    };
+    assert_eq!(u16::from(frame.code), 1008);
+    assert_eq!(frame.reason, "runtime plane only");
+    handle.wait().await.unwrap();
 }
 
 #[tokio::test]
