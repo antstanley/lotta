@@ -575,8 +575,18 @@ const TASK73_AUDIT_SOURCES: &[&str] = &[
 const TASK78_PRODUCTION_SOURCES: &[&str] = &[
     "crates/lotta-app-server/src/auth/channel_session.rs",
     "crates/lotta-app-server/src/listener.rs",
+    "crates/lotta-app-server/src/listener/groups.rs",
+    "crates/lotta-app-server/src/listener/helpers.rs",
+    "crates/lotta-app-server/src/listener/http.rs",
+    "crates/lotta-app-server/src/listener/lifecycle.rs",
+    "crates/lotta-app-server/src/listener/runtime_dispatch.rs",
+    "crates/lotta-app-server/src/listener/session.rs",
+    "crates/lotta-app-server/src/listener/turn_supervisor.rs",
     "crates/lotta-channels/src/adapter.rs",
     "crates/lotta-channels/src/control_plane.rs",
+    "crates/lotta-channels/src/control_plane/codec.rs",
+    "crates/lotta-channels/src/control_plane/protocol.rs",
+    "crates/lotta-channels/src/control_plane/session.rs",
     "crates/lotta-channels/src/host.rs",
     "crates/lotta-channels/src/lib.rs",
     "crates/lotta-channels/src/state_store.rs",
@@ -602,10 +612,6 @@ const TASK76_PRODUCTION_SOURCES: &[&str] = &[
 // Exact pre-a3583b9e findings in newly covered files. Keeping the path and fingerprint makes this
 // scope visible and fails on any drift; Task73-touched code may not add to this debt.
 const TASK73_BASELINE_GAPS: &[(&str, &str)] = &[
-    (
-        "crates/lotta-app-server/src/listener.rs",
-        "FunctionLines { name: \"compose_listener_state\", lines: 82 }",
-    ),
     (
         "crates/lotta-providers/src/host/client.rs",
         "LintSuppression { line: 3 }",
@@ -694,6 +700,53 @@ fn task73_audit_sources(workspace: &Path) -> std::io::Result<Vec<PathBuf>> {
     validate_task73_manifest(workspace, TASK73_AUDIT_SOURCES)
 }
 
+fn task78_expected_sources(workspace: &Path) -> std::io::Result<BTreeSet<String>> {
+    let mut expected = BTreeSet::from([
+        "crates/lotta-app-server/src/auth/channel_session.rs".to_owned(),
+        "crates/lotta-app-server/src/listener.rs".to_owned(),
+        "crates/lotta-channels/src/adapter.rs".to_owned(),
+        "crates/lotta-channels/src/control_plane.rs".to_owned(),
+        "crates/lotta-channels/src/host.rs".to_owned(),
+        "crates/lotta-channels/src/lib.rs".to_owned(),
+        "crates/lotta-channels/src/state_store.rs".to_owned(),
+        "crates/lotta-channels/src/supervisor.rs".to_owned(),
+        "crates/lotta-channels/src/topology.rs".to_owned(),
+        "src/main.rs".to_owned(),
+    ]);
+    for relative in [
+        "crates/lotta-app-server/src/listener",
+        "crates/lotta-channels/src/control_plane",
+    ] {
+        for path in production_rust_sources(&workspace.join(relative))? {
+            expected.insert(
+                path.strip_prefix(workspace)
+                    .expect("Task78 source under workspace")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    Ok(expected)
+}
+
+fn validate_task78_manifest(workspace: &Path, audit: &[&str]) -> std::io::Result<Vec<PathBuf>> {
+    let expected = task78_expected_sources(workspace)?;
+    let actual: BTreeSet<_> = audit.iter().map(|path| (*path).to_owned()).collect();
+    if actual != expected {
+        let missing: Vec<_> = expected.difference(&actual).collect();
+        let unexpected: Vec<_> = actual.difference(&expected).collect();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Task78 audit manifest gaps: missing={missing:?}, unexpected={unexpected:?}"),
+        ));
+    }
+    checked_manifest_paths(workspace, audit)
+}
+
+fn task78_audit_sources(workspace: &Path) -> std::io::Result<Vec<PathBuf>> {
+    validate_task78_manifest(workspace, TASK78_PRODUCTION_SOURCES)
+}
+
 fn hard_limit_sources(workspace: &Path, manifest: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut files = production_rust_sources(&manifest.join("src"))?;
     files.extend(task73_audit_sources(workspace)?);
@@ -701,10 +754,7 @@ fn hard_limit_sources(workspace: &Path, manifest: &Path) -> std::io::Result<Vec<
         workspace,
         TASK76_PRODUCTION_SOURCES,
     )?);
-    files.extend(checked_manifest_paths(
-        workspace,
-        TASK78_PRODUCTION_SOURCES,
-    )?);
+    files.extend(task78_audit_sources(workspace)?);
     files.sort();
     files.dedup();
     Ok(files)
@@ -730,8 +780,9 @@ fn source_hard_limits_and_mutations() {
             .strip_prefix(workspace)
             .expect("audited source under workspace")
             .to_string_lossy();
+        let task78_source = TASK78_PRODUCTION_SOURCES.contains(&relative.as_ref());
         for finding in limit_findings(&source).expect("parse Rust source") {
-            if matches!(finding, LimitFinding::FileLines(_)) {
+            if matches!(finding, LimitFinding::FileLines(_)) && !task78_source {
                 continue;
             }
             let key = format!("{relative}: {finding:?}");
@@ -750,6 +801,11 @@ fn source_hard_limits_and_mutations() {
     let long_file = "\n".repeat(1_001);
     let long_line = format!("const X: &str = \"{}\";", "x".repeat(101));
     let long_function = format!("fn oversized() {{\n{}\n}}", "let _x = 1;\n".repeat(70));
+    assert_eq!(
+        limit_findings(&long_file).expect("parse 1001-line mutation"),
+        vec![LimitFinding::FileLines(1_001)],
+        "a 1001-line Task78 source must fail the file limit"
+    );
     let mutations = [
         (long_file, "file"),
         (long_line, "line"),
@@ -816,6 +872,14 @@ fn source_audit_manifest_rejects_gaps_and_duplicates() {
     let mut duplicate = TASK73_AUDIT_SOURCES.to_vec();
     duplicate.push(TASK73_AUDIT_SOURCES[0]);
     assert!(validate_task73_manifest(workspace, &duplicate).is_err());
+    assert!(validate_task78_manifest(workspace, TASK78_PRODUCTION_SOURCES).is_ok());
+    assert!(
+        validate_task78_manifest(workspace, &TASK78_PRODUCTION_SOURCES[1..]).is_err(),
+        "Task78 production source omission must fail"
+    );
+    let mut task78_duplicate = TASK78_PRODUCTION_SOURCES.to_vec();
+    task78_duplicate.push(TASK78_PRODUCTION_SOURCES[0]);
+    assert!(validate_task78_manifest(workspace, &task78_duplicate).is_err());
     assert!(checked_manifest_paths(workspace, &["src/production_setup.rs"]).is_ok());
     assert!(checked_manifest_paths(workspace, &["src/definitely-missing-task73.rs"]).is_err());
 }
